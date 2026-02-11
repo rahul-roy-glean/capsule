@@ -16,6 +16,20 @@ locals {
   host_image = var.use_custom_host_image ? data.google_compute_image.host[0].self_link : data.google_compute_image.ubuntu.self_link
 }
 
+# Data snapshot containing Firecracker snapshots + git-cache
+# Built by data-snapshot-builder, labeled as "current=true"
+# When use_data_snapshot is false, hosts will download from GCS (slower)
+data "google_compute_snapshot" "runner_data" {
+  count   = var.use_data_snapshot ? 1 : 0
+  name    = var.data_snapshot_name
+  project = var.project_id
+}
+
+locals {
+  # Use snapshot if available, otherwise null (startup script will download from GCS)
+  data_snapshot = var.use_data_snapshot ? data.google_compute_snapshot.runner_data[0].self_link : null
+}
+
 # Instance template for Firecracker hosts
 resource "google_compute_instance_template" "firecracker_host" {
   name_prefix  = "${local.name_prefix}-host-"
@@ -40,10 +54,9 @@ resource "google_compute_instance_template" "firecracker_host" {
     auto_delete  = true
   }
 
-  # Additional data disk for snapshots and workspaces
-  # Using pd-ssd instead of local SSDs to avoid n2-standard-64's
-  # requirement for 8/16/24 SSDs (3TB+ minimum)
-  # pd-ssd provides ~100K IOPS which is sufficient for this workload
+  # Data disk for snapshots, git-cache, and workspaces
+  # When use_data_snapshot=true: Created from snapshot (fast, ~30s, all data pre-populated)
+  # When use_data_snapshot=false: Empty disk, startup script downloads from GCS (slower)
   disk {
     device_name  = "data"
     type         = "PERSISTENT"
@@ -51,6 +64,8 @@ resource "google_compute_instance_template" "firecracker_host" {
     disk_size_gb = var.host_data_disk_size_gb
     boot         = false
     auto_delete  = true
+    # Create from snapshot if available - disk comes pre-populated with all artifacts!
+    source_snapshot = local.data_snapshot
   }
 
   network_interface {
@@ -81,165 +96,99 @@ resource "google_compute_instance_template" "firecracker_host" {
     vcpus-per-runner      = var.vcpus_per_runner
     memory-per-runner     = var.memory_per_runner_mb
     runner-ephemeral      = var.runner_ephemeral ? "true" : "false"
+    # Indicates whether data disk was created from snapshot (fast) or empty (needs GCS download)
+    use-data-snapshot     = var.use_data_snapshot ? "true" : "false"
   }
 
   metadata_startup_script = <<-EOF
     #!/bin/bash
     set -e
 
-    # Log startup
+    STARTUP_START=$(date +%s)
     echo "Starting Firecracker host initialization..."
 
-    # Mount the data disk (pd-ssd attached as /dev/sdb or by device name)
-    # Wait for disk to be attached
-    sleep 5
+    # Get key metadata
+    USE_DATA_SNAPSHOT=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/use-data-snapshot || echo "false")
+    SNAPSHOT_BUCKET=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/snapshot-bucket || echo "")
+
+    # Wait for data disk
+    sleep 3
     DATA_DISK="/dev/disk/by-id/google-data"
-    if [ -b "$DATA_DISK" ]; then
-      echo "Formatting and mounting data disk..."
-      mkfs.ext4 -F "$DATA_DISK"
-      mkdir -p /mnt/data
-      mount "$DATA_DISK" /mnt/data
-      echo "$DATA_DISK /mnt/data ext4 defaults,nofail 0 2" >> /etc/fstab
+    
+    # Mount the data disk
+    mkdir -p /mnt/data
+    
+    if [ "$USE_DATA_SNAPSHOT" = "true" ]; then
+      #######################################################################
+      # FAST PATH: Disk created from snapshot - all data is already there!
+      # Just mount and go. (~30 seconds total startup)
+      #######################################################################
+      echo "Data disk created from snapshot - mounting directly..."
+      
+      if [ -b "$DATA_DISK" ]; then
+        # Disk from snapshot is already formatted, just mount it
+        mount "$DATA_DISK" /mnt/data
+        echo "$DATA_DISK /mnt/data ext4 defaults,nofail 0 2" >> /etc/fstab
+        
+        # Verify expected files exist
+        if [ -d "/mnt/data/snapshots" ] && [ -f "/mnt/data/git-cache.img" ]; then
+          echo "Snapshot data verified OK:"
+          ls -la /mnt/data/
+          ls -la /mnt/data/snapshots/
+          if [ -f "/mnt/data/metadata.json" ]; then
+            echo "Snapshot metadata:"
+            cat /mnt/data/metadata.json
+          fi
+        else
+          echo "WARNING: Expected snapshot data not found, may need to fall back to GCS"
+        fi
+      else
+        echo "ERROR: Data disk not found at $DATA_DISK"
+        exit 1
+      fi
+      
     else
-      echo "Data disk not found at $DATA_DISK, checking alternatives..."
-      # Fallback to /dev/sdb
-      if [ -b "/dev/sdb" ]; then
-        mkfs.ext4 -F /dev/sdb
-        mkdir -p /mnt/data
+      #######################################################################
+      # SLOW PATH: Empty disk - need to download from GCS
+      # (~5-15 minutes depending on data size)
+      #######################################################################
+      echo "Empty data disk - downloading artifacts from GCS (slow path)..."
+      
+      if [ -b "$DATA_DISK" ]; then
+        echo "Formatting data disk..."
+        mkfs.ext4 -F -L RUNNER_DATA "$DATA_DISK"
+        mount "$DATA_DISK" /mnt/data
+        echo "$DATA_DISK /mnt/data ext4 defaults,nofail 0 2" >> /etc/fstab
+      elif [ -b "/dev/sdb" ]; then
+        mkfs.ext4 -F -L RUNNER_DATA /dev/sdb
         mount /dev/sdb /mnt/data
         echo "/dev/sdb /mnt/data ext4 defaults,nofail 0 2" >> /etc/fstab
       else
-        echo "WARNING: No data disk found, using boot disk directory"
-        mkdir -p /mnt/data
+        echo "WARNING: No data disk found"
       fi
-    fi
-
-    # Create directories
-    mkdir -p /mnt/data/snapshots
-    mkdir -p /mnt/data/workspaces
-    mkdir -p /var/run/firecracker
-
-    # Get metadata
-    SNAPSHOT_BUCKET=$(curl -s -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/snapshot-bucket)
-    MICROVM_SUBNET=$(curl -s -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/microvm-subnet)
-
-    # Sync snapshots from GCS to local NVMe
-    echo "Syncing snapshots from GCS..."
-    gsutil -m rsync -r "gs://$SNAPSHOT_BUCKET/current/" /mnt/data/snapshots/ || true
-
-    # Download Bazel cache image from GCS (single file, much faster than rsync)
-    echo "Downloading Bazel cache image from GCS..."
-    if gsutil -q stat "gs://$SNAPSHOT_BUCKET/cache/bazel-cache.img" 2>/dev/null; then
-      gsutil cp "gs://$SNAPSHOT_BUCKET/cache/bazel-cache.img" /mnt/data/cache.img
-      echo "Bazel cache image downloaded: $(ls -lh /mnt/data/cache.img)"
-    else
-      echo "No bazel-cache.img found in GCS, skipping cache setup"
-    fi
-
-    # Git cache setup (if enabled)
-    # Clones directly from GitHub - NO source code stored in GCS
-    GIT_CACHE_ENABLED=$(curl -sf -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/git-cache-enabled || echo "false")
-
-    if [ "$GIT_CACHE_ENABLED" = "true" ]; then
-      echo "Setting up git-cache..."
-      mkdir -p /mnt/data/git-cache
-
-      # Get repo config from metadata
-      GIT_CACHE_REPOS=$(curl -sf -H "Metadata-Flavor: Google" \
-        http://metadata.google.internal/computeMetadata/v1/instance/attributes/git-cache-repos || echo "")
-
-      # Generate GitHub App installation token (for private repos)
-      GITHUB_APP_ID=$(curl -sf -H "Metadata-Flavor: Google" \
-        http://metadata.google.internal/computeMetadata/v1/instance/attributes/github-app-id || echo "")
-      GITHUB_APP_SECRET=$(curl -sf -H "Metadata-Flavor: Google" \
-        http://metadata.google.internal/computeMetadata/v1/instance/attributes/github-app-secret || echo "")
-
-      GIT_AUTH_URL=""
-      if [ -n "$GITHUB_APP_ID" ] && [ -n "$GITHUB_APP_SECRET" ]; then
-        echo "Generating GitHub App installation token..."
+      
+      # Create directories
+      mkdir -p /mnt/data/snapshots
+      
+      # Download from GCS
+      if [ -n "$SNAPSHOT_BUCKET" ]; then
+        echo "Downloading Firecracker snapshot artifacts from GCS..."
+        gsutil -m rsync -r "gs://$SNAPSHOT_BUCKET/current/" /mnt/data/snapshots/ || true
         
-        # Fetch private key from Secret Manager
-        PEM=$(gcloud secrets versions access latest --secret="$GITHUB_APP_SECRET" 2>/dev/null || echo "")
-        
-        if [ -n "$PEM" ]; then
-          # Generate JWT
-          NOW=$(date +%s)
-          IAT=$((NOW - 60))
-          EXP=$((NOW + 600))
-          
-          b64enc() { openssl base64 | tr -d '=' | tr '/+' '_-' | tr -d '\n'; }
-          
-          HEADER=$(echo -n '{"typ":"JWT","alg":"RS256"}' | b64enc)
-          PAYLOAD=$(echo -n "{\"iat\":$IAT,\"exp\":$EXP,\"iss\":$GITHUB_APP_ID}" | b64enc)
-          SIGNATURE=$(echo -n "$HEADER.$PAYLOAD" | openssl dgst -sha256 -sign <(echo "$PEM") | b64enc)
-          JWT="$HEADER.$PAYLOAD.$SIGNATURE"
-          
-          # Get installation ID and token
-          INSTALLATION_ID=$(curl -sf -H "Authorization: Bearer $JWT" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/app/installations" | jq -r '.[0].id')
-          
-          if [ -n "$INSTALLATION_ID" ] && [ "$INSTALLATION_ID" != "null" ]; then
-            GIT_TOKEN=$(curl -sf -X POST \
-              -H "Authorization: Bearer $JWT" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/app/installations/$INSTALLATION_ID/access_tokens" | jq -r '.token')
-            
-            if [ -n "$GIT_TOKEN" ] && [ "$GIT_TOKEN" != "null" ]; then
-              GIT_AUTH_URL="x-access-token:$GIT_TOKEN@"
-              echo "GitHub App installation token generated successfully"
-            fi
-          fi
+        # Download git-cache.img if it exists
+        GIT_CACHE_GCS="gs://$SNAPSHOT_BUCKET/git-cache/current/git-cache.img"
+        if gsutil -q stat "$GIT_CACHE_GCS" 2>/dev/null; then
+          echo "Downloading git-cache.img from GCS..."
+          gsutil cp "$GIT_CACHE_GCS" /mnt/data/git-cache.img
         fi
       fi
-
-      # Clone/update repos directly from GitHub
-      # Format: "github.com/org/repo:dirname,github.com/org/other:othername"
-      if [ -n "$GIT_CACHE_REPOS" ]; then
-        IFS=',' read -ra REPOS <<< "$GIT_CACHE_REPOS"
-        for mapping in "$${REPOS[@]}"; do
-          REPO_URL=$(echo "$mapping" | cut -d: -f1)
-          REPO_DIR=$(echo "$mapping" | cut -d: -f2)
-          CLONE_PATH="/mnt/data/git-cache/$REPO_DIR"
-
-          # Build authenticated URL
-          if [ -n "$GIT_AUTH_URL" ]; then
-            FULL_URL="https://$${GIT_AUTH_URL}$REPO_URL"
-          else
-            FULL_URL="https://$REPO_URL"
-          fi
-
-          if [ -d "$CLONE_PATH/.git" ]; then
-            echo "Updating existing clone: $REPO_DIR"
-            # Update remote URL in case token changed
-            (cd "$CLONE_PATH" && git remote set-url origin "$FULL_URL" && git fetch --all --prune) || true
-          else
-            echo "Cloning: $REPO_URL -> $REPO_DIR"
-            git clone "$FULL_URL" "$CLONE_PATH" || echo "Warning: Clone failed for $REPO_URL"
-          fi
-        done
-      fi
-
-      # Create git-cache block device for Firecracker
-      if [ -d /mnt/data/git-cache ] && [ "$(ls -A /mnt/data/git-cache)" ]; then
-        echo "Creating git-cache block device..."
-        rm -f /mnt/data/git-cache.img
-        truncate -s 80G /mnt/data/git-cache.img
-        mkfs.ext4 -F -L GIT_CACHE /mnt/data/git-cache.img
-        MOUNT_TMP=$(mktemp -d)
-        mount -o loop /mnt/data/git-cache.img "$MOUNT_TMP"
-        cp -a /mnt/data/git-cache/* "$MOUNT_TMP"/ || true
-        chown -R root:root "$MOUNT_TMP"
-        chmod -R 755 "$MOUNT_TMP"
-        sync
-        umount "$MOUNT_TMP"
-        rmdir "$MOUNT_TMP"
-        echo "Git-cache block device created"
-      fi
     fi
+
+    # Create workspaces directory (per-VM, not in snapshot)
+    mkdir -p /mnt/data/workspaces
+    mkdir -p /var/run/firecracker
 
     # Setup bridge networking for microVMs
     echo "Setting up bridge networking..."
@@ -344,7 +293,10 @@ OVERRIDE
     systemctl enable firecracker-manager
     systemctl restart firecracker-manager
 
-    echo "Firecracker host initialization complete."
+    STARTUP_END=$(date +%s)
+    STARTUP_DURATION=$((STARTUP_END - STARTUP_START))
+    echo "Firecracker host initialization complete in $${STARTUP_DURATION}s"
+    echo "  Data source: $([ "$USE_DATA_SNAPSHOT" = "true" ] && echo "disk snapshot (fast)" || echo "GCS download (slow)")"
   EOF
 
   lifecycle {

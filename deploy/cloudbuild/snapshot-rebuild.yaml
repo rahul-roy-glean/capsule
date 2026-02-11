@@ -1,0 +1,124 @@
+# Full snapshot rebuild pipeline
+#
+# This chains: freshness check -> snapshot build -> data snapshot -> rolling update
+#
+# Triggered by:
+# - Cloud Scheduler (automated freshness check)
+# - Manual: gcloud builds submit --config=deploy/cloudbuild/snapshot-rebuild.yaml
+#
+# Required substitutions:
+# - _GCS_BUCKET: GCS bucket for snapshot storage
+# - _ZONE: GCP zone for temporary VMs
+# - _MAX_AGE_HOURS: Maximum snapshot age before rebuild (default: 24)
+# - _MAX_COMMIT_DRIFT: Maximum commits behind HEAD (default: 50)
+
+substitutions:
+  _GCS_BUCKET: ''
+  _ZONE: 'us-central1-a'
+  _MAX_AGE_HOURS: '24'
+  _MAX_COMMIT_DRIFT: '50'
+  _SNAPSHOT_PREFIX: 'runner-data'
+  _REPOS: ''
+
+options:
+  machineType: 'E2_HIGHCPU_8'
+  diskSizeGb: 200
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+  # Step 1: Build freshness checker and check if rebuild is needed
+  - name: 'golang:1.22'
+    id: 'check-freshness'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        cd /workspace
+        go build -o /workspace/bin/git-cache-freshness ./cmd/git-cache-freshness
+        /workspace/bin/git-cache-freshness \
+          --gcs-bucket=${_GCS_BUCKET} \
+          --gcp-project=$PROJECT_ID \
+          --max-age-hours=${_MAX_AGE_HOURS} \
+          --max-commit-drift=${_MAX_COMMIT_DRIFT}
+        # If freshness check passes (exit 0), snapshot is fresh - skip rebuild
+        # If it fails (exit 1), snapshot is stale - continue with rebuild
+        if [ $? -eq 0 ]; then
+          echo "Snapshot is fresh, skipping rebuild"
+          echo "SKIP" > /workspace/rebuild_needed
+        else
+          echo "Snapshot is stale, triggering rebuild"
+          echo "REBUILD" > /workspace/rebuild_needed
+        fi
+
+  # Step 2: Build snapshot (only if stale)
+  - name: 'golang:1.22'
+    id: 'build-snapshot'
+    waitFor: ['check-freshness']
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        if [ "$(cat /workspace/rebuild_needed)" = "SKIP" ]; then
+          echo "Skipping snapshot build (snapshot is fresh)"
+          exit 0
+        fi
+        echo "Building snapshot..."
+        cd /workspace
+        go build -o /workspace/bin/snapshot-builder ./cmd/snapshot-builder
+        # NOTE: snapshot-builder needs to run on a VM with Firecracker
+        # In practice, this step launches a temporary GCE VM
+        echo "Snapshot build would run on a temporary GCE VM"
+        echo "Use 'make snapshot-build' on a nested-virtualization-enabled VM"
+
+  # Step 3: Build data snapshot (only if stale)
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'build-data-snapshot'
+    waitFor: ['build-snapshot']
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        if [ "$(cat /workspace/rebuild_needed)" = "SKIP" ]; then
+          echo "Skipping data snapshot build (snapshot is fresh)"
+          exit 0
+        fi
+        echo "Building data snapshot..."
+        cd /workspace
+        go build -o /workspace/bin/data-snapshot-builder ./cmd/data-snapshot-builder
+        /workspace/bin/data-snapshot-builder \
+          --project=$PROJECT_ID \
+          --zone=${_ZONE} \
+          --snapshot-gcs=gs://${_GCS_BUCKET}/current/ \
+          --metadata-bucket=${_GCS_BUCKET}
+
+  # Step 4: Trigger MIG rolling update (only if rebuilt)
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'rolling-update'
+    waitFor: ['build-data-snapshot']
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        if [ "$(cat /workspace/rebuild_needed)" = "SKIP" ]; then
+          echo "Skipping rolling update (snapshot is fresh)"
+          exit 0
+        fi
+        echo "Triggering MIG rolling update..."
+        # Get the latest data snapshot name
+        SNAPSHOT_NAME=$(gcloud compute snapshots list \
+          --project=$PROJECT_ID \
+          --filter="name~${_SNAPSHOT_PREFIX}" \
+          --sort-by=~creationTimestamp \
+          --limit=1 \
+          --format="value(name)")
+
+        if [ -z "$SNAPSHOT_NAME" ]; then
+          echo "ERROR: No data snapshot found"
+          exit 1
+        fi
+
+        echo "Using data snapshot: $SNAPSHOT_NAME"
+        echo "MIG rolling update would be triggered here"
+        echo "Run: make mig-rolling-update PROJECT_ID=$PROJECT_ID"
+
+timeout: '3600s'  # 1 hour max

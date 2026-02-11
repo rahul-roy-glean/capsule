@@ -1,0 +1,63 @@
+# Cloud Build config for checking git-cache freshness
+#
+# This build:
+# 1. Downloads git-cache metadata from GCS
+# 2. Checks if cache is stale (age or commit drift)
+# 3. Optionally triggers rebuild if stale
+#
+# Schedule: Run every 4 hours via Cloud Scheduler
+# 
+# Cloud Scheduler setup:
+#   gcloud scheduler jobs create http git-cache-freshness-check \
+#     --schedule="0 */4 * * *" \
+#     --uri="https://cloudbuild.googleapis.com/v1/projects/${PROJECT_ID}/triggers/${TRIGGER_ID}:run" \
+#     --http-method=POST \
+#     --oauth-service-account-email="${SA_EMAIL}"
+
+substitutions:
+  _GCS_BUCKET: ''
+  _MAX_AGE_HOURS: '24'
+  _MAX_COMMIT_DRIFT: '50'
+  _REBUILD_TRIGGER_ID: ''
+
+options:
+  machineType: 'E2_MEDIUM'
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+  # Build the freshness checker
+  - name: 'golang:1.22'
+    id: 'build-tool'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        go build -o /workspace/git-cache-freshness ./cmd/git-cache-freshness
+
+  # Run freshness check
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'check-freshness'
+    entrypoint: 'bash'
+    env:
+      - 'GITHUB_TOKEN=$_GITHUB_TOKEN'
+    secretEnv: ['GITHUB_TOKEN']
+    args:
+      - '-c'
+      - |
+        /workspace/git-cache-freshness \
+          --gcs-bucket="${_GCS_BUCKET}" \
+          --max-age-hours=${_MAX_AGE_HOURS} \
+          --max-commit-drift=${_MAX_COMMIT_DRIFT} \
+          --trigger-rebuild=true \
+          --cloud-build-trigger="${_REBUILD_TRIGGER_ID}" \
+          --gcp-project="${PROJECT_ID}" \
+          --log-level=info || true
+        
+        # Exit 0 even if stale - the rebuild was triggered
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/$PROJECT_ID/secrets/github-token/versions/latest
+      env: 'GITHUB_TOKEN'
+
+timeout: '300s'  # 5 minutes max

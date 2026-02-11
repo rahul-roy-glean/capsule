@@ -117,6 +117,21 @@ variable "use_custom_host_image" {
   default     = false
 }
 
+# Data snapshot configuration
+# When enabled, the data disk is created from a pre-built snapshot containing
+# all Firecracker artifacts + git-cache. This is MUCH faster than downloading from GCS.
+variable "use_data_snapshot" {
+  description = "Create data disk from snapshot instead of downloading from GCS. Set to true after running data-snapshot-builder."
+  type        = bool
+  default     = false
+}
+
+variable "data_snapshot_name" {
+  description = "Name of the GCP disk snapshot to use for data disk (created by data-snapshot-builder)"
+  type        = string
+  default     = ""
+}
+
 # Git cache configuration
 variable "git_cache_enabled" {
   description = "Enable git-cache for fast reference cloning in microVMs"
@@ -245,4 +260,48 @@ variable "alert_snapshot_age_threshold_hours" {
   description = "Alert when active snapshot is older than this many hours"
   type        = number
   default     = 48
+}
+
+# CI system configuration
+variable "ci_system" {
+  description = "CI system integration (github-actions, none). Controls runner registration and webhook handling."
+  type        = string
+  default     = "github-actions"
+
+  validation {
+    condition     = contains(["github-actions", "none"], var.ci_system)
+    error_message = "ci_system must be one of: github-actions, none"
+  }
+}
+
+# GitHub organization for org-level runner registration
+variable "github_org" {
+  description = "GitHub organization for org-level runner registration. If set, uses org-level API instead of repo-level."
+  type        = string
+  default     = ""
+}
+
+# Snapshot automation configuration
+variable "enable_snapshot_automation" {
+  description = "Enable Cloud Scheduler for automated snapshot freshness checks and rebuild triggers"
+  type        = bool
+  default     = false
+}
+
+variable "snapshot_freshness_schedule" {
+  description = "Cron schedule for snapshot freshness checks (Cloud Scheduler format)"
+  type        = string
+  default     = "0 */4 * * *"
+}
+
+variable "snapshot_max_age_hours" {
+  description = "Maximum snapshot age in hours before triggering rebuild"
+  type        = number
+  default     = 24
+}
+
+variable "snapshot_max_commit_drift" {
+  description = "Maximum number of commits behind HEAD before triggering rebuild"
+  type        = number
+  default     = 50
 }

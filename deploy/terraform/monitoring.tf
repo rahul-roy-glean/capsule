@@ -581,6 +581,203 @@ resource "google_monitoring_alert_policy" "host_unhealthy" {
   }
 }
 
+# ============================================================================
+# Operations Dashboard (snapshot automation & fleet health)
+# ============================================================================
+
+resource "google_monitoring_dashboard" "firecracker_operations" {
+  count          = var.enable_monitoring ? 1 : 0
+  project        = var.project_id
+  dashboard_json = jsonencode({
+    displayName = "Firecracker Runner Operations"
+    labels = {
+      environment = var.environment
+    }
+    mosaicLayout = {
+      columns = 12
+      tiles = [
+        # Fleet overview
+        {
+          width  = 6
+          height = 4
+          widget = {
+            title = "Active Hosts"
+            scorecard = {
+              timeSeriesQuery = {
+                timeSeriesFilter = {
+                  filter = "metric.type=\"${local.metric_prefix}/control_plane/hosts_total\" resource.type=\"global\""
+                  aggregation = {
+                    alignmentPeriod  = "60s"
+                    perSeriesAligner = "ALIGN_MEAN"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          width  = 6
+          height = 4
+          widget = {
+            title = "Total Runners"
+            scorecard = {
+              timeSeriesQuery = {
+                timeSeriesFilter = {
+                  filter = "metric.type=\"${local.metric_prefix}/control_plane/runners_total\" resource.type=\"global\""
+                  aggregation = {
+                    alignmentPeriod  = "60s"
+                    perSeriesAligner = "ALIGN_MEAN"
+                  }
+                }
+              }
+            }
+          }
+        },
+        # VM Boot Time
+        {
+          yPos   = 4
+          width  = 6
+          height = 4
+          widget = {
+            title = "VM Boot Duration (p50/p95)"
+            xyChart = {
+              dataSets = [
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/vm/ready_duration_seconds\" resource.type=\"gce_instance\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_PERCENTILE_50"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                      }
+                    }
+                  }
+                  legendTemplate = "p50"
+                  plotType       = "LINE"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/vm/ready_duration_seconds\" resource.type=\"gce_instance\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_PERCENTILE_95"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                      }
+                    }
+                  }
+                  legendTemplate = "p95"
+                  plotType       = "LINE"
+                }
+              ]
+              yAxis = { label = "seconds" }
+            }
+          }
+        },
+        # Idle vs Busy Runners
+        {
+          xPos   = 6
+          yPos   = 4
+          width  = 6
+          height = 4
+          widget = {
+            title = "Idle vs Busy Runners"
+            xyChart = {
+              dataSets = [
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/host/runners_idle\" resource.type=\"gce_instance\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MEAN"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Idle"
+                  plotType       = "STACKED_AREA"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/host/runners_busy\" resource.type=\"gce_instance\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MEAN"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Busy"
+                  plotType       = "STACKED_AREA"
+                }
+              ]
+              yAxis = { label = "runners" }
+            }
+          }
+        },
+        # Snapshot Age
+        {
+          yPos   = 8
+          width  = 6
+          height = 4
+          widget = {
+            title = "Snapshot Age"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "metric.type=\"${local.metric_prefix}/snapshot/age_seconds\" resource.type=\"global\""
+                    aggregation = {
+                      alignmentPeriod  = "300s"
+                      perSeriesAligner = "ALIGN_MEAN"
+                    }
+                  }
+                }
+                legendTemplate = "Age"
+                plotType       = "LINE"
+              }]
+              yAxis = { label = "seconds" }
+            }
+          }
+        },
+        # VM Allocations
+        {
+          xPos   = 6
+          yPos   = 8
+          width  = 6
+          height = 4
+          widget = {
+            title = "VM Allocations (Success/Failure)"
+            xyChart = {
+              dataSets = [
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/control_plane/allocation_latency_seconds\" resource.type=\"global\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_COUNT"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Allocations"
+                  plotType       = "STACKED_BAR"
+                }
+              ]
+              yAxis = { label = "allocations/5min" }
+            }
+          }
+        }
+      ]
+    }
+  })
+}
+
 # Log-based metric for thaw-agent boot phases (runs inside VM)
 # Using DISTRIBUTION type to extract numeric values
 resource "google_logging_metric" "vm_boot_phase_from_logs" {
