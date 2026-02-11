@@ -17,13 +17,13 @@ import (
 )
 
 var (
-	configFile   = flag.String("config", "", "Path to git-cache config file (YAML/JSON)")
-	outputDir    = flag.String("output-dir", "/tmp/git-cache-build", "Output directory for build artifacts")
-	gcsBucket    = flag.String("gcs-bucket", "", "GCS bucket for git-cache upload")
-	imageSizeGB  = flag.Int("image-size-gb", 100, "Size of git-cache.img in GB")
-	githubToken  = flag.String("github-token", "", "GitHub token for private repo access (or use GITHUB_TOKEN env)")
-	logLevel     = flag.String("log-level", "info", "Log level")
-	dryRun       = flag.Bool("dry-run", false, "Build locally but don't upload to GCS")
+	configFile  = flag.String("config", "", "Path to git-cache config file (YAML/JSON)")
+	outputDir   = flag.String("output-dir", "/tmp/git-cache-build", "Output directory for build artifacts")
+	gcsBucket   = flag.String("gcs-bucket", "", "GCS bucket for git-cache upload")
+	imageSizeGB = flag.Int("image-size-gb", 100, "Size of git-cache.img in GB")
+	githubToken = flag.String("github-token", "", "GitHub token for private repo access (or use GITHUB_TOKEN env)")
+	logLevel    = flag.String("log-level", "info", "Log level")
+	dryRun      = flag.Bool("dry-run", false, "Build locally but don't upload to GCS")
 
 	// GitHub App authentication (alternative to --github-token for production)
 	githubAppID     = flag.String("github-app-id", "", "GitHub App ID for private repo access")
@@ -53,10 +53,10 @@ type RepoConfig struct {
 
 // GitCacheMetadata records what's in the cache (for freshness checking)
 type GitCacheMetadata struct {
-	Version   string                 `json:"version"`
-	BuildTime time.Time              `json:"build_time"`
-	Repos     map[string]RepoStatus  `json:"repos"`
-	ImageSize int64                  `json:"image_size_bytes"`
+	Version   string                `json:"version"`
+	BuildTime time.Time             `json:"build_time"`
+	Repos     map[string]RepoStatus `json:"repos"`
+	ImageSize int64                 `json:"image_size_bytes"`
 }
 
 // RepoStatus tracks the state of a cached repo
@@ -102,8 +102,8 @@ func main() {
 		}
 
 		log.WithFields(logrus.Fields{
-			"app_id":     *githubAppID,
-			"secret":     *githubAppSecret,
+			"app_id":      *githubAppID,
+			"secret":      *githubAppSecret,
 			"gcp_project": project,
 		}).Info("Using GitHub App for authentication")
 

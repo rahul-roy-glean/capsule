@@ -96,10 +96,10 @@ func (s *StructuredLogger) LogBootComplete(timer *Timer) {
 	}
 
 	s.logger.WithFields(logrus.Fields{
-		"event":          "boot_complete",
-		"runner_id":      s.runnerID,
-		"total_ms":       timer.Total().Milliseconds(),
-		"phases_ms":      phasesMs,
+		"event":     "boot_complete",
+		"runner_id": s.runnerID,
+		"total_ms":  timer.Total().Milliseconds(),
+		"phases_ms": phasesMs,
 	}).Info("Boot complete")
 }
 
@@ -123,4 +123,3 @@ func (s *StructuredLogger) LogJobComplete(repo string, duration time.Duration, r
 		"result":      result,
 	}).Info("Job complete")
 }
-

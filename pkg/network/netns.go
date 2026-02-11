@@ -27,12 +27,13 @@ import (
 // - All clones use the same IP without conflict
 //
 // Architecture:
-//   Host namespace:
-//     - veth-{vmid}-host (connected to bridge)
-//   VM namespace (netns-{vmid}):
-//     - veth-{vmid}-vm (same IP for all VMs, e.g., 172.16.0.2)
-//     - TAP device for Firecracker (tap0)
-//     - NAT masquerade from VM subnet to veth
+//
+//	Host namespace:
+//	  - veth-{vmid}-host (connected to bridge)
+//	VM namespace (netns-{vmid}):
+//	  - veth-{vmid}-vm (same IP for all VMs, e.g., 172.16.0.2)
+//	  - TAP device for Firecracker (tap0)
+//	  - NAT masquerade from VM subnet to veth
 type NetNSNetwork struct {
 	bridgeName    string
 	subnet        *net.IPNet
@@ -46,15 +47,15 @@ type NetNSNetwork struct {
 
 // VMNamespace holds info about a VM's network namespace
 type VMNamespace struct {
-	Name       string    // Namespace name
-	Path       string    // Path to namespace file
-	VethHost   string    // Host-side veth name
-	VethVM     string    // VM-side veth name (inside namespace)
-	TapName    string    // TAP device name inside namespace
-	IP         net.IP    // IP address (same for all VMs)
-	Gateway    net.IP    // Gateway IP
-	MAC        string    // MAC address for TAP
-	Handle     netns.NsHandle
+	Name     string // Namespace name
+	Path     string // Path to namespace file
+	VethHost string // Host-side veth name
+	VethVM   string // VM-side veth name (inside namespace)
+	TapName  string // TAP device name inside namespace
+	IP       net.IP // IP address (same for all VMs)
+	Gateway  net.IP // Gateway IP
+	MAC      string // MAC address for TAP
+	Handle   netns.NsHandle
 }
 
 // NetNSConfig holds configuration for network namespace setup
@@ -97,10 +98,10 @@ func (n *NetNSNetwork) Setup() error {
 	defer n.mu.Unlock()
 
 	n.logger.WithFields(logrus.Fields{
-		"bridge":    n.bridgeName,
-		"subnet":    n.subnet.String(),
-		"gateway":   n.gateway.String(),
-		"vm_ip":     n.vmIP.String(),
+		"bridge":  n.bridgeName,
+		"subnet":  n.subnet.String(),
+		"gateway": n.gateway.String(),
+		"vm_ip":   n.vmIP.String(),
 	}).Info("Setting up network namespace infrastructure")
 
 	// Create bridge

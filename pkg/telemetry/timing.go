@@ -134,4 +134,3 @@ func (s *Stopwatch) Reset() time.Duration {
 func (s *Stopwatch) ElapsedMs() int64 {
 	return time.Since(s.start).Milliseconds()
 }
-

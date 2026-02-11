@@ -19,11 +19,11 @@ type BootSource struct {
 
 // Drive represents a block device configuration
 type Drive struct {
-	DriveID      string `json:"drive_id"`
-	PathOnHost   string `json:"path_on_host"`
-	IsRootDevice bool   `json:"is_root_device"`
-	IsReadOnly   bool   `json:"is_read_only"`
-	CacheType    string `json:"cache_type,omitempty"`
+	DriveID      string       `json:"drive_id"`
+	PathOnHost   string       `json:"path_on_host"`
+	IsRootDevice bool         `json:"is_root_device"`
+	IsReadOnly   bool         `json:"is_read_only"`
+	CacheType    string       `json:"cache_type,omitempty"`
 	RateLimiter  *RateLimiter `json:"rate_limiter,omitempty"`
 }
 
@@ -42,9 +42,9 @@ type TokenBucket struct {
 
 // NetworkInterface represents a network interface configuration
 type NetworkInterface struct {
-	IfaceID     string       `json:"iface_id"`
-	GuestMAC    string       `json:"guest_mac,omitempty"`
-	HostDevName string       `json:"host_dev_name"`
+	IfaceID       string       `json:"iface_id"`
+	GuestMAC      string       `json:"guest_mac,omitempty"`
+	HostDevName   string       `json:"host_dev_name"`
 	RxRateLimiter *RateLimiter `json:"rx_rate_limiter,omitempty"`
 	TxRateLimiter *RateLimiter `json:"tx_rate_limiter,omitempty"`
 }
@@ -58,11 +58,11 @@ type SnapshotCreateParams struct {
 
 // SnapshotLoadParams for loading a snapshot
 type SnapshotLoadParams struct {
-	SnapshotPath        string `json:"snapshot_path"`
-	MemFilePath         string `json:"mem_file_path,omitempty"`
+	SnapshotPath        string      `json:"snapshot_path"`
+	MemFilePath         string      `json:"mem_file_path,omitempty"`
 	MemBackend          *MemBackend `json:"mem_backend,omitempty"`
-	EnableDiffSnapshots bool   `json:"enable_diff_snapshots,omitempty"`
-	ResumeVM            bool   `json:"resume_vm,omitempty"`
+	EnableDiffSnapshots bool        `json:"enable_diff_snapshots,omitempty"`
+	ResumeVM            bool        `json:"resume_vm,omitempty"`
 }
 
 // MemBackend configuration for memory backend
@@ -78,18 +78,18 @@ type VMState struct {
 
 // InstanceInfo returned by GET /
 type InstanceInfo struct {
-	ID            string `json:"id"`
-	State         string `json:"state"`
-	VMConfig      string `json:"vmm_version"`
-	AppName       string `json:"app_name"`
-	StartedAt     time.Time `json:"started"`
+	ID        string    `json:"id"`
+	State     string    `json:"state"`
+	VMConfig  string    `json:"vmm_version"`
+	AppName   string    `json:"app_name"`
+	StartedAt time.Time `json:"started"`
 }
 
 // MMDS (MicroVM Metadata Service) configuration
 type MMDSConfig struct {
-	Version         string   `json:"version,omitempty"` // "V1" or "V2"
+	Version           string   `json:"version,omitempty"` // "V1" or "V2"
 	NetworkInterfaces []string `json:"network_interfaces,omitempty"`
-	IPv4Address     string   `json:"ipv4_address,omitempty"`
+	IPv4Address       string   `json:"ipv4_address,omitempty"`
 }
 
 // MMDSContentsPath for MMDS data
@@ -124,5 +124,3 @@ type APIError struct {
 func (e *APIError) Error() string {
 	return e.FaultMessage
 }
-
-

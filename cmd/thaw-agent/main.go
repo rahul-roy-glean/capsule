@@ -43,16 +43,16 @@ var (
 	buildbarnCertsLabel    = flag.String("buildbarn-certs-label", "BUILDBARN_CERTS", "Filesystem label for Buildbarn certs drive")
 
 	// Credentials flags (generic replacement for buildbarn-specific certs)
-	skipCredentials    = flag.Bool("skip-credentials", false, "Skip mounting credentials drive")
-	credentialsDevice  = flag.String("credentials-device", "/dev/vdd", "Block device for credentials drive")
-	credentialsMount   = flag.String("credentials-mount", "/mnt/credentials", "Mount point for credentials")
-	credentialsLabel   = flag.String("credentials-label", "CREDENTIALS", "Filesystem label for credentials drive")
+	skipCredentials   = flag.Bool("skip-credentials", false, "Skip mounting credentials drive")
+	credentialsDevice = flag.String("credentials-device", "/dev/vdd", "Block device for credentials drive")
+	credentialsMount  = flag.String("credentials-mount", "/mnt/credentials", "Mount point for credentials")
+	credentialsLabel  = flag.String("credentials-label", "CREDENTIALS", "Filesystem label for credentials drive")
 
 	// Git cache flags
-	skipGitCache         = flag.Bool("skip-git-cache", false, "Skip git-cache setup and reference cloning")
-	gitCacheDevice       = flag.String("git-cache-device", "/dev/vde", "Block device for git-cache (read-only mount inside VM)")
-	gitCacheMount        = flag.String("git-cache-mount", "/mnt/git-cache", "Mount point for git-cache inside the microVM")
-	gitCacheLabel        = flag.String("git-cache-label", "GIT_CACHE", "Filesystem label for git-cache drive")
+	skipGitCache   = flag.Bool("skip-git-cache", false, "Skip git-cache setup and reference cloning")
+	gitCacheDevice = flag.String("git-cache-device", "/dev/vde", "Block device for git-cache (read-only mount inside VM)")
+	gitCacheMount  = flag.String("git-cache-mount", "/mnt/git-cache", "Mount point for git-cache inside the microVM")
+	gitCacheLabel  = flag.String("git-cache-label", "GIT_CACHE", "Filesystem label for git-cache drive")
 )
 
 // WarmupState tracks the current warmup progress (for snapshot building)
@@ -177,7 +177,7 @@ func main() {
 		stepMutex.Unlock()
 		log.WithField("step", step).Info("Boot progress")
 	}
-	
+
 	// Start a basic health server immediately (for debugging)
 	// This allows us to verify the agent is alive even if MMDS fails
 	go func() {
@@ -294,7 +294,7 @@ func main() {
 				}
 			}
 		}
-		
+
 		// Create symlink to pre-cloned repo after tmpfs mount
 		// The repo is pre-cloned in the snapshot rootfs, workflow expects it at WorkspaceDir
 		preClonedRepo := getPreClonedPath(mmdsData)
@@ -368,7 +368,7 @@ func main() {
 				pollInterval *= 2
 			}
 			pollCount++
-			
+
 			newData, err := fetchMMDSData()
 			if err != nil {
 				if pollCount%20 == 0 { // Log every 10 seconds
@@ -376,7 +376,7 @@ func main() {
 				}
 				continue
 			}
-			
+
 			// Log what we got every 10 seconds for debugging
 			if pollCount%20 == 0 {
 				log.WithFields(logrus.Fields{
@@ -385,7 +385,7 @@ func main() {
 					"runner_id":  newData.Latest.Meta.RunnerID,
 				}).Info("MMDS poll result")
 			}
-			
+
 			// Check if mode changed from warmup (indicates snapshot was restored)
 			if newData.Latest.Meta.Mode != "warmup" {
 				log.WithFields(logrus.Fields{
@@ -396,31 +396,31 @@ func main() {
 				// Update the existing mmdsData in-place so the health server sees the new data
 				// (the health server has a reference to the original mmdsData)
 				mmdsData.Latest = newData.Latest
-				
+
 				// Recreate symlink after restore (tmpfs was fresh, symlink from warmup is gone)
 				// Use configured paths from MMDS
 				globalSymlinkState.Attempted = true
-				
+
 				// Use a temporary MMDSData wrapper for the helper functions
 				tempData := &MMDSData{}
 				tempData.Latest = newData.Latest
-				
+
 				preClonedRepo := getPreClonedPath(tempData)
 				globalSymlinkState.TargetPath = preClonedRepo
-				
+
 				if preClonedRepo != "" {
 					gitPath := filepath.Join(preClonedRepo, ".git")
 					if _, err := os.Stat(gitPath); err == nil {
 						globalSymlinkState.TargetExists = true
 						symlinkPath := getWorkspaceRepoPath(tempData)
 						globalSymlinkState.SymlinkPath = symlinkPath
-						
+
 						if symlinkPath != "" && symlinkPath != preClonedRepo {
 							log.WithFields(logrus.Fields{
 								"symlink": symlinkPath,
 								"target":  preClonedRepo,
 							}).Info("Creating symlink to pre-cloned repo after restore")
-							
+
 							if err := os.MkdirAll(filepath.Dir(symlinkPath), 0755); err != nil {
 								globalSymlinkState.Error = fmt.Sprintf("MkdirAll failed: %v", err)
 								log.WithError(err).Error("Failed to create symlink parent dir")
@@ -461,10 +461,10 @@ func main() {
 				break
 			}
 		}
-		
+
 		// Fall through to normal runner mode
 	}
-	
+
 	// Normal runner mode
 	setStep("starting_health_server")
 	// Start health server in background FIRST so we can always monitor the VM
@@ -870,7 +870,7 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 func fetchMMDSData() (*MMDSData, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	
+
 	// Reuse waitForMMDS logic but with a short timeout
 	// This handles all the JSON parsing complexity
 	return waitForMMDSOnce(ctx)
@@ -1072,7 +1072,7 @@ func setupWorkspaceFromGitCache(data *MMDSData) error {
 	repoFullPath := extractRepoDir(job.Repo) // Returns "scio/scio" for askscio/scio
 	parts := strings.Split(job.Repo, "/")
 	simpleRepoName := parts[len(parts)-1] // Just "scio"
-	
+
 	cachePath := filepath.Join(gitCachePath, simpleRepoName) // /mnt/git-cache/scio
 	targetPath := filepath.Join(workspacePath, repoFullPath) // /mnt/ephemeral/workdir/scio/scio
 
@@ -1103,7 +1103,7 @@ func setupWorkspaceFromGitCache(data *MMDSData) error {
 		targetPath,
 	)
 	cloneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-	
+
 	if output, err := cloneCmd.CombinedOutput(); err != nil {
 		// If target exists, try to set it up as alternates instead
 		if _, statErr := os.Stat(targetPath); statErr == nil {
@@ -1164,8 +1164,8 @@ func findGitCacheReference(data *MMDSData, repoURL string) string {
 	}
 
 	// Try to infer from repo URL - extractRepoDir returns repo/repo, we need just repo
-	repoPath := extractRepoDir(repoURL)       // scio/scio
-	repoName := filepath.Base(repoPath)       // scio
+	repoPath := extractRepoDir(repoURL) // scio/scio
+	repoName := filepath.Base(repoPath) // scio
 	candidates := []string{
 		filepath.Join(mountPath, repoName),        // /mnt/git-cache/scio
 		filepath.Join(mountPath, repoName+".git"), // /mnt/git-cache/scio.git
@@ -1278,7 +1278,7 @@ func registerGitHubRunner(data *MMDSData) error {
 		"home":     runnerUser.HomeDir,
 		"run_path": runnerPath,
 	}).Info("Configuring GitHub runner (timeout: 120s)...")
-	
+
 	output, err := configCmd.CombinedOutput()
 	if err != nil {
 		log.WithFields(logrus.Fields{
@@ -1331,47 +1331,47 @@ func runWarmupMode(data *MMDSData) error {
 	if warmup.RepoURL == "" {
 		return fmt.Errorf("no repo_url in warmup config")
 	}
-	
+
 	// Clone to rootfs (which has more space) but symlink to expected GitHub Actions location
 	// This allows the workflow to find the repo at /mnt/ephemeral/workdir/scio/scio
 	// while actually storing it on the persistent rootfs at /workspace/scio/scio
-	
+
 	// Extract org/repo from URL for directory structure (GitHub Actions convention)
 	repoPath := extractRepoDir(warmup.RepoURL) // Returns "scio/scio" for github.com/askscio/scio
-	
+
 	// Store on rootfs with enough space
 	actualRepoDir := filepath.Join("/workspace", repoPath)
-	
+
 	// Create symlink from expected location to actual location
 	workDir := data.Latest.GitCache.WorkspaceDir
 	if workDir == "" {
 		workDir = "/mnt/ephemeral/workdir"
 	}
 	expectedRepoDir := filepath.Join(workDir, repoPath)
-	
+
 	// Clone to actual location on rootfs
 	repoDir := actualRepoDir
-	
+
 	log.WithFields(logrus.Fields{
 		"actual_repo_dir":   actualRepoDir,
 		"expected_repo_dir": expectedRepoDir,
 		"work_dir":          workDir,
 	}).Info("Setting up repo directories for warmup")
-	
+
 	// Phase 1: Clone repository
 	updateWarmupState("cloning", "Cloning repository...")
 	log.WithFields(logrus.Fields{
-		"repo_url":  warmup.RepoURL,
-		"branch":    warmup.RepoBranch,
-		"repo_dir":  repoDir,
-		"work_dir":  workDir,
+		"repo_url": warmup.RepoURL,
+		"branch":   warmup.RepoBranch,
+		"repo_dir": repoDir,
+		"work_dir": workDir,
 	}).Info("Cloning repository for warmup")
-	
+
 	// Create parent directory for the clone target (e.g., /mnt/ephemeral/workdir/scio for scio/scio)
 	if err := os.MkdirAll(filepath.Dir(repoDir), 0755); err != nil {
 		return fmt.Errorf("failed to create repo parent dir: %w", err)
 	}
-	
+
 	branch := warmup.RepoBranch
 	if branch == "" {
 		branch = "main"
@@ -1450,7 +1450,7 @@ func runWarmupMode(data *MMDSData) error {
 			}
 		}
 	}
-	
+
 	// Create symlink from expected location to actual location for GitHub Actions compatibility
 	// e.g., /mnt/ephemeral/workdir/scio/scio -> /workspace/scio/scio
 	if actualRepoDir != expectedRepoDir {
@@ -1470,10 +1470,10 @@ func runWarmupMode(data *MMDSData) error {
 			}
 		}
 	}
-	
+
 	// Phase 2: Configure Bazel
 	updateWarmupState("configuring", "Configuring Bazel...")
-	
+
 	// Create bazelrc for warmup
 	bazelrcContent := `# Warmup-specific Bazel configuration
 build --repository_cache=/mnt/ephemeral/caches/repository
@@ -1487,11 +1487,11 @@ build --local_cpu_resources=HOST_CPUS
 	if err := os.WriteFile(bazelrcPath, []byte(bazelrcContent), 0644); err != nil {
 		log.WithError(err).Warn("Failed to write bazelrc.warmup")
 	}
-	
+
 	// Phase 3: Fetch external dependencies
 	updateWarmupState("fetching", "Fetching external dependencies...")
 	log.Info("Running bazel fetch //...")
-	
+
 	fetchCmd := exec.Command("bazel", "--bazelrc="+bazelrcPath, "fetch", "//...")
 	fetchCmd.Dir = repoDir
 	fetchCmd.Stdout = os.Stdout
@@ -1500,17 +1500,17 @@ build --local_cpu_resources=HOST_CPUS
 	if err := fetchCmd.Run(); err != nil {
 		log.WithError(err).Warn("bazel fetch failed (continuing)")
 	}
-	
+
 	// Count fetched externals
 	externalsDir := filepath.Join("/mnt/ephemeral/caches/repository", "content_addressable")
 	if entries, err := os.ReadDir(externalsDir); err == nil {
 		globalWarmupState.ExternalsFetched = len(entries)
 	}
-	
+
 	// Phase 4: Run analysis
 	updateWarmupState("analyzing", "Running Bazel analysis (--nobuild)...")
 	log.Info("Running bazel build --nobuild //...")
-	
+
 	analyzeCmd := exec.Command("bazel", "--bazelrc="+bazelrcPath, "build", "--nobuild", "//...")
 	analyzeCmd.Dir = repoDir
 	analyzeCmd.Stdout = os.Stdout
@@ -1519,11 +1519,11 @@ build --local_cpu_resources=HOST_CPUS
 	if err := analyzeCmd.Run(); err != nil {
 		log.WithError(err).Warn("bazel build --nobuild failed (continuing)")
 	}
-	
+
 	// Phase 5: Start Bazel server (keeps server state in memory for snapshot)
 	updateWarmupState("starting_server", "Starting Bazel server...")
 	log.Info("Starting persistent Bazel server")
-	
+
 	infoCmd := exec.Command("bazel", "--bazelrc="+bazelrcPath, "info")
 	infoCmd.Dir = repoDir
 	infoCmd.Stdout = os.Stdout
@@ -1532,11 +1532,11 @@ build --local_cpu_resources=HOST_CPUS
 	if err := infoCmd.Run(); err != nil {
 		log.WithError(err).Warn("bazel info failed")
 	}
-	
+
 	// Phase 6: Sync caches to disk
 	updateWarmupState("syncing", "Syncing caches to disk...")
 	exec.Command("sync").Run()
-	
+
 	return nil
 }
 
@@ -1571,12 +1571,12 @@ func getPreClonedPath(data *MMDSData) string {
 	if data == nil {
 		return ""
 	}
-	
+
 	// First check explicit config
 	if data.Latest.GitCache.PreClonedPath != "" {
 		return data.Latest.GitCache.PreClonedPath
 	}
-	
+
 	// Derive from job.repo if not explicitly set
 	// During warmup, repos are cloned to /workspace/{org}/{repo}
 	// e.g., askscio/scio -> /workspace/scio/scio
@@ -1584,7 +1584,7 @@ func getPreClonedPath(data *MMDSData) string {
 		repoPath := extractRepoDir(data.Latest.Job.Repo)
 		return filepath.Join("/workspace", repoPath)
 	}
-	
+
 	return ""
 }
 
@@ -1594,18 +1594,18 @@ func getWorkspaceRepoPath(data *MMDSData) string {
 	if data == nil {
 		return ""
 	}
-	
+
 	workspaceDir := data.Latest.GitCache.WorkspaceDir
 	if workspaceDir == "" {
 		workspaceDir = "/mnt/ephemeral/workdir"
 	}
-	
+
 	// Derive from job.repo
 	if data.Latest.Job.Repo != "" {
 		repoPath := extractRepoDir(data.Latest.Job.Repo)
 		return filepath.Join(workspaceDir, repoPath)
 	}
-	
+
 	return ""
 }
 
@@ -1630,9 +1630,9 @@ func startHealthServer(mmdsData *MMDSData) {
 			log.WithField("panic", r).Error("Health server panicked!")
 		}
 	}()
-	
+
 	log.Info("Creating health server on :8080...")
-	
+
 	// Use a separate ServeMux to avoid conflicts with the default mux (used by :8081)
 	mux := http.NewServeMux()
 
@@ -1655,7 +1655,7 @@ func startHealthServer(mmdsData *MMDSData) {
 			"symlink":      globalSymlinkState,
 		})
 	})
-	
+
 	// Warmup status endpoint (for snapshot-builder to poll)
 	mux.HandleFunc("/warmup-status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1665,13 +1665,13 @@ func startHealthServer(mmdsData *MMDSData) {
 	// MMDS diagnostic endpoint - queries MMDS directly from inside VM
 	mux.HandleFunc("/mmds-diag", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		
+
 		// Query MMDS directly
 		client := &http.Client{Timeout: 2 * time.Second}
 		req, _ := http.NewRequest("GET", *mmdsEndpoint+"/latest", nil)
 		req.Header.Set("Accept", "application/json")
 		resp, err := client.Do(req)
-		
+
 		var mmdsRaw string
 		var mmdsErr string
 		if err != nil {
@@ -1681,7 +1681,7 @@ func startHealthServer(mmdsData *MMDSData) {
 			body, _ := io.ReadAll(resp.Body)
 			mmdsRaw = string(body)
 		}
-		
+
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"mmds_endpoint":     *mmdsEndpoint,
 			"mmds_raw":          mmdsRaw,
@@ -1712,10 +1712,10 @@ func startHealthServer(mmdsData *MMDSData) {
 		pingOut, pingErr := exec.Command("ping", "-c", "1", "-W", "2", "8.8.8.8").CombinedOutput()
 		dnsOut, dnsErr := exec.Command("ping", "-c", "1", "-W", "2", "google.com").CombinedOutput()
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"ping_8888":     pingErr == nil,
-			"ping_output":   string(pingOut),
-			"dns_works":     dnsErr == nil,
-			"dns_output":    string(dnsOut),
+			"ping_8888":   pingErr == nil,
+			"ping_output": string(pingOut),
+			"dns_works":   dnsErr == nil,
+			"dns_output":  string(dnsOut),
 		})
 	})
 
@@ -1728,22 +1728,22 @@ func startHealthServer(mmdsData *MMDSData) {
 		bazelVer, _ := exec.Command("bazel", "--version").CombinedOutput()
 		goVer, _ := exec.Command("go", "version").CombinedOutput()
 		runnerCheck, _ := exec.Command("ls", "-la", "/home/runner").CombinedOutput()
-		
+
 		// Check symlink paths
 		workdirLs, _ := exec.Command("ls", "-la", "/mnt/ephemeral/workdir").CombinedOutput()
 		workdirScioLs, _ := exec.Command("ls", "-la", "/mnt/ephemeral/workdir/scio").CombinedOutput()
 		symlinkLs, _ := exec.Command("ls", "-la", "/mnt/ephemeral/workdir/scio/scio").CombinedOutput()
 		targetLs, _ := exec.Command("ls", "-la", "/workspace/scio/scio/.git").CombinedOutput()
-		
+
 		// Try git status in the symlink path
 		gitStatusCmd := exec.Command("git", "status")
 		gitStatusCmd.Dir = "/mnt/ephemeral/workdir/scio/scio"
 		gitStatus, _ := gitStatusCmd.CombinedOutput()
-		
+
 		// Check git config
 		gitConfigCmd := exec.Command("cat", "/workspace/scio/scio/.git/config")
 		gitConfig, _ := gitConfigCmd.CombinedOutput()
-		
+
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"mounts":            string(mounts),
 			"lsblk":             string(lsblk),

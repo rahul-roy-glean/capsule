@@ -75,9 +75,9 @@ func NewClient(ctx context.Context, config Config, logger *logrus.Logger) (*Clie
 	go c.flushLoop(ctx)
 
 	log.WithFields(logrus.Fields{
-		"project":       config.ProjectID,
-		"component":     config.Component,
-		"resource_type": resourceType,
+		"project":        config.ProjectID,
+		"component":      config.Component,
+		"resource_type":  resourceType,
 		"flush_interval": config.FlushInterval,
 	}).Info("Telemetry initialized")
 
@@ -321,4 +321,3 @@ func (c *Client) RecordHostMetrics(ctx context.Context, m HostMetrics) {
 	c.RecordInt(ctx, "host/runners_idle", int64(m.IdleRunners), nil)
 	c.RecordInt(ctx, "host/runners_busy", int64(m.BusyRunners), nil)
 }
-

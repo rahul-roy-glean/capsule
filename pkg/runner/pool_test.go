@@ -559,7 +559,7 @@ func TestTryRecycle(t *testing.T) {
 		func(ctx context.Context, runnerID string) error { return nil },
 		func(ctx context.Context, runnerID string) (*VMStats, error) {
 			return &VMStats{
-				MemoryUsageBytes: 1024 * 1024 * 1024, // 1GB
+				MemoryUsageBytes: 1024 * 1024 * 1024,     // 1GB
 				DiskUsageBytes:   5 * 1024 * 1024 * 1024, // 5GB
 			}, nil
 		},

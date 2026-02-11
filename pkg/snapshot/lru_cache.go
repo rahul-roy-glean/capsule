@@ -8,8 +8,8 @@ import (
 // LRUCache is a thread-safe LRU cache for chunk data
 type LRUCache struct {
 	capacity int
-	size     int64    // Current size in bytes
-	maxSize  int64    // Maximum size in bytes
+	size     int64 // Current size in bytes
+	maxSize  int64 // Maximum size in bytes
 	items    map[string]*list.Element
 	order    *list.List
 	mu       sync.RWMutex

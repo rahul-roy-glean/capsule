@@ -22,12 +22,12 @@ const (
 
 // WarmupStatus represents the warmup status from the guest
 type WarmupStatus struct {
-	Complete    bool      `json:"complete"`
-	Phase       string    `json:"phase"`
-	Message     string    `json:"message,omitempty"`
-	Error       string    `json:"error,omitempty"`
-	Timestamp   time.Time `json:"timestamp"`
-	BazelInfo   *BazelInfo `json:"bazel_info,omitempty"`
+	Complete  bool       `json:"complete"`
+	Phase     string     `json:"phase"`
+	Message   string     `json:"message,omitempty"`
+	Error     string     `json:"error,omitempty"`
+	Timestamp time.Time  `json:"timestamp"`
+	BazelInfo *BazelInfo `json:"bazel_info,omitempty"`
 }
 
 // BazelInfo holds bazel warmup information
@@ -219,7 +219,7 @@ func (c *GuestClient) connect() (net.Conn, error) {
 	//
 	// For simplicity in the guest, we'll use the vsock device directly.
 	addr := fmt.Sprintf("/dev/vsock")
-	
+
 	// Check if vsock device exists
 	if _, err := os.Stat(addr); err != nil {
 		return nil, fmt.Errorf("vsock device not available: %w", err)
@@ -230,4 +230,3 @@ func (c *GuestClient) connect() (net.Conn, error) {
 	// For now, return an error indicating vsock needs to be set up
 	return nil, fmt.Errorf("vsock guest connection requires /dev/vsock - ensure vsock is enabled in VM config")
 }
-

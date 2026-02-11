@@ -15,9 +15,9 @@ import (
 // HostAgentServer implements the HostAgent gRPC service
 type HostAgentServer struct {
 	pb.UnimplementedHostAgentServer
-	manager       *runner.Manager
-	chunkedMgr    *runner.ChunkedManager // Optional, for chunked snapshot support
-	logger        *logrus.Entry
+	manager    *runner.Manager
+	chunkedMgr *runner.ChunkedManager // Optional, for chunked snapshot support
+	logger     *logrus.Entry
 }
 
 // NewHostAgentServer creates a new HostAgentServer
@@ -40,10 +40,10 @@ func NewHostAgentServerWithChunked(mgr *runner.Manager, chunkedMgr *runner.Chunk
 // AllocateRunner allocates a new runner
 func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRunnerRequest) (*pb.AllocateRunnerResponse, error) {
 	s.logger.WithFields(logrus.Fields{
-		"request_id":     req.RequestId,
-		"repo":           req.Repo,
-		"branch":         req.Branch,
-		"chunked_mode":   s.chunkedMgr != nil,
+		"request_id":   req.RequestId,
+		"repo":         req.Repo,
+		"branch":       req.Branch,
+		"chunked_mode": s.chunkedMgr != nil,
 	}).Info("AllocateRunner request")
 
 	allocReq := runner.AllocateRequest{

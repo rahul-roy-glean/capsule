@@ -63,6 +63,7 @@ jobs:
       - uses: golangci/golangci-lint-action@v6
         with:
           version: latest
+          args: --timeout 5m
 
   test:
     name: Test
@@ -99,9 +100,9 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      - name: Build all binaries (linux/amd64)
+      - name: Build all binaries
         run: |
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 make build
+          make build
           echo "Built binaries:"
           ls -lh bin/
 

@@ -467,9 +467,9 @@ func (s *ControlPlaneServer) HandleGetSnapshots(w http.ResponseWriter, r *http.R
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"snapshots":        snapshots,
-		"count":            len(snapshots),
-		"current_version":  s.snapshotManager.GetCurrentVersion(),
+		"snapshots":       snapshots,
+		"count":           len(snapshots),
+		"current_version": s.snapshotManager.GetCurrentVersion(),
 	})
 }
 

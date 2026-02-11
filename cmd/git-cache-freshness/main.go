@@ -20,27 +20,27 @@ var (
 	gcsBucket      = flag.String("gcs-bucket", "", "GCS bucket containing git-cache metadata (legacy mode)")
 	gcpProject     = flag.String("gcp-project", "", "GCP project for snapshot/Cloud Build")
 	snapshotPrefix = flag.String("snapshot-prefix", "runner-data", "Prefix for snapshot names")
-	
+
 	// Freshness thresholds
 	maxAgeHours    = flag.Int("max-age-hours", 24, "Maximum age before rebuild (hours)")
 	maxCommitDrift = flag.Int("max-commit-drift", 50, "Maximum commits behind before rebuild")
-	
+
 	// GitHub
 	githubToken = flag.String("github-token", "", "GitHub token for API access (or GITHUB_TOKEN env)")
-	
+
 	// Rebuild trigger
 	triggerRebuild    = flag.Bool("trigger-rebuild", false, "Trigger Cloud Build rebuild if stale")
 	cloudBuildTrigger = flag.String("cloud-build-trigger", "", "Cloud Build trigger ID for rebuild")
-	
+
 	logLevel = flag.String("log-level", "info", "Log level")
 )
 
 // GitCacheMetadata from git-cache-builder
 type GitCacheMetadata struct {
-	Version   string                 `json:"version"`
-	BuildTime time.Time              `json:"build_time"`
-	Repos     map[string]RepoStatus  `json:"repos"`
-	ImageSize int64                  `json:"image_size_bytes"`
+	Version   string                `json:"version"`
+	BuildTime time.Time             `json:"build_time"`
+	Repos     map[string]RepoStatus `json:"repos"`
+	ImageSize int64                 `json:"image_size_bytes"`
 }
 
 type RepoStatus struct {
@@ -52,23 +52,23 @@ type RepoStatus struct {
 
 // FreshnessReport summarizes the check results
 type FreshnessReport struct {
-	CheckTime       time.Time              `json:"check_time"`
-	CacheVersion    string                 `json:"cache_version"`
-	CacheAge        string                 `json:"cache_age"`
-	CacheAgeHours   float64                `json:"cache_age_hours"`
-	IsStale         bool                   `json:"is_stale"`
-	StaleReason     string                 `json:"stale_reason,omitempty"`
-	RepoStatus      map[string]RepoFreshness `json:"repo_status"`
-	RebuildTriggered bool                  `json:"rebuild_triggered,omitempty"`
+	CheckTime        time.Time                `json:"check_time"`
+	CacheVersion     string                   `json:"cache_version"`
+	CacheAge         string                   `json:"cache_age"`
+	CacheAgeHours    float64                  `json:"cache_age_hours"`
+	IsStale          bool                     `json:"is_stale"`
+	StaleReason      string                   `json:"stale_reason,omitempty"`
+	RepoStatus       map[string]RepoFreshness `json:"repo_status"`
+	RebuildTriggered bool                     `json:"rebuild_triggered,omitempty"`
 }
 
 type RepoFreshness struct {
-	URL            string `json:"url"`
-	CachedSHA      string `json:"cached_sha"`
-	CurrentSHA     string `json:"current_sha"`
-	CommitsBehind  int    `json:"commits_behind"`
-	IsStale        bool   `json:"is_stale"`
-	Error          string `json:"error,omitempty"`
+	URL           string `json:"url"`
+	CachedSHA     string `json:"cached_sha"`
+	CurrentSHA    string `json:"current_sha"`
+	CommitsBehind int    `json:"commits_behind"`
+	IsStale       bool   `json:"is_stale"`
+	Error         string `json:"error,omitempty"`
 }
 
 func main() {
@@ -114,7 +114,7 @@ func main() {
 	// Trigger rebuild if needed
 	if report.IsStale && *triggerRebuild && *cloudBuildTrigger != "" && *gcpProject != "" {
 		log.WithField("reason", report.StaleReason).Info("Git-cache is stale, triggering rebuild")
-		
+
 		if err := triggerCloudBuild(ctx, *gcpProject, *cloudBuildTrigger, log); err != nil {
 			log.WithError(err).Error("Failed to trigger Cloud Build")
 			os.Exit(1)
@@ -130,7 +130,7 @@ func main() {
 
 func downloadMetadata(ctx context.Context, bucket string) (*GitCacheMetadata, error) {
 	gcsPath := fmt.Sprintf("gs://%s/git-cache/current/metadata.json", bucket)
-	
+
 	// Download to temp file
 	tmpFile, err := os.CreateTemp("", "git-cache-metadata-*.json")
 	if err != nil {
@@ -159,11 +159,11 @@ func downloadMetadata(ctx context.Context, bucket string) (*GitCacheMetadata, er
 
 func checkFreshness(ctx context.Context, metadata *GitCacheMetadata, token string, maxAgeHours, maxCommitDrift int, log *logrus.Entry) *FreshnessReport {
 	report := &FreshnessReport{
-		CheckTime:    time.Now(),
-		CacheVersion: metadata.Version,
-		CacheAge:     time.Since(metadata.BuildTime).String(),
+		CheckTime:     time.Now(),
+		CacheVersion:  metadata.Version,
+		CacheAge:      time.Since(metadata.BuildTime).String(),
 		CacheAgeHours: time.Since(metadata.BuildTime).Hours(),
-		RepoStatus:   make(map[string]RepoFreshness),
+		RepoStatus:    make(map[string]RepoFreshness),
 	}
 
 	// Check age
@@ -179,7 +179,7 @@ func checkFreshness(ctx context.Context, metadata *GitCacheMetadata, token strin
 
 		if freshness.IsStale && !report.IsStale {
 			report.IsStale = true
-			report.StaleReason = fmt.Sprintf("Repo %s is %d commits behind (max: %d)", 
+			report.StaleReason = fmt.Sprintf("Repo %s is %d commits behind (max: %d)",
 				name, freshness.CommitsBehind, maxCommitDrift)
 		}
 	}
@@ -223,7 +223,7 @@ func checkRepoFreshness(ctx context.Context, status RepoStatus, token string, ma
 func getCommitInfo(ctx context.Context, repo, branch, cachedSHA, token string) (currentSHA string, commitsBehind int, err error) {
 	// Get current branch HEAD
 	url := fmt.Sprintf("https://api.github.com/repos/%s/commits/%s", repo, branch)
-	
+
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 	if token != "" {
@@ -257,7 +257,7 @@ func getCommitInfo(ctx context.Context, repo, branch, cachedSHA, token string) (
 
 	// Compare commits to get count
 	compareURL := fmt.Sprintf("https://api.github.com/repos/%s/compare/%s...%s", repo, cachedSHA[:12], currentSHA[:12])
-	
+
 	req, _ = http.NewRequestWithContext(ctx, "GET", compareURL, nil)
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 	if token != "" {
@@ -290,7 +290,7 @@ func triggerCloudBuild(ctx context.Context, project, triggerID string, log *logr
 	cmd := exec.CommandContext(ctx, "gcloud", "builds", "triggers", "run", triggerID,
 		"--project", project,
 		"--branch", "main")
-	
+
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("gcloud builds triggers run failed: %s: %w", string(output), err)

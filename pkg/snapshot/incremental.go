@@ -34,7 +34,7 @@ func (u *IncrementalUploader) UploadIncrementalSnapshot(
 	ctx context.Context,
 	baseMeta *ChunkedSnapshotMetadata,
 	dirtyDiskChunks map[int][]byte, // Dirty rootfs chunks from FUSE disk
-	dirtyMemChunks map[int][]byte,  // Dirty memory chunks (if doing memory diff)
+	dirtyMemChunks map[int][]byte, // Dirty memory chunks (if doing memory diff)
 	newVersion string,
 ) (*ChunkedSnapshotMetadata, error) {
 	u.logger.WithFields(logrus.Fields{
@@ -48,14 +48,14 @@ func (u *IncrementalUploader) UploadIncrementalSnapshot(
 
 	// Create new metadata based on base
 	newMeta := &ChunkedSnapshotMetadata{
-		Version:      newVersion,
-		BazelVersion: baseMeta.BazelVersion,
-		RepoCommit:   baseMeta.RepoCommit,
-		CreatedAt:    time.Now(),
-		ChunkSize:    baseMeta.ChunkSize,
-		KernelHash:   baseMeta.KernelHash, // Kernel doesn't change
-		StateHash:    baseMeta.StateHash,  // State might need update for paused state
-		TotalMemSize: baseMeta.TotalMemSize,
+		Version:       newVersion,
+		BazelVersion:  baseMeta.BazelVersion,
+		RepoCommit:    baseMeta.RepoCommit,
+		CreatedAt:     time.Now(),
+		ChunkSize:     baseMeta.ChunkSize,
+		KernelHash:    baseMeta.KernelHash, // Kernel doesn't change
+		StateHash:     baseMeta.StateHash,  // State might need update for paused state
+		TotalMemSize:  baseMeta.TotalMemSize,
 		TotalDiskSize: baseMeta.TotalDiskSize,
 	}
 
@@ -140,12 +140,12 @@ func (u *IncrementalUploader) UploadIncrementalSnapshot(
 	}
 
 	u.logger.WithFields(logrus.Fields{
-		"new_version":      newVersion,
-		"duration":         duration,
-		"dirty_disk":       dirtyDiskCount,
-		"dirty_mem":        dirtyMemCount,
-		"total_chunks":     totalChunks,
-		"dedup_ratio":      fmt.Sprintf("%.1f%%", dedupRatio*100),
+		"new_version":  newVersion,
+		"duration":     duration,
+		"dirty_disk":   dirtyDiskCount,
+		"dirty_mem":    dirtyMemCount,
+		"total_chunks": totalChunks,
+		"dedup_ratio":  fmt.Sprintf("%.1f%%", dedupRatio*100),
 	}).Info("Incremental snapshot created successfully")
 
 	return newMeta, nil

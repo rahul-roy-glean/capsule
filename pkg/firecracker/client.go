@@ -235,11 +235,11 @@ func (c *Client) SetMMDSConfig(ctx context.Context, cfg MMDSConfig) error {
 // PutMMDSData puts data into the MMDS
 func (c *Client) PutMMDSData(ctx context.Context, data interface{}) error {
 	c.logger.WithField("socket", c.socketPath).Debug("Putting MMDS data")
-	
+
 	// Marshal and log the data for debugging
 	jsonData, _ := json.Marshal(data)
 	c.logger.WithField("data_size", len(jsonData)).Debug("MMDS data size")
-	
+
 	err := c.doRequest(ctx, http.MethodPut, "/mmds", data)
 	if err != nil {
 		c.logger.WithError(err).Error("Failed to PUT MMDS data")
@@ -436,5 +436,3 @@ func (c *Client) VMID() string {
 func (c *Client) SocketPath() string {
 	return c.socketPath
 }
-
-

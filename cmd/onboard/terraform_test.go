@@ -10,10 +10,10 @@ import (
 func TestGenerateTFVars_Bootstrap(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &Config{
-		Platform:   PlatformConfig{GCPProject: "test-project", Region: "us-central1", Zone: "us-central1-a"},
-		Hosts:      HostsConfig{MachineType: "n2-standard-64", MinCount: 2, MaxCount: 20, DataDiskGB: 500},
-		MicroVM:    MicroVMConfig{MaxPerHost: 16, IdleTarget: 2, VCPUs: 4, MemoryMB: 8192},
-		CI:         CIConfig{System: "none"},
+		Platform: PlatformConfig{GCPProject: "test-project", Region: "us-central1", Zone: "us-central1-a"},
+		Hosts:    HostsConfig{MachineType: "n2-standard-64", MinCount: 2, MaxCount: 20, DataDiskGB: 500},
+		MicroVM:  MicroVMConfig{MaxPerHost: 16, IdleTarget: 2, VCPUs: 4, MemoryMB: 8192},
+		CI:       CIConfig{System: "none"},
 	}
 
 	path, err := generateTFVars(cfg, false, dir)

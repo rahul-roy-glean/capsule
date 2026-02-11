@@ -202,12 +202,12 @@ func (c *TokenClient) GetOrgRunnerRegistrationToken(ctx context.Context, org str
 
 // Runner represents a GitHub Actions runner
 type Runner struct {
-	ID     int64    `json:"id"`
-	Name   string   `json:"name"`
-	OS     string   `json:"os"`
-	Status string   `json:"status"`
-	Busy   bool     `json:"busy"`
-	Labels []Label  `json:"labels"`
+	ID     int64   `json:"id"`
+	Name   string  `json:"name"`
+	OS     string  `json:"os"`
+	Status string  `json:"status"`
+	Busy   bool    `json:"busy"`
+	Labels []Label `json:"labels"`
 }
 
 // Label represents a runner label
@@ -363,4 +363,3 @@ func (c *TokenClient) DeleteRunner(ctx context.Context, repo string, runnerID in
 
 	return nil
 }
-

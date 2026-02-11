@@ -16,14 +16,14 @@ import (
 
 var (
 	// GCP settings
-	project      = flag.String("project", "", "GCP project ID (required)")
-	zone         = flag.String("zone", "us-central1-a", "GCP zone for disk operations")
-	region       = flag.String("region", "us-central1", "GCP region for snapshot storage")
-	diskSizeGB   = flag.Int("disk-size-gb", 200, "Size of data disk in GB")
-	diskType     = flag.String("disk-type", "pd-ssd", "Disk type (pd-ssd, pd-balanced, pd-standard)")
+	project    = flag.String("project", "", "GCP project ID (required)")
+	zone       = flag.String("zone", "us-central1-a", "GCP zone for disk operations")
+	region     = flag.String("region", "us-central1", "GCP region for snapshot storage")
+	diskSizeGB = flag.Int("disk-size-gb", 200, "Size of data disk in GB")
+	diskType   = flag.String("disk-type", "pd-ssd", "Disk type (pd-ssd, pd-balanced, pd-standard)")
 
 	// Source artifacts
-	snapshotGCSPath = flag.String("snapshot-gcs", "", "GCS path to Firecracker snapshot artifacts (gs://bucket/current/)")
+	snapshotGCSPath   = flag.String("snapshot-gcs", "", "GCS path to Firecracker snapshot artifacts (gs://bucket/current/)")
 	snapshotLocalPath = flag.String("snapshot-local", "", "Local path to snapshot artifacts (alternative to GCS)")
 
 	// Git cache settings
@@ -34,24 +34,24 @@ var (
 	// Snapshot naming
 	snapshotPrefix = flag.String("snapshot-prefix", "runner-data", "Prefix for snapshot names")
 	snapshotLabel  = flag.String("snapshot-label", "current", "Label value for current snapshot")
-	
+
 	// GCS for metadata (for freshness checker)
 	metadataBucket = flag.String("metadata-bucket", "", "GCS bucket for metadata upload (for freshness checker)")
 
 	// Operational flags
-	keepDisk   = flag.Bool("keep-disk", false, "Don't delete the build disk after snapshot (for debugging)")
-	dryRun     = flag.Bool("dry-run", false, "Build disk but don't create snapshot")
-	logLevel   = flag.String("log-level", "info", "Log level")
+	keepDisk = flag.Bool("keep-disk", false, "Don't delete the build disk after snapshot (for debugging)")
+	dryRun   = flag.Bool("dry-run", false, "Build disk but don't create snapshot")
+	logLevel = flag.String("log-level", "info", "Log level")
 )
 
 // SnapshotMetadata records what's in the snapshot
 type SnapshotMetadata struct {
-	Version       string               `json:"version"`
-	BuildTime     time.Time            `json:"build_time"`
-	SnapshotName  string               `json:"snapshot_name"`
-	DiskSizeGB    int                  `json:"disk_size_gb"`
+	Version        string              `json:"version"`
+	BuildTime      time.Time           `json:"build_time"`
+	SnapshotName   string              `json:"snapshot_name"`
+	DiskSizeGB     int                 `json:"disk_size_gb"`
 	SnapshotSource string              `json:"snapshot_source"`
-	Repos         map[string]RepoInfo  `json:"repos"`
+	Repos          map[string]RepoInfo `json:"repos"`
 }
 
 type RepoInfo struct {
@@ -489,12 +489,12 @@ func uploadMetadataToGCS(ctx context.Context, metadata []byte, gcsPath string) e
 		return err
 	}
 	defer os.Remove(tmpFile.Name())
-	
+
 	if _, err := tmpFile.Write(metadata); err != nil {
 		return err
 	}
 	tmpFile.Close()
-	
+
 	cmd := exec.CommandContext(ctx, "gsutil", "cp", tmpFile.Name(), gcsPath)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("gsutil cp failed: %s: %w", string(output), err)
@@ -509,7 +509,7 @@ func updateSnapshotLabels(ctx context.Context, project, prefix, newSnapshot, lab
 		"--filter", fmt.Sprintf("labels.%s=true AND name~^%s", labelValue, prefix),
 		"--format", "value(name)")
 	output, _ := listCmd.Output()
-	
+
 	oldSnapshots := strings.Split(strings.TrimSpace(string(output)), "\n")
 	for _, old := range oldSnapshots {
 		old = strings.TrimSpace(old)

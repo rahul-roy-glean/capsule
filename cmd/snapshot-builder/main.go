@@ -177,8 +177,8 @@ func main() {
 	// host_dev_name after snapshot load, so the TAP name in the snapshot must match
 	// what the manager uses at restore time.
 	vmID := "snapshot-builder"
-	tapName := "tap-slot-0" // Must match manager's slot naming for snapshot compatibility
-	guestIP := "172.16.0.2" // Slot 0 always gets .2
+	tapName := "tap-slot-0"         // Must match manager's slot naming for snapshot compatibility
+	guestIP := "172.16.0.2"         // Slot 0 always gets .2
 	guestMAC := "AA:FC:00:00:00:02" // Deterministic MAC based on slot
 	hostIP := "172.16.0.1"
 	netmask := "255.255.255.0"
@@ -188,9 +188,9 @@ func main() {
 		log.WithError(err).Fatal("Failed to setup warmup network")
 	}
 	defer cleanupWarmupNetwork(tapName)
-	
+
 	// Build kernel boot args with network configuration
-	bootArgs := fmt.Sprintf("console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off", 
+	bootArgs := fmt.Sprintf("console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off",
 		guestIP, hostIP, netmask)
 
 	vmCfg := firecracker.VMConfig{
@@ -249,7 +249,7 @@ func main() {
 	if err := vm.Start(ctx); err != nil {
 		log.WithError(err).Fatal("Failed to start VM")
 	}
-	
+
 	// Inject MMDS data for warmup configuration
 	mmdsData := buildWarmupMMDS(*repoURL, *repoBranch, *bazelVersion, gitToken, gitCacheEnabled)
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
@@ -369,12 +369,12 @@ type WarmupMMDSData struct {
 func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, log *logrus.Entry) error {
 	// Wait for thaw-agent health endpoint to become available
 	// The thaw-agent runs warmup and exposes /health and /warmup-status endpoints
-	
+
 	log.WithField("guest_ip", guestIP).Info("Waiting for warmup to complete...")
-	
+
 	healthURL := fmt.Sprintf("http://%s:8080/health", guestIP)
 	warmupURL := fmt.Sprintf("http://%s:8080/warmup-status", guestIP)
-	
+
 	client := &http.Client{
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
@@ -383,23 +383,23 @@ func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, log 
 			}).DialContext,
 		},
 	}
-	
+
 	// Phase 1: Wait for VM to boot and thaw-agent to start
 	log.Info("Phase 1: Waiting for thaw-agent to become responsive...")
 	bootCtx, bootCancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer bootCancel()
-	
+
 	if err := waitForHealth(bootCtx, client, healthURL, log); err != nil {
 		return fmt.Errorf("VM failed to boot: %w", err)
 	}
 	log.Info("Thaw-agent is responsive")
-	
+
 	// Phase 2: Wait for warmup to complete
 	log.Info("Phase 2: Waiting for warmup to complete...")
-	
+
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-	
+
 	lastPhase := ""
 	for {
 		select {
@@ -414,7 +414,7 @@ func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, log 
 				}
 				continue
 			}
-			
+
 			if status.Phase != lastPhase {
 				log.WithFields(logrus.Fields{
 					"phase":   status.Phase,
@@ -422,7 +422,7 @@ func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, log 
 				}).Info("Warmup progress")
 				lastPhase = status.Phase
 			}
-			
+
 			if status.Complete {
 				log.WithFields(logrus.Fields{
 					"duration":  status.Duration,
@@ -430,7 +430,7 @@ func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, log 
 				}).Info("Warmup completed successfully")
 				return nil
 			}
-			
+
 			if status.Error != "" {
 				return fmt.Errorf("warmup failed: %s", status.Error)
 			}
@@ -441,7 +441,7 @@ func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, log 
 func waitForHealth(ctx context.Context, client *http.Client, healthURL string, log *logrus.Entry) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -461,16 +461,16 @@ func checkHealth(client *http.Client, url string) (map[string]interface{}, error
 		return nil, err
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("health check returned %d", resp.StatusCode)
 	}
-	
+
 	var result map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
-	
+
 	return result, nil
 }
 
@@ -490,17 +490,17 @@ func getWarmupStatus(client *http.Client, url string) (*WarmupStatus, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("warmup status returned %d: %s", resp.StatusCode, string(body))
 	}
-	
+
 	var status WarmupStatus
 	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
 		return nil, err
 	}
-	
+
 	return &status, nil
 }
 

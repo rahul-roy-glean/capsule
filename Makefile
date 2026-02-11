@@ -17,7 +17,7 @@ GO := go
 GOFLAGS := -ldflags "-X main.version=$(VERSION)"
 
 # Binaries
-BINARIES := firecracker-manager control-plane snapshot-builder thaw-agent git-cache-builder git-cache-freshness data-snapshot-builder onboard
+BINARIES := firecracker-manager control-plane snapshot-builder thaw-agent git-cache-builder git-cache-freshness data-snapshot-builder snapshot-converter bin-onboard
 
 all: build
 
@@ -45,12 +45,16 @@ git-cache-freshness:
 data-snapshot-builder:
 	$(GO) build $(GOFLAGS) -o bin/data-snapshot-builder ./cmd/data-snapshot-builder
 
-onboard:
+snapshot-converter:
+	$(GO) build $(GOFLAGS) -o bin/snapshot-converter ./cmd/snapshot-converter
+
+bin-onboard:
 	$(GO) build $(GOFLAGS) -o bin/onboard ./cmd/onboard
+
+onboard: bin-onboard
 	./bin/onboard --config=$(CONFIG) $(if $(STEPS),--steps=$(STEPS))
 
-onboard-validate:
-	$(GO) build $(GOFLAGS) -o bin/onboard ./cmd/onboard
+onboard-validate: bin-onboard
 	./bin/onboard --config=$(CONFIG) --dry-run
 
 # Generate protobuf code

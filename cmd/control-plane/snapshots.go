@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"cloud.google.com/go/storage"
 	compute "cloud.google.com/go/compute/apiv1"
 	computepb "cloud.google.com/go/compute/apiv1/computepb"
+	"cloud.google.com/go/storage"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -671,17 +671,17 @@ func (sm *SnapshotManager) SnapshotToProto(s *Snapshot) *pb.Snapshot {
 
 // RolloutConfig holds configuration for snapshot rollout
 type RolloutConfig struct {
-	CanaryPercent   int           // Percentage of hosts for canary (default 10)
-	CanaryWaitTime  time.Duration // Time to wait observing canary before full rollout (default 5m)
-	RolloutBatchSize int          // Number of hosts to rollout at once (default 5)
-	HealthCheckURL  string        // URL path to check host health after sync
+	CanaryPercent    int           // Percentage of hosts for canary (default 10)
+	CanaryWaitTime   time.Duration // Time to wait observing canary before full rollout (default 5m)
+	RolloutBatchSize int           // Number of hosts to rollout at once (default 5)
+	HealthCheckURL   string        // URL path to check host health after sync
 }
 
 // RolloutSnapshot rolls out a new snapshot to hosts
 func (sm *SnapshotManager) RolloutSnapshot(ctx context.Context, version string, hostRegistry *HostRegistry) error {
 	return sm.RolloutSnapshotWithConfig(ctx, version, hostRegistry, RolloutConfig{
-		CanaryPercent:   10,
-		CanaryWaitTime:  5 * time.Minute,
+		CanaryPercent:    10,
+		CanaryWaitTime:   5 * time.Minute,
 		RolloutBatchSize: 5,
 	})
 }

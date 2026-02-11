@@ -33,15 +33,15 @@ import (
 
 const (
 	// UFFD ioctl commands
-	UFFDIO_API          = 0xc018aa3f
-	UFFDIO_REGISTER     = 0xc020aa00
-	UFFDIO_COPY         = 0xc028aa03
-	UFFDIO_ZEROPAGE     = 0xc020aa04
-	UFFDIO_WAKE         = 0xc010aa02
+	UFFDIO_API      = 0xc018aa3f
+	UFFDIO_REGISTER = 0xc020aa00
+	UFFDIO_COPY     = 0xc028aa03
+	UFFDIO_ZEROPAGE = 0xc020aa04
+	UFFDIO_WAKE     = 0xc010aa02
 
 	// UFFD API features
-	UFFD_API             = 0xaa
-	UFFD_API_FEATURES    = 0
+	UFFD_API          = 0xaa
+	UFFD_API_FEATURES = 0
 
 	// UFFD event types
 	UFFD_EVENT_PAGEFAULT = 0x12
@@ -186,11 +186,11 @@ func (h *Handler) buildChunkLookup() {
 	if h.metadata == nil || len(h.metadata.MemChunks) == 0 {
 		return
 	}
-	
+
 	// Chunks are sorted by offset, just copy them
 	h.chunkLookup = make([]snapshot.ChunkRef, len(h.metadata.MemChunks))
 	copy(h.chunkLookup, h.metadata.MemChunks)
-	
+
 	h.logger.WithField("chunks", len(h.chunkLookup)).Debug("Built chunk lookup table")
 }
 
@@ -200,24 +200,24 @@ func (h *Handler) findChunk(offset uint64) *snapshot.ChunkRef {
 	if len(chunks) == 0 {
 		return nil
 	}
-	
+
 	// Binary search for the chunk containing this offset
 	lo, hi := 0, len(chunks)-1
 	for lo <= hi {
 		mid := (lo + hi) / 2
 		chunk := &chunks[mid]
-		
+
 		if uint64(chunk.Offset) <= offset && offset < uint64(chunk.Offset+chunk.Size) {
 			return chunk
 		}
-		
+
 		if uint64(chunk.Offset) > offset {
 			hi = mid - 1
 		} else {
 			lo = mid + 1
 		}
 	}
-	
+
 	return nil
 }
 
@@ -225,25 +225,25 @@ func (h *Handler) findChunk(offset uint64) *snapshot.ChunkRef {
 func (h *Handler) Start() error {
 	// Remove existing socket file
 	os.Remove(h.socketPath)
-	
+
 	listener, err := net.Listen("unix", h.socketPath)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", h.socketPath, err)
 	}
 	h.listener = listener
-	
+
 	h.logger.WithField("socket", h.socketPath).Info("UFFD handler listening")
-	
+
 	h.wg.Add(1)
 	go h.acceptLoop()
-	
+
 	return nil
 }
 
 // acceptLoop accepts connections from Firecracker
 func (h *Handler) acceptLoop() {
 	defer h.wg.Done()
-	
+
 	for {
 		conn, err := h.listener.Accept()
 		if err != nil {
@@ -255,9 +255,9 @@ func (h *Handler) acceptLoop() {
 				continue
 			}
 		}
-		
+
 		h.logger.Info("Firecracker connected to UFFD handler")
-		
+
 		// Handle this connection
 		h.wg.Add(1)
 		go h.handleConnection(conn)
@@ -268,14 +268,14 @@ func (h *Handler) acceptLoop() {
 func (h *Handler) handleConnection(conn net.Conn) {
 	defer h.wg.Done()
 	defer conn.Close()
-	
+
 	// Firecracker sends the UFFD file descriptor over this socket
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {
 		h.logger.Error("Connection is not a Unix socket")
 		return
 	}
-	
+
 	// Receive the UFFD file descriptor
 	uffdFd, err := h.receiveUffdFd(unixConn)
 	if err != nil {
@@ -283,9 +283,9 @@ func (h *Handler) handleConnection(conn net.Conn) {
 		return
 	}
 	defer unix.Close(uffdFd)
-	
+
 	h.logger.WithField("fd", uffdFd).Info("Received UFFD file descriptor")
-	
+
 	// Handle page faults
 	h.handlePageFaults(uffdFd)
 }
@@ -297,26 +297,26 @@ func (h *Handler) receiveUffdFd(conn *net.UnixConn) (int, error) {
 	if err != nil {
 		return -1, fmt.Errorf("failed to get raw connection: %w", err)
 	}
-	
+
 	var uffdFd int = -1
 	var recvErr error
-	
+
 	err = rawConn.Read(func(fd uintptr) bool {
 		// Receive message with file descriptor
 		buf := make([]byte, 64)
 		oob := make([]byte, unix.CmsgSpace(4)) // Space for one fd
-		
+
 		n, oobn, _, _, err := unix.Recvmsg(int(fd), buf, oob, 0)
 		if err != nil {
 			recvErr = err
 			return true
 		}
-		
+
 		h.logger.WithFields(logrus.Fields{
 			"n":    n,
 			"oobn": oobn,
 		}).Debug("Received UFFD message")
-		
+
 		// Parse the control message to extract the fd
 		if oobn > 0 {
 			msgs, err := unix.ParseSocketControlMessage(oob[:oobn])
@@ -324,7 +324,7 @@ func (h *Handler) receiveUffdFd(conn *net.UnixConn) (int, error) {
 				recvErr = fmt.Errorf("failed to parse control message: %w", err)
 				return true
 			}
-			
+
 			for _, msg := range msgs {
 				fds, err := unix.ParseUnixRights(&msg)
 				if err != nil {
@@ -336,36 +336,36 @@ func (h *Handler) receiveUffdFd(conn *net.UnixConn) (int, error) {
 				}
 			}
 		}
-		
+
 		recvErr = fmt.Errorf("no file descriptor received")
 		return true
 	})
-	
+
 	if err != nil {
 		return -1, err
 	}
 	if recvErr != nil {
 		return -1, recvErr
 	}
-	
+
 	return uffdFd, nil
 }
 
 // handlePageFaults reads and handles page fault events from the UFFD
 func (h *Handler) handlePageFaults(uffdFd int) {
 	h.logger.Info("Starting page fault handler loop")
-	
+
 	pollFds := []unix.PollFd{
 		{Fd: int32(uffdFd), Events: unix.POLLIN},
 	}
-	
+
 	for {
 		select {
 		case <-h.ctx.Done():
 			return
 		default:
 		}
-		
+
 		// Poll with timeout to allow checking for cancellation
 		n, err := unix.Poll(pollFds, 100) // 100ms timeout
 		if err != nil {
@@ -375,15 +375,15 @@ func (h *Handler) handlePageFaults(uffdFd int) {
 			h.logger.WithError(err).Error("Poll failed")
 			return
 		}
-		
+
 		if n == 0 {
 			continue // Timeout, check for cancellation
 		}
-		
+
 		// Read the fault message
 		var msg uffdMsg
 		msgBytes := make([]byte, unsafe.Sizeof(msg))
-		
+
 		_, err = unix.Read(uffdFd, msgBytes)
 		if err != nil {
 			if err == unix.EAGAIN {
@@ -392,19 +392,19 @@ func (h *Handler) handlePageFaults(uffdFd int) {
 			h.logger.WithError(err).Error("Failed to read UFFD message")
 			return
 		}
-		
+
 		// Parse message
 		msg.Event = msgBytes[0]
 		msg.Arg.Pagefault.Flags = binary.LittleEndian.Uint64(msgBytes[8:16])
 		msg.Arg.Pagefault.Address = binary.LittleEndian.Uint64(msgBytes[16:24])
-		
+
 		if msg.Event != UFFD_EVENT_PAGEFAULT {
 			h.logger.WithField("event", msg.Event).Debug("Non-pagefault event")
 			continue
 		}
-		
+
 		atomic.AddUint64(&h.pageFaults, 1)
-		
+
 		// Handle the page fault
 		if err := h.handleSingleFault(uffdFd, msg.Arg.Pagefault.Address); err != nil {
 			h.logger.WithError(err).WithField("address", fmt.Sprintf("0x%x", msg.Arg.Pagefault.Address)).Error("Failed to handle page fault")
@@ -527,7 +527,7 @@ func (h *Handler) cacheChunkPages(chunkOffset uint64, data []byte) {
 		copy(page, data[off:endOff])
 		h.pageCache.Add(pageAddr, page) // LRU eviction is automatic
 	}
-	
+
 	// TODO: Implement LRU eviction when cache gets too large
 }
 

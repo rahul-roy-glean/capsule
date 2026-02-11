@@ -38,17 +38,17 @@ const (
 // ChunkedSnapshotMetadata holds metadata for a chunked snapshot.
 // Instead of storing full files, we store references to content-addressed chunks.
 type ChunkedSnapshotMetadata struct {
-	Version      string            `json:"version"`
-	BazelVersion string            `json:"bazel_version,omitempty"`
-	RepoCommit   string            `json:"repo_commit,omitempty"`
-	CreatedAt    time.Time         `json:"created_at"`
-	ChunkSize    int64             `json:"chunk_size"`
-	KernelHash   string            `json:"kernel_hash"`
-	StateHash    string            `json:"state_hash"`
-	MemChunks    []ChunkRef        `json:"mem_chunks"`
-	RootfsChunks []ChunkRef        `json:"rootfs_chunks"`
-	TotalMemSize int64             `json:"total_mem_size"`
-	TotalDiskSize int64            `json:"total_disk_size"`
+	Version       string     `json:"version"`
+	BazelVersion  string     `json:"bazel_version,omitempty"`
+	RepoCommit    string     `json:"repo_commit,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	ChunkSize     int64      `json:"chunk_size"`
+	KernelHash    string     `json:"kernel_hash"`
+	StateHash     string     `json:"state_hash"`
+	MemChunks     []ChunkRef `json:"mem_chunks"`
+	RootfsChunks  []ChunkRef `json:"rootfs_chunks"`
+	TotalMemSize  int64      `json:"total_mem_size"`
+	TotalDiskSize int64      `json:"total_disk_size"`
 	// RepoCacheSeedChunks holds chunks for the shared Bazel repo cache seed image
 	RepoCacheSeedChunks []ChunkRef `json:"repo_cache_seed_chunks,omitempty"`
 }
@@ -75,10 +75,10 @@ type ChunkStore struct {
 	chunkCache *LRUCache
 
 	// Eager prefetching infrastructure
-	eagerFetchStack  *boundedstack.BoundedStack[string]
-	eagerFetchCtx    context.Context
-	eagerFetchCancel context.CancelFunc
-	eagerFetchWg     sync.WaitGroup
+	eagerFetchStack   *boundedstack.BoundedStack[string]
+	eagerFetchCtx     context.Context
+	eagerFetchCancel  context.CancelFunc
+	eagerFetchWg      sync.WaitGroup
 	eagerFetchStarted bool
 }
 
@@ -505,8 +505,8 @@ func (cs *ChunkStore) eagerFetchLoop(limiter *rate.Limiter, eg *errgroup.Group) 
 
 // ChunkedSnapshotBuilder creates chunked snapshots from existing snapshot files
 type ChunkedSnapshotBuilder struct {
-	store    *ChunkStore
-	logger   *logrus.Entry
+	store  *ChunkStore
+	logger *logrus.Entry
 }
 
 // NewChunkedSnapshotBuilder creates a new chunked snapshot builder

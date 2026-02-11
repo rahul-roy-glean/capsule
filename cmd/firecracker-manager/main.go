@@ -57,11 +57,11 @@ var (
 	logLevel             = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 
 	// Git cache flags
-	gitCacheEnabled      = flag.Bool("git-cache-enabled", false, "Enable git-cache reference cloning for faster repo setup")
-	gitCacheDir          = flag.String("git-cache-dir", "/mnt/nvme/git-cache", "Host directory containing git mirrors")
-	gitCacheImagePath    = flag.String("git-cache-image", "/mnt/nvme/git-cache.img", "Path to git-cache block device image")
-	gitCacheMountPath    = flag.String("git-cache-mount", "/mnt/git-cache", "Mount path inside microVMs for git-cache")
-	gitCacheRepos        = flag.String("git-cache-repos", "", "Comma-separated repo mappings (e.g. 'github.com/org/repo:repo-dir,github.com/org/other:other-dir')")
+	gitCacheEnabled       = flag.Bool("git-cache-enabled", false, "Enable git-cache reference cloning for faster repo setup")
+	gitCacheDir           = flag.String("git-cache-dir", "/mnt/nvme/git-cache", "Host directory containing git mirrors")
+	gitCacheImagePath     = flag.String("git-cache-image", "/mnt/nvme/git-cache.img", "Path to git-cache block device image")
+	gitCacheMountPath     = flag.String("git-cache-mount", "/mnt/git-cache", "Mount path inside microVMs for git-cache")
+	gitCacheRepos         = flag.String("git-cache-repos", "", "Comma-separated repo mappings (e.g. 'github.com/org/repo:repo-dir,github.com/org/other:other-dir')")
 	gitCacheWorkspaceDir  = flag.String("git-cache-workspace", "/mnt/ephemeral/workdir", "Target directory for cloned repos inside microVMs")
 	gitCachePreClonedPath = flag.String("git-cache-pre-cloned", "", "Path where repo was pre-cloned in snapshot (default: derived from repo URL)")
 
@@ -90,12 +90,12 @@ var (
 	ciSystem = flag.String("ci-system", "github-actions", "CI system integration (github-actions, none)")
 
 	// Runner pooling flags (VM reuse across tasks)
-	poolEnabled          = flag.Bool("pool-enabled", false, "Enable runner pooling for VM reuse across tasks")
-	poolMaxRunners       = flag.Int("pool-max-runners", 0, "Max pooled runners (0 = derive from resources)")
-	poolMaxTotalMemoryGB = flag.Int("pool-max-total-memory-gb", 0, "Max total memory for pooled runners in GB (0 = unlimited)")
+	poolEnabled           = flag.Bool("pool-enabled", false, "Enable runner pooling for VM reuse across tasks")
+	poolMaxRunners        = flag.Int("pool-max-runners", 0, "Max pooled runners (0 = derive from resources)")
+	poolMaxTotalMemoryGB  = flag.Int("pool-max-total-memory-gb", 0, "Max total memory for pooled runners in GB (0 = unlimited)")
 	poolMaxRunnerMemoryGB = flag.Int("pool-max-runner-memory-gb", 2, "Max memory per pooled runner in GB")
-	poolMaxRunnerDiskGB  = flag.Int("pool-max-runner-disk-gb", 16, "Max disk per pooled runner in GB")
-	poolRecycleTimeout   = flag.Int("pool-recycle-timeout-secs", 30, "Timeout for recycling operations in seconds")
+	poolMaxRunnerDiskGB   = flag.Int("pool-max-runner-disk-gb", 16, "Max disk per pooled runner in GB")
+	poolRecycleTimeout    = flag.Int("pool-recycle-timeout-secs", 30, "Timeout for recycling operations in seconds")
 )
 
 func main() {
@@ -231,11 +231,11 @@ func main() {
 		Environment:               *environment,
 		ControlPlaneAddr:          *controlPlane,
 		// Git cache config
-		GitCacheEnabled:      gitCacheEnabledVal,
-		GitCacheDir:          *gitCacheDir,
-		GitCacheImagePath:    *gitCacheImagePath,
-		GitCacheMountPath:    *gitCacheMountPath,
-		GitCacheRepoMappings: gitCacheRepoMappings,
+		GitCacheEnabled:       gitCacheEnabledVal,
+		GitCacheDir:           *gitCacheDir,
+		GitCacheImagePath:     *gitCacheImagePath,
+		GitCacheMountPath:     *gitCacheMountPath,
+		GitCacheRepoMappings:  gitCacheRepoMappings,
 		GitCacheWorkspaceDir:  *gitCacheWorkspaceDir,
 		GitCachePreClonedPath: *gitCachePreClonedPath,
 		// GitHub runner auto-registration (Option C)
@@ -666,7 +666,7 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, controlPlane, insta
 			if changed {
 				if hbResp.ShouldDrain {
 					wasDraining = true
-					
+
 					// Remove labels from GitHub runners to prevent new jobs being scheduled
 					labelsRemoved, err := mgr.RemoveRunnerLabels(ctx)
 					if err != nil {
@@ -674,7 +674,7 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, controlPlane, insta
 					} else if labelsRemoved > 0 {
 						log.WithField("labels_removed", labelsRemoved).Info("Removed labels from GitHub runners")
 					}
-					
+
 					// Drain idle runners (terminate them)
 					drained, err := mgr.DrainIdleRunners(ctx)
 					if err != nil {

@@ -156,8 +156,8 @@ func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logge
 			m.removeRunnerVM,
 		)
 		logger.WithFields(logrus.Fields{
-			"max_runners":    poolCfg.MaxPooledRunners,
-			"max_memory_gb":  cfg.PoolMaxTotalMemoryGB,
+			"max_runners":   poolCfg.MaxPooledRunners,
+			"max_memory_gb": cfg.PoolMaxTotalMemoryGB,
 		}).Info("Runner pooling enabled")
 	}
 
@@ -363,7 +363,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 			Version:           "V1", // V1 for simple GET requests (thaw-agent uses V1 protocol)
 			NetworkInterfaces: []string{"eth0"},
 		},
-		Drives: m.buildDrives(snapshotPaths.RepoCacheSeed, repoCacheUpperPath),
+		Drives:      m.buildDrives(snapshotPaths.RepoCacheSeed, repoCacheUpperPath),
 		LogPath:     runner.LogPath,
 		MetricsPath: runner.MetricsPath,
 	}
@@ -486,7 +486,7 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 		if data.Latest.Job.Repo == "" && m.config.GitHubRepo != "" {
 			data.Latest.Job.Repo = m.config.GitHubRepo
 		}
-		
+
 		// Set pre-cloned path (where repo was cloned during warmup, baked into snapshot)
 		// This allows thaw-agent to create symlinks from workspace to pre-cloned repo
 		if m.config.GitCachePreClonedPath != "" {
@@ -494,7 +494,7 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 		}
 		// Note: if PreClonedPath is not set, thaw-agent will derive it from job.repo
 	}
-	
+
 	// Always set WorkspaceDir - needed for pre-cloned repo symlink even without git-cache
 	if m.config.GitCacheWorkspaceDir != "" {
 		data.Latest.GitCache.WorkspaceDir = m.config.GitCacheWorkspaceDir

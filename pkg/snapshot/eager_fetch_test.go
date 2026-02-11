@@ -80,7 +80,7 @@ func TestEagerFetchEviction(t *testing.T) {
 
 // MockChunkFetcher simulates chunk fetching for testing
 type MockChunkFetcher struct {
-	fetchCount int64
+	fetchCount    int64
 	fetchedHashes []string
 }
 

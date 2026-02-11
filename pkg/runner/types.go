@@ -114,20 +114,20 @@ type MMDSData struct {
 		Snapshot struct {
 			Version string `json:"version"`
 		} `json:"snapshot"`
-	GitCache struct {
-		// Enabled indicates whether git-cache reference cloning is available
-		Enabled bool `json:"enabled"`
-		// MountPath is where the git-cache block device is mounted inside the microVM
-		MountPath string `json:"mount_path,omitempty"`
-		// RepoMappings maps repo URLs/names to their cache paths inside MountPath
-		// e.g. {"github.com/org/repo": "org-repo"} means /mnt/git-cache/org-repo
-		RepoMappings map[string]string `json:"repo_mappings,omitempty"`
-		// WorkspaceDir is the target directory for cloned repositories
-		WorkspaceDir string `json:"workspace_dir,omitempty"`
-		// PreClonedPath is the path where the repo was pre-cloned during warmup
-		// (baked into the snapshot rootfs). Thaw-agent creates a symlink from WorkspaceDir to here.
-		PreClonedPath string `json:"pre_cloned_path,omitempty"`
-	} `json:"git_cache,omitempty"`
+		GitCache struct {
+			// Enabled indicates whether git-cache reference cloning is available
+			Enabled bool `json:"enabled"`
+			// MountPath is where the git-cache block device is mounted inside the microVM
+			MountPath string `json:"mount_path,omitempty"`
+			// RepoMappings maps repo URLs/names to their cache paths inside MountPath
+			// e.g. {"github.com/org/repo": "org-repo"} means /mnt/git-cache/org-repo
+			RepoMappings map[string]string `json:"repo_mappings,omitempty"`
+			// WorkspaceDir is the target directory for cloned repositories
+			WorkspaceDir string `json:"workspace_dir,omitempty"`
+			// PreClonedPath is the path where the repo was pre-cloned during warmup
+			// (baked into the snapshot rootfs). Thaw-agent creates a symlink from WorkspaceDir to here.
+			PreClonedPath string `json:"pre_cloned_path,omitempty"`
+		} `json:"git_cache,omitempty"`
 	} `json:"latest"`
 }
 
@@ -190,12 +190,12 @@ type HostConfig struct {
 	ControlPlaneAddr  string
 
 	// Runner Pool Configuration
-	PoolEnabled            bool  `json:"pool_enabled"`
-	PoolMaxRunners         int   `json:"pool_max_runners"`
-	PoolMaxTotalMemoryGB   int   `json:"pool_max_total_memory_gb"`
-	PoolMaxRunnerMemoryGB  int   `json:"pool_max_runner_memory_gb"`
-	PoolMaxRunnerDiskGB    int   `json:"pool_max_runner_disk_gb"`
-	PoolRecycleTimeoutSecs int   `json:"pool_recycle_timeout_secs"`
+	PoolEnabled            bool `json:"pool_enabled"`
+	PoolMaxRunners         int  `json:"pool_max_runners"`
+	PoolMaxTotalMemoryGB   int  `json:"pool_max_total_memory_gb"`
+	PoolMaxRunnerMemoryGB  int  `json:"pool_max_runner_memory_gb"`
+	PoolMaxRunnerDiskGB    int  `json:"pool_max_runner_disk_gb"`
+	PoolRecycleTimeoutSecs int  `json:"pool_recycle_timeout_secs"`
 
 	// GitCacheEnabled enables git-cache reference cloning for faster repo setup
 	GitCacheEnabled bool
@@ -234,4 +234,3 @@ type HostConfig struct {
 	// GCPProject is the GCP project for Secret Manager access
 	GCPProject string
 }
-

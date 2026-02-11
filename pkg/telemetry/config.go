@@ -133,4 +133,3 @@ type ConfigError struct {
 func (e *ConfigError) Error() string {
 	return "telemetry config: " + e.Field + ": " + e.Message
 }
-

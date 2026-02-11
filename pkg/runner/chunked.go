@@ -113,11 +113,11 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 		} else {
 			cm.chunkedMeta = meta
 			cm.chunkedLogger.WithFields(logrus.Fields{
-				"version":      meta.Version,
-				"mem_chunks":   len(meta.MemChunks),
-				"disk_chunks":  len(meta.RootfsChunks),
-				"total_mem":    meta.TotalMemSize,
-				"total_disk":   meta.TotalDiskSize,
+				"version":     meta.Version,
+				"mem_chunks":  len(meta.MemChunks),
+				"disk_chunks": len(meta.RootfsChunks),
+				"total_mem":   meta.TotalMemSize,
+				"total_disk":  meta.TotalDiskSize,
 			}).Info("Loaded chunked snapshot metadata")
 		}
 	}
