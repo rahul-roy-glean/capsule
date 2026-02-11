@@ -1,0 +1,78 @@
+//go:build !linux
+// +build !linux
+
+package runner
+
+import (
+	"context"
+	"fmt"
+	"net"
+
+	"github.com/sirupsen/logrus"
+
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/ci"
+)
+
+// ChunkedManager is a stub for non-Linux platforms
+// The real implementation uses UFFD and FUSE which are Linux-only
+type ChunkedManager struct {
+	*Manager
+}
+
+// ChunkedManagerConfig extends HostConfig with chunked snapshot settings
+type ChunkedManagerConfig struct {
+	HostConfig
+	CIAdapter           ci.Adapter
+	UseChunkedSnapshots bool
+	UseNetNS            bool
+	ChunkCacheSizeBytes int64
+}
+
+// NewChunkedManager returns an error on non-Linux platforms
+func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *logrus.Logger) (*ChunkedManager, error) {
+	return nil, fmt.Errorf("chunked snapshots (UFFD/FUSE) are only supported on Linux")
+}
+
+// AllocateRunnerChunked is a stub
+func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req AllocateRequest) (*Runner, error) {
+	return nil, fmt.Errorf("chunked snapshots are only supported on Linux")
+}
+
+// ReleaseRunnerChunked is a stub
+func (cm *ChunkedManager) ReleaseRunnerChunked(ctx context.Context, runnerID string, saveIncremental bool) error {
+	return fmt.Errorf("chunked snapshots are only supported on Linux")
+}
+
+// GetChunkedStats is a stub
+func (cm *ChunkedManager) GetChunkedStats() ChunkedStats {
+	return ChunkedStats{}
+}
+
+// ChunkedStats holds statistics (stub)
+type ChunkedStats struct {
+	CacheSize         int64
+	CacheMaxSize      int64
+	CacheItems        int
+	TotalPageFaults   uint64
+	TotalCacheHits    uint64
+	TotalChunkFetches uint64
+	TotalDiskReads    uint64
+	TotalDiskWrites   uint64
+	TotalDirtyChunks  int
+}
+
+// Close is a stub
+func (cm *ChunkedManager) Close() error {
+	if cm.Manager != nil {
+		return cm.Manager.Close()
+	}
+	return nil
+}
+
+// GetSubnet is a stub
+func (cm *ChunkedManager) GetSubnet() *net.IPNet {
+	if cm.Manager != nil {
+		return cm.Manager.network.GetSubnet()
+	}
+	return nil
+}

@@ -69,6 +69,7 @@ enum RunnerState {
   RUNNER_STATE_QUARANTINED = 7;
   RUNNER_STATE_RETIRING = 8;
   RUNNER_STATE_TERMINATED = 9;
+  RUNNER_STATE_PAUSED = 10;  // VM paused and pooled for reuse
 }
 
 // Host states
@@ -117,6 +118,20 @@ message HostStatus {
   string snapshot_version = 12;
   google.protobuf.Timestamp snapshot_synced_at = 13;
   google.protobuf.Timestamp last_heartbeat = 14;
+  // Pool statistics
+  PoolStats pool_stats = 15;
+}
+
+// PoolStats contains runner pool statistics
+message PoolStats {
+  int32 pooled_runners = 1;
+  int32 max_runners = 2;
+  int64 memory_usage_bytes = 3;
+  int64 max_memory_bytes = 4;
+  int64 pool_hits = 5;
+  int64 pool_misses = 6;
+  int64 evictions = 7;
+  int64 recycle_failures = 8;
 }
 
 // Snapshot represents a snapshot version
@@ -138,7 +153,9 @@ message AllocateRunnerRequest {
   string commit = 4;
   Resources resources = 5;
   map<string, string> labels = 6;
-  string github_runner_token = 7;
+  string github_runner_token = 7; // Deprecated: use ci_runner_token
+  string ci_runner_token = 8;     // Generic CI runner registration token
+  string ci_system = 9;           // CI system identifier (e.g., "github-actions", "none")
 }
 
 // AllocateRunnerResponse
@@ -151,6 +168,12 @@ message AllocateRunnerResponse {
 message ReleaseRunnerRequest {
   string runner_id = 1;
   bool destroy = 2;
+  // try_recycle attempts to pause and pool the runner for reuse
+  // Only works if pool is enabled and finished_cleanly is true
+  bool try_recycle = 3;
+  // finished_cleanly indicates the task completed without errors
+  // Required for try_recycle to succeed
+  bool finished_cleanly = 4;
 }
 
 // ReleaseRunnerResponse

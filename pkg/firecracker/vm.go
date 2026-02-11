@@ -297,6 +297,47 @@ func (vm *VM) IsRunning() bool {
 	return vm.client.IsRunning()
 }
 
+// RestoreFromSnapshotWithUFFD restores the microVM from a snapshot using UFFD for lazy memory loading.
+// The uffdSocketPath should be a Unix socket where a UFFD handler is listening.
+// Firecracker will send the UFFD file descriptor to this socket, and the handler will
+// service page faults by fetching memory chunks on demand.
+func (vm *VM) RestoreFromSnapshotWithUFFD(ctx context.Context, snapshotPath, uffdSocketPath string, resume bool) error {
+	vm.logger.WithFields(logrus.Fields{
+		"snapshot":    snapshotPath,
+		"uffd_socket": uffdSocketPath,
+	}).Info("Restoring microVM from snapshot with UFFD backend")
+
+	// Verify snapshot file exists
+	if _, err := os.Stat(snapshotPath); err != nil {
+		return fmt.Errorf("snapshot file not found: %w", err)
+	}
+
+	// Verify UFFD socket exists (handler should be listening)
+	if _, err := os.Stat(uffdSocketPath); err != nil {
+		return fmt.Errorf("UFFD socket not found: %w", err)
+	}
+
+	// Start Firecracker process
+	if err := vm.client.StartFirecracker(ctx, vm.config.FirecrackerBin); err != nil {
+		return fmt.Errorf("failed to start firecracker: %w", err)
+	}
+
+	// Load the snapshot with UFFD backend
+	if err := vm.client.LoadSnapshot(ctx, SnapshotLoadParams{
+		SnapshotPath: snapshotPath,
+		MemBackend: &MemBackend{
+			BackendPath: uffdSocketPath,
+			BackendType: "Uffd",
+		},
+		ResumeVM: resume,
+	}); err != nil {
+		return fmt.Errorf("failed to load snapshot with UFFD: %w", err)
+	}
+
+	vm.logger.Info("MicroVM restored from snapshot with UFFD successfully")
+	return nil
+}
+
 // ID returns the VM ID
 func (vm *VM) ID() string {
 	return vm.config.VMID

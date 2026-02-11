@@ -15,8 +15,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/ci"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/github"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
@@ -28,14 +28,14 @@ type Manager struct {
 	vms           map[string]*firecracker.VM
 	snapshotCache *snapshot.Cache
 	network       *network.NATNetwork
-	// buildbarnCertsImage is an ext4 image containing Buildbarn certs, attached
-	// read-only to each microVM for Bazel remote cache/execution TLS config.
-	buildbarnCertsImage string
+	// credentialsImage is an ext4 image containing credentials (e.g. Buildbarn certs),
+	// attached read-only to each microVM for Bazel remote cache/execution TLS config.
+	credentialsImage string
 	// gitCacheImage is an ext4 image containing git repository mirrors, attached
 	// read-only to each microVM for fast reference cloning.
 	gitCacheImage string
-	// githubClient generates runner registration tokens for auto-registration
-	githubClient *github.TokenClient
+	// ciAdapter provides CI system integration (runner registration, drain, etc.)
+	ciAdapter ci.Adapter
 	// slotToRunner tracks which runner is using each TAP slot (for snapshot restore).
 	// Key is slot number (0, 1, 2, ...), value is runner ID.
 	slotToRunner map[int]string
@@ -44,6 +44,9 @@ type Manager struct {
 	draining     bool
 	mu           sync.RWMutex
 	logger       *logrus.Entry
+
+	// Runner pool for VM reuse (nil if pooling disabled)
+	pool *Pool
 }
 
 type QuarantineOptions struct {
@@ -58,7 +61,7 @@ type UnquarantineOptions struct {
 }
 
 // NewManager creates a new runner manager
-func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Manager, error) {
+func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logger *logrus.Logger) (*Manager, error) {
 	if logger == nil {
 		logger = logrus.New()
 	}
@@ -96,9 +99,9 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 		}
 	}
 
-	buildbarnCertsImg, err := ensureBuildbarnCertsImage(cfg, logger.WithField("component", "runner-manager"))
+	credentialsImg, err := ensureCredentialsImage(cfg, logger.WithField("component", "runner-manager"))
 	if err != nil {
-		return nil, fmt.Errorf("failed to prepare buildbarn certs image: %w", err)
+		return nil, fmt.Errorf("failed to prepare credentials image: %w", err)
 	}
 
 	// Check if git-cache image exists (created by startup script)
@@ -112,34 +115,53 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 		}
 	}
 
-	// Initialize GitHub token client if runner auto-registration is enabled
-	var githubClient *github.TokenClient
-	if cfg.GitHubRunnerEnabled && cfg.GitHubAppID != "" && cfg.GitHubAppSecret != "" {
-		var err error
-		githubClient, err = github.NewTokenClient(ctx, cfg.GitHubAppID, cfg.GitHubAppSecret, cfg.GCPProject)
-		if err != nil {
-			logger.WithError(err).Warn("Failed to initialize GitHub token client - runners won't auto-register")
-		} else {
-			logger.WithFields(logrus.Fields{
-				"github_repo":   cfg.GitHubRepo,
-				"github_labels": cfg.GitHubRunnerLabels,
-			}).Info("GitHub runner auto-registration enabled")
-		}
+	m := &Manager{
+		config:           cfg,
+		runners:          make(map[string]*Runner),
+		vms:              make(map[string]*firecracker.VM),
+		snapshotCache:    cache,
+		network:          natNet,
+		credentialsImage: credentialsImg,
+		gitCacheImage:    gitCacheImg,
+		ciAdapter:        ciAdapter,
+		slotToRunner:     make(map[int]string),
+		runnerToSlot:     make(map[string]int),
+		logger:           logger.WithField("component", "runner-manager"),
 	}
 
-	return &Manager{
-		config:              cfg,
-		runners:             make(map[string]*Runner),
-		vms:                 make(map[string]*firecracker.VM),
-		snapshotCache:       cache,
-		network:             natNet,
-		buildbarnCertsImage: buildbarnCertsImg,
-		gitCacheImage:       gitCacheImg,
-		githubClient:        githubClient,
-		slotToRunner:        make(map[int]string),
-		runnerToSlot:        make(map[string]int),
-		logger:              logger.WithField("component", "runner-manager"),
-	}, nil
+	// Initialize runner pool if enabled
+	if cfg.PoolEnabled {
+		poolCfg := PoolConfig{
+			Enabled:          true,
+			MaxPooledRunners: cfg.PoolMaxRunners,
+		}
+		if cfg.PoolMaxTotalMemoryGB > 0 {
+			poolCfg.MaxTotalMemoryBytes = int64(cfg.PoolMaxTotalMemoryGB) * 1024 * 1024 * 1024
+		}
+		if cfg.PoolMaxRunnerMemoryGB > 0 {
+			poolCfg.MaxRunnerMemoryBytes = int64(cfg.PoolMaxRunnerMemoryGB) * 1024 * 1024 * 1024
+		}
+		if cfg.PoolMaxRunnerDiskGB > 0 {
+			poolCfg.MaxRunnerDiskBytes = int64(cfg.PoolMaxRunnerDiskGB) * 1024 * 1024 * 1024
+		}
+		if cfg.PoolRecycleTimeoutSecs > 0 {
+			poolCfg.RecycleTimeout = time.Duration(cfg.PoolRecycleTimeoutSecs) * time.Second
+		}
+
+		m.pool = NewPool(poolCfg, logger)
+		m.pool.SetCallbacks(
+			m.pauseRunnerVM,
+			m.resumeRunnerVM,
+			m.getRunnerVMStats,
+			m.removeRunnerVM,
+		)
+		logger.WithFields(logrus.Fields{
+			"max_runners":    poolCfg.MaxPooledRunners,
+			"max_memory_gb":  cfg.PoolMaxTotalMemoryGB,
+		}).Info("Runner pooling enabled")
+	}
+
+	return m, nil
 }
 
 func (m *Manager) IsDraining() bool {
@@ -160,6 +182,52 @@ func (m *Manager) SetDraining(draining bool) (changed bool) {
 
 // AllocateRunner allocates a new runner
 func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Runner, error) {
+	// Build pool key from request (before locking, as pool.Get needs the key)
+	var poolKey *RunnerKey
+	if m.pool != nil {
+		// Get snapshot version for pool key
+		snapshotPaths, err := m.snapshotCache.GetSnapshotPaths()
+		if err == nil {
+			poolKey = &RunnerKey{
+				SnapshotVersion: snapshotPaths.Version,
+				Platform:        "linux/amd64",
+				GitHubRepo:      req.Repo,
+				Labels:          req.Labels,
+			}
+		}
+	}
+
+	// Try to get from pool first (before acquiring main lock)
+	if m.pool != nil && poolKey != nil {
+		if pooled := m.pool.Get(ctx, poolKey); pooled != nil {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+
+			m.logger.WithField("runner_id", pooled.Runner.ID).Info("Reusing pooled runner")
+
+			// Update runner state
+			pooled.Runner.State = StateBusy
+			pooled.Runner.TaskCount++
+			pooled.Runner.JobID = req.RequestID
+
+			// Update MMDS with new task data
+			if vm, ok := m.vms[pooled.Runner.ID]; ok {
+				var tap *network.TapDevice
+				if slot, hasSlot := m.runnerToSlot[pooled.Runner.ID]; hasSlot {
+					tap, _ = m.network.GetOrCreateTapSlot(slot, pooled.Runner.ID)
+				}
+				if tap != nil {
+					mmdsData := m.buildMMDSData(ctx, pooled.Runner, tap, req)
+					if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
+						m.logger.WithError(err).Warn("Failed to update MMDS for pooled runner")
+					}
+				}
+			}
+
+			return pooled.Runner, nil
+		}
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -246,6 +314,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		TapDevice:       tap.Name,
 		MAC:             tap.MAC,
 		SnapshotVersion: snapshotPaths.Version,
+		GitHubRepo:      req.Repo, // For pool key matching
 		Resources: Resources{
 			VCPUs:    m.config.VCPUsPerRunner,
 			MemoryMB: m.config.MemoryMBPerRunner,
@@ -384,29 +453,17 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 	data.Latest.Job.Labels = req.Labels
 	data.Latest.Snapshot.Version = runner.SnapshotVersion
 
-	// If GitHub runner auto-registration is enabled and no token provided in request,
-	// get a fresh registration token (Option C: pre-register at boot)
-	if m.githubClient != nil && req.GitHubRunnerToken == "" && (m.config.GitHubRepo != "" || m.config.GitHubOrg != "") {
-		var token string
-		var err error
-		var runnerURL string
-
-		if m.config.GitHubOrg != "" {
-			// Use org-level registration (requires "Organization self-hosted runners" permission)
-			token, err = m.githubClient.GetOrgRunnerRegistrationToken(ctx, m.config.GitHubOrg)
-			runnerURL = fmt.Sprintf("https://github.com/%s", m.config.GitHubOrg)
-		} else {
-			// Use repo-level registration (requires "Administration" permission on repo)
-			token, err = m.githubClient.GetRunnerRegistrationToken(ctx, m.config.GitHubRepo)
-			runnerURL = fmt.Sprintf("https://github.com/%s", m.config.GitHubRepo)
-		}
-
+	// Get CI runner token if adapter is configured and no token in request
+	if m.ciAdapter != nil && req.GitHubRunnerToken == "" {
+		token, err := m.ciAdapter.GetRunnerToken(ctx, ci.RunnerTokenOpts{})
 		if err != nil {
-			m.logger.WithError(err).Warn("Failed to get GitHub runner registration token")
-		} else {
+			m.logger.WithError(err).Warn("Failed to get CI runner registration token")
+		} else if token != "" {
 			data.Latest.Job.GitHubRunnerToken = token
-			data.Latest.Job.Repo = runnerURL // Use full URL for runner registration
-			// Convert labels slice to map
+			runnerURL := m.ciAdapter.RunnerURL()
+			if runnerURL != "" {
+				data.Latest.Job.Repo = runnerURL
+			}
 			if len(m.config.GitHubRunnerLabels) > 0 {
 				labels := make(map[string]string)
 				for _, label := range m.config.GitHubRunnerLabels {
@@ -414,7 +471,7 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 				}
 				data.Latest.Job.Labels = labels
 			}
-			m.logger.WithField("runner_id", runner.ID).Info("Got GitHub runner registration token for auto-registration")
+			m.logger.WithField("runner_id", runner.ID).Info("Got CI runner registration token")
 		}
 	}
 
@@ -423,17 +480,31 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 		data.Latest.GitCache.Enabled = true
 		data.Latest.GitCache.MountPath = m.config.GitCacheMountPath
 		data.Latest.GitCache.RepoMappings = m.config.GitCacheRepoMappings
-		data.Latest.GitCache.WorkspaceDir = m.config.GitCacheWorkspaceDir
 
 		// Ensure Job.Repo is set for git-cache workspace setup
 		// This is needed even if GitHub runner registration fails
 		if data.Latest.Job.Repo == "" && m.config.GitHubRepo != "" {
 			data.Latest.Job.Repo = m.config.GitHubRepo
 		}
+		
+		// Set pre-cloned path (where repo was cloned during warmup, baked into snapshot)
+		// This allows thaw-agent to create symlinks from workspace to pre-cloned repo
+		if m.config.GitCachePreClonedPath != "" {
+			data.Latest.GitCache.PreClonedPath = m.config.GitCachePreClonedPath
+		}
+		// Note: if PreClonedPath is not set, thaw-agent will derive it from job.repo
+	}
+	
+	// Always set WorkspaceDir - needed for pre-cloned repo symlink even without git-cache
+	if m.config.GitCacheWorkspaceDir != "" {
+		data.Latest.GitCache.WorkspaceDir = m.config.GitCacheWorkspaceDir
 	}
 
 	// Runner configuration
 	data.Latest.Runner.Ephemeral = m.config.GitHubRunnerEphemeral
+	if m.ciAdapter != nil {
+		data.Latest.Runner.CISystem = m.ciAdapter.Name()
+	}
 
 	return data
 }
@@ -763,8 +834,8 @@ func (m *Manager) buildDrives(repoCacheSeedPath, repoCacheUpperPath string) []fi
 			IsReadOnly:   false,
 		},
 		{
-			DriveID:      "buildbarn_certs",
-			PathOnHost:   m.buildbarnCertsImage,
+			DriveID:      "credentials",
+			PathOnHost:   m.credentialsImage,
 			IsRootDevice: false,
 			IsReadOnly:   true,
 		},
@@ -828,13 +899,13 @@ func createExt4Image(path string, sizeGB int, label string) error {
 	return nil
 }
 
-func ensureBuildbarnCertsImage(cfg HostConfig, log *logrus.Entry) (string, error) {
+func ensureCredentialsImage(cfg HostConfig, log *logrus.Entry) (string, error) {
 	sharedDir := filepath.Join(cfg.WorkspaceDir, "_shared")
 	if err := os.MkdirAll(sharedDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create shared dir: %w", err)
 	}
 
-	imgPath := filepath.Join(sharedDir, "buildbarn-certs.img")
+	imgPath := filepath.Join(sharedDir, "credentials.img")
 	sizeMB := cfg.BuildbarnCertsImageSizeMB
 	if sizeMB <= 0 {
 		sizeMB = 32
@@ -842,19 +913,17 @@ func ensureBuildbarnCertsImage(cfg HostConfig, log *logrus.Entry) (string, error
 
 	seedDir := cfg.BuildbarnCertsDir
 	if seedDir == "" {
-		// Ensure a placeholder image exists so the snapshot device layout is always satisfied.
 		if _, err := os.Stat(imgPath); err == nil {
 			return imgPath, nil
 		}
-		if err := createExt4ImageMB(imgPath, sizeMB, "BUILDBARN_CERTS"); err != nil {
+		if err := createExt4ImageMB(imgPath, sizeMB, "CREDENTIALS"); err != nil {
 			return "", err
 		}
 		_ = os.Chmod(imgPath, 0600)
 		return imgPath, nil
 	}
 
-	// Rebuild on manager startup so rotations in the source directory are picked up.
-	if err := createExt4ImageMB(imgPath, sizeMB, "BUILDBARN_CERTS"); err != nil {
+	if err := createExt4ImageMB(imgPath, sizeMB, "CREDENTIALS"); err != nil {
 		return "", err
 	}
 	if err := seedExt4ImageFromDir(imgPath, seedDir); err != nil {
@@ -862,7 +931,7 @@ func ensureBuildbarnCertsImage(cfg HostConfig, log *logrus.Entry) (string, error
 			log.WithError(err).WithFields(logrus.Fields{
 				"seed_dir": seedDir,
 				"image":    imgPath,
-			}).Warn("Failed to seed buildbarn certs image; continuing with empty image")
+			}).Warn("Failed to seed credentials image; continuing with empty image")
 		}
 	}
 	_ = os.Chmod(imgPath, 0600)
@@ -1047,23 +1116,21 @@ func (m *Manager) DrainIdleRunners(ctx context.Context) (int, error) {
 }
 
 // RemoveRunnerLabels removes custom labels from all runners on this host.
-// This is called when entering drain mode to prevent GitHub from scheduling new jobs.
+// This is called when entering drain mode to prevent the CI system from scheduling new jobs.
 func (m *Manager) RemoveRunnerLabels(ctx context.Context) (int, error) {
-	if m.githubClient == nil {
-		m.logger.Debug("GitHub client not configured, skipping label removal")
-		return 0, nil
-	}
-
-	repo := m.config.GitHubRepo
-	if repo == "" {
-		m.logger.Debug("GitHub repo not configured, skipping label removal")
+	if m.ciAdapter == nil {
+		m.logger.Debug("CI adapter not configured, skipping label removal")
 		return 0, nil
 	}
 
 	m.mu.RLock()
-	runners := make([]*Runner, 0, len(m.runners))
+	var runners []ci.RunnerInfo
 	for _, r := range m.runners {
-		runners = append(runners, r)
+		runners = append(runners, ci.RunnerInfo{
+			ID:   r.ID,
+			Name: r.ID,
+			Repo: r.GitHubRepo,
+		})
 	}
 	m.mu.RUnlock()
 
@@ -1071,49 +1138,11 @@ func (m *Manager) RemoveRunnerLabels(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
-	m.logger.WithFields(logrus.Fields{
-		"runner_count": len(runners),
-		"repo":         repo,
-	}).Info("Removing labels from runners for drain mode")
-
-	var errs []error
-	removed := 0
-
-	for _, runner := range runners {
-		// Get runner name (first 8 chars of ID, matching thaw-agent registration)
-		runnerName := runner.ID
-		if len(runnerName) > 8 {
-			runnerName = runnerName[:8]
-		}
-
-		// Look up GitHub runner by name
-		ghRunner, err := m.githubClient.GetRunnerByName(ctx, repo, runnerName)
-		if err != nil {
-			m.logger.WithError(err).WithField("runner_name", runnerName).Debug("Runner not found in GitHub (may not be registered yet)")
-			continue
-		}
-
-		// Remove all custom labels
-		if err := m.githubClient.RemoveAllCustomLabels(ctx, repo, ghRunner.ID); err != nil {
-			m.logger.WithError(err).WithFields(logrus.Fields{
-				"runner_name":   runnerName,
-				"github_runner": ghRunner.ID,
-			}).Warn("Failed to remove labels from runner")
-			errs = append(errs, err)
-			continue
-		}
-
-		m.logger.WithFields(logrus.Fields{
-			"runner_name":   runnerName,
-			"github_runner": ghRunner.ID,
-		}).Info("Removed labels from runner")
-		removed++
+	m.logger.WithField("runner_count", len(runners)).Info("Draining runners via CI adapter")
+	if err := m.ciAdapter.OnDrain(ctx, runners); err != nil {
+		return 0, err
 	}
-
-	if len(errs) > 0 {
-		return removed, joinErrors(errs)
-	}
-	return removed, nil
+	return len(runners), nil
 }
 
 // Close shuts down the manager and all runners
@@ -1123,10 +1152,24 @@ func (m *Manager) Close() error {
 
 	m.logger.Info("Shutting down runner manager")
 
+	// Shutdown runner pool first
+	if m.pool != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		if err := m.pool.Shutdown(ctx); err != nil {
+			m.logger.WithError(err).Warn("Failed to shutdown runner pool")
+		}
+	}
+
 	// Stop all VMs
 	for id, vm := range m.vms {
 		m.logger.WithField("runner_id", id).Debug("Stopping VM")
 		vm.Stop()
+	}
+
+	// Close CI adapter
+	if m.ciAdapter != nil {
+		m.ciAdapter.Close()
 	}
 
 	// Cleanup network
@@ -1136,4 +1179,102 @@ func (m *Manager) Close() error {
 	m.snapshotCache.Close()
 
 	return nil
+}
+
+// pauseRunnerVM pauses a runner's VM (pool callback)
+func (m *Manager) pauseRunnerVM(ctx context.Context, runnerID string) error {
+	m.mu.RLock()
+	vm := m.vms[runnerID]
+	m.mu.RUnlock()
+
+	if vm == nil {
+		return fmt.Errorf("VM not found for runner %s", runnerID)
+	}
+	return vm.Pause(ctx)
+}
+
+// resumeRunnerVM resumes a runner's VM (pool callback)
+func (m *Manager) resumeRunnerVM(ctx context.Context, runnerID string) error {
+	m.mu.RLock()
+	vm := m.vms[runnerID]
+	m.mu.RUnlock()
+
+	if vm == nil {
+		return fmt.Errorf("VM not found for runner %s", runnerID)
+	}
+	return vm.Resume(ctx)
+}
+
+// getRunnerVMStats gets VM resource statistics (pool callback)
+func (m *Manager) getRunnerVMStats(ctx context.Context, runnerID string) (*VMStats, error) {
+	m.mu.RLock()
+	runner := m.runners[runnerID]
+	m.mu.RUnlock()
+
+	if runner == nil {
+		return nil, fmt.Errorf("runner not found: %s", runnerID)
+	}
+
+	// Estimate memory usage from config
+	memoryUsage := int64(runner.Resources.MemoryMB) * 1024 * 1024
+
+	// Disk usage would be the overlay size, but for now just estimate
+	diskUsage := int64(m.config.RepoCacheUpperSizeGB) * 1024 * 1024 * 1024
+
+	return &VMStats{
+		MemoryUsageBytes: memoryUsage,
+		DiskUsageBytes:   diskUsage,
+	}, nil
+}
+
+// removeRunnerVM removes a runner completely (pool callback)
+func (m *Manager) removeRunnerVM(ctx context.Context, runnerID string) error {
+	return m.ReleaseRunner(runnerID, true)
+}
+
+// GetPool returns the runner pool (may be nil if pooling disabled)
+func (m *Manager) GetPool() *Pool {
+	return m.pool
+}
+
+// ReleaseRunnerWithOptions releases a runner with more control over behavior
+func (m *Manager) ReleaseRunnerWithOptions(ctx context.Context, runnerID string, opts ReleaseOptions) error {
+	m.mu.Lock()
+	runner, exists := m.runners[runnerID]
+	if !exists {
+		m.mu.Unlock()
+		return fmt.Errorf("runner not found: %s", runnerID)
+	}
+
+	// Don't pool quarantined runners
+	if runner.State == StateQuarantined {
+		m.mu.Unlock()
+		if opts.Destroy {
+			return fmt.Errorf("runner %s is quarantined; unquarantine before destroying", runnerID)
+		}
+		return nil
+	}
+	m.mu.Unlock()
+
+	// Try to recycle if pooling enabled and requested
+	if m.pool != nil && opts.TryRecycle && !opts.Destroy {
+		pooled := &pooledRunner{
+			Runner: runner,
+			key: &RunnerKey{
+				SnapshotVersion: runner.SnapshotVersion,
+				Platform:        "linux/amd64",
+				GitHubRepo:      runner.GitHubRepo,
+			},
+		}
+
+		if err := m.pool.TryRecycle(ctx, pooled, opts.FinishedCleanly); err == nil {
+			m.logger.WithField("runner_id", runnerID).Info("Runner recycled to pool")
+			return nil
+		} else {
+			m.logger.WithError(err).WithField("runner_id", runnerID).Debug("Failed to recycle runner, destroying")
+		}
+	}
+
+	// Fall back to destroy
+	return m.ReleaseRunner(runnerID, true)
 }
