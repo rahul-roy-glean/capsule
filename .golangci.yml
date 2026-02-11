@@ -1,0 +1,15 @@
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gosimple
+    - typecheck
+
+issues:
+  exclude-dirs:
+    - api/proto/runner
+  max-issues-per-linter: 0
+  max-same-issues: 0

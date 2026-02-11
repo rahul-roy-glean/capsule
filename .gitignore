@@ -5,6 +5,17 @@ bin/
 *.so
 *.dylib
 
+# Go build output (matches cmd/ directory names)
+/control-plane
+/data-snapshot-builder
+/firecracker-manager
+/git-cache-builder
+/git-cache-freshness
+/onboard
+/snapshot-builder
+/snapshot-converter
+/thaw-agent
+
 # Build outputs
 images/microvm/output/
 *.img

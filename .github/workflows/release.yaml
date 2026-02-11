@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: '1.24'
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: go test -race -count=1 ./pkg/... ./cmd/...
+
+  release:
+    name: Release
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Get version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Build linux/amd64
+        run: |
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 make build
+          mkdir -p dist
+          for bin in bin/*; do
+            name=$(basename "$bin")
+            mv "$bin" "dist/${name}-linux-amd64"
+          done
+
+      - name: Build linux/arm64
+        run: |
+          rm -rf bin/
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 make build
+          for bin in bin/*; do
+            name=$(basename "$bin")
+            mv "$bin" "dist/${name}-linux-arm64"
+          done
+
+      - name: Build darwin/arm64
+        run: |
+          rm -rf bin/
+          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 make build
+          for bin in bin/*; do
+            name=$(basename "$bin")
+            mv "$bin" "dist/${name}-darwin-arm64"
+          done
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum * > checksums.txt
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get previous tag
+          prev_tag=$(git tag --sort=-v:refname | head -2 | tail -1)
+          if [ -z "$prev_tag" ] || [ "$prev_tag" = "${{ steps.version.outputs.version }}" ]; then
+            echo "body=Initial release" >> $GITHUB_OUTPUT
+          else
+            changelog=$(git log --pretty=format:"- %s (%h)" "$prev_tag".."${{ steps.version.outputs.version }}" -- . ':!docs' ':!*.md')
+            # Write to file to handle multiline
+            echo "$changelog" > /tmp/changelog.md
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.version.outputs.version }}
+          body_path: /tmp/changelog.md
+          files: dist/*
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, '-rc') || contains(steps.version.outputs.version, '-beta') || contains(steps.version.outputs.version, '-alpha') }}
+          fail_on_unmatched_files: true
