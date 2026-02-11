@@ -24,6 +24,8 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/ci"
+	cigithub "github.com/rahul-roy-glean/bazel-firecracker/pkg/ci/github"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/metrics"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
@@ -60,7 +62,8 @@ var (
 	gitCacheImagePath    = flag.String("git-cache-image", "/mnt/nvme/git-cache.img", "Path to git-cache block device image")
 	gitCacheMountPath    = flag.String("git-cache-mount", "/mnt/git-cache", "Mount path inside microVMs for git-cache")
 	gitCacheRepos        = flag.String("git-cache-repos", "", "Comma-separated repo mappings (e.g. 'github.com/org/repo:repo-dir,github.com/org/other:other-dir')")
-	gitCacheWorkspaceDir = flag.String("git-cache-workspace", "/mnt/ephemeral/workdir", "Target directory for cloned repos inside microVMs")
+	gitCacheWorkspaceDir  = flag.String("git-cache-workspace", "/mnt/ephemeral/workdir", "Target directory for cloned repos inside microVMs")
+	gitCachePreClonedPath = flag.String("git-cache-pre-cloned", "", "Path where repo was pre-cloned in snapshot (default: derived from repo URL)")
 
 	// GitHub runner auto-registration flags (Option C)
 	githubRunnerEnabled   = flag.Bool("github-runner-enabled", false, "Enable automatic GitHub runner registration at VM boot")
@@ -75,6 +78,24 @@ var (
 	// Telemetry flags
 	telemetryEnabled = flag.Bool("telemetry-enabled", true, "Enable GCP Cloud Monitoring telemetry")
 	telemetryPrefix  = flag.String("telemetry-prefix", "custom.googleapis.com/firecracker", "Custom metric prefix for Cloud Monitoring")
+
+	// Chunked snapshot flags (BuildBuddy-style lazy loading)
+	useChunkedSnapshots = flag.Bool("use-chunked-snapshots", false, "Enable chunked snapshot restore with UFFD (lazy memory) and FUSE (lazy disk)")
+	chunkCacheSizeGB    = flag.Int("chunk-cache-size-gb", 2, "Size in GB of local LRU chunk cache")
+
+	// Network namespace mode (alternative to slot-based TAPs)
+	useNetNS = flag.Bool("use-netns", false, "Use network namespaces instead of slot-based TAP devices (simplifies snapshot restore)")
+
+	// CI system adapter flag
+	ciSystem = flag.String("ci-system", "github-actions", "CI system integration (github-actions, none)")
+
+	// Runner pooling flags (VM reuse across tasks)
+	poolEnabled          = flag.Bool("pool-enabled", false, "Enable runner pooling for VM reuse across tasks")
+	poolMaxRunners       = flag.Int("pool-max-runners", 0, "Max pooled runners (0 = derive from resources)")
+	poolMaxTotalMemoryGB = flag.Int("pool-max-total-memory-gb", 0, "Max total memory for pooled runners in GB (0 = unlimited)")
+	poolMaxRunnerMemoryGB = flag.Int("pool-max-runner-memory-gb", 2, "Max memory per pooled runner in GB")
+	poolMaxRunnerDiskGB  = flag.Int("pool-max-runner-disk-gb", 16, "Max disk per pooled runner in GB")
+	poolRecycleTimeout   = flag.Int("pool-recycle-timeout-secs", 30, "Timeout for recycling operations in seconds")
 )
 
 func main() {
@@ -215,7 +236,8 @@ func main() {
 		GitCacheImagePath:    *gitCacheImagePath,
 		GitCacheMountPath:    *gitCacheMountPath,
 		GitCacheRepoMappings: gitCacheRepoMappings,
-		GitCacheWorkspaceDir: *gitCacheWorkspaceDir,
+		GitCacheWorkspaceDir:  *gitCacheWorkspaceDir,
+		GitCachePreClonedPath: *gitCachePreClonedPath,
 		// GitHub runner auto-registration (Option C)
 		GitHubRunnerEnabled:   githubRunnerEnabledVal,
 		GitHubRepo:            githubRepoVal,
@@ -225,17 +247,90 @@ func main() {
 		GitHubAppID:           githubAppIDVal,
 		GitHubAppSecret:       githubAppSecretVal,
 		GCPProject:            gcpProjectVal,
+		// Runner pooling configuration
+		PoolEnabled:            *poolEnabled,
+		PoolMaxRunners:         *poolMaxRunners,
+		PoolMaxTotalMemoryGB:   *poolMaxTotalMemoryGB,
+		PoolMaxRunnerMemoryGB:  *poolMaxRunnerMemoryGB,
+		PoolMaxRunnerDiskGB:    *poolMaxRunnerDiskGB,
+		PoolRecycleTimeoutSecs: *poolRecycleTimeout,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Create runner manager
-	mgr, err := runner.NewManager(ctx, cfg, logger)
-	if err != nil {
-		log.WithError(err).Fatal("Failed to create runner manager")
+	// Construct CI adapter
+	var ciAdapter ci.Adapter
+	ciSystemVal := *ciSystem
+	if ciSystemVal == "" {
+		ciSystemVal = getMetadataAttribute("ci-system")
+		if ciSystemVal == "" {
+			ciSystemVal = "github-actions" // default for backwards compat
+		}
 	}
-	defer mgr.Close()
+
+	switch ciSystemVal {
+	case "github-actions":
+		if githubAppIDVal != "" && githubAppSecretVal != "" {
+			adapter, err := cigithub.NewAdapter(ctx, cigithub.Config{
+				AppID:      githubAppIDVal,
+				AppSecret:  githubAppSecretVal,
+				GCPProject: gcpProjectVal,
+				Repo:       githubRepoVal,
+				Org:        githubOrgVal,
+				Labels:     githubRunnerLabelsVal,
+				Ephemeral:  runnerEphemeralVal,
+			}, logger)
+			if err != nil {
+				log.WithError(err).Warn("Failed to create GitHub CI adapter, falling back to no-op")
+				ciAdapter = ci.NewNoopAdapter()
+			} else {
+				ciAdapter = adapter
+				log.Info("GitHub Actions CI adapter initialized")
+			}
+		} else {
+			log.Info("GitHub App not configured, using no-op CI adapter")
+			ciAdapter = ci.NewNoopAdapter()
+		}
+	default:
+		log.WithField("ci_system", ciSystemVal).Info("Using no-op CI adapter")
+		ciAdapter = ci.NewNoopAdapter()
+	}
+
+	// Create runner manager (optionally with chunked snapshot support)
+	var mgr *runner.Manager
+	var chunkedMgr *runner.ChunkedManager
+
+	if *useChunkedSnapshots || *useNetNS {
+		log.WithFields(logrus.Fields{
+			"chunked_snapshots": *useChunkedSnapshots,
+			"use_netns":         *useNetNS,
+			"chunk_cache_gb":    *chunkCacheSizeGB,
+		}).Info("Creating chunked manager with BuildBuddy-style optimizations")
+
+		chunkedCfg := runner.ChunkedManagerConfig{
+			HostConfig:          cfg,
+			CIAdapter:           ciAdapter,
+			UseChunkedSnapshots: *useChunkedSnapshots,
+			UseNetNS:            *useNetNS,
+			ChunkCacheSizeBytes: int64(*chunkCacheSizeGB) * 1024 * 1024 * 1024,
+		}
+
+		var err error
+		chunkedMgr, err = runner.NewChunkedManager(ctx, chunkedCfg, logger)
+		if err != nil {
+			log.WithError(err).Fatal("Failed to create chunked runner manager")
+		}
+		defer chunkedMgr.Close()
+		mgr = chunkedMgr.Manager // Use embedded manager for compatibility
+	} else {
+		var err error
+		mgr, err = runner.NewManager(ctx, cfg, ciAdapter, logger)
+		if err != nil {
+			log.WithError(err).Fatal("Failed to create runner manager")
+		}
+		defer mgr.Close()
+	}
 
 	// Initialize telemetry
 	telemetryCfg := telemetry.Config{
@@ -273,7 +368,12 @@ func main() {
 	)
 
 	// Register services
-	hostAgentServer := NewHostAgentServer(mgr, logger)
+	var hostAgentServer *HostAgentServer
+	if chunkedMgr != nil {
+		hostAgentServer = NewHostAgentServerWithChunked(mgr, chunkedMgr, logger)
+	} else {
+		hostAgentServer = NewHostAgentServer(mgr, logger)
+	}
 	pb.RegisterHostAgentServer(grpcServer, hostAgentServer)
 
 	// Register health service
@@ -305,6 +405,9 @@ func main() {
 	httpMux.HandleFunc("/api/v1/runners/quarantine", quarantineRunnerHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/runners/unquarantine", unquarantineRunnerHandler(mgr, logger))
 	httpMux.HandleFunc("/snapshot/sync", snapshotSyncHandler(mgr, logger))
+	httpMux.HandleFunc("/api/v1/gc", gcHandler(mgr, logger))
+	httpMux.HandleFunc("/api/v1/pool/flush", poolFlushHandler(mgr, logger))
+	httpMux.HandleFunc("/api/v1/pool/stats", poolStatsHandler(mgr, logger))
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *httpPort),
@@ -734,4 +837,52 @@ func getLocalIPFallback() string {
 		}
 	}
 	return ""
+}
+
+func gcHandler(mgr *runner.Manager, logger *logrus.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "GC not yet implemented"})
+	}
+}
+
+func poolFlushHandler(mgr *runner.Manager, logger *logrus.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		pool := mgr.GetPool()
+		if pool == nil {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "pool_disabled"})
+			return
+		}
+		olderThan := r.URL.Query().Get("older_than")
+		ctx := r.Context()
+		evicted := pool.FlushOlderThan(ctx, olderThan)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "ok",
+			"evicted": evicted,
+		})
+	}
+}
+
+func poolStatsHandler(mgr *runner.Manager, logger *logrus.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		pool := mgr.GetPool()
+		if pool == nil {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "pool_disabled"})
+			return
+		}
+		stats := pool.Stats()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(stats)
+	}
 }

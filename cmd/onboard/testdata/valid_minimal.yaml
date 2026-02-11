@@ -1,0 +1,8 @@
+platform:
+  gcp_project: minimal-project
+repository:
+  url: https://github.com/org/minimal
+ci:
+  system: github-actions
+  github:
+    repo: org/minimal

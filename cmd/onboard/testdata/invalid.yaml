@@ -1,0 +1,3 @@
+platform:
+  gcp_project: [not, valid, yaml
+  region: broken

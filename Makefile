@@ -1,11 +1,14 @@
 .PHONY: all build test clean proto docker-build docker-push terraform-init terraform-plan terraform-apply
 .PHONY: packer-init packer-validate packer-build firecracker-manager-linux release-host-image mig-rolling-update
+.PHONY: onboard onboard-validate
+.PHONY: test-unit test-race test-cover test-integration test-all check
 
 # Variables
 PROJECT_ID ?= your-project-id
 REGION ?= us-central1
 ENV ?= dev
 ZONE ?= us-central1-a
+CONFIG ?= onboard.yaml
 REGISTRY ?= gcr.io/$(PROJECT_ID)
 VERSION ?= $(shell git describe --tags --always --dirty)
 
@@ -14,7 +17,7 @@ GO := go
 GOFLAGS := -ldflags "-X main.version=$(VERSION)"
 
 # Binaries
-BINARIES := firecracker-manager control-plane snapshot-builder thaw-agent
+BINARIES := firecracker-manager control-plane snapshot-builder thaw-agent git-cache-builder git-cache-freshness data-snapshot-builder onboard
 
 all: build
 
@@ -32,6 +35,23 @@ snapshot-builder:
 
 thaw-agent:
 	CGO_ENABLED=0 GOOS=linux $(GO) build $(GOFLAGS) -o bin/thaw-agent ./cmd/thaw-agent
+
+git-cache-builder:
+	$(GO) build $(GOFLAGS) -o bin/git-cache-builder ./cmd/git-cache-builder
+
+git-cache-freshness:
+	$(GO) build $(GOFLAGS) -o bin/git-cache-freshness ./cmd/git-cache-freshness
+
+data-snapshot-builder:
+	$(GO) build $(GOFLAGS) -o bin/data-snapshot-builder ./cmd/data-snapshot-builder
+
+onboard:
+	$(GO) build $(GOFLAGS) -o bin/onboard ./cmd/onboard
+	./bin/onboard --config=$(CONFIG) $(if $(STEPS),--steps=$(STEPS))
+
+onboard-validate:
+	$(GO) build $(GOFLAGS) -o bin/onboard ./cmd/onboard
+	./bin/onboard --config=$(CONFIG) --dry-run
 
 # Generate protobuf code
 .PHONY: proto proto-buf proto-protoc
@@ -182,37 +202,116 @@ run-host-agent:
 		--socket-dir=/tmp/firecracker \
 		--log-dir=/tmp/firecracker-logs
 
+# Data snapshot targets (disk snapshot approach - fast host boot)
+.PHONY: data-snapshot-build data-snapshot-check
+
+data-snapshot-build: data-snapshot-builder
+	@echo "Building data snapshot (run on a GCE VM)..."
+	@echo "This creates a disk, populates it with snapshot+git-cache, and creates a GCP disk snapshot."
+	./bin/data-snapshot-builder \
+		--project=$(PROJECT_ID) \
+		--zone=$(ZONE) \
+		--snapshot-gcs=gs://$(PROJECT_ID)-firecracker-snapshots/current/ \
+		--repos="$(GIT_CACHE_REPOS)" \
+		--metadata-bucket=$(PROJECT_ID)-firecracker-snapshots
+
+data-snapshot-check: git-cache-freshness
+	@echo "Checking data snapshot freshness..."
+	./bin/git-cache-freshness \
+		--gcs-bucket=$(PROJECT_ID)-firecracker-snapshots \
+		--gcp-project=$(PROJECT_ID) \
+		--max-age-hours=24 \
+		--max-commit-drift=50
+
+# Legacy git-cache targets (GCS-based approach - slower host boot)
+.PHONY: git-cache-build git-cache-check
+
+git-cache-build: git-cache-builder
+	@echo "Building git-cache image to GCS (legacy mode)..."
+	./bin/git-cache-builder \
+		--repos="$(GIT_CACHE_REPOS)" \
+		--gcs-bucket=$(PROJECT_ID)-firecracker-snapshots \
+		--output-dir=/tmp/git-cache-build
+
+git-cache-check: git-cache-freshness
+	@echo "Checking git-cache freshness..."
+	./bin/git-cache-freshness \
+		--gcs-bucket=$(PROJECT_ID)-firecracker-snapshots \
+		--max-age-hours=24 \
+		--max-commit-drift=50
+
+# Unit tests (works on macOS + Linux, no infra needed)
+test-unit:
+	$(GO) test -v -count=1 ./pkg/... ./cmd/...
+
+# Unit tests with race detector
+test-race:
+	$(GO) test -v -race -count=1 ./pkg/... ./cmd/...
+
+# Unit tests with coverage
+test-cover:
+	$(GO) test -coverprofile=coverage.out -covermode=atomic ./pkg/... ./cmd/...
+	$(GO) tool cover -func=coverage.out
+	@echo "HTML report: go tool cover -html=coverage.out"
+
+# Integration tests (Linux + KVM only)
+test-integration:
+	$(GO) test -v -tags=integration -count=1 -timeout=10m ./pkg/... ./cmd/...
+
+# All tests
+test-all:
+	$(GO) test -v -tags=integration -count=1 -timeout=10m ./pkg/... ./cmd/...
+
+# Pre-commit check (compile + unit tests)
+check: build test-unit
+	@echo "All checks passed"
+
 # Help
 help:
 	@echo "Firecracker Bazel Runner Platform"
 	@echo ""
-	@echo "Targets:"
+	@echo "Build Targets:"
 	@echo "  build                  - Build all binaries"
 	@echo "  firecracker-manager    - Build firecracker-manager (native)"
 	@echo "  firecracker-manager-linux - Build firecracker-manager (linux/amd64)"
-	@echo "  test                   - Run tests"
+	@echo "  test                   - Run all tests"
+	@echo "  test-unit              - Unit tests (macOS + Linux)"
+	@echo "  test-race              - Unit tests with race detector"
+	@echo "  test-cover             - Unit tests with coverage report"
+	@echo "  test-integration       - Integration tests (Linux + KVM)"
+	@echo "  test-all               - All tests including integration"
+	@echo "  check                  - Build + unit tests (pre-commit)"
 	@echo "  lint                   - Run linter"
 	@echo "  clean                  - Clean build artifacts"
-	@echo "  docker-build           - Build Docker images"
-	@echo "  docker-push            - Push Docker images"
-	@echo "  rootfs                 - Build microVM rootfs"
+	@echo ""
+	@echo "Infrastructure:"
 	@echo "  terraform-init         - Initialize Terraform"
 	@echo "  terraform-plan         - Plan Terraform changes"
 	@echo "  terraform-apply        - Apply Terraform changes"
-	@echo "  packer-build           - Build GCE host image (includes binary)"
-	@echo "  packer-validate        - Validate Packer template"
+	@echo "  packer-build           - Build GCE host image"
 	@echo "  release-host-image     - Build binary + Packer image"
 	@echo "  mig-rolling-update     - Rolling update hosts to latest image"
-	@echo "  k8s-deploy             - Deploy to Kubernetes"
+	@echo ""
+	@echo "Data Snapshot (RECOMMENDED - fast ~30s host boot):"
+	@echo "  data-snapshot-build    - Build GCP disk snapshot with all artifacts"
+	@echo "  data-snapshot-check    - Check if snapshot needs rebuild"
+	@echo ""
+	@echo "Legacy GCS Mode (slower ~5-15min host boot):"
+	@echo "  git-cache-build        - Build git-cache.img to GCS"
+	@echo "  git-cache-check        - Check git-cache freshness"
 	@echo ""
 	@echo "Variables:"
 	@echo "  PROJECT_ID         - GCP project ID (required)"
 	@echo "  REGION             - GCP region (default: us-central1)"
+	@echo "  ZONE               - GCP zone (default: us-central1-a)"
 	@echo "  ENV                - Environment name (default: dev)"
-	@echo "  DB_PASSWORD        - Database password (required for terraform)"
+	@echo "  GIT_CACHE_REPOS    - Repos for git-cache (e.g., github.com/org/repo:name)"
 	@echo ""
-	@echo "Example workflow:"
-	@echo "  make release-host-image PROJECT_ID=my-project"
-	@echo "  make mig-rolling-update PROJECT_ID=my-project ENV=dev"
+	@echo "Example workflow (disk snapshots):"
+	@echo "  1. make packer-build PROJECT_ID=my-project"
+	@echo "  2. make snapshot-builder && ./bin/snapshot-builder --repo-url=... --gcs-bucket=..."
+	@echo "  3. make data-snapshot-build PROJECT_ID=my-project GIT_CACHE_REPOS=github.com/org/repo:name"
+	@echo "  4. terraform apply -var='use_data_snapshot=true' -var='data_snapshot_name=runner-data-YYYYMMDD-HHMMSS'"
+	@echo "  5. make mig-rolling-update PROJECT_ID=my-project"
 
 

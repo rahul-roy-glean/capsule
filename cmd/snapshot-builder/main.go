@@ -17,6 +17,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/github"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
@@ -34,7 +35,13 @@ var (
 	warmupTimeout       = flag.Duration("warmup-timeout", 30*time.Minute, "Timeout for warmup phase")
 	repoCacheSeedSizeGB = flag.Int("repo-cache-seed-size-gb", 20, "Size in GB of repo-cache-seed.img (shared Bazel repository cache seed)")
 	repoCacheSeedDir    = flag.String("repo-cache-seed-dir", "", "Optional directory to seed into repo-cache-seed.img (copied into image root)")
+	gitCachePath        = flag.String("git-cache-path", "", "Path to pre-populated git-cache.img (from git-cache-builder). If set, uses this instead of cloning during warmup.")
 	logLevel            = flag.String("log-level", "info", "Log level")
+
+	// GitHub App authentication for private repos (used when git-cache is not available)
+	githubAppID     = flag.String("github-app-id", "", "GitHub App ID for private repo access")
+	githubAppSecret = flag.String("github-app-secret", "", "GCP Secret Manager secret name containing GitHub App private key")
+	gcpProject      = flag.String("gcp-project", "", "GCP project for Secret Manager (defaults to metadata project)")
 )
 
 func main() {
@@ -61,6 +68,37 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), *warmupTimeout+30*time.Minute)
 	defer cancel()
+
+	// Generate GitHub token for private repo access (if GitHub App is configured)
+	var gitToken string
+	if *githubAppID != "" && *githubAppSecret != "" {
+		project := *gcpProject
+		if project == "" {
+			project = os.Getenv("GCP_PROJECT")
+		}
+		if project == "" {
+			log.Fatal("--gcp-project is required when using GitHub App authentication")
+		}
+
+		log.WithFields(logrus.Fields{
+			"app_id":      *githubAppID,
+			"secret":      *githubAppSecret,
+			"gcp_project": project,
+		}).Info("Using GitHub App for private repo authentication")
+
+		tokenClient, err := github.NewTokenClient(ctx, *githubAppID, *githubAppSecret, project)
+		if err != nil {
+			log.WithError(err).Fatal("Failed to create GitHub App token client")
+		}
+
+		installToken, err := tokenClient.GetInstallationToken(ctx)
+		if err != nil {
+			log.WithError(err).Fatal("Failed to get GitHub App installation token")
+		}
+
+		gitToken = installToken
+		log.Info("Successfully obtained GitHub App installation token for warmup")
+	}
 
 	// Generate version string
 	branchSuffix := *repoBranch
@@ -107,21 +145,30 @@ func main() {
 		log.WithError(err).Fatal("Failed to create repo-cache upper image")
 	}
 
-	// Create a placeholder Buildbarn certs image so the snapshot includes the same
+	// Create a placeholder credentials image so the snapshot includes the same
 	// device layout (drive ID) as the restore path. Hosts may override the backing
 	// file at restore time with an image built from secret material.
-	buildbarnCertsImg := filepath.Join(*outputDir, "buildbarn-certs.img")
-	if err := createExt4ImageMB(buildbarnCertsImg, 32, "BUILDBARN_CERTS"); err != nil {
-		log.WithError(err).Fatal("Failed to create buildbarn-certs image")
+	credentialsImg := filepath.Join(*outputDir, "credentials.img")
+	if err := createExt4ImageMB(credentialsImg, 32, "CREDENTIALS"); err != nil {
+		log.WithError(err).Fatal("Failed to create credentials image")
 	}
 
-	// Create a placeholder git-cache image so the snapshot includes the same
-	// device layout (drive ID) as the restore path. Hosts will override the backing
-	// file at restore time with their pre-populated git-cache.
+	// Create or copy git-cache image.
+	// If --git-cache-path is provided, use the pre-populated image (enables local clone from cache).
+	// Otherwise, create a placeholder so the snapshot has the same device layout.
 	gitCacheImg := filepath.Join(*outputDir, "git-cache.img")
-	log.Info("Creating placeholder git-cache image...")
-	if err := createExt4ImageMB(gitCacheImg, 64, "GIT_CACHE"); err != nil {
-		log.WithError(err).Fatal("Failed to create git-cache image")
+	gitCacheEnabled := false
+	if *gitCachePath != "" {
+		log.WithField("source", *gitCachePath).Info("Copying pre-populated git-cache image...")
+		if err := copyFile(*gitCachePath, gitCacheImg); err != nil {
+			log.WithError(err).Fatal("Failed to copy git-cache image")
+		}
+		gitCacheEnabled = true
+	} else {
+		log.Info("Creating placeholder git-cache image...")
+		if err := createExt4ImageMB(gitCacheImg, 64, "GIT_CACHE"); err != nil {
+			log.WithError(err).Fatal("Failed to create git-cache image")
+		}
 	}
 
 	// Create TAP device for warmup VM networking
@@ -178,8 +225,8 @@ func main() {
 				IsReadOnly:   false,
 			},
 			{
-				DriveID:      "buildbarn_certs",
-				PathOnHost:   buildbarnCertsImg,
+				DriveID:      "credentials",
+				PathOnHost:   credentialsImg,
 				IsRootDevice: false,
 				IsReadOnly:   true,
 			},
@@ -204,7 +251,7 @@ func main() {
 	}
 	
 	// Inject MMDS data for warmup configuration
-	mmdsData := buildWarmupMMDS(*repoURL, *repoBranch, *bazelVersion)
+	mmdsData := buildWarmupMMDS(*repoURL, *repoBranch, *bazelVersion, gitToken, gitCacheEnabled)
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
 		log.WithError(err).Fatal("Failed to set MMDS data")
@@ -598,7 +645,10 @@ func cleanupWarmupNetwork(tapName string) {
 }
 
 // buildWarmupMMDS creates the MMDS data for warmup mode
-func buildWarmupMMDS(repoURL, repoBranch, bazelVersion string) map[string]interface{} {
+func buildWarmupMMDS(repoURL, repoBranch, bazelVersion, gitToken string, gitCacheEnabled bool) map[string]interface{} {
+	// Extract repo name for git-cache lookup (e.g., "askscio/scio" -> "scio")
+	repoName := filepath.Base(strings.TrimSuffix(repoURL, ".git"))
+
 	return map[string]interface{}{
 		"latest": map[string]interface{}{
 			"meta": map[string]interface{}{
@@ -620,13 +670,18 @@ func buildWarmupMMDS(repoURL, repoBranch, bazelVersion string) map[string]interf
 				"interface": "eth0",
 			},
 			"job": map[string]interface{}{
-				"repo":   repoURL,
-				"branch": repoBranch,
+				"repo":      repoURL,
+				"branch":    repoBranch,
+				"git_token": gitToken,
 			},
 			"git_cache": map[string]interface{}{
-				"enabled":       false, // No pre-populated git-cache during warmup
+				"enabled":       gitCacheEnabled,
 				"mount_path":    "/mnt/git-cache",
 				"workspace_dir": "/mnt/ephemeral/workdir",
+				// Map the repo URL to its cache directory name
+				"repo_mappings": map[string]string{
+					repoURL: repoName,
+				},
 			},
 		},
 	}

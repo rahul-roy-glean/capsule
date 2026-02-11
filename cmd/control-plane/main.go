@@ -196,7 +196,11 @@ func main() {
 	httpMux.HandleFunc("/api/v1/hosts", controlPlaneServer.HandleGetHosts)
 	httpMux.HandleFunc("/api/v1/hosts/heartbeat", controlPlaneServer.HandleHostHeartbeat)
 	httpMux.HandleFunc("/api/v1/snapshots", controlPlaneServer.HandleGetSnapshots)
-	httpMux.HandleFunc("/webhook/github", controlPlaneServer.HandleGitHubWebhook)
+	// Register webhook handler conditionally based on CI system config
+	ciSystemEnv := os.Getenv("CI_SYSTEM")
+	if ciSystemEnv == "" || ciSystemEnv == "github-actions" {
+		httpMux.HandleFunc("/webhook/github", controlPlaneServer.HandleGitHubWebhook)
+	}
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *httpPort),

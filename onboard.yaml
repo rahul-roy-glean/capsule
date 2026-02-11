@@ -1,0 +1,64 @@
+# Onboard configuration for bazel-firecracker platform
+# Fill in your project-specific values and run: make onboard CONFIG=onboard.yaml
+
+platform:
+  gcp_project: "my-project"
+  region: "us-central1"
+  zone: "us-central1-a"
+
+repository:
+  url: "github.com/myorg/myrepo"
+  branch: "main"
+  # GitHub App authentication for private repos (optional)
+  github_app_id: ""
+  github_app_secret_name: ""  # GCP Secret Manager reference
+
+bazel:
+  warmup_targets: "//..."     # Targets to warm up during snapshot build
+
+microvm:
+  vcpus: 4
+  memory_mb: 8192
+  max_per_host: 16
+  idle_target: 2
+
+hosts:
+  machine_type: "n2-standard-64"
+  min_count: 2
+  max_count: 20
+  data_disk_gb: 500
+
+ci:
+  system: "github-actions"    # "github-actions" | "none"
+  github:                     # Only used when system == "github-actions"
+    repo: "myorg/myrepo"
+    org: "myorg"              # For org-level runner registration (optional)
+    labels:
+      - "self-hosted"
+      - "firecracker"
+      - "bazel"
+    ephemeral: true
+
+credentials:
+  # Secrets fetched from GCP Secret Manager and injected into microVMs
+  secrets: []
+  # Example:
+  #   - name: "artifactory-netrc"
+  #     secret_name: "projects/my-proj/secrets/artifactory-netrc/versions/latest"
+  #     target: "netrc"
+  #   - name: "gcp-sa-key"
+  #     secret_name: "projects/my-proj/secrets/ci-sa-key/versions/latest"
+  #     target: "gcp-service-account.json"
+  # Host-local directories to include in credentials drive
+  host_dirs: []
+  # Example:
+  #   - name: "buildbarn-certs"
+  #     host_path: "/etc/glean/ci/certs/buildbarn"
+  #     target: "certs/buildbarn"
+  # Environment variables for build tools
+  env: {}
+  # Example:
+  #   GOOGLE_APPLICATION_CREDENTIALS: "/mnt/credentials/gcp-service-account.json"
+
+buildbarn:
+  certs_dir: ""               # Host path to Buildbarn certs (legacy, use credentials.host_dirs instead)

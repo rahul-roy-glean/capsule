@@ -15,8 +15,9 @@ import (
 // HostAgentServer implements the HostAgent gRPC service
 type HostAgentServer struct {
 	pb.UnimplementedHostAgentServer
-	manager *runner.Manager
-	logger  *logrus.Entry
+	manager       *runner.Manager
+	chunkedMgr    *runner.ChunkedManager // Optional, for chunked snapshot support
+	logger        *logrus.Entry
 }
 
 // NewHostAgentServer creates a new HostAgentServer
@@ -27,12 +28,22 @@ func NewHostAgentServer(mgr *runner.Manager, logger *logrus.Logger) *HostAgentSe
 	}
 }
 
+// NewHostAgentServerWithChunked creates a HostAgentServer with chunked snapshot support
+func NewHostAgentServerWithChunked(mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, logger *logrus.Logger) *HostAgentServer {
+	return &HostAgentServer{
+		manager:    mgr,
+		chunkedMgr: chunkedMgr,
+		logger:     logger.WithField("service", "host-agent"),
+	}
+}
+
 // AllocateRunner allocates a new runner
 func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRunnerRequest) (*pb.AllocateRunnerResponse, error) {
 	s.logger.WithFields(logrus.Fields{
-		"request_id": req.RequestId,
-		"repo":       req.Repo,
-		"branch":     req.Branch,
+		"request_id":     req.RequestId,
+		"repo":           req.Repo,
+		"branch":         req.Branch,
+		"chunked_mode":   s.chunkedMgr != nil,
 	}).Info("AllocateRunner request")
 
 	allocReq := runner.AllocateRequest{
@@ -52,7 +63,16 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		}
 	}
 
-	r, err := s.manager.AllocateRunner(ctx, allocReq)
+	var r *runner.Runner
+	var err error
+
+	// Use chunked allocation if available (UFFD + FUSE for lazy loading)
+	if s.chunkedMgr != nil {
+		r, err = s.chunkedMgr.AllocateRunnerChunked(ctx, allocReq)
+	} else {
+		r, err = s.manager.AllocateRunner(ctx, allocReq)
+	}
+
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to allocate runner")
 		return &pb.AllocateRunnerResponse{
@@ -68,11 +88,30 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 // ReleaseRunner releases a runner
 func (s *HostAgentServer) ReleaseRunner(ctx context.Context, req *pb.ReleaseRunnerRequest) (*pb.ReleaseRunnerResponse, error) {
 	s.logger.WithFields(logrus.Fields{
-		"runner_id": req.RunnerId,
-		"destroy":   req.Destroy,
+		"runner_id":        req.RunnerId,
+		"destroy":          req.Destroy,
+		"try_recycle":      req.TryRecycle,
+		"finished_cleanly": req.FinishedCleanly,
+		"chunked_mode":     s.chunkedMgr != nil,
 	}).Info("ReleaseRunner request")
 
-	err := s.manager.ReleaseRunner(req.RunnerId, req.Destroy)
+	var err error
+
+	// Use chunked release if available (with optional incremental snapshot save)
+	if s.chunkedMgr != nil {
+		// Don't save incremental for normal destroy - only for explicit snapshot saves
+		err = s.chunkedMgr.ReleaseRunnerChunked(ctx, req.RunnerId, false)
+	} else if req.TryRecycle && !req.Destroy {
+		// Try to recycle to pool if requested
+		err = s.manager.ReleaseRunnerWithOptions(ctx, req.RunnerId, runner.ReleaseOptions{
+			Destroy:         req.Destroy,
+			TryRecycle:      req.TryRecycle,
+			FinishedCleanly: req.FinishedCleanly,
+		})
+	} else {
+		err = s.manager.ReleaseRunner(req.RunnerId, req.Destroy)
+	}
+
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to release runner")
 		return &pb.ReleaseRunnerResponse{
@@ -90,13 +129,30 @@ func (s *HostAgentServer) ReleaseRunner(ctx context.Context, req *pb.ReleaseRunn
 func (s *HostAgentServer) GetHostStatus(ctx context.Context, req *pb.GetHostStatusRequest) (*pb.HostStatus, error) {
 	st := s.manager.GetStatus()
 
-	return &pb.HostStatus{
+	resp := &pb.HostStatus{
 		TotalSlots:      int32(st.TotalSlots),
 		UsedSlots:       int32(st.UsedSlots),
 		IdleRunners:     int32(st.IdleRunners),
 		BusyRunners:     int32(st.BusyRunners),
 		SnapshotVersion: st.SnapshotVersion,
-	}, nil
+	}
+
+	// Include pool stats if pool is enabled
+	if pool := s.manager.GetPool(); pool != nil {
+		poolStats := pool.Stats()
+		resp.PoolStats = &pb.PoolStats{
+			PooledRunners:    int32(poolStats.PooledRunners),
+			MaxRunners:       int32(poolStats.MaxRunners),
+			MemoryUsageBytes: poolStats.MemoryUsageBytes,
+			MaxMemoryBytes:   poolStats.MaxMemoryBytes,
+			PoolHits:         poolStats.PoolHits,
+			PoolMisses:       poolStats.PoolMisses,
+			Evictions:        poolStats.Evictions,
+			RecycleFailures:  poolStats.RecycleFailures,
+		}
+	}
+
+	return resp, nil
 }
 
 // SyncSnapshot triggers a snapshot sync
@@ -230,6 +286,8 @@ func runnerToProto(r *runner.Runner) *pb.Runner {
 		state = pb.RunnerState_RUNNER_STATE_RETIRING
 	case runner.StateTerminated:
 		state = pb.RunnerState_RUNNER_STATE_TERMINATED
+	case runner.StatePaused:
+		state = pb.RunnerState_RUNNER_STATE_PAUSED
 	}
 
 	proto := &pb.Runner{

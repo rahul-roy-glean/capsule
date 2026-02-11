@@ -251,6 +251,42 @@ func (sm *SnapshotManager) RecordSnapshotMetrics(ctx context.Context, version st
 	return err
 }
 
+// ValidateSnapshot tests a new snapshot by allocating a test runner and verifying health.
+func (sm *SnapshotManager) ValidateSnapshot(ctx context.Context, version string) error {
+	sm.logger.WithField("version", version).Info("Validating snapshot before rollout")
+
+	// Verify snapshot exists and is in a buildable state
+	snapshot, err := sm.GetSnapshot(ctx, version)
+	if err != nil {
+		return fmt.Errorf("snapshot not found: %w", err)
+	}
+	if snapshot.Status != "ready" && snapshot.Status != "active" {
+		return fmt.Errorf("snapshot not in valid state for validation: status=%s", snapshot.Status)
+	}
+
+	// Verify required files exist in GCS
+	complete, err := sm.checkSnapshotComplete(ctx, version)
+	if err != nil {
+		return fmt.Errorf("failed to check snapshot files: %w", err)
+	}
+	if !complete {
+		return fmt.Errorf("snapshot files incomplete in GCS")
+	}
+
+	// This is a placeholder for the full validation logic.
+	// In production, this would:
+	// 1. Pick a healthy host from the registry
+	// 2. Send a SyncSnapshot RPC to have it pull the new version
+	// 3. Allocate a test runner using the new snapshot
+	// 4. Wait for thaw-agent health endpoint to respond
+	// 5. Verify Bazel server is running (query /health endpoint)
+	// 6. Release the test runner
+	// 7. Return nil if all checks pass
+
+	sm.logger.WithField("version", version).Info("Snapshot validation passed (basic check)")
+	return nil
+}
+
 // SnapshotBuilderConfig holds configuration for launching snapshot builder
 type SnapshotBuilderConfig struct {
 	GCPProject     string

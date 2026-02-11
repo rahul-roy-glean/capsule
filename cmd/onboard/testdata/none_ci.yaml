@@ -1,0 +1,6 @@
+platform:
+  gcp_project: none-project
+repository:
+  url: https://github.com/org/none-repo
+ci:
+  system: none

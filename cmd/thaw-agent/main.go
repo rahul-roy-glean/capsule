@@ -30,7 +30,6 @@ var (
 	logLevel               = flag.String("log-level", "info", "Log level")
 	readyFile              = flag.String("ready-file", "/var/run/thaw-agent/ready", "Ready signal file")
 	skipNetwork            = flag.Bool("skip-network", false, "Skip network configuration")
-	skipGitSync            = flag.Bool("skip-git-sync", false, "Skip git sync")
 	skipRunner             = flag.Bool("skip-runner", false, "Skip GitHub runner registration")
 	skipRepoCache          = flag.Bool("skip-repo-cache", false, "Skip shared Bazel repository cache overlay setup")
 	skipBuildbarnCerts     = flag.Bool("skip-buildbarn-certs", false, "Skip mounting Buildbarn certificate drive")
@@ -42,6 +41,12 @@ var (
 	buildbarnCertsDevice   = flag.String("buildbarn-certs-device", "/dev/vdd", "Block device for Buildbarn certs drive (read-only mount inside VM)")
 	buildbarnCertsMount    = flag.String("buildbarn-certs-mount", "/etc/bazel-firecracker/certs/buildbarn", "Mount point for Buildbarn certs inside the microVM")
 	buildbarnCertsLabel    = flag.String("buildbarn-certs-label", "BUILDBARN_CERTS", "Filesystem label for Buildbarn certs drive")
+
+	// Credentials flags (generic replacement for buildbarn-specific certs)
+	skipCredentials    = flag.Bool("skip-credentials", false, "Skip mounting credentials drive")
+	credentialsDevice  = flag.String("credentials-device", "/dev/vdd", "Block device for credentials drive")
+	credentialsMount   = flag.String("credentials-mount", "/mnt/credentials", "Mount point for credentials")
+	credentialsLabel   = flag.String("credentials-label", "CREDENTIALS", "Filesystem label for credentials drive")
 
 	// Git cache flags
 	skipGitCache         = flag.Bool("skip-git-cache", false, "Skip git-cache setup and reference cloning")
@@ -66,6 +71,28 @@ var globalWarmupState = &WarmupState{
 	Phase:     "initializing",
 	StartedAt: time.Now(),
 }
+
+// RegistrationState tracks GitHub runner registration status
+type RegistrationState struct {
+	Attempted bool   `json:"attempted"`
+	Success   bool   `json:"success"`
+	Error     string `json:"error,omitempty"`
+	Output    string `json:"output,omitempty"`
+}
+
+var globalRegistrationState = &RegistrationState{}
+
+// SymlinkState tracks pre-cloned repo symlink status
+type SymlinkState struct {
+	Attempted    bool   `json:"attempted"`
+	Success      bool   `json:"success"`
+	SymlinkPath  string `json:"symlink_path,omitempty"`
+	TargetPath   string `json:"target_path,omitempty"`
+	TargetExists bool   `json:"target_exists"`
+	Error        string `json:"error,omitempty"`
+}
+
+var globalSymlinkState = &SymlinkState{}
 
 // MMDSData represents the data structure from MMDS
 type MMDSData struct {
@@ -92,6 +119,7 @@ type MMDSData struct {
 			Branch            string            `json:"branch"`
 			Commit            string            `json:"commit"`
 			GitHubRunnerToken string            `json:"github_runner_token"`
+			GitToken          string            `json:"git_token"` // Installation token for git clone auth (private repos)
 			Labels            map[string]string `json:"labels"`
 		} `json:"job"`
 		Snapshot struct {
@@ -102,9 +130,13 @@ type MMDSData struct {
 			MountPath    string            `json:"mount_path,omitempty"`
 			RepoMappings map[string]string `json:"repo_mappings,omitempty"`
 			WorkspaceDir string            `json:"workspace_dir,omitempty"`
+			// PreClonedPath is the path where the repo was pre-cloned during warmup
+			// (baked into the snapshot). Thaw-agent creates a symlink from WorkspaceDir to here.
+			PreClonedPath string `json:"pre_cloned_path,omitempty"`
 		} `json:"git_cache,omitempty"`
 		Runner struct {
-			Ephemeral bool `json:"ephemeral"`
+			Ephemeral bool   `json:"ephemeral"`
+			CISystem  string `json:"ci_system,omitempty"`
 		} `json:"runner,omitempty"`
 		Warmup struct {
 			RepoURL       string `json:"repo_url,omitempty"`
@@ -203,14 +235,19 @@ func main() {
 	}
 	bootTimer.Phase("repo_cache_overlay")
 
-	// Mount Buildbarn certificate drive (shared read-only seed image packaged by host).
-	if !*skipBuildbarnCerts {
-		log.Info("Mounting Buildbarn certs...")
-		if err := mountBuildbarnCerts(mmdsData); err != nil {
-			log.WithError(err).Error("Failed to mount Buildbarn certs")
+	// Mount credentials drive (shared read-only image with certs, keys, etc.)
+	if !*skipCredentials && !*skipBuildbarnCerts {
+		log.Info("Mounting credentials drive...")
+		if err := mountCredentials(mmdsData); err != nil {
+			log.WithError(err).Error("Failed to mount credentials drive")
+			// Fall back to legacy Buildbarn certs mount
+			log.Info("Falling back to legacy Buildbarn certs mount...")
+			if err := mountBuildbarnCerts(mmdsData); err != nil {
+				log.WithError(err).Error("Failed to mount Buildbarn certs (legacy fallback)")
+			}
 		}
 	}
-	bootTimer.Phase("buildbarn_certs")
+	bootTimer.Phase("credentials_mount")
 
 	// Mount git-cache for fast reference cloning
 	if !*skipGitCache && mmdsData.Latest.GitCache.Enabled {
@@ -254,6 +291,28 @@ func main() {
 				log.WithField("path", workspaceDir).Info("Mounting tmpfs for workspace...")
 				if err := exec.Command("mount", "-t", "tmpfs", "-o", "size=3G", "tmpfs", workspaceDir).Run(); err != nil {
 					log.WithError(err).Warn("Failed to mount tmpfs for workspace")
+				}
+			}
+		}
+		
+		// Create symlink to pre-cloned repo after tmpfs mount
+		// The repo is pre-cloned in the snapshot rootfs, workflow expects it at WorkspaceDir
+		preClonedRepo := getPreClonedPath(mmdsData)
+		if preClonedRepo != "" {
+			if _, err := os.Stat(filepath.Join(preClonedRepo, ".git")); err == nil {
+				symlinkPath := getWorkspaceRepoPath(mmdsData)
+				if symlinkPath != "" && symlinkPath != preClonedRepo {
+					if err := os.MkdirAll(filepath.Dir(symlinkPath), 0755); err == nil {
+						os.RemoveAll(symlinkPath) // Remove if exists
+						if err := os.Symlink(preClonedRepo, symlinkPath); err != nil {
+							log.WithError(err).Warn("Failed to create symlink to pre-cloned repo")
+						} else {
+							log.WithFields(logrus.Fields{
+								"link":   symlinkPath,
+								"target": preClonedRepo,
+							}).Info("Created symlink to pre-cloned repo")
+						}
+					}
 				}
 			}
 		}
@@ -302,8 +361,12 @@ func main() {
 		// After snapshot restore, MMDS will have new data with mode != "warmup"
 		log.Info("Warmup complete, polling MMDS for mode change (snapshot restore)...")
 		pollCount := 0
+		pollInterval := 10 * time.Millisecond
 		for {
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(pollInterval)
+			if pollInterval < 100*time.Millisecond {
+				pollInterval *= 2
+			}
 			pollCount++
 			
 			newData, err := fetchMMDSData()
@@ -333,6 +396,68 @@ func main() {
 				// Update the existing mmdsData in-place so the health server sees the new data
 				// (the health server has a reference to the original mmdsData)
 				mmdsData.Latest = newData.Latest
+				
+				// Recreate symlink after restore (tmpfs was fresh, symlink from warmup is gone)
+				// Use configured paths from MMDS
+				globalSymlinkState.Attempted = true
+				
+				// Use a temporary MMDSData wrapper for the helper functions
+				tempData := &MMDSData{}
+				tempData.Latest = newData.Latest
+				
+				preClonedRepo := getPreClonedPath(tempData)
+				globalSymlinkState.TargetPath = preClonedRepo
+				
+				if preClonedRepo != "" {
+					gitPath := filepath.Join(preClonedRepo, ".git")
+					if _, err := os.Stat(gitPath); err == nil {
+						globalSymlinkState.TargetExists = true
+						symlinkPath := getWorkspaceRepoPath(tempData)
+						globalSymlinkState.SymlinkPath = symlinkPath
+						
+						if symlinkPath != "" && symlinkPath != preClonedRepo {
+							log.WithFields(logrus.Fields{
+								"symlink": symlinkPath,
+								"target":  preClonedRepo,
+							}).Info("Creating symlink to pre-cloned repo after restore")
+							
+							if err := os.MkdirAll(filepath.Dir(symlinkPath), 0755); err != nil {
+								globalSymlinkState.Error = fmt.Sprintf("MkdirAll failed: %v", err)
+								log.WithError(err).Error("Failed to create symlink parent dir")
+							} else {
+								os.RemoveAll(symlinkPath) // Remove if exists
+								if err := os.Symlink(preClonedRepo, symlinkPath); err != nil {
+									globalSymlinkState.Error = fmt.Sprintf("Symlink failed: %v", err)
+									log.WithError(err).Error("Failed to create post-restore symlink")
+								} else {
+									globalSymlinkState.Success = true
+									log.Info("Successfully created symlink to pre-cloned repo")
+								}
+							}
+						}
+					} else {
+						globalSymlinkState.Error = fmt.Sprintf("Target .git not found: %v", err)
+						log.WithFields(logrus.Fields{
+							"path":  gitPath,
+							"error": err,
+						}).Warn("Pre-cloned repo .git not found for symlink")
+					}
+				} else {
+					log.Debug("No pre-cloned path configured, skipping symlink")
+				}
+
+				// Reconfigure network for new slot
+				// Bug fix: Snapshot bakes slot-0's IP via kernel boot params.
+				// After restore on slot N, the guest has the wrong IP.
+				if !*skipNetwork {
+					log.Info("Reconfiguring network after snapshot restore...")
+					if err := configureNetwork(tempData); err != nil {
+						log.WithError(err).Error("Post-restore network reconfig failed")
+					} else {
+						log.Info("Post-restore network reconfigured successfully")
+					}
+				}
+
 				break
 			}
 		}
@@ -346,15 +471,45 @@ func main() {
 	go startHealthServer(mmdsData)
 	log.Info("Health server started in background")
 
-	// Register GitHub runner
-	setStep("github_registration")
-	if !*skipRunner && mmdsData.Latest.Job.GitHubRunnerToken != "" {
-		log.Info("Registering GitHub runner...")
-		if err := registerGitHubRunner(mmdsData); err != nil {
-			log.WithError(err).Error("Failed to register GitHub runner")
+	// Verify Bazel server survived snapshot restore
+	setStep("bazel_verification")
+	preClonedRepo := getPreClonedPath(mmdsData)
+	if preClonedRepo != "" {
+		if err := verifyBazelServer(preClonedRepo); err != nil {
+			log.WithError(err).Warn("Bazel server verification failed (will cold-start on first build)")
 		}
 	}
-	bootTimer.Phase("github_runner")
+	bootTimer.Phase("bazel_verify")
+
+	// Register CI runner based on configured CI system
+	setStep("ci_registration")
+	ciSystem := mmdsData.Latest.Runner.CISystem
+	if ciSystem == "" && mmdsData.Latest.Job.GitHubRunnerToken != "" {
+		ciSystem = "github-actions" // backwards compat
+	}
+
+	if !*skipRunner {
+		switch ciSystem {
+		case "github-actions":
+			if mmdsData.Latest.Job.GitHubRunnerToken != "" {
+				log.Info("Registering GitHub Actions runner...")
+				globalRegistrationState.Attempted = true
+				if err := registerGitHubRunner(mmdsData); err != nil {
+					globalRegistrationState.Error = err.Error()
+					log.WithError(err).Error("Failed to register GitHub runner")
+				} else {
+					globalRegistrationState.Success = true
+				}
+			} else {
+				log.Info("GitHub Actions CI system configured but no runner token provided, skipping registration")
+			}
+		case "none", "":
+			log.Info("No CI system configured, skipping runner registration")
+		default:
+			log.WithField("ci_system", ciSystem).Warn("Unknown CI system, skipping runner registration")
+		}
+	}
+	bootTimer.Phase("ci_runner")
 
 	// Signal ready
 	log.Info("Signaling ready...")
@@ -474,6 +629,126 @@ func mountBuildbarnCerts(data *MMDSData) error {
 	return nil
 }
 
+// mountCredentials mounts the generic credentials drive and sets up symlinks.
+func mountCredentials(data *MMDSData) error {
+	mountPath := *credentialsMount
+
+	if err := os.MkdirAll(mountPath, 0755); err != nil {
+		return fmt.Errorf("failed to create credentials mount dir: %w", err)
+	}
+
+	// Try new CREDENTIALS label first, fall back to legacy BUILDBARN_CERTS
+	dev := resolveDevice(*credentialsDevice, *credentialsLabel)
+	if _, err := os.Stat(dev); err != nil {
+		dev = resolveDevice(*buildbarnCertsDevice, *buildbarnCertsLabel)
+	}
+
+	if err := exec.Command("mountpoint", "-q", mountPath).Run(); err == nil {
+		return nil // already mounted
+	}
+	if output, err := exec.Command("mount", "-o", "ro", dev, mountPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("mount failed: %s: %w", string(output), err)
+	}
+
+	log.WithFields(logrus.Fields{
+		"device": dev,
+		"mount":  mountPath,
+	}).Info("Credentials drive mounted")
+
+	// Setup credential symlinks and environment
+	setupCredentialSymlinks(mountPath, data)
+
+	return nil
+}
+
+// setupCredentialSymlinks creates symlinks and environment setup from the credentials drive.
+func setupCredentialSymlinks(mountPath string, data *MMDSData) {
+	runnerHome := "/home/" + *runnerUsername
+
+	// Symlink .netrc if present
+	netrcPath := filepath.Join(mountPath, "netrc")
+	if _, err := os.Stat(netrcPath); err == nil {
+		target := filepath.Join(runnerHome, ".netrc")
+		os.Remove(target)
+		if err := os.Symlink(netrcPath, target); err != nil {
+			log.WithError(err).Warn("Failed to symlink .netrc")
+		} else {
+			log.Info("Linked .netrc from credentials drive")
+		}
+	}
+
+	// Symlink git-credentials if present
+	gitCredsPath := filepath.Join(mountPath, "git-credentials")
+	if _, err := os.Stat(gitCredsPath); err == nil {
+		target := filepath.Join(runnerHome, ".git-credentials")
+		os.Remove(target)
+		if err := os.Symlink(gitCredsPath, target); err != nil {
+			log.WithError(err).Warn("Failed to symlink .git-credentials")
+		} else {
+			log.Info("Linked .git-credentials from credentials drive")
+		}
+		// Configure git to use credential store
+		exec.Command("git", "config", "--global", "credential.helper", "store").Run()
+	}
+
+	// Source environment file if present
+	envPath := filepath.Join(mountPath, "env")
+	if envData, err := os.ReadFile(envPath); err == nil {
+		for k, v := range parseEnvFile(envData) {
+			os.Setenv(k, v)
+			log.WithField("var", k).Debug("Set environment variable from credentials")
+		}
+	}
+
+	// Install CA certs if present
+	caBundlePath := filepath.Join(mountPath, "certs", "ca-bundle")
+	if _, err := os.Stat(caBundlePath); err == nil {
+		entries, _ := os.ReadDir(caBundlePath)
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".crt") {
+				src := filepath.Join(caBundlePath, entry.Name())
+				dst := filepath.Join("/usr/local/share/ca-certificates", entry.Name())
+				exec.Command("cp", src, dst).Run()
+			}
+		}
+		if len(entries) > 0 {
+			exec.Command("update-ca-certificates").Run()
+			log.Info("Installed CA certificates from credentials drive")
+		}
+	}
+
+	// Copy .npmrc if present
+	npmrcPath := filepath.Join(mountPath, "npm", ".npmrc")
+	if _, err := os.Stat(npmrcPath); err == nil {
+		target := filepath.Join(runnerHome, ".npmrc")
+		exec.Command("cp", npmrcPath, target).Run()
+		exec.Command("chown", *runnerUsername+":"+*runnerUsername, target).Run()
+		log.Info("Copied .npmrc from credentials drive")
+	}
+
+	// Backwards compatibility: if buildbarn certs exist in credentials drive,
+	// create legacy mount path symlink
+	buildbarnPath := filepath.Join(mountPath, "certs", "buildbarn")
+	if _, err := os.Stat(buildbarnPath); err == nil {
+		legacyMount := data.Latest.Buildbarn.CertsMountPath
+		if legacyMount == "" {
+			legacyMount = *buildbarnCertsMount
+		}
+		if legacyMount != "" && legacyMount != buildbarnPath {
+			os.MkdirAll(filepath.Dir(legacyMount), 0755)
+			os.Remove(legacyMount)
+			if err := os.Symlink(buildbarnPath, legacyMount); err != nil {
+				log.WithError(err).Warn("Failed to create legacy buildbarn certs symlink")
+			} else {
+				log.WithFields(logrus.Fields{
+					"link":   legacyMount,
+					"target": buildbarnPath,
+				}).Info("Created legacy Buildbarn certs symlink")
+			}
+		}
+	}
+}
+
 func resolveDevice(defaultDev string, label string) string {
 	// Prefer by-label path if present.
 	byLabel := filepath.Join("/dev/disk/by-label", label)
@@ -548,19 +823,22 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					Branch            string            `json:"branch"`
 					Commit            string            `json:"commit"`
 					GitHubRunnerToken string            `json:"github_runner_token"`
+					GitToken          string            `json:"git_token"`
 					Labels            map[string]string `json:"labels"`
 				} `json:"job"`
 				Snapshot struct {
 					Version string `json:"version"`
 				} `json:"snapshot"`
 				GitCache struct {
-					Enabled      bool              `json:"enabled"`
-					MountPath    string            `json:"mount_path,omitempty"`
-					RepoMappings map[string]string `json:"repo_mappings,omitempty"`
-					WorkspaceDir string            `json:"workspace_dir,omitempty"`
+					Enabled       bool              `json:"enabled"`
+					MountPath     string            `json:"mount_path,omitempty"`
+					RepoMappings  map[string]string `json:"repo_mappings,omitempty"`
+					WorkspaceDir  string            `json:"workspace_dir,omitempty"`
+					PreClonedPath string            `json:"pre_cloned_path,omitempty"`
 				} `json:"git_cache,omitempty"`
 				Runner struct {
-					Ephemeral bool `json:"ephemeral"`
+					Ephemeral bool   `json:"ephemeral"`
+					CISystem  string `json:"ci_system,omitempty"`
 				} `json:"runner,omitempty"`
 				Warmup struct {
 					RepoURL       string `json:"repo_url,omitempty"`
@@ -860,201 +1138,6 @@ func setupGitAlternates(repoPath, cachePath string) error {
 	return os.WriteFile(alternatesFile, []byte(cacheObjects+"\n"), 0644)
 }
 
-func syncGitRepo(data *MMDSData) error {
-	job := data.Latest.Job
-	if job.Repo == "" {
-		return nil
-	}
-
-	// Determine workspace directory
-	workspacePath := *workspaceDir
-	if data.Latest.GitCache.WorkspaceDir != "" {
-		workspacePath = data.Latest.GitCache.WorkspaceDir
-	}
-
-	// Extract repo name for directory structure
-	repoDir := extractRepoDir(job.Repo)
-	targetDir := filepath.Join(workspacePath, repoDir)
-
-	// Check if git-cache reference cloning is available
-	if data.Latest.GitCache.Enabled {
-		refPath := findGitCacheReference(data, job.Repo)
-		if refPath != "" {
-			return syncGitRepoWithReference(data, targetDir, refPath)
-		}
-		log.WithField("repo", job.Repo).Warn("Git-cache enabled but no reference found, falling back to regular clone")
-	}
-
-	// Fall back to existing behavior
-	if err := os.Chdir(workspacePath); err != nil {
-		return fmt.Errorf("failed to change to workspace: %w", err)
-	}
-
-	// Check if repo exists
-	if _, err := os.Stat(filepath.Join(targetDir, ".git")); os.IsNotExist(err) {
-		log.Warn("No git repo in workspace, skipping sync")
-		return nil
-	}
-
-	if err := os.Chdir(targetDir); err != nil {
-		return fmt.Errorf("failed to change to repo dir: %w", err)
-	}
-
-	// Fetch updates
-	log.WithField("branch", job.Branch).Info("Fetching git updates")
-	if err := exec.Command("git", "fetch", "origin", job.Branch).Run(); err != nil {
-		return fmt.Errorf("git fetch failed: %w", err)
-	}
-
-	// Checkout specific commit or branch
-	target := job.Commit
-	if target == "" {
-		target = "origin/" + job.Branch
-	}
-
-	log.WithField("target", target).Info("Checking out")
-	if err := exec.Command("git", "checkout", "-f", target).Run(); err != nil {
-		return fmt.Errorf("git checkout failed: %w", err)
-	}
-
-	// Clean workspace
-	exec.Command("git", "clean", "-fd").Run()
-
-	return nil
-}
-
-func syncGitRepoWithReference(data *MMDSData, targetDir, refPath string) error {
-	job := data.Latest.Job
-
-	// Ensure parent directory exists
-	if err := os.MkdirAll(filepath.Dir(targetDir), 0755); err != nil {
-		return fmt.Errorf("failed to create parent dir: %w", err)
-	}
-
-	// Check if target already exists with .git
-	gitDir := filepath.Join(targetDir, ".git")
-	if _, err := os.Stat(gitDir); err == nil {
-		// Repo exists, just fetch and checkout
-		log.WithFields(logrus.Fields{
-			"target":    targetDir,
-			"reference": refPath,
-		}).Info("Repo exists, fetching updates with reference")
-
-		if err := os.Chdir(targetDir); err != nil {
-			return fmt.Errorf("failed to chdir: %w", err)
-		}
-
-		// Ensure alternates is set up
-		alternatesFile := filepath.Join(gitDir, "objects", "info", "alternates")
-		refObjects := filepath.Join(refPath, ".git", "objects")
-		if _, err := os.Stat(refObjects); err == nil {
-			if err := os.MkdirAll(filepath.Dir(alternatesFile), 0755); err == nil {
-				os.WriteFile(alternatesFile, []byte(refObjects+"\n"), 0644)
-			}
-		}
-
-		// Fetch
-		if err := exec.Command("git", "fetch", "origin").Run(); err != nil {
-			log.WithError(err).Warn("git fetch failed")
-		}
-	} else {
-		// Try clone with reference first
-		log.WithFields(logrus.Fields{
-			"target":    targetDir,
-			"reference": refPath,
-			"repo":      job.Repo,
-		}).Info("Cloning with git-cache reference")
-
-		repoURL := job.Repo
-		if !strings.HasPrefix(repoURL, "https://") && !strings.HasPrefix(repoURL, "git@") {
-			repoURL = "https://github.com/" + repoURL
-		}
-
-		// Build clone command with reference (no --dissociate to keep using shared objects)
-		args := []string{"clone", "--reference", refPath, repoURL, targetDir}
-
-		cmd := exec.Command("git", args...)
-		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-		if _, err := cmd.CombinedOutput(); err != nil {
-			// Fallback: local-only checkout using alternates (for private repos without auth)
-			log.WithError(err).Info("Network clone failed, trying local-only checkout from cache")
-
-			// Set up git repo with alternates pointing to cache
-			gitDir := filepath.Join(targetDir, ".git")
-			if err := os.MkdirAll(filepath.Join(gitDir, "objects", "info"), 0755); err != nil {
-				return fmt.Errorf("failed to create .git dirs: %w", err)
-			}
-
-			// Copy refs and config from cache
-			refGitDir := filepath.Join(refPath, ".git")
-			for _, f := range []string{"HEAD", "config", "packed-refs"} {
-				src := filepath.Join(refGitDir, f)
-				dst := filepath.Join(gitDir, f)
-				if data, err := os.ReadFile(src); err == nil {
-					os.WriteFile(dst, data, 0644)
-				}
-			}
-
-			// Copy refs directory
-			exec.Command("cp", "-r", filepath.Join(refGitDir, "refs"), gitDir).Run()
-
-			// Set up alternates to share objects
-			alternatesFile := filepath.Join(gitDir, "objects", "info", "alternates")
-			refObjects := filepath.Join(refGitDir, "objects")
-			os.WriteFile(alternatesFile, []byte(refObjects+"\n"), 0644)
-
-			// Checkout working tree
-			if err := os.Chdir(targetDir); err != nil {
-				return fmt.Errorf("failed to chdir: %w", err)
-			}
-
-			// Reset to HEAD to populate working tree
-			if out, err := exec.Command("git", "checkout", "HEAD", "--", ".").CombinedOutput(); err != nil {
-				return fmt.Errorf("local checkout failed: %s: %w", string(out), err)
-			}
-
-			log.Info("Local-only checkout from cache completed")
-			// Fix ownership for runner user
-			exec.Command("chown", "-R", *runnerUsername+":"+*runnerUsername, targetDir).Run()
-			return nil
-		}
-
-		if err := os.Chdir(targetDir); err != nil {
-			return fmt.Errorf("failed to chdir after clone: %w", err)
-		}
-	}
-
-	// Checkout the target branch/commit
-	target := job.Commit
-	if target == "" {
-		target = job.Branch
-		if target == "" {
-			target = "main"
-		}
-	}
-
-	// Fetch the specific branch if needed
-	if job.Branch != "" {
-		exec.Command("git", "fetch", "origin", job.Branch).Run()
-	}
-
-	log.WithField("target", target).Info("Checking out")
-	if err := exec.Command("git", "checkout", "-f", target).Run(); err != nil {
-		// Try with origin/ prefix
-		if err := exec.Command("git", "checkout", "-f", "origin/"+target).Run(); err != nil {
-			return fmt.Errorf("git checkout failed: %w", err)
-		}
-	}
-
-	// Clean workspace
-	exec.Command("git", "clean", "-fdx").Run()
-
-	// Fix ownership for runner user
-	exec.Command("chown", "-R", *runnerUsername+":"+*runnerUsername, targetDir).Run()
-
-	return nil
-}
-
 func findGitCacheReference(data *MMDSData, repoURL string) string {
 	gitCache := data.Latest.GitCache
 	if !gitCache.Enabled {
@@ -1178,8 +1261,6 @@ func registerGitHubRunner(data *MMDSData) error {
 
 	configCmd := exec.CommandContext(ctx, filepath.Join(runnerPath, "config.sh"), configArgs...)
 	configCmd.Dir = runnerPath
-	configCmd.Stdout = os.Stdout
-	configCmd.Stderr = os.Stderr
 	configCmd.SysProcAttr = &syscall.SysProcAttr{
 		Credential: &syscall.Credential{
 			Uid: uint32(uid),
@@ -1188,13 +1269,28 @@ func registerGitHubRunner(data *MMDSData) error {
 	}
 	configCmd.Env = append(os.Environ(), "HOME="+runnerUser.HomeDir)
 
-	log.Info("Configuring GitHub runner (timeout: 120s)...")
-	if err := configCmd.Run(); err != nil {
+	log.WithFields(logrus.Fields{
+		"url":      repoURL,
+		"name":     data.Latest.Meta.RunnerID[:8],
+		"labels":   labelsStr,
+		"uid":      uid,
+		"gid":      gid,
+		"home":     runnerUser.HomeDir,
+		"run_path": runnerPath,
+	}).Info("Configuring GitHub runner (timeout: 120s)...")
+	
+	output, err := configCmd.CombinedOutput()
+	if err != nil {
+		log.WithFields(logrus.Fields{
+			"error":  err.Error(),
+			"output": string(output),
+		}).Error("config.sh failed")
 		if ctx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("runner config timed out after 120s")
 		}
-		return fmt.Errorf("runner config failed: %w", err)
+		return fmt.Errorf("runner config failed: %w (output: %s)", err, string(output))
 	}
+	log.WithField("output", string(output)).Info("config.sh completed successfully")
 
 	// Start runner in background as 'runner' user
 	// Use setsid to create a new session so runner survives if thaw-agent exits
@@ -1236,18 +1332,44 @@ func runWarmupMode(data *MMDSData) error {
 		return fmt.Errorf("no repo_url in warmup config")
 	}
 	
-	workDir := "/workspace"
-	repoDir := filepath.Join(workDir, "repo")
+	// Clone to rootfs (which has more space) but symlink to expected GitHub Actions location
+	// This allows the workflow to find the repo at /mnt/ephemeral/workdir/scio/scio
+	// while actually storing it on the persistent rootfs at /workspace/scio/scio
+	
+	// Extract org/repo from URL for directory structure (GitHub Actions convention)
+	repoPath := extractRepoDir(warmup.RepoURL) // Returns "scio/scio" for github.com/askscio/scio
+	
+	// Store on rootfs with enough space
+	actualRepoDir := filepath.Join("/workspace", repoPath)
+	
+	// Create symlink from expected location to actual location
+	workDir := data.Latest.GitCache.WorkspaceDir
+	if workDir == "" {
+		workDir = "/mnt/ephemeral/workdir"
+	}
+	expectedRepoDir := filepath.Join(workDir, repoPath)
+	
+	// Clone to actual location on rootfs
+	repoDir := actualRepoDir
+	
+	log.WithFields(logrus.Fields{
+		"actual_repo_dir":   actualRepoDir,
+		"expected_repo_dir": expectedRepoDir,
+		"work_dir":          workDir,
+	}).Info("Setting up repo directories for warmup")
 	
 	// Phase 1: Clone repository
 	updateWarmupState("cloning", "Cloning repository...")
 	log.WithFields(logrus.Fields{
-		"repo_url": warmup.RepoURL,
-		"branch":   warmup.RepoBranch,
+		"repo_url":  warmup.RepoURL,
+		"branch":    warmup.RepoBranch,
+		"repo_dir":  repoDir,
+		"work_dir":  workDir,
 	}).Info("Cloning repository for warmup")
 	
-	if err := os.MkdirAll(workDir, 0755); err != nil {
-		return fmt.Errorf("failed to create workspace: %w", err)
+	// Create parent directory for the clone target (e.g., /mnt/ephemeral/workdir/scio for scio/scio)
+	if err := os.MkdirAll(filepath.Dir(repoDir), 0755); err != nil {
+		return fmt.Errorf("failed to create repo parent dir: %w", err)
 	}
 	
 	branch := warmup.RepoBranch
@@ -1259,12 +1381,93 @@ func runWarmupMode(data *MMDSData) error {
 	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err == nil {
 		log.Info("Repository already exists, skipping clone")
 	} else {
-		cloneCmd := exec.Command("git", "clone", "--depth=1", "--branch", branch, warmup.RepoURL, repoDir)
-		cloneCmd.Stdout = os.Stdout
-		cloneCmd.Stderr = os.Stderr
-		cloneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-		if err := cloneCmd.Run(); err != nil {
-			return fmt.Errorf("git clone failed: %w", err)
+		// Check available space before cloning
+		var stat syscall.Statfs_t
+		if err := syscall.Statfs(filepath.Dir(repoDir), &stat); err == nil {
+			availMB := (stat.Bavail * uint64(stat.Bsize)) / (1024 * 1024)
+			log.WithField("avail_mb", availMB).Info("Available space in workspace")
+		}
+
+		// Check if git-cache is enabled and has the repo (for private repos without network auth)
+		var cloned bool
+		if data.Latest.GitCache.Enabled {
+			cachePath := findGitCacheReference(data, warmup.RepoURL)
+			if cachePath != "" {
+				log.WithFields(logrus.Fields{
+					"cache_path": cachePath,
+					"repo_dir":   repoDir,
+				}).Info("Using git-cache for local clone (no network auth needed)")
+
+				// Clone locally from the cache
+				cloneCmd := exec.Command("git", "clone", "--branch", branch, "file://"+cachePath, repoDir)
+				cloneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+				output, err := cloneCmd.CombinedOutput()
+				if err != nil {
+					log.WithFields(logrus.Fields{
+						"error":  err.Error(),
+						"output": string(output),
+					}).Warn("Local clone from git-cache failed, will try network clone")
+				} else {
+					// Set the remote to the real GitHub URL for future fetches
+					exec.Command("git", "-C", repoDir, "remote", "set-url", "origin", "https://github.com/"+warmup.RepoURL).Run()
+					cloned = true
+					log.Info("Local clone from git-cache completed successfully")
+				}
+			}
+		}
+
+		// Fall back to network clone if git-cache didn't work
+		if !cloned {
+			// Build clone URL with auth token if available (for private repos)
+			cloneURL := warmup.RepoURL
+			if data.Latest.Job.GitToken != "" {
+				// Use GitHub App installation token for auth
+				// Format: https://x-access-token:TOKEN@github.com/org/repo
+				repoPath := strings.TrimPrefix(warmup.RepoURL, "https://github.com/")
+				repoPath = strings.TrimPrefix(repoPath, "github.com/")
+				cloneURL = fmt.Sprintf("https://x-access-token:%s@github.com/%s", data.Latest.Job.GitToken, repoPath)
+				log.Info("Using GitHub App token for authenticated clone")
+			}
+
+			cloneCmd := exec.Command("git", "clone", "--depth=1", "--branch", branch, cloneURL, repoDir)
+			cloneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+			output, err := cloneCmd.CombinedOutput()
+			if err != nil {
+				log.WithFields(logrus.Fields{
+					"error":  err.Error(),
+					"output": string(output),
+				}).Error("Git clone failed")
+				return fmt.Errorf("git clone failed: %w (output: %s)", err, string(output))
+			}
+			log.Info("Git clone completed successfully")
+
+			// Set remote URL to non-authenticated URL for future operations
+			// (GitHub Actions will handle auth for subsequent fetches)
+			if data.Latest.Job.GitToken != "" {
+				repoPath := strings.TrimPrefix(warmup.RepoURL, "https://github.com/")
+				repoPath = strings.TrimPrefix(repoPath, "github.com/")
+				exec.Command("git", "-C", repoDir, "remote", "set-url", "origin", "https://github.com/"+repoPath).Run()
+			}
+		}
+	}
+	
+	// Create symlink from expected location to actual location for GitHub Actions compatibility
+	// e.g., /mnt/ephemeral/workdir/scio/scio -> /workspace/scio/scio
+	if actualRepoDir != expectedRepoDir {
+		// Ensure parent directory of symlink exists
+		if err := os.MkdirAll(filepath.Dir(expectedRepoDir), 0755); err != nil {
+			log.WithError(err).Warn("Failed to create symlink parent directory")
+		} else {
+			// Remove any existing symlink or directory
+			os.RemoveAll(expectedRepoDir)
+			if err := os.Symlink(actualRepoDir, expectedRepoDir); err != nil {
+				log.WithError(err).Warn("Failed to create symlink to repo")
+			} else {
+				log.WithFields(logrus.Fields{
+					"link":   expectedRepoDir,
+					"target": actualRepoDir,
+				}).Info("Created symlink for GitHub Actions compatibility")
+			}
 		}
 	}
 	
@@ -1346,6 +1549,80 @@ func updateWarmupState(phase, message string) {
 	}).Info("Warmup progress")
 }
 
+// parseEnvFile parses an env file (KEY=VALUE per line, # comments, blank lines ignored).
+func parseEnvFile(data []byte) map[string]string {
+	env := make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			env[parts[0]] = parts[1]
+		}
+	}
+	return env
+}
+
+// getPreClonedPath returns the path to the pre-cloned repo in the snapshot.
+// This is where the repo was cloned during warmup and baked into the rootfs.
+func getPreClonedPath(data *MMDSData) string {
+	if data == nil {
+		return ""
+	}
+	
+	// First check explicit config
+	if data.Latest.GitCache.PreClonedPath != "" {
+		return data.Latest.GitCache.PreClonedPath
+	}
+	
+	// Derive from job.repo if not explicitly set
+	// During warmup, repos are cloned to /workspace/{org}/{repo}
+	// e.g., askscio/scio -> /workspace/scio/scio
+	if data.Latest.Job.Repo != "" {
+		repoPath := extractRepoDir(data.Latest.Job.Repo)
+		return filepath.Join("/workspace", repoPath)
+	}
+	
+	return ""
+}
+
+// getWorkspaceRepoPath returns the path where workflows expect to find the repo.
+// This is typically {WorkspaceDir}/{org}/{repo} following GitHub Actions conventions.
+func getWorkspaceRepoPath(data *MMDSData) string {
+	if data == nil {
+		return ""
+	}
+	
+	workspaceDir := data.Latest.GitCache.WorkspaceDir
+	if workspaceDir == "" {
+		workspaceDir = "/mnt/ephemeral/workdir"
+	}
+	
+	// Derive from job.repo
+	if data.Latest.Job.Repo != "" {
+		repoPath := extractRepoDir(data.Latest.Job.Repo)
+		return filepath.Join(workspaceDir, repoPath)
+	}
+	
+	return ""
+}
+
+// verifyBazelServer checks that the Bazel JVM survived snapshot restore.
+func verifyBazelServer(repoDir string) error {
+	cmd := exec.Command("bazel", "info", "server_pid")
+	cmd.Dir = repoDir
+	cmd.Env = append(os.Environ(), "HOME=/home/runner")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("bazel server not running: %w (output: %s)", err, string(output))
+	}
+	pid := strings.TrimSpace(string(output))
+	log.WithField("pid", pid).Info("Bazel server alive after restore")
+	return nil
+}
+
 // startHealthServer starts a simple HTTP server for health checks and testing
 func startHealthServer(mmdsData *MMDSData) {
 	defer func() {
@@ -1370,10 +1647,12 @@ func startHealthServer(mmdsData *MMDSData) {
 			mode = mmdsData.Latest.Meta.Mode
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":    "healthy",
-			"runner_id": runnerID,
-			"mode":      mode,
-			"uptime":    time.Since(globalWarmupState.StartedAt).String(),
+			"status":       "healthy",
+			"runner_id":    runnerID,
+			"mode":         mode,
+			"uptime":       time.Since(globalWarmupState.StartedAt).String(),
+			"registration": globalRegistrationState,
+			"symlink":      globalSymlinkState,
 		})
 	})
 	
@@ -1449,13 +1728,35 @@ func startHealthServer(mmdsData *MMDSData) {
 		bazelVer, _ := exec.Command("bazel", "--version").CombinedOutput()
 		goVer, _ := exec.Command("go", "version").CombinedOutput()
 		runnerCheck, _ := exec.Command("ls", "-la", "/home/runner").CombinedOutput()
+		
+		// Check symlink paths
+		workdirLs, _ := exec.Command("ls", "-la", "/mnt/ephemeral/workdir").CombinedOutput()
+		workdirScioLs, _ := exec.Command("ls", "-la", "/mnt/ephemeral/workdir/scio").CombinedOutput()
+		symlinkLs, _ := exec.Command("ls", "-la", "/mnt/ephemeral/workdir/scio/scio").CombinedOutput()
+		targetLs, _ := exec.Command("ls", "-la", "/workspace/scio/scio/.git").CombinedOutput()
+		
+		// Try git status in the symlink path
+		gitStatusCmd := exec.Command("git", "status")
+		gitStatusCmd.Dir = "/mnt/ephemeral/workdir/scio/scio"
+		gitStatus, _ := gitStatusCmd.CombinedOutput()
+		
+		// Check git config
+		gitConfigCmd := exec.Command("cat", "/workspace/scio/scio/.git/config")
+		gitConfig, _ := gitConfigCmd.CombinedOutput()
+		
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"mounts":        string(mounts),
-			"lsblk":         string(lsblk),
-			"df":            string(df),
-			"bazel_version": string(bazelVer),
-			"go_version":    string(goVer),
-			"runner_dir":    string(runnerCheck),
+			"mounts":            string(mounts),
+			"lsblk":             string(lsblk),
+			"df":                string(df),
+			"bazel_version":     string(bazelVer),
+			"go_version":        string(goVer),
+			"runner_dir":        string(runnerCheck),
+			"workdir_ls":        string(workdirLs),
+			"workdir_scio_ls":   string(workdirScioLs),
+			"symlink_ls":        string(symlinkLs),
+			"symlink_target_ls": string(targetLs),
+			"git_status":        string(gitStatus),
+			"git_config":        string(gitConfig),
 		})
 	})
 
