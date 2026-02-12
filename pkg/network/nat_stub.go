@@ -39,6 +39,7 @@ type NetworkConfig struct {
 	DNS       string `json:"dns"`
 	Interface string `json:"interface"`
 	MAC       string `json:"mac"`
+	MTU       int    `json:"mtu,omitempty"`
 }
 
 func NewNATNetwork(_ NATConfig) (*NATNetwork, error) {
@@ -78,6 +79,10 @@ func (n *NATNetwork) GetSubnet() *net.IPNet {
 
 func (n *NATNetwork) GetBridgeName() string {
 	return ""
+}
+
+func (n *NATNetwork) GetMTU() int {
+	return 0
 }
 
 func (n *NATNetwork) BlockEgress(_ net.IP) error {

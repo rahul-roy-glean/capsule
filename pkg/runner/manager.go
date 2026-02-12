@@ -446,6 +446,7 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 	data.Latest.Network.DNS = netCfg.DNS
 	data.Latest.Network.Interface = netCfg.Interface
 	data.Latest.Network.MAC = netCfg.MAC
+	data.Latest.Network.MTU = m.network.GetMTU()
 	data.Latest.Job.Repo = req.Repo
 	data.Latest.Job.Branch = req.Branch
 	data.Latest.Job.Commit = req.Commit
