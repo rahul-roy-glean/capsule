@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -1358,6 +1359,13 @@ func runWarmupMode(data *MMDSData) error {
 		"work_dir":          workDir,
 	}).Info("Setting up repo directories for warmup")
 
+	// Pre-flight: verify network connectivity before attempting clone
+	updateWarmupState("connectivity_check", "Verifying network connectivity...")
+	if err := verifyConnectivity(warmup.RepoURL); err != nil {
+		return fmt.Errorf("connectivity check failed (cannot reach GitHub): %w", err)
+	}
+	log.Info("Network connectivity verified")
+
 	// Phase 1: Clone repository
 	updateWarmupState("cloning", "Cloning repository...")
 	log.WithFields(logrus.Fields{
@@ -1607,6 +1615,51 @@ func getWorkspaceRepoPath(data *MMDSData) string {
 	}
 
 	return ""
+}
+
+// verifyConnectivity checks that the microVM can reach the target host before
+// attempting long-running network operations like git clone. Fails fast instead
+// of waiting for a 10-minute git timeout.
+func verifyConnectivity(repoURL string) error {
+	// Determine the host to check
+	host := "github.com"
+	if strings.Contains(repoURL, "://") {
+		parts := strings.SplitN(repoURL, "://", 2)
+		if len(parts) == 2 {
+			host = strings.SplitN(parts[1], "/", 2)[0]
+		}
+	}
+
+	// Check DNS resolution
+	log.WithField("host", host).Info("Checking DNS resolution...")
+	if output, err := exec.Command("nslookup", host).CombinedOutput(); err != nil {
+		// Try with dig as fallback
+		if output2, err2 := exec.Command("host", host).CombinedOutput(); err2 != nil {
+			return fmt.Errorf("DNS resolution failed for %s: %s / %s", host, string(output), string(output2))
+		}
+	}
+
+	// Check TCP connectivity to HTTPS port
+	log.WithField("host", host).Info("Checking TCP connectivity to port 443...")
+	conn, err := net.DialTimeout("tcp", host+":443", 10*time.Second)
+	if err != nil {
+		// Log diagnostic info
+		log.WithError(err).Error("TCP connection failed")
+		if routeOut, _ := exec.Command("ip", "route").Output(); len(routeOut) > 0 {
+			log.WithField("routes", string(routeOut)).Debug("Current routes")
+		}
+		if resolvOut, _ := os.ReadFile("/etc/resolv.conf"); len(resolvOut) > 0 {
+			log.WithField("resolv.conf", string(resolvOut)).Debug("DNS config")
+		}
+		if pingOut, _ := exec.Command("ping", "-c", "1", "-W", "3", "8.8.8.8").CombinedOutput(); len(pingOut) > 0 {
+			log.WithField("ping_8888", string(pingOut)).Debug("Ping to 8.8.8.8")
+		}
+		return fmt.Errorf("cannot connect to %s:443: %w", host, err)
+	}
+	conn.Close()
+
+	log.WithField("host", host).Info("Connectivity check passed")
+	return nil
 }
 
 // verifyBazelServer checks that the Bazel JVM survived snapshot restore.
