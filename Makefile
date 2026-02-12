@@ -11,7 +11,7 @@ REGION ?= us-central1
 ENV ?= dev
 ZONE ?= us-central1-a
 CONFIG ?= onboard.yaml
-REGISTRY ?= gcr.io/$(PROJECT_ID)
+REGISTRY ?= $(REGION)-docker.pkg.dev/$(PROJECT_ID)/firecracker
 VERSION ?= $(shell git describe --tags --always --dirty)
 
 # Go build settings
