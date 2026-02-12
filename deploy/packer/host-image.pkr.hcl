@@ -32,14 +32,20 @@ variable "image_family" {
 
 variable "network" {
   type        = string
-  default     = "default"
-  description = "VPC network to use for building"
+  default     = ""
+  description = "VPC network to use for building (empty = default)"
 }
 
 variable "subnetwork" {
   type        = string
-  default     = "default"
-  description = "Subnetwork to use for building"
+  default     = ""
+  description = "Subnetwork to use for building (empty = default)"
+}
+
+variable "firecracker_manager_binary" {
+  type        = string
+  default     = ""
+  description = "Local path to firecracker-manager binary to upload"
 }
 
 source "googlecompute" "firecracker-host" {
@@ -156,15 +162,17 @@ build {
     ]
   }
 
-  # Download firecracker-manager binary from GCS
-  # Upload binaries before running packer:
-  #   gsutil cp bin/firecracker-manager gs://${project_id}-firecracker-snapshots/bin/
+  # Upload firecracker-manager binary from local build
+  provisioner "file" {
+    source      = var.firecracker_manager_binary
+    destination = "/tmp/firecracker-manager"
+  }
+
   provisioner "shell" {
     inline = [
-      "gsutil cp gs://${var.project_id}-firecracker-snapshots/bin/firecracker-manager /tmp/firecracker-manager",
       "sudo mv /tmp/firecracker-manager /usr/local/bin/firecracker-manager",
       "sudo chmod +x /usr/local/bin/firecracker-manager",
-      "echo 'firecracker-manager binary installed'"
+      "firecracker-manager --version || echo 'firecracker-manager installed (no --version flag)'"
     ]
   }
 

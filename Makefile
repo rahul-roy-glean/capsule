@@ -139,12 +139,16 @@ packer-validate: firecracker-manager-linux
 	cd deploy/packer && packer validate \
 		-var="project_id=$(PROJECT_ID)" \
 		-var="firecracker_manager_binary=../../bin/firecracker-manager" \
+		-var="network=fc-runner-$(ENV)-vpc" \
+		-var="subnetwork=fc-runner-$(ENV)-hosts" \
 		host-image.pkr.hcl
 
 packer-build: firecracker-manager-linux packer-init
 	cd deploy/packer && packer build \
 		-var="project_id=$(PROJECT_ID)" \
 		-var="firecracker_manager_binary=../../bin/firecracker-manager" \
+		-var="network=fc-runner-$(ENV)-vpc" \
+		-var="subnetwork=fc-runner-$(ENV)-hosts" \
 		host-image.pkr.hcl
 
 # Cross-compile firecracker-manager for Linux (for Packer builds from macOS)
