@@ -63,10 +63,13 @@ source "googlecompute" "firecracker-host" {
   image_description = "Firecracker host image with KVM support"
 
   ssh_username = "ubuntu"
-  use_iap      = true
 
   network    = var.network
   subnetwork = var.subnetwork
+  tags       = ["firecracker-host"]
+
+  # Use IAP tunnel for SSH (requires firewall rule for 35.235.240.0/20 -> port 22)
+  use_iap    = true
 
   # Enable nested virtualization for Firecracker
   enable_nested_virtualization = true
