@@ -1630,13 +1630,10 @@ func verifyConnectivity(repoURL string) error {
 		}
 	}
 
-	// Check DNS resolution
+	// Check DNS resolution using getent (available on all Linux systems)
 	log.WithField("host", host).Info("Checking DNS resolution...")
-	if output, err := exec.Command("nslookup", host).CombinedOutput(); err != nil {
-		// Try with dig as fallback
-		if output2, err2 := exec.Command("host", host).CombinedOutput(); err2 != nil {
-			return fmt.Errorf("DNS resolution failed for %s: %s / %s", host, string(output), string(output2))
-		}
+	if output, err := exec.Command("getent", "hosts", host).CombinedOutput(); err != nil {
+		return fmt.Errorf("DNS resolution failed for %s: %s", host, strings.TrimSpace(string(output)))
 	}
 
 	// Check TCP connectivity to HTTPS port
