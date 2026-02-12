@@ -30,7 +30,7 @@ import (
 var (
 	sourceDir  = flag.String("source-dir", "", "Directory containing traditional snapshot files")
 	gcsBucket  = flag.String("gcs-bucket", "", "GCS bucket for chunk storage")
-	version    = flag.String("version", "", "Snapshot version (e.g., v20240101-abc123)")
+	snapshotVersion = flag.String("version", "", "Snapshot version (e.g., v20240101-abc123)")
 	chunkSize  = flag.Int64("chunk-size", snapshot.DefaultChunkSize, "Chunk size in bytes (default 4MB)")
 	setCurrent = flag.Bool("set-current", false, "Set this version as current after conversion")
 	logLevel   = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
@@ -60,10 +60,10 @@ func main() {
 	if *gcsBucket == "" {
 		log.Fatal("--gcs-bucket is required")
 	}
-	if *version == "" {
+	if *snapshotVersion == "" {
 		// Generate version from timestamp
-		*version = fmt.Sprintf("v%s", time.Now().Format("20060102-150405"))
-		log.WithField("version", *version).Info("Generated version from timestamp")
+		*snapshotVersion = fmt.Sprintf("v%s", time.Now().Format("20060102-150405"))
+		log.WithField("version", *snapshotVersion).Info("Generated version from timestamp")
 	}
 
 	// Verify source files exist
@@ -94,7 +94,7 @@ func main() {
 	log.WithFields(logrus.Fields{
 		"source_dir": *sourceDir,
 		"gcs_bucket": *gcsBucket,
-		"version":    *version,
+		"version":    *snapshotVersion,
 		"chunk_size": *chunkSize,
 	}).Info("Starting snapshot conversion")
 
@@ -116,7 +116,7 @@ func main() {
 	paths := &snapshot.SnapshotPaths{
 		Kernel:  filepath.Join(*sourceDir, "kernel.bin"),
 		Rootfs:  filepath.Join(*sourceDir, "rootfs.img"),
-		Version: *version,
+		Version: *snapshotVersion,
 	}
 
 	if hasMemSnapshot {
@@ -135,7 +135,7 @@ func main() {
 
 	// Build chunked snapshot
 	log.Info("Building chunked snapshot (this may take a while for large snapshots)...")
-	meta, err := builder.BuildChunkedSnapshot(ctx, paths, *version)
+	meta, err := builder.BuildChunkedSnapshot(ctx, paths, *snapshotVersion)
 	if err != nil {
 		log.WithError(err).Fatal("Failed to build chunked snapshot")
 	}

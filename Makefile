@@ -1,6 +1,8 @@
 .PHONY: all build test clean proto docker-build docker-push terraform-init terraform-plan terraform-apply
 .PHONY: packer-init packer-validate packer-build firecracker-manager-linux release-host-image mig-rolling-update
-.PHONY: onboard onboard-validate
+.PHONY: onboard onboard-validate bin-onboard
+.PHONY: firecracker-manager control-plane snapshot-builder thaw-agent
+.PHONY: git-cache-builder git-cache-freshness data-snapshot-builder snapshot-converter
 .PHONY: test-unit test-race test-cover test-integration test-all check
 
 # Variables
