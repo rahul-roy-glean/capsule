@@ -57,11 +57,13 @@ docker run --rm --privileged --platform linux/amd64 \
 echo "Rootfs created: $ROOTFS_IMG"
 
 # Also download a kernel if not present
+# Note: Firecracker recommends 6.1 kernels for v1.14+. The quickstart URL only
+# provides 5.10, which works but is past official support. To use 6.1, build one
+# with: ./tools/devtool build_ci_artifacts kernels 6.1
 KERNEL_VERSION="${KERNEL_VERSION:-5.10.217}"
 KERNEL_FILE="$OUTPUT_DIR/kernel.bin"
 if [ ! -f "$KERNEL_FILE" ]; then
     echo "Downloading kernel $KERNEL_VERSION..."
-    # Use Firecracker's pre-built kernel
     curl -fsSL "https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux.bin" \
         -o "$KERNEL_FILE"
 fi
