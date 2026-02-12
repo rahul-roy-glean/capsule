@@ -40,6 +40,9 @@ resource "google_compute_instance_template" "firecracker_host" {
 
   labels = local.labels
 
+  # Required for NAT routing of microVM traffic
+  can_ip_forward = true
+
   # Enable nested virtualization for Firecracker
   advanced_machine_features {
     enable_nested_virtualization = true
