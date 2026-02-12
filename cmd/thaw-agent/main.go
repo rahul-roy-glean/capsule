@@ -1482,6 +1482,13 @@ func runWarmupMode(data *MMDSData) error {
 				"branch":   branch,
 				"repo_dir": repoDir,
 			}).Info("Starting git clone")
+
+			// Configure git for reliability over NAT (gnutls can drop during large transfers)
+			exec.Command("git", "config", "--global", "http.postBuffer", "524288000").Run()
+			exec.Command("git", "config", "--global", "http.lowSpeedLimit", "1000").Run()
+			exec.Command("git", "config", "--global", "http.lowSpeedTime", "60").Run()
+			exec.Command("git", "config", "--global", "http.version", "HTTP/1.1").Run()
+
 			cloneCmd := exec.Command("git", "clone", "--depth=1", "--branch", branch, cloneURL, repoDir)
 			cloneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 			output, err := cloneCmd.CombinedOutput()

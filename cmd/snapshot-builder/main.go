@@ -579,6 +579,20 @@ func seedExt4ImageFromDir(imgPath, seedDir string, log *logrus.Entry) error {
 	return nil
 }
 
+func getDefaultIface() string {
+	out, err := exec.Command("ip", "route", "show", "default").Output()
+	if err != nil {
+		return "eth0"
+	}
+	fields := strings.Fields(string(out))
+	for i, f := range fields {
+		if f == "dev" && i+1 < len(fields) {
+			return fields[i+1]
+		}
+	}
+	return "eth0"
+}
+
 func getGitCommit(dir string) string {
 	cmd := exec.Command("git", "rev-parse", "HEAD")
 	cmd.Dir = dir
@@ -616,6 +630,16 @@ func setupWarmupNetwork(tapName, hostIP string) error {
 				return fmt.Errorf("failed to add ip: %s: %w", string(output), err)
 			}
 		}
+	}
+
+	// Match TAP/bridge MTU to the host's outbound interface (GCP uses 1460, not 1500)
+	hostMTU := "1460" // safe default for GCP
+	if mtuBytes, err := os.ReadFile("/sys/class/net/" + getDefaultIface() + "/mtu"); err == nil {
+		hostMTU = strings.TrimSpace(string(mtuBytes))
+	}
+	exec.Command("ip", "link", "set", tapName, "mtu", hostMTU).Run()
+	if bridgeName == "fcbr0" {
+		exec.Command("ip", "link", "set", bridgeName, "mtu", hostMTU).Run()
 	}
 
 	// Bring TAP up

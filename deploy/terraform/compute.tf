@@ -199,9 +199,13 @@ resource "google_compute_instance_template" "firecracker_host" {
 
     # Setup bridge networking for microVMs
     echo "Setting up bridge networking..."
+    # Get the host interface MTU (GCP uses 1460, not 1500)
+    HOST_MTU=$(cat /sys/class/net/$(ip route | grep default | awk '{print $5}' | head -1)/mtu)
     ip link add fcbr0 type bridge || true
+    ip link set fcbr0 mtu $HOST_MTU
     ip addr add ${cidrhost(var.microvm_subnet, 1)}/24 dev fcbr0 || true
     ip link set fcbr0 up
+    echo "Bridge MTU set to $HOST_MTU (matching host interface)"
 
     # Enable IP forwarding
     echo 1 > /proc/sys/net/ipv4/ip_forward

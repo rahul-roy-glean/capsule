@@ -165,6 +165,12 @@ RUN echo "glean-runner" > /etc/hostname
 # Configure DNS
 RUN echo "nameserver 8.8.8.8" > /etc/resolv.conf.default
 
+# Configure git for reliable cloning over NAT (gnutls can fail on large transfers)
+RUN git config --system http.postBuffer 524288000 \
+    && git config --system http.lowSpeedLimit 1000 \
+    && git config --system http.lowSpeedTime 60 \
+    && git config --system http.version HTTP/1.1
+
 # Final cleanup
 RUN apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
