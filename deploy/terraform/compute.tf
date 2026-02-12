@@ -113,9 +113,13 @@ resource "google_compute_instance_template" "firecracker_host" {
     SNAPSHOT_BUCKET=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/snapshot-bucket || echo "")
 
-    # Wait for data disk
-    sleep 3
+    # Wait for data disk (poll instead of fixed sleep)
     DATA_DISK="/dev/disk/by-id/google-data"
+    for i in $(seq 1 30); do
+      [ -b "$DATA_DISK" ] && break
+      echo "Waiting for data disk... ($i/30)"
+      sleep 2
+    done
     
     # Mount the data disk
     mkdir -p /mnt/data
@@ -210,11 +214,18 @@ resource "google_compute_instance_template" "firecracker_host" {
     # Save iptables rules
     iptables-save > /etc/iptables/rules.v4 || true
 
-    # Load KVM module
+    # Load required kernel modules
+    modprobe tun || true
     modprobe kvm_intel || modprobe kvm_amd || true
 
     # Set permissions for KVM
     chmod 666 /dev/kvm || true
+
+    # Verify IP forwarding is enabled
+    if [ "$(cat /proc/sys/net/ipv4/ip_forward)" != "1" ]; then
+      echo "ERROR: IP forwarding not enabled"
+      exit 1
+    fi
 
     # Get microVM configuration from metadata
     MAX_RUNNERS=$(curl -sf -H "Metadata-Flavor: Google" \

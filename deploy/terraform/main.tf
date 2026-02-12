@@ -51,6 +51,7 @@ resource "google_project_service" "apis" {
     "servicenetworking.googleapis.com",
     "cloudresourcemanager.googleapis.com",
     "artifactregistry.googleapis.com",
+    "secretmanager.googleapis.com",
   ])
 
   service            = each.value
@@ -188,6 +189,13 @@ resource "google_project_iam_member" "control_plane_sql" {
   project = var.project_id
   role    = "roles/cloudsql.client"
   member  = "serviceAccount:${google_service_account.control_plane.email}"
+}
+
+# IAM for host agent to read secrets (GitHub App key)
+resource "google_project_iam_member" "host_secrets" {
+  project = var.project_id
+  role    = "roles/secretmanager.secretAccessor"
+  member  = "serviceAccount:${google_service_account.host_agent.email}"
 }
 
 

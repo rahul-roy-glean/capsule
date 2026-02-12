@@ -27,7 +27,7 @@ options:
 
 steps:
   # Step 1: Build freshness checker and check if rebuild is needed
-  - name: 'golang:1.22'
+  - name: 'golang:1.24'
     id: 'check-freshness'
     entrypoint: 'bash'
     args:
@@ -51,7 +51,7 @@ steps:
         fi
 
   # Step 2: Build snapshot (only if stale)
-  - name: 'golang:1.22'
+  - name: 'golang:1.24'
     id: 'build-snapshot'
     waitFor: ['check-freshness']
     entrypoint: 'bash'

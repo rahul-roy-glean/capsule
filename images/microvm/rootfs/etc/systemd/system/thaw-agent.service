@@ -1,11 +1,11 @@
 [Unit]
 Description=Thaw Agent - MicroVM initialization and GitHub runner setup
-After=network.target
-Wants=network.target
+After=systemd-networkd.service
+Wants=systemd-networkd.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/thaw-agent --runner-dir=/home/gleanuser --runner-user=gleanuser
+ExecStart=/usr/local/bin/thaw-agent --runner-dir=/home/runner --runner-user=runner
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

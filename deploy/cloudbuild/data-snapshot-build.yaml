@@ -20,7 +20,7 @@ substitutions:
   _ZONE: 'us-central1-a'
   _REGION: 'us-central1'
   _DISK_SIZE_GB: '200'
-  _REPOS: 'github.com/askscio/scio:scio'
+  _REPOS: ''  # Required: e.g. 'github.com/org/repo:name'
   _GIT_CACHE_SIZE_GB: '100'
   _SNAPSHOT_PREFIX: 'runner-data'
 
@@ -31,7 +31,7 @@ options:
 
 steps:
   # Build the data-snapshot-builder binary
-  - name: 'golang:1.22'
+  - name: 'golang:1.24'
     id: 'build-tool'
     entrypoint: 'bash'
     args:
