@@ -6,7 +6,9 @@ package network
 import (
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
+	"strings"
 	"sync"
 
 	"github.com/sirupsen/logrus"
@@ -21,6 +23,7 @@ type NATNetwork struct {
 	allocatedIPs  map[string]net.IP
 	nextIPOffset  uint32
 	externalIface string
+	mtu           int // MTU to use for bridge and TAP devices (matches external interface)
 	mu            sync.Mutex
 	logger        *logrus.Entry
 }
@@ -47,6 +50,15 @@ func NewNATNetwork(cfg NATConfig) (*NATNetwork, error) {
 		logger = logrus.New()
 	}
 
+	// Detect the MTU of the external interface. GCP VPCs typically use 1460
+	// instead of the standard 1500. The bridge and all TAP devices MUST use
+	// the same (or lower) MTU, otherwise large packets (TLS handshakes, git
+	// clone data) are silently dropped, causing HTTPS connections to hang.
+	mtu := detectInterfaceMTU(cfg.ExternalIface)
+	if mtu <= 0 {
+		mtu = 1460 // Safe default for GCP
+	}
+
 	return &NATNetwork{
 		bridgeName:    cfg.BridgeName,
 		subnet:        subnet,
@@ -54,6 +66,7 @@ func NewNATNetwork(cfg NATConfig) (*NATNetwork, error) {
 		allocatedIPs:  make(map[string]net.IP),
 		nextIPOffset:  2, // Start at .2, .1 is gateway
 		externalIface: cfg.ExternalIface,
+		mtu:           mtu,
 		logger:        logger.WithField("component", "nat-network"),
 	}, nil
 }
@@ -89,7 +102,10 @@ func (n *NATNetwork) createBridge() error {
 	link, err := netlink.LinkByName(n.bridgeName)
 	if err == nil {
 		n.logger.WithField("bridge", n.bridgeName).Debug("Bridge already exists")
-		// Ensure it's up
+		// Ensure MTU matches external interface (may have been created with wrong MTU)
+		if err := netlink.LinkSetMTU(link, n.mtu); err != nil {
+			n.logger.WithError(err).Warn("Failed to set MTU on existing bridge")
+		}
 		return netlink.LinkSetUp(link)
 	}
 
@@ -97,6 +113,7 @@ func (n *NATNetwork) createBridge() error {
 	bridge := &netlink.Bridge{
 		LinkAttrs: netlink.LinkAttrs{
 			Name: n.bridgeName,
+			MTU:  n.mtu,
 		},
 	}
 
@@ -130,7 +147,10 @@ func (n *NATNetwork) createBridge() error {
 		return fmt.Errorf("failed to bring up bridge: %w", err)
 	}
 
-	n.logger.WithField("bridge", n.bridgeName).Info("Bridge created successfully")
+	n.logger.WithFields(logrus.Fields{
+		"bridge": n.bridgeName,
+		"mtu":    n.mtu,
+	}).Info("Bridge created successfully")
 	return nil
 }
 
@@ -199,6 +219,30 @@ func (n *NATNetwork) setupNAT() error {
 		}
 		if err := exec.Command("iptables", addRule...).Run(); err != nil {
 			return fmt.Errorf("failed to add forward in rule: %w", err)
+		}
+	}
+
+	// TCP MSS clamping: essential for NAT'd connections through interfaces with
+	// non-standard MTU (GCP uses 1460). Without this, TCP SYN packets advertise
+	// MSS based on the guest's 1500 MTU, but the path can only handle 1460.
+	// If ICMP "fragmentation needed" messages are dropped (common in cloud),
+	// PMTUD fails silently and large packets (TLS handshakes, git data) are lost.
+	// This clamps MSS to match the actual path MTU, fixing HTTPS/git clone.
+	mssClampRule := []string{
+		"-C", "FORWARD",
+		"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+		"-j", "TCPMSS", "--clamp-mss-to-pmtu",
+	}
+	if err := exec.Command("iptables", mssClampRule...).Run(); err != nil {
+		addRule := []string{
+			"-I", "FORWARD", "1", // Insert at top so it runs before ACCEPT/DROP rules
+			"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+			"-j", "TCPMSS", "--clamp-mss-to-pmtu",
+		}
+		if err := exec.Command("iptables", addRule...).Run(); err != nil {
+			n.logger.WithError(err).Warn("Failed to add TCP MSS clamping rule (HTTPS may fail through NAT)")
+		} else {
+			n.logger.Info("TCP MSS clamping rule added (fixes HTTPS through non-standard MTU)")
 		}
 	}
 
@@ -274,6 +318,11 @@ func (n *NATNetwork) CreateTapForVM(vmID string) (*TapDevice, error) {
 		return nil, fmt.Errorf("failed to attach TAP to bridge: %w", err)
 	}
 
+	// Set MTU to match bridge/external interface (prevents packet drops for large frames)
+	if err := netlink.LinkSetMTU(link, n.mtu); err != nil {
+		n.logger.WithError(err).WithField("tap", tapName).Warn("Failed to set MTU on TAP device")
+	}
+
 	// Bring TAP up
 	if err := netlink.LinkSetUp(link); err != nil {
 		netlink.LinkDel(link)
@@ -284,6 +333,7 @@ func (n *NATNetwork) CreateTapForVM(vmID string) (*TapDevice, error) {
 	n.logger.WithFields(logrus.Fields{
 		"tap": tapName,
 		"ip":  ip.String(),
+		"mtu": n.mtu,
 	}).Info("TAP device created successfully")
 
 	return &TapDevice{
@@ -350,11 +400,17 @@ func (n *NATNetwork) GetOrCreateTapSlot(slot int, vmID string) (*TapDevice, erro
 	// Check if TAP already exists
 	link, err := netlink.LinkByName(tapName)
 	if err == nil {
-		// TAP exists, ensure it's up and on the bridge
+		// TAP exists, ensure MTU matches and it's up
+		if err := netlink.LinkSetMTU(link, n.mtu); err != nil {
+			n.logger.WithError(err).WithField("tap", tapName).Warn("Failed to set MTU on existing TAP")
+		}
 		if err := netlink.LinkSetUp(link); err != nil {
 			return nil, fmt.Errorf("failed to bring up existing TAP: %w", err)
 		}
-		n.logger.WithField("tap", tapName).Debug("Using existing TAP device")
+		n.logger.WithFields(logrus.Fields{
+			"tap": tapName,
+			"mtu": n.mtu,
+		}).Debug("Using existing TAP device")
 		n.allocatedIPs[vmID] = slotIP
 		return &TapDevice{
 			Name:       tapName,
@@ -397,6 +453,11 @@ func (n *NATNetwork) GetOrCreateTapSlot(slot int, vmID string) (*TapDevice, erro
 		return nil, fmt.Errorf("failed to attach TAP to bridge: %w", err)
 	}
 
+	// Set MTU to match bridge/external interface
+	if err := netlink.LinkSetMTU(link, n.mtu); err != nil {
+		n.logger.WithError(err).WithField("tap", tapName).Warn("Failed to set MTU on new TAP slot")
+	}
+
 	// Bring TAP up
 	if err := netlink.LinkSetUp(link); err != nil {
 		netlink.LinkDel(link)
@@ -408,6 +469,7 @@ func (n *NATNetwork) GetOrCreateTapSlot(slot int, vmID string) (*TapDevice, erro
 		"tap":  tapName,
 		"slot": slot,
 		"ip":   slotIP.String(),
+		"mtu":  n.mtu,
 	}).Info("TAP slot created successfully")
 
 	return &TapDevice{
@@ -567,6 +629,34 @@ func (n *NATNetwork) Cleanup() error {
 	return nil
 }
 
+// detectInterfaceMTU reads the MTU of a network interface from sysfs.
+// Returns the MTU value, or 0 if detection fails. Callers should fall back to
+// a safe default (1460 for GCP) when 0 is returned.
+func detectInterfaceMTU(ifaceName string) int {
+	// Read from sysfs (most reliable, no elevated privileges needed)
+	mtuPath := fmt.Sprintf("/sys/class/net/%s/mtu", ifaceName)
+	data, err := os.ReadFile(mtuPath)
+	if err != nil {
+		// Fall back to netlink
+		link, err := netlink.LinkByName(ifaceName)
+		if err != nil {
+			return 0
+		}
+		return link.Attrs().MTU
+	}
+
+	var mtu int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &mtu); err != nil {
+		return 0
+	}
+	return mtu
+}
+
+// GetMTU returns the MTU used for bridge and TAP devices
+func (n *NATNetwork) GetMTU() int {
+	return n.mtu
+}
+
 // incrementIP increments an IP address by offset
 func incrementIP(ip net.IP, offset uint32) net.IP {
 	ip = ip.To4()
@@ -603,6 +693,7 @@ type NetworkConfig struct {
 	DNS       string `json:"dns"`
 	Interface string `json:"interface"`
 	MAC       string `json:"mac"`
+	MTU       int    `json:"mtu,omitempty"` // MTU for the guest interface (matches host path MTU)
 }
 
 // GetNetworkConfig returns the network configuration for a TAP device

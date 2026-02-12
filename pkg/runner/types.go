@@ -98,6 +98,7 @@ type MMDSData struct {
 			DNS       string `json:"dns"`
 			Interface string `json:"interface"`
 			MAC       string `json:"mac"`
+			MTU       int    `json:"mtu,omitempty"` // Guest interface MTU (matches host path MTU)
 		} `json:"network"`
 		Job struct {
 			Repo              string            `json:"repo"`

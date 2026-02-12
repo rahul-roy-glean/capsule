@@ -218,6 +218,13 @@ resource "google_compute_instance_template" "firecracker_host" {
     iptables -A FORWARD -i fcbr0 -o "$PRIMARY_IFACE" -j ACCEPT
     iptables -A FORWARD -i "$PRIMARY_IFACE" -o fcbr0 -m state --state RELATED,ESTABLISHED -j ACCEPT
 
+    # TCP MSS clamping: CRITICAL for HTTPS/TLS through NAT on GCP.
+    # GCP uses MTU 1460 (not 1500). Without MSS clamping, TCP SYN packets
+    # advertise MSS for 1500 MTU, causing large TLS/HTTPS packets to be
+    # silently dropped. This breaks git clone, apt-get, and any HTTPS traffic.
+    iptables -I FORWARD 1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    echo "TCP MSS clamping rule added for NAT'd traffic"
+
     # Save iptables rules
     iptables-save > /etc/iptables/rules.v4 || true
 

@@ -114,6 +114,7 @@ type MMDSData struct {
 			DNS       string `json:"dns"`
 			Interface string `json:"interface"`
 			MAC       string `json:"mac"`
+			MTU       int    `json:"mtu,omitempty"` // Guest interface MTU (matches host path MTU)
 		} `json:"network"`
 		Job struct {
 			Repo              string            `json:"repo"`
@@ -818,6 +819,7 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					DNS       string `json:"dns"`
 					Interface string `json:"interface"`
 					MAC       string `json:"mac"`
+					MTU       int    `json:"mtu,omitempty"`
 				} `json:"network"`
 				Job struct {
 					Repo              string            `json:"repo"`
@@ -943,25 +945,50 @@ func waitForMMDSOnce(ctx context.Context) (*MMDSData, error) {
 }
 
 func configureNetwork(data *MMDSData) error {
-	net := data.Latest.Network
-	if net.IP == "" {
+	netCfg := data.Latest.Network
+	if netCfg.IP == "" {
 		return fmt.Errorf("no IP address in MMDS data")
 	}
 
-	iface := net.Interface
+	iface := netCfg.Interface
 	if iface == "" {
 		iface = "eth0"
+	}
+
+	// Determine the correct MTU. The host sets this based on the external
+	// interface MTU (GCP uses 1460, not 1500). If not provided, default to
+	// 1460 which is safe for GCP and most cloud environments.
+	mtu := netCfg.MTU
+	if mtu <= 0 {
+		mtu = 1460
+	}
+
+	// Always set MTU on the guest interface, even if the kernel already
+	// configured the IP via boot parameters. The kernel ip= parameter does
+	// NOT set MTU, so the interface defaults to 1500 which is too large for
+	// GCP's 1460 MTU. This mismatch causes large packets (TLS handshakes,
+	// git clone data) to be silently dropped, breaking HTTPS connections.
+	if err := exec.Command("ip", "link", "set", iface, "mtu", fmt.Sprintf("%d", mtu)).Run(); err != nil {
+		log.WithError(err).WithFields(logrus.Fields{
+			"iface": iface,
+			"mtu":   mtu,
+		}).Warn("Failed to set MTU on guest interface")
+	} else {
+		log.WithFields(logrus.Fields{
+			"iface": iface,
+			"mtu":   mtu,
+		}).Info("Set MTU on guest interface")
 	}
 
 	// Check if kernel already configured the network (via ip= boot parameter)
 	// If so, skip IP reconfiguration but still ensure DNS is configured
 	out, _ := exec.Command("ip", "addr", "show", "dev", iface).Output()
-	expectedIP := strings.Split(net.IP, "/")[0]
+	expectedIP := strings.Split(netCfg.IP, "/")[0]
 	if strings.Contains(string(out), expectedIP) {
 		log.WithField("ip", expectedIP).Info("Network IP already configured by kernel, ensuring DNS is set")
 		// Still configure DNS since kernel ip= parameter doesn't set it
-		if net.DNS != "" {
-			resolv := fmt.Sprintf("nameserver %s\n", net.DNS)
+		if netCfg.DNS != "" {
+			resolv := fmt.Sprintf("nameserver %s\n", netCfg.DNS)
 			if err := os.WriteFile("/etc/resolv.conf", []byte(resolv), 0644); err != nil {
 				log.WithError(err).Warn("Failed to write resolv.conf")
 			}
@@ -976,7 +1003,7 @@ func configureNetwork(data *MMDSData) error {
 	exec.Command("ip", "addr", "flush", "dev", iface).Run()
 
 	// Add IP address
-	if err := exec.Command("ip", "addr", "add", net.IP, "dev", iface).Run(); err != nil {
+	if err := exec.Command("ip", "addr", "add", netCfg.IP, "dev", iface).Run(); err != nil {
 		return fmt.Errorf("failed to add IP address: %w", err)
 	}
 
@@ -986,16 +1013,16 @@ func configureNetwork(data *MMDSData) error {
 	}
 
 	// Add default route
-	if net.Gateway != "" {
+	if netCfg.Gateway != "" {
 		exec.Command("ip", "route", "del", "default").Run()
-		if err := exec.Command("ip", "route", "add", "default", "via", net.Gateway).Run(); err != nil {
+		if err := exec.Command("ip", "route", "add", "default", "via", netCfg.Gateway).Run(); err != nil {
 			return fmt.Errorf("failed to add default route: %w", err)
 		}
 	}
 
 	// Configure DNS
-	if net.DNS != "" {
-		resolv := fmt.Sprintf("nameserver %s\n", net.DNS)
+	if netCfg.DNS != "" {
+		resolv := fmt.Sprintf("nameserver %s\n", netCfg.DNS)
 		if err := os.WriteFile("/etc/resolv.conf", []byte(resolv), 0644); err != nil {
 			return fmt.Errorf("failed to write resolv.conf: %w", err)
 		}
@@ -1003,9 +1030,10 @@ func configureNetwork(data *MMDSData) error {
 
 	log.WithFields(logrus.Fields{
 		"interface": iface,
-		"ip":        net.IP,
-		"gateway":   net.Gateway,
-		"dns":       net.DNS,
+		"ip":        netCfg.IP,
+		"gateway":   netCfg.Gateway,
+		"dns":       netCfg.DNS,
+		"mtu":       mtu,
 	}).Info("Network configured")
 
 	return nil
@@ -1702,8 +1730,12 @@ func verifyConnectivity(repoURL string) error {
 	log.WithField("host", host).Info("Checking TCP connectivity to port 443...")
 	conn, err := net.DialTimeout("tcp", host+":443", 10*time.Second)
 	if err != nil {
-		// Log diagnostic info
+		// Log diagnostic info including MTU (MTU mismatch is the most common
+		// cause of "can ping but can't HTTPS" failures)
 		log.WithError(err).Error("TCP connection failed")
+		if mtuOut, _ := exec.Command("ip", "link", "show", "eth0").Output(); len(mtuOut) > 0 {
+			log.WithField("eth0_link", string(mtuOut)).Info("Guest interface config (check MTU)")
+		}
 		if routeOut, _ := exec.Command("ip", "route").Output(); len(routeOut) > 0 {
 			log.WithField("routes", string(routeOut)).Debug("Current routes")
 		}
@@ -1712,6 +1744,10 @@ func verifyConnectivity(repoURL string) error {
 		}
 		if pingOut, _ := exec.Command("ping", "-c", "1", "-W", "3", "8.8.8.8").CombinedOutput(); len(pingOut) > 0 {
 			log.WithField("ping_8888", string(pingOut)).Debug("Ping to 8.8.8.8")
+		}
+		// Test with small HTTP request (works even with MTU issues)
+		if curlOut, _ := exec.Command("curl", "-sS", "--connect-timeout", "5", "-o", "/dev/null", "-w", "%{http_code}", "http://"+host).CombinedOutput(); len(curlOut) > 0 {
+			log.WithField("http_status", string(curlOut)).Debug("HTTP (non-TLS) connectivity test")
 		}
 		return fmt.Errorf("cannot connect to %s:443: %w", host, err)
 	}
@@ -1810,11 +1846,14 @@ func startHealthServer(mmdsData *MMDSData) {
 		// Get actual network config
 		out, _ := exec.Command("ip", "addr", "show", "eth0").Output()
 		route, _ := exec.Command("ip", "route").Output()
+		linkInfo, _ := exec.Command("ip", "link", "show", "eth0").Output()
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"configured_ip": mmdsData.Latest.Network.IP,
-			"gateway":       mmdsData.Latest.Network.Gateway,
-			"ip_addr":       string(out),
-			"routes":        string(route),
+			"configured_ip":  mmdsData.Latest.Network.IP,
+			"configured_mtu": mmdsData.Latest.Network.MTU,
+			"gateway":        mmdsData.Latest.Network.Gateway,
+			"ip_addr":        string(out),
+			"routes":         string(route),
+			"link_info":      string(linkInfo), // Shows actual MTU
 		})
 	})
 

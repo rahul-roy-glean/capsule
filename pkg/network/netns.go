@@ -40,6 +40,7 @@ type NetNSNetwork struct {
 	gateway       net.IP
 	vmIP          net.IP // Same IP for all VMs
 	externalIface string
+	mtu           int // MTU to use, matches external interface (GCP uses 1460)
 	namespaces    map[string]*VMNamespace // vmID -> namespace info
 	mu            sync.Mutex
 	logger        *logrus.Entry
@@ -81,12 +82,19 @@ func NewNetNSNetwork(cfg NetNSConfig) (*NetNSNetwork, error) {
 		logger = logrus.New()
 	}
 
+	// Detect MTU from external interface (GCP uses 1460, not 1500)
+	mtu := detectInterfaceMTU(cfg.ExternalIface)
+	if mtu <= 0 {
+		mtu = 1460 // Safe default for GCP
+	}
+
 	return &NetNSNetwork{
 		bridgeName:    cfg.BridgeName,
 		subnet:        subnet,
 		gateway:       gateway,
 		vmIP:          vmIP,
 		externalIface: cfg.ExternalIface,
+		mtu:           mtu,
 		namespaces:    make(map[string]*VMNamespace),
 		logger:        logger.WithField("component", "netns-network"),
 	}, nil
@@ -127,12 +135,17 @@ func (n *NetNSNetwork) createBridge() error {
 	link, err := netlink.LinkByName(n.bridgeName)
 	if err == nil {
 		n.logger.WithField("bridge", n.bridgeName).Debug("Bridge already exists")
+		// Ensure MTU matches external interface
+		if err := netlink.LinkSetMTU(link, n.mtu); err != nil {
+			n.logger.WithError(err).Warn("Failed to set MTU on existing bridge")
+		}
 		return netlink.LinkSetUp(link)
 	}
 
 	bridge := &netlink.Bridge{
 		LinkAttrs: netlink.LinkAttrs{
 			Name: n.bridgeName,
+			MTU:  n.mtu,
 		},
 	}
 
@@ -163,7 +176,10 @@ func (n *NetNSNetwork) createBridge() error {
 		return fmt.Errorf("failed to bring up bridge: %w", err)
 	}
 
-	n.logger.WithField("bridge", n.bridgeName).Info("Bridge created successfully")
+	n.logger.WithFields(logrus.Fields{
+		"bridge": n.bridgeName,
+		"mtu":    n.mtu,
+	}).Info("Bridge created successfully")
 	return nil
 }
 
@@ -204,6 +220,15 @@ func (n *NetNSNetwork) setupBridgeNAT() error {
 		addRule := []string{"-A", "FORWARD", "-i", n.externalIface, "-o", n.bridgeName, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"}
 		if err := exec.Command("iptables", addRule...).Run(); err != nil {
 			return fmt.Errorf("failed to add forward in rule: %w", err)
+		}
+	}
+
+	// TCP MSS clamping: fixes HTTPS/TLS through NAT with non-standard MTU
+	mssClampRule := []string{"-C", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"}
+	if err := exec.Command("iptables", mssClampRule...).Run(); err != nil {
+		addRule := []string{"-I", "FORWARD", "1", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"}
+		if err := exec.Command("iptables", addRule...).Run(); err != nil {
+			n.logger.WithError(err).Warn("Failed to add TCP MSS clamping rule")
 		}
 	}
 
@@ -258,10 +283,11 @@ func (n *NetNSNetwork) CreateNamespaceForVM(vmID string) (*VMNamespace, error) {
 		return nil, fmt.Errorf("failed to switch back to original namespace: %w", err)
 	}
 
-	// Create veth pair in host namespace
+	// Create veth pair in host namespace with correct MTU
 	veth := &netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{
 			Name: vethHost,
+			MTU:  n.mtu,
 		},
 		PeerName: vethVM,
 	}
@@ -376,10 +402,11 @@ func (n *NetNSNetwork) CreateNamespaceForVM(vmID string) (*VMNamespace, error) {
 		n.logger.WithError(err).Warn("Failed to add default route (may already exist)")
 	}
 
-	// Create TAP device inside namespace
+	// Create TAP device inside namespace with correct MTU
 	tap := &netlink.Tuntap{
 		LinkAttrs: netlink.LinkAttrs{
 			Name: tapName,
+			MTU:  n.mtu,
 		},
 		Mode:  netlink.TUNTAP_MODE_TAP,
 		Flags: netlink.TUNTAP_DEFAULTS,
