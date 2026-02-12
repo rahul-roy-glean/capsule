@@ -902,15 +902,40 @@ func waitForMMDSOnce(ctx context.Context) (*MMDSData, error) {
 		return nil, err
 	}
 
+	log.WithFields(logrus.Fields{
+		"body_size":    len(body),
+		"body_preview": string(body[:min(len(body), 500)]),
+	}).Debug("Raw MMDS response")
+
 	var data MMDSData
 	if err := json.Unmarshal(body, &data); err != nil {
+		log.WithError(err).Debug("Failed to parse MMDS into MMDSData wrapper")
 		return nil, fmt.Errorf("failed to parse MMDS: %w", err)
 	}
 
+	log.WithFields(logrus.Fields{
+		"runner_id":     data.Latest.Meta.RunnerID,
+		"mode":          data.Latest.Meta.Mode,
+		"job_repo":      data.Latest.Job.Repo,
+		"has_git_token": data.Latest.Job.GitToken != "",
+		"git_token_len": len(data.Latest.Job.GitToken),
+		"warmup_repo":   data.Latest.Warmup.RepoURL,
+	}).Debug("Parsed MMDS data (first pass)")
+
 	// Handle unwrapped format - try to parse directly into Latest
 	if data.Latest.Meta.RunnerID == "" && len(body) > 0 {
+		log.Debug("RunnerID empty after first parse, trying unwrapped format")
 		if err := json.Unmarshal(body, &data.Latest); err == nil {
-			// Successfully parsed directly into Latest
+			log.WithFields(logrus.Fields{
+				"runner_id":     data.Latest.Meta.RunnerID,
+				"mode":          data.Latest.Meta.Mode,
+				"job_repo":      data.Latest.Job.Repo,
+				"has_git_token": data.Latest.Job.GitToken != "",
+				"git_token_len": len(data.Latest.Job.GitToken),
+				"warmup_repo":   data.Latest.Warmup.RepoURL,
+			}).Debug("Parsed MMDS data (unwrapped format)")
+		} else {
+			log.WithError(err).Debug("Failed to parse MMDS in unwrapped format")
 		}
 	}
 
@@ -1369,10 +1394,12 @@ func runWarmupMode(data *MMDSData) error {
 	// Phase 1: Clone repository
 	updateWarmupState("cloning", "Cloning repository...")
 	log.WithFields(logrus.Fields{
-		"repo_url": warmup.RepoURL,
-		"branch":   warmup.RepoBranch,
-		"repo_dir": repoDir,
-		"work_dir": workDir,
+		"repo_url":      warmup.RepoURL,
+		"branch":        warmup.RepoBranch,
+		"repo_dir":      repoDir,
+		"work_dir":      workDir,
+		"has_git_token": data.Latest.Job.GitToken != "",
+		"job_repo":      data.Latest.Job.Repo,
 	}).Info("Cloning repository for warmup")
 
 	// Create parent directory for the clone target (e.g., /mnt/ephemeral/workdir/scio for scio/scio)
@@ -1428,15 +1455,33 @@ func runWarmupMode(data *MMDSData) error {
 		if !cloned {
 			// Build clone URL with auth token if available (for private repos)
 			cloneURL := warmup.RepoURL
+			log.WithFields(logrus.Fields{
+				"warmup_repo_url":  warmup.RepoURL,
+				"job_repo":         data.Latest.Job.Repo,
+				"job_git_token":    fmt.Sprintf("len=%d, empty=%v, first5=%s", len(data.Latest.Job.GitToken), data.Latest.Job.GitToken == "", safePrefix(data.Latest.Job.GitToken, 5)),
+				"git_cache_enabled": data.Latest.GitCache.Enabled,
+			}).Debug("Clone decision - checking token")
+
 			if data.Latest.Job.GitToken != "" {
 				// Use GitHub App installation token for auth
 				// Format: https://x-access-token:TOKEN@github.com/org/repo
 				repoPath := strings.TrimPrefix(warmup.RepoURL, "https://github.com/")
 				repoPath = strings.TrimPrefix(repoPath, "github.com/")
 				cloneURL = fmt.Sprintf("https://x-access-token:%s@github.com/%s", data.Latest.Job.GitToken, repoPath)
-				log.Info("Using GitHub App token for authenticated clone")
+				log.WithField("clone_url_host", "x-access-token:***@github.com/"+repoPath).Info("Using GitHub App token for authenticated clone")
+			} else {
+				log.Warn("No git_token found in MMDS job data - clone will be unauthenticated")
+				// Try to build a plain HTTPS URL
+				if !strings.HasPrefix(cloneURL, "https://") && !strings.HasPrefix(cloneURL, "git@") {
+					cloneURL = "https://github.com/" + cloneURL
+				}
+				log.WithField("clone_url", cloneURL).Debug("Using unauthenticated clone URL")
 			}
 
+			log.WithFields(logrus.Fields{
+				"branch":   branch,
+				"repo_dir": repoDir,
+			}).Info("Starting git clone")
 			cloneCmd := exec.Command("git", "clone", "--depth=1", "--branch", branch, cloneURL, repoDir)
 			cloneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 			output, err := cloneCmd.CombinedOutput()
@@ -1615,6 +1660,16 @@ func getWorkspaceRepoPath(data *MMDSData) string {
 	}
 
 	return ""
+}
+
+func safePrefix(s string, n int) string {
+	if len(s) == 0 {
+		return "<empty>"
+	}
+	if len(s) <= n {
+		return s + "..."
+	}
+	return s[:n] + "..."
 }
 
 // verifyConnectivity checks that the microVM can reach the target host before
