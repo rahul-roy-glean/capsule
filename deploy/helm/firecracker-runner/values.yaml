@@ -8,7 +8,7 @@ namespace:
 image:
   # Default uses Artifact Registry. Override with --set or values file.
   # Format: REGION-docker.pkg.dev/PROJECT_ID/REPO_NAME/IMAGE
-  repository: us-central1-docker.pkg.dev/scio-ci/firecracker/control-plane
+  repository: us-central1-docker.pkg.dev/scio-ci/firecracker/firecracker-control-plane
   tag: latest
   pullPolicy: IfNotPresent
 
