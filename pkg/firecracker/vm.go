@@ -111,6 +111,12 @@ func (vm *VM) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to set machine config: %w", err)
 	}
 
+	// Enable virtio-rng entropy device so the guest kernel CRNG initializes
+	// immediately. Without this, getrandom() blocks and TLS (git, curl) hangs.
+	if err := vm.client.SetEntropyDevice(ctx, EntropyDevice{}); err != nil {
+		vm.logger.WithError(err).Warn("Failed to set entropy device (requires Firecracker >= 1.5)")
+	}
+
 	// Set boot source
 	if err := vm.client.SetBootSource(ctx, BootSource{
 		KernelImagePath: vm.config.KernelPath,

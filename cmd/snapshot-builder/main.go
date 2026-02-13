@@ -33,9 +33,12 @@ var (
 	vcpus               = flag.Int("vcpus", 4, "vCPUs for warmup VM")
 	memoryMB            = flag.Int("memory-mb", 8192, "Memory MB for warmup VM")
 	warmupTimeout       = flag.Duration("warmup-timeout", 30*time.Minute, "Timeout for warmup phase")
-	repoCacheSeedSizeGB = flag.Int("repo-cache-seed-size-gb", 20, "Size in GB of repo-cache-seed.img (shared Bazel repository cache seed)")
+	rootfsSizeGB        = flag.Int("rootfs-size-gb", 0, "Expand rootfs to this size in GB (0 = keep original size). Increase if bazel fetch runs out of space.")
+	repoCacheUpperSizeGB = flag.Int("repo-cache-upper-size-gb", 10, "Size in GB of repo-cache-upper.img (writable overlay for Bazel repository cache)")
+	repoCacheSeedSizeGB  = flag.Int("repo-cache-seed-size-gb", 20, "Size in GB of repo-cache-seed.img (shared Bazel repository cache seed)")
 	repoCacheSeedDir    = flag.String("repo-cache-seed-dir", "", "Optional directory to seed into repo-cache-seed.img (copied into image root)")
 	gitCachePath        = flag.String("git-cache-path", "", "Path to pre-populated git-cache.img (from git-cache-builder). If set, uses this instead of cloning during warmup.")
+	fetchTargets        = flag.String("fetch-targets", "//...", "Bazel target pattern for fetch (e.g., '//... -- -//terraform/...' to exclude terraform)")
 	logLevel            = flag.String("log-level", "info", "Log level")
 
 	// GitHub App authentication for private repos (used when git-cache is not available)
@@ -100,6 +103,29 @@ func main() {
 		log.Info("Successfully obtained GitHub App installation token for warmup")
 	}
 
+	// Get GCP access token from metadata server (for Artifact Registry auth inside warmup VM)
+	gcpAccessToken := ""
+	if resp, err := http.Get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"); err == nil {
+		// Metadata server requires Metadata-Flavor header, retry with it
+		resp.Body.Close()
+	}
+	metadataReq, _ := http.NewRequest("GET", "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", nil)
+	metadataReq.Header.Set("Metadata-Flavor", "Google")
+	if resp, err := http.DefaultClient.Do(metadataReq); err == nil {
+		defer resp.Body.Close()
+		var tokenResp struct {
+			AccessToken string `json:"access_token"`
+			ExpiresIn   int    `json:"expires_in"`
+			TokenType   string `json:"token_type"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err == nil && tokenResp.AccessToken != "" {
+			gcpAccessToken = tokenResp.AccessToken
+			log.WithField("expires_in", tokenResp.ExpiresIn).Info("Obtained GCP access token for Artifact Registry auth")
+		}
+	} else {
+		log.WithError(err).Warn("Failed to get GCP access token (Artifact Registry auth won't work in warmup VM)")
+	}
+
 	// Generate version string
 	branchSuffix := *repoBranch
 	if len(branchSuffix) > 8 {
@@ -113,11 +139,24 @@ func main() {
 		log.WithError(err).Fatal("Failed to create output directory")
 	}
 
-	// Create working rootfs (copy of base)
+	// Create working rootfs (copy of base, optionally expanded)
 	workingRootfs := filepath.Join(*outputDir, "rootfs.img")
 	log.Info("Creating working rootfs...")
 	if err := copyFile(*rootfsPath, workingRootfs); err != nil {
 		log.WithError(err).Fatal("Failed to copy rootfs")
+	}
+	if *rootfsSizeGB > 0 {
+		log.WithField("size_gb", *rootfsSizeGB).Info("Expanding rootfs...")
+		if err := exec.Command("truncate", "-s", fmt.Sprintf("%dG", *rootfsSizeGB), workingRootfs).Run(); err != nil {
+			log.WithError(err).Fatal("Failed to expand rootfs")
+		}
+		if output, err := exec.Command("e2fsck", "-fy", workingRootfs).CombinedOutput(); err != nil {
+			log.WithField("output", string(output)).Warn("e2fsck returned non-zero (may be OK)")
+		}
+		if output, err := exec.Command("resize2fs", workingRootfs).CombinedOutput(); err != nil {
+			log.WithField("output", string(output)).Fatal("Failed to resize2fs rootfs")
+		}
+		log.Info("Rootfs expanded successfully")
 	}
 
 	// Create (or seed) shared repo cache seed image
@@ -141,7 +180,7 @@ func main() {
 	// At runtime each runner gets its own upper image, but the snapshot should
 	// include the same device layout (drive IDs) for compatibility.
 	repoCacheUpperImg := filepath.Join(*outputDir, "repo-cache-upper.img")
-	if err := createExt4Image(repoCacheUpperImg, 1, "BAZEL_REPO_UPPER"); err != nil {
+	if err := createExt4Image(repoCacheUpperImg, *repoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
 		log.WithError(err).Fatal("Failed to create repo-cache upper image")
 	}
 
@@ -251,7 +290,7 @@ func main() {
 	}
 
 	// Inject MMDS data for warmup configuration
-	mmdsData := buildWarmupMMDS(*repoURL, *repoBranch, *bazelVersion, gitToken, gitCacheEnabled)
+	mmdsData := buildWarmupMMDS(*repoURL, *repoBranch, *bazelVersion, *fetchTargets, gitToken, gcpAccessToken, gitCacheEnabled)
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
 		log.WithError(err).Fatal("Failed to set MMDS data")
@@ -374,6 +413,7 @@ func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, log 
 
 	healthURL := fmt.Sprintf("http://%s:8080/health", guestIP)
 	warmupURL := fmt.Sprintf("http://%s:8080/warmup-status", guestIP)
+	logsURL := fmt.Sprintf("http://%s:8080/warmup-logs", guestIP)
 
 	client := &http.Client{
 		Timeout: 5 * time.Second,
@@ -397,15 +437,19 @@ func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, log 
 	// Phase 2: Wait for warmup to complete
 	log.Info("Phase 2: Waiting for warmup to complete...")
 
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
 	lastPhase := ""
+	var logSeq int64
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+			// Poll warmup logs and print new lines
+			fetchWarmupLogs(client, logsURL, &logSeq, log)
+
 			status, err := getWarmupStatus(client, warmupURL)
 			if err != nil {
 				// Warmup endpoint might not exist yet, check health instead
@@ -424,6 +468,8 @@ func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, log 
 			}
 
 			if status.Complete {
+				// Final log flush
+				fetchWarmupLogs(client, logsURL, &logSeq, log)
 				log.WithFields(logrus.Fields{
 					"duration":  status.Duration,
 					"externals": status.ExternalsFetched,
@@ -432,6 +478,8 @@ func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, log 
 			}
 
 			if status.Error != "" {
+				// Final log flush
+				fetchWarmupLogs(client, logsURL, &logSeq, log)
 				return fmt.Errorf("warmup failed: %s", status.Error)
 			}
 		}
@@ -502,6 +550,32 @@ func getWarmupStatus(client *http.Client, url string) (*WarmupStatus, error) {
 	}
 
 	return &status, nil
+}
+
+func fetchWarmupLogs(client *http.Client, baseURL string, seq *int64, log *logrus.Entry) {
+	url := fmt.Sprintf("%s?after=%d", baseURL, *seq)
+	resp, err := client.Get(url)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+
+	var result struct {
+		Lines []string `json:"lines"`
+		Seq   int64    `json:"seq"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return
+	}
+
+	for _, line := range result.Lines {
+		log.WithField("vm", "warmup").Info(line)
+	}
+	*seq = result.Seq
 }
 
 func copyFile(src, dst string) error {
@@ -656,6 +730,12 @@ func setupWarmupNetwork(tapName, hostIP string) error {
 	exec.Command("iptables", "-A", "FORWARD", "-i", tapName, "-j", "ACCEPT").Run()
 	exec.Command("iptables", "-A", "FORWARD", "-o", tapName, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT").Run()
 
+	// Clamp TCP MSS to path MTU. The guest may have MTU 1500 (default) while the host
+	// outbound interface uses 1460 (GCP). Without this, large TCP segments from the guest
+	// get dropped after NAT because they exceed the host MTU and DF is set.
+	exec.Command("iptables", "-t", "mangle", "-A", "FORWARD", "-p", "tcp",
+		"--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu").Run()
+
 	return nil
 }
 
@@ -669,7 +749,7 @@ func cleanupWarmupNetwork(tapName string) {
 }
 
 // buildWarmupMMDS creates the MMDS data for warmup mode
-func buildWarmupMMDS(repoURL, repoBranch, bazelVersion, gitToken string, gitCacheEnabled bool) map[string]interface{} {
+func buildWarmupMMDS(repoURL, repoBranch, bazelVersion, fetchTargets, gitToken, gcpAccessToken string, gitCacheEnabled bool) map[string]interface{} {
 	// Extract repo name for git-cache lookup (e.g., "askscio/scio" -> "scio")
 	repoName := filepath.Base(strings.TrimSuffix(repoURL, ".git"))
 
@@ -684,7 +764,7 @@ func buildWarmupMMDS(repoURL, repoBranch, bazelVersion, gitToken string, gitCach
 				"repo_url":       repoURL,
 				"repo_branch":    repoBranch,
 				"bazel_version":  bazelVersion,
-				"warmup_targets": "//...",
+				"warmup_targets": fetchTargets,
 			},
 			"network": map[string]interface{}{
 				"ip":        "172.16.0.2/24",
@@ -694,9 +774,10 @@ func buildWarmupMMDS(repoURL, repoBranch, bazelVersion, gitToken string, gitCach
 				"interface": "eth0",
 			},
 			"job": map[string]interface{}{
-				"repo":      repoURL,
-				"branch":    repoBranch,
-				"git_token": gitToken,
+				"repo":             repoURL,
+				"branch":           repoBranch,
+				"git_token":        gitToken,
+				"gcp_access_token": gcpAccessToken,
 			},
 			"git_cache": map[string]interface{}{
 				"enabled":       gitCacheEnabled,

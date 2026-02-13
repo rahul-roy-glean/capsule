@@ -218,6 +218,10 @@ resource "google_compute_instance_template" "firecracker_host" {
     iptables -A FORWARD -i fcbr0 -o "$PRIMARY_IFACE" -j ACCEPT
     iptables -A FORWARD -i "$PRIMARY_IFACE" -o fcbr0 -m state --state RELATED,ESTABLISHED -j ACCEPT
 
+    # Clamp TCP MSS to path MTU - guest VMs may have MTU 1500 while GCP uses 1460.
+    # Without this, large TCP segments get dropped after NAT (DF bit set, can't fragment).
+    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
     # Save iptables rules
     iptables-save > /etc/iptables/rules.v4 || true
 

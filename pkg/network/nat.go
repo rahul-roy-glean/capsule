@@ -202,6 +202,25 @@ func (n *NATNetwork) setupNAT() error {
 		}
 	}
 
+	// Clamp TCP MSS to path MTU. Guest VMs default to MTU 1500 while GCP uses
+	// 1460. Without this rule, large TCP segments from guests get silently dropped
+	// after NAT because DF is set and the packet exceeds the host MTU.
+	mssClampRule := []string{
+		"-t", "mangle", "-C", "FORWARD",
+		"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+		"-j", "TCPMSS", "--clamp-mss-to-pmtu",
+	}
+	if err := exec.Command("iptables", mssClampRule...).Run(); err != nil {
+		addRule := []string{
+			"-t", "mangle", "-A", "FORWARD",
+			"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+			"-j", "TCPMSS", "--clamp-mss-to-pmtu",
+		}
+		if err := exec.Command("iptables", addRule...).Run(); err != nil {
+			n.logger.WithError(err).Warn("Failed to add MSS clamping rule")
+		}
+	}
+
 	n.logger.Info("NAT rules configured successfully")
 	return nil
 }

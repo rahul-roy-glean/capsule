@@ -110,6 +110,13 @@ type Metrics struct {
 	MetricsPath string `json:"metrics_path"`
 }
 
+// EntropyDevice configuration for virtio-rng
+// Provides host entropy to the guest via /dev/hwrng, seeding the guest kernel's CRNG.
+// Without this, GnuTLS/OpenSSL may block on getrandom() in VMs lacking hardware RNG.
+type EntropyDevice struct {
+	RateLimiter *RateLimiter `json:"rate_limiter,omitempty"`
+}
+
 // Vsock device configuration
 type Vsock struct {
 	GuestCID uint32 `json:"guest_cid"`

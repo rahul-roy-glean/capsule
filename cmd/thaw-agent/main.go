@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -68,6 +69,44 @@ type WarmupState struct {
 	ExternalsFetched int       `json:"externals_fetched,omitempty"`
 }
 
+// WarmupLogBuffer is a thread-safe ring buffer for streaming warmup command output
+type WarmupLogBuffer struct {
+	mu    sync.Mutex
+	lines []string
+	seq   int64 // monotonic sequence number
+}
+
+func (b *WarmupLogBuffer) Add(line string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.seq++
+	b.lines = append(b.lines, line)
+	// Keep last 500 lines
+	if len(b.lines) > 500 {
+		b.lines = b.lines[len(b.lines)-500:]
+	}
+}
+
+// Since returns lines added after the given sequence number
+func (b *WarmupLogBuffer) Since(afterSeq int64) ([]string, int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if afterSeq >= b.seq {
+		return nil, b.seq
+	}
+	// Calculate how many new lines
+	total := b.seq
+	count := int(total - afterSeq)
+	if count > len(b.lines) {
+		count = len(b.lines)
+	}
+	result := make([]string, count)
+	copy(result, b.lines[len(b.lines)-count:])
+	return result, total
+}
+
+var globalWarmupLogs = &WarmupLogBuffer{}
+
 var globalWarmupState = &WarmupState{
 	Phase:     "initializing",
 	StartedAt: time.Now(),
@@ -120,7 +159,8 @@ type MMDSData struct {
 			Branch            string            `json:"branch"`
 			Commit            string            `json:"commit"`
 			GitHubRunnerToken string            `json:"github_runner_token"`
-			GitToken          string            `json:"git_token"` // Installation token for git clone auth (private repos)
+			GitToken          string            `json:"git_token"`        // Installation token for git clone auth (private repos)
+			GCPAccessToken    string            `json:"gcp_access_token"` // Short-lived GCP token for Artifact Registry auth
 			Labels            map[string]string `json:"labels"`
 		} `json:"job"`
 		Snapshot struct {
@@ -825,6 +865,7 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					Commit            string            `json:"commit"`
 					GitHubRunnerToken string            `json:"github_runner_token"`
 					GitToken          string            `json:"git_token"`
+					GCPAccessToken    string            `json:"gcp_access_token"`
 					Labels            map[string]string `json:"labels"`
 				} `json:"job"`
 				Snapshot struct {
@@ -1483,6 +1524,12 @@ func runWarmupMode(data *MMDSData) error {
 				"repo_dir": repoDir,
 			}).Info("Starting git clone")
 
+			// Ensure HOME is set (systemd services may not have it, and git/GnuTLS need it)
+			if os.Getenv("HOME") == "" {
+				os.Setenv("HOME", "/root")
+				log.Info("HOME was not set, defaulting to /root")
+			}
+
 			// Configure git for reliability over NAT (gnutls can drop during large transfers)
 			exec.Command("git", "config", "--global", "http.postBuffer", "524288000").Run()
 			exec.Command("git", "config", "--global", "http.lowSpeedLimit", "1000").Run()
@@ -1490,7 +1537,10 @@ func runWarmupMode(data *MMDSData) error {
 			exec.Command("git", "config", "--global", "http.version", "HTTP/1.1").Run()
 
 			cloneCmd := exec.Command("git", "clone", "--depth=1", "--branch", branch, cloneURL, repoDir)
-			cloneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+			cloneCmd.Env = append(os.Environ(),
+				"GIT_TERMINAL_PROMPT=0",
+				"HOME=/root",
+			)
 			output, err := cloneCmd.CombinedOutput()
 			if err != nil {
 				log.WithFields(logrus.Fields{
@@ -1548,17 +1598,61 @@ build --local_cpu_resources=HOST_CPUS
 		log.WithError(err).Warn("Failed to write bazelrc.warmup")
 	}
 
-	// Phase 3: Fetch external dependencies
-	updateWarmupState("fetching", "Fetching external dependencies...")
-	log.Info("Running bazel fetch //...")
+	bazelEnv := append(os.Environ(), "HOME=/home/"+*runnerUsername)
 
-	fetchCmd := exec.Command("bazel", "--bazelrc="+bazelrcPath, "fetch", "//...")
-	fetchCmd.Dir = repoDir
-	fetchCmd.Stdout = os.Stdout
-	fetchCmd.Stderr = os.Stderr
-	fetchCmd.Env = append(os.Environ(), "HOME=/home/runner")
-	if err := fetchCmd.Run(); err != nil {
+	// Configure GCP auth if access token is available (for Artifact Registry PyPI access)
+	if data.Latest.Job.GCPAccessToken != "" {
+		log.Info("Configuring GCP Application Default Credentials for Artifact Registry access")
+		globalWarmupLogs.Add("[auth] Configuring GCP ADC for Artifact Registry")
+
+		// Write ADC JSON that tools like pip/keyring can use
+		adcJSON := fmt.Sprintf(`{"type":"authorized_user","token":"%s"}`, data.Latest.Job.GCPAccessToken)
+		adcPath := "/tmp/gcp-adc.json"
+		if err := os.WriteFile(adcPath, []byte(adcJSON), 0600); err != nil {
+			log.WithError(err).Warn("Failed to write ADC file")
+		} else {
+			bazelEnv = append(bazelEnv,
+				"GOOGLE_APPLICATION_CREDENTIALS="+adcPath,
+				"CLOUDSDK_AUTH_ACCESS_TOKEN="+data.Latest.Job.GCPAccessToken,
+			)
+			// Also configure gcloud with the access token so credential helpers work
+			exec.Command("gcloud", "config", "set", "auth/access_token_file", adcPath).Run()
+			exec.Command("gcloud", "config", "set", "project", "scio-engineering").Run()
+			log.Info("GCP auth configured for warmup")
+		}
+	} else {
+		log.Warn("No GCP access token available - Artifact Registry deps will fail")
+		globalWarmupLogs.Add("[auth] No GCP access token - private PyPI deps will be skipped")
+	}
+
+	// Log repo's bazelrc and .bazelversion for debugging
+	if data, err := os.ReadFile(filepath.Join(repoDir, ".bazelrc")); err == nil {
+		log.WithField("content", string(data)).Debug("Repo .bazelrc")
+		globalWarmupLogs.Add("[repo .bazelrc]\n" + string(data))
+	}
+	if data, err := os.ReadFile(filepath.Join(repoDir, ".bazelversion")); err == nil {
+		log.WithField("version", strings.TrimSpace(string(data))).Info("Repo .bazelversion")
+		globalWarmupLogs.Add("[.bazelversion] " + strings.TrimSpace(string(data)))
+	}
+
+	// Phase 3: Fetch external dependencies
+	// Parse fetch targets - supports "//... -- -//terraform/..." syntax (space-separated args)
+	fetchTargets := warmup.WarmupTargets
+	if fetchTargets == "" {
+		fetchTargets = "//..."
+	}
+	fetchArgs := []string{"--bazelrc=" + bazelrcPath, "fetch"}
+	fetchArgs = append(fetchArgs, strings.Fields(fetchTargets)...)
+
+	updateWarmupState("fetching", "Fetching external dependencies...")
+	log.WithField("targets", fetchTargets).Info("Running bazel fetch")
+	globalWarmupLogs.Add("[phase] bazel fetch " + fetchTargets)
+
+	if err := runStreamedCommand(repoDir, bazelEnv, "bazel", fetchArgs[0:]...); err != nil {
 		log.WithError(err).Warn("bazel fetch failed (continuing)")
+		globalWarmupLogs.Add("[error] bazel fetch failed: " + err.Error())
+	} else {
+		globalWarmupLogs.Add("[done] bazel fetch completed")
 	}
 
 	// Count fetched externals
@@ -1567,30 +1661,38 @@ build --local_cpu_resources=HOST_CPUS
 		globalWarmupState.ExternalsFetched = len(entries)
 	}
 
-	// Phase 4: Run analysis
-	updateWarmupState("analyzing", "Running Bazel analysis (--nobuild)...")
-	log.Info("Running bazel build --nobuild //...")
+	// Log cache size
+	if out, err := exec.Command("du", "-sh", "/mnt/ephemeral/caches/repository").CombinedOutput(); err == nil {
+		cacheSize := strings.TrimSpace(string(out))
+		log.WithField("cache_size", cacheSize).Info("Repository cache size after fetch")
+		globalWarmupLogs.Add("[cache] " + cacheSize)
+	}
 
-	analyzeCmd := exec.Command("bazel", "--bazelrc="+bazelrcPath, "build", "--nobuild", "//...")
-	analyzeCmd.Dir = repoDir
-	analyzeCmd.Stdout = os.Stdout
-	analyzeCmd.Stderr = os.Stderr
-	analyzeCmd.Env = append(os.Environ(), "HOME=/home/runner")
-	if err := analyzeCmd.Run(); err != nil {
+	// Phase 4: Run analysis (same targets as fetch)
+	analyzeArgs := []string{"--bazelrc=" + bazelrcPath, "build", "--nobuild"}
+	analyzeArgs = append(analyzeArgs, strings.Fields(fetchTargets)...)
+
+	updateWarmupState("analyzing", "Running Bazel analysis (--nobuild)...")
+	log.WithField("targets", fetchTargets).Info("Running bazel build --nobuild")
+	globalWarmupLogs.Add("[phase] bazel build --nobuild " + fetchTargets)
+
+	if err := runStreamedCommand(repoDir, bazelEnv, "bazel", analyzeArgs[0:]...); err != nil {
 		log.WithError(err).Warn("bazel build --nobuild failed (continuing)")
+		globalWarmupLogs.Add("[error] bazel build --nobuild failed: " + err.Error())
+	} else {
+		globalWarmupLogs.Add("[done] bazel build --nobuild completed")
 	}
 
 	// Phase 5: Start Bazel server (keeps server state in memory for snapshot)
 	updateWarmupState("starting_server", "Starting Bazel server...")
 	log.Info("Starting persistent Bazel server")
+	globalWarmupLogs.Add("[phase] bazel info")
 
-	infoCmd := exec.Command("bazel", "--bazelrc="+bazelrcPath, "info")
-	infoCmd.Dir = repoDir
-	infoCmd.Stdout = os.Stdout
-	infoCmd.Stderr = os.Stderr
-	infoCmd.Env = append(os.Environ(), "HOME=/home/runner")
-	if err := infoCmd.Run(); err != nil {
+	if err := runStreamedCommand(repoDir, bazelEnv, "bazel", "--bazelrc="+bazelrcPath, "info"); err != nil {
 		log.WithError(err).Warn("bazel info failed")
+		globalWarmupLogs.Add("[error] bazel info failed: " + err.Error())
+	} else {
+		globalWarmupLogs.Add("[done] bazel info completed")
 	}
 
 	// Phase 6: Sync caches to disk
@@ -1598,6 +1700,48 @@ build --local_cpu_resources=HOST_CPUS
 	exec.Command("sync").Run()
 
 	return nil
+}
+
+// runStreamedCommand runs a command, capturing stdout/stderr line by line
+// into the warmup log buffer and the structured logger.
+func runStreamedCommand(dir string, env []string, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	cmd.Env = env
+
+	// Create pipes for stdout and stderr
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("stdout pipe: %w", err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("stderr pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+
+	// Stream both stdout and stderr concurrently
+	var wg sync.WaitGroup
+	streamLines := func(prefix string, r io.Reader) {
+		defer wg.Done()
+		scanner := bufio.NewScanner(r)
+		scanner.Buffer(make([]byte, 256*1024), 256*1024) // 256KB line buffer for bazel
+		for scanner.Scan() {
+			line := scanner.Text()
+			log.WithField("src", prefix).Debug(line)
+			globalWarmupLogs.Add(fmt.Sprintf("[%s] %s", prefix, line))
+		}
+	}
+
+	wg.Add(2)
+	go streamLines("stdout", stdoutPipe)
+	go streamLines("stderr", stderrPipe)
+	wg.Wait()
+
+	return cmd.Wait()
 }
 
 func updateWarmupState(phase, message string) {
@@ -1725,7 +1869,7 @@ func verifyConnectivity(repoURL string) error {
 func verifyBazelServer(repoDir string) error {
 	cmd := exec.Command("bazel", "info", "server_pid")
 	cmd.Dir = repoDir
-	cmd.Env = append(os.Environ(), "HOME=/home/runner")
+	cmd.Env = append(os.Environ(), "HOME=/home/"+*runnerUsername)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("bazel server not running: %w (output: %s)", err, string(output))
@@ -1801,6 +1945,20 @@ func startHealthServer(mmdsData *MMDSData) {
 			"current_runner_id": mmdsData.Latest.Meta.RunnerID,
 			"current_mode":      mmdsData.Latest.Meta.Mode,
 			"github_token_set":  mmdsData.Latest.Job.GitHubRunnerToken != "",
+		})
+	})
+
+	// Warmup log streaming endpoint - returns new log lines since ?after=N
+	mux.HandleFunc("/warmup-logs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		afterSeq := int64(0)
+		if s := r.URL.Query().Get("after"); s != "" {
+			afterSeq, _ = strconv.ParseInt(s, 10, 64)
+		}
+		lines, seq := globalWarmupLogs.Since(afterSeq)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"lines": lines,
+			"seq":   seq,
 		})
 	})
 

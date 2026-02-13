@@ -56,7 +56,7 @@ func NewClient(cfg Config) *Client {
 		vmID:       cfg.VMID,
 		httpClient: &http.Client{
 			Transport: transport,
-			Timeout:   30 * time.Second,
+			Timeout:   5 * time.Minute, // Snapshot creation can take minutes for large memory VMs
 		},
 		logger: logger.WithField("vm_id", cfg.VMID),
 	}
@@ -215,6 +215,13 @@ func (c *Client) PatchDrive(ctx context.Context, driveID, newPathOnHost string) 
 	}).Debug("Patching drive")
 	patch := map[string]string{"drive_id": driveID, "path_on_host": newPathOnHost}
 	return c.doRequest(ctx, http.MethodPatch, fmt.Sprintf("/drives/%s", driveID), patch)
+}
+
+// SetEntropyDevice configures the virtio-rng entropy device.
+// This provides host entropy to the guest, preventing getrandom() from blocking.
+func (c *Client) SetEntropyDevice(ctx context.Context, entropy EntropyDevice) error {
+	c.logger.Debug("Setting entropy device")
+	return c.doRequest(ctx, http.MethodPut, "/entropy", entropy)
 }
 
 // SetVsock configures a vsock device for host-guest communication

@@ -85,6 +85,11 @@ RUN curl -fsSL "https://github.com/bazelbuild/bazelisk/releases/download/v${BAZE
 # Setup Python
 RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 \
     && python3.12 -m pip install --upgrade pip wheel setuptools \
+    && python3.12 -m pip install \
+        keyrings.google-artifactregistry-auth \
+        keyring \
+        pyparsing==2.4.7 \
+        packaging==24.2 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
     && ln -sf /usr/local/bin/pip3.12 /usr/bin/pip
 
