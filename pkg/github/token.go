@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
@@ -32,7 +33,11 @@ func NewTokenClient(ctx context.Context, appID, secretName, gcpProject string) (
 	}
 	defer client.Close()
 
-	secretPath := fmt.Sprintf("projects/%s/secrets/%s/versions/latest", gcpProject, secretName)
+	// Support both full secret paths (projects/X/secrets/Y/versions/Z) and plain names
+	secretPath := secretName
+	if !strings.HasPrefix(secretName, "projects/") {
+		secretPath = fmt.Sprintf("projects/%s/secrets/%s/versions/latest", gcpProject, secretName)
+	}
 	result, err := client.AccessSecretVersion(ctx, &secretmanagerpb.AccessSecretVersionRequest{
 		Name: secretPath,
 	})

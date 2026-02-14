@@ -1590,8 +1590,8 @@ build --repository_cache=/mnt/ephemeral/caches/repository
 build --disk_cache=/mnt/bazel-repo-upper/disk-cache
 build --experimental_repository_cache_hardlinks
 build --jobs=auto
-build --local_ram_resources=HOST_RAM*.8
-build --local_cpu_resources=HOST_CPUS
+build --local_resources=memory=HOST_RAM*.8
+build --local_resources=cpu=HOST_CPUS
 `
 	bazelrcPath := filepath.Join(repoDir, ".bazelrc.warmup")
 	if err := os.WriteFile(bazelrcPath, []byte(bazelrcContent), 0644); err != nil {

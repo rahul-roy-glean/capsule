@@ -173,8 +173,8 @@ func (vm *VM) Start(ctx context.Context) error {
 }
 
 // RestoreFromSnapshot restores the microVM from a snapshot.
-// The snapshot includes network and drive configuration, so we PATCH them to point
-// to new TAP devices and backing files for this specific runner.
+// It loads the snapshot, patches drive paths to match the current host layout,
+// then resumes the VM.
 func (vm *VM) RestoreFromSnapshot(ctx context.Context, snapshotPath, memPath string, resume bool) error {
 	vm.logger.WithFields(logrus.Fields{
 		"snapshot": snapshotPath,
@@ -194,29 +194,47 @@ func (vm *VM) RestoreFromSnapshot(ctx context.Context, snapshotPath, memPath str
 		return fmt.Errorf("failed to start firecracker: %w", err)
 	}
 
-	// Load the snapshot and resume immediately.
-	// NOTE: We're resuming directly without patching drives because:
-	// 1. Firecracker's PATCH /drives API has issues after snapshot load
-	// 2. The snapshot was created with the same drive paths we're using
-	// 3. Per-runner overlays can be implemented later using OverlayFS at the host level
+	// Load snapshot WITHOUT resuming so we can patch drives first.
+	// The snapshot bakes in the original drive paths (e.g., /tmp/snapshot/*),
+	// but the host has them at different locations (e.g., /mnt/data/snapshots/*).
 	if err := vm.client.LoadSnapshot(ctx, SnapshotLoadParams{
 		SnapshotPath: snapshotPath,
 		MemBackend: &MemBackend{
 			BackendPath: memPath,
 			BackendType: "File",
 		},
-		ResumeVM: resume, // Resume immediately - no drive patching needed
+		ResumeVM: false, // Don't resume yet - need to patch drives first
 	}); err != nil {
 		return fmt.Errorf("failed to load snapshot: %w", err)
 	}
 
-	// Log configured drives for debugging (not patching them for now)
-	vm.logger.WithField("rootfs_path", vm.config.RootfsPath).Debug("Using rootfs from snapshot (no patching)")
+	// Patch root drive to point to the correct path on this host
+	if vm.config.RootfsPath != "" {
+		vm.logger.WithFields(logrus.Fields{
+			"drive_id": "rootfs",
+			"path":     vm.config.RootfsPath,
+		}).Debug("Patching rootfs drive path")
+		if err := vm.client.PatchDrive(ctx, "rootfs", vm.config.RootfsPath); err != nil {
+			vm.logger.WithError(err).Warn("Failed to patch rootfs drive (may already be correct)")
+		}
+	}
+
+	// Patch additional drives (repo-cache, credentials, git-cache, etc.)
 	for _, drive := range vm.config.Drives {
 		vm.logger.WithFields(logrus.Fields{
 			"drive_id": drive.DriveID,
 			"path":     drive.PathOnHost,
-		}).Debug("Drive configured (using snapshot path)")
+		}).Debug("Patching drive path")
+		if err := vm.client.PatchDrive(ctx, drive.DriveID, drive.PathOnHost); err != nil {
+			vm.logger.WithError(err).Warn("Failed to patch drive (may already be correct)")
+		}
+	}
+
+	// Resume the VM now that drives are patched
+	if resume {
+		if err := vm.client.ResumeVM(ctx); err != nil {
+			return fmt.Errorf("failed to resume VM after snapshot load: %w", err)
+		}
 	}
 
 	// IMPORTANT: Network interface host_dev_name CANNOT be changed after snapshot load.
@@ -232,7 +250,6 @@ func (vm *VM) RestoreFromSnapshot(ctx context.Context, snapshotPath, memPath str
 
 	// NOTE: MMDS config IS persisted in the snapshot, so we don't need to set it again.
 	// After restore, we can PUT/PATCH MMDS data (done by caller after this function returns).
-	// Trying to set MMDS config after VM is resumed will fail with "operation not supported".
 
 	vm.logger.Info("MicroVM restored from snapshot successfully")
 	return nil

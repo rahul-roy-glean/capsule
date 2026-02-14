@@ -107,7 +107,7 @@ build {
   # Install KVM and virtualization tools
   provisioner "shell" {
     inline = [
-      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-kvm libvirt-daemon-system virtinst bridge-utils",
+      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-kvm bridge-utils",
       "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y linux-headers-$(uname -r) || true",
       "sudo modprobe kvm",
       "sudo modprobe kvm_intel || sudo modprobe kvm_amd || true"
@@ -133,6 +133,15 @@ build {
       "sudo rm -rf /tmp/release-v${var.firecracker_version}-$${ARCH}",
       "sudo chmod +x /usr/local/bin/firecracker /usr/local/bin/jailer",
       "firecracker --version"
+    ]
+  }
+
+  # Download guest kernel (5.10 - required for entropy device support)
+  provisioner "shell" {
+    inline = [
+      "sudo mkdir -p /opt/firecracker",
+      "sudo curl -fsSL -o /opt/firecracker/kernel.bin https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.14-def/x86_64/vmlinux-5.10.242",
+      "echo 'Guest kernel 5.10.242 installed at /opt/firecracker/kernel.bin'"
     ]
   }
 
