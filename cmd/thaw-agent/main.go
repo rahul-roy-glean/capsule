@@ -218,6 +218,21 @@ var metrics *telemetry.StructuredLogger
 var bootTimer *telemetry.Timer
 
 func main() {
+	// Top-level panic recovery: keep the process alive so the health server
+	// (:8081) remains accessible for debugging even if initialization panics.
+	defer func() {
+		if r := recover(); r != nil {
+			if log != nil {
+				log.WithField("panic", fmt.Sprintf("%v", r)).Error("Thaw agent panicked - keeping process alive for debugging")
+				globalLogBuffer.Add(fmt.Sprintf("[PANIC] %v", r))
+			} else {
+				fmt.Fprintf(os.Stderr, "PANIC: %v\n", r)
+			}
+			// Block forever so health server stays up
+			select {}
+		}
+	}()
+
 	flag.Parse()
 
 	// Setup logger
@@ -532,6 +547,23 @@ func main() {
 					}
 				}
 
+				// Sync clock from MMDS current_time BEFORE runner registration.
+				// The host sets current_time when building MMDS data. Without this,
+				// config.sh fails with "clock may be out of sync" because the guest
+				// clock is stuck at snapshot creation time.
+				if ct := newData.Latest.Meta.CurrentTime; ct != "" {
+					if hostTime, err := time.Parse(time.RFC3339, ct); err == nil {
+						tv := syscall.Timeval{Sec: hostTime.Unix()}
+						if err := syscall.Settimeofday(&tv); err == nil {
+							log.WithField("server_time", hostTime.UTC().Format(time.RFC3339)).Info("Clock synced from MMDS after snapshot restore (pre-registration)")
+						} else {
+							formatted := hostTime.UTC().Format("2006-01-02 15:04:05")
+							exec.Command("date", "-u", "-s", formatted).Run()
+							log.WithField("server_time", hostTime.UTC().Format(time.RFC3339)).Info("Clock synced via date command after snapshot restore")
+						}
+					}
+				}
+
 				break
 			}
 		}
@@ -568,9 +600,28 @@ func main() {
 			if mmdsData.Latest.Job.GitHubRunnerToken != "" {
 				log.Info("Registering GitHub Actions runner...")
 				globalRegistrationState.Attempted = true
-				if err := registerGitHubRunner(mmdsData); err != nil {
-					globalRegistrationState.Error = err.Error()
-					log.WithError(err).Error("Failed to register GitHub runner")
+				// Retry registration up to 3 times with backoff.
+				// Transient GitHub API errors ("Resource temporarily unavailable")
+				// are common when multiple VMs register simultaneously.
+				var regErr error
+				for attempt := 1; attempt <= 3; attempt++ {
+					if attempt > 1 {
+						delay := time.Duration(attempt*5) * time.Second
+						log.WithFields(logrus.Fields{
+							"attempt": attempt,
+							"delay":   delay,
+						}).Info("Retrying runner registration...")
+						time.Sleep(delay)
+					}
+					regErr = registerGitHubRunner(mmdsData)
+					if regErr == nil {
+						break
+					}
+					log.WithError(regErr).WithField("attempt", attempt).Warn("Runner registration attempt failed")
+				}
+				if regErr != nil {
+					globalRegistrationState.Error = regErr.Error()
+					log.WithError(regErr).Error("Failed to register GitHub runner after all retries")
 				} else {
 					globalRegistrationState.Success = true
 				}
@@ -2284,6 +2335,15 @@ func startHealthServer(mmdsData *MMDSData) {
 		Addr:    ":8080",
 		Handler: mux,
 	}
+
+	// Check if :8080 is already bound (from warmup mode). If so, skip —
+	// the warmup health server is already running and has the same endpoints.
+	ln, err := net.Listen("tcp", ":8080")
+	if err != nil {
+		log.Info("Health server :8080 already running (from warmup), skipping")
+		return
+	}
+	ln.Close()
 
 	log.Info("Attempting to start health server on :8080...")
 	if err := server.ListenAndServe(); err != nil {

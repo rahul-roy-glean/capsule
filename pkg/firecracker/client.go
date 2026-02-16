@@ -56,7 +56,7 @@ func NewClient(cfg Config) *Client {
 		vmID:       cfg.VMID,
 		httpClient: &http.Client{
 			Transport: transport,
-			Timeout:   5 * time.Minute, // Snapshot creation can take minutes for large memory VMs
+			Timeout:   10 * time.Minute, // Snapshot creation can take minutes for large memory VMs on standard disks
 		},
 		logger: logger.WithField("vm_id", cfg.VMID),
 	}
