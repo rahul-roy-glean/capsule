@@ -26,32 +26,34 @@ all: build
 # Build all binaries
 build: $(BINARIES)
 
+LINUX_BUILD = CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+
 firecracker-manager:
-	$(GO) build $(GOFLAGS) -o bin/firecracker-manager ./cmd/firecracker-manager
+	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/firecracker-manager ./cmd/firecracker-manager
 
 control-plane:
-	$(GO) build $(GOFLAGS) -o bin/control-plane ./cmd/control-plane
+	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/control-plane ./cmd/control-plane
 
 snapshot-builder:
-	$(GO) build $(GOFLAGS) -o bin/snapshot-builder ./cmd/snapshot-builder
+	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/snapshot-builder ./cmd/snapshot-builder
 
 thaw-agent:
-	CGO_ENABLED=0 GOOS=linux $(GO) build $(GOFLAGS) -o bin/thaw-agent ./cmd/thaw-agent
+	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/thaw-agent ./cmd/thaw-agent
 
 git-cache-builder:
-	$(GO) build $(GOFLAGS) -o bin/git-cache-builder ./cmd/git-cache-builder
+	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/git-cache-builder ./cmd/git-cache-builder
 
 git-cache-freshness:
-	$(GO) build $(GOFLAGS) -o bin/git-cache-freshness ./cmd/git-cache-freshness
+	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/git-cache-freshness ./cmd/git-cache-freshness
 
 data-snapshot-builder:
-	$(GO) build $(GOFLAGS) -o bin/data-snapshot-builder ./cmd/data-snapshot-builder
+	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/data-snapshot-builder ./cmd/data-snapshot-builder
 
 snapshot-converter:
-	$(GO) build $(GOFLAGS) -o bin/snapshot-converter ./cmd/snapshot-converter
+	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/snapshot-converter ./cmd/snapshot-converter
 
 bin-onboard:
-	$(GO) build $(GOFLAGS) -o bin/onboard ./cmd/onboard
+	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/onboard ./cmd/onboard
 
 onboard: bin-onboard
 	./bin/onboard --config=$(CONFIG) $(if $(STEPS),--steps=$(STEPS))
