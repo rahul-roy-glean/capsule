@@ -100,6 +100,7 @@ resource "google_compute_instance" "snapshot_builder" {
     gcp-project         = var.project_id
     debug-mode          = var.debug_mode ? "true" : "false"
     firecracker-version = var.firecracker_version
+    rootfs-size-gb      = var.rootfs_size_gb
   }
 
   metadata_startup_script = file("${path.module}/startup.sh")

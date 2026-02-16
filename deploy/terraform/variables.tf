@@ -185,7 +185,7 @@ variable "github_runner_enabled" {
 variable "max_runners_per_host" {
   description = "Maximum number of microVMs (runners) per host"
   type        = number
-  default     = 16
+  default     = 4
 }
 
 variable "idle_runners_target" {
@@ -197,13 +197,13 @@ variable "idle_runners_target" {
 variable "vcpus_per_runner" {
   description = "Number of vCPUs allocated to each microVM"
   type        = number
-  default     = 4
+  default     = 12
 }
 
 variable "memory_per_runner_mb" {
   description = "Memory in MB allocated to each microVM"
   type        = number
-  default     = 8192
+  default     = 49152
 }
 
 variable "runner_ephemeral" {

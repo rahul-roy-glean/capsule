@@ -92,3 +92,4 @@ temp/
 .cache/
 __pycache__/
 
+/deploy/terraform/tfplan
