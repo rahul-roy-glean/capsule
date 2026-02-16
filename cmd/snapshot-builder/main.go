@@ -99,6 +99,9 @@ func main() {
 			log.WithError(err).Fatal("Failed to get GitHub App installation token")
 		}
 
+		if installToken == "" {
+			log.Fatal("GitHub App installation token is empty - check App permissions and installation")
+		}
 		gitToken = installToken
 		log.Info("Successfully obtained GitHub App installation token for warmup")
 	}
