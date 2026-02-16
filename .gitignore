@@ -22,13 +22,13 @@ images/microvm/output/
 *.bin
 
 # Terraform
-deploy/terraform/.terraform/
-deploy/terraform/.terraform.lock.hcl
-deploy/terraform/tfplan
-deploy/terraform/*.tfstate
-deploy/terraform/*.tfstate.*
-deploy/terraform/*.tfvars
-!deploy/terraform/terraform.tfvars.example
+deploy/terraform/**/.terraform/
+deploy/terraform/**/.terraform.lock.hcl
+deploy/terraform/**/*.tfplan
+deploy/terraform/**/*.tfstate
+deploy/terraform/**/*.tfstate.*
+deploy/terraform/**/*.tfvars
+!deploy/terraform/**/*.tfvars.example
 
 # Packer
 deploy/packer/*.pkr.hcl.bak

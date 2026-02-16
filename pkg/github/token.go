@@ -103,6 +103,11 @@ func (c *TokenClient) GetInstallationToken(ctx context.Context) (string, error) 
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("failed to list installations: %s - %s", resp.Status, string(body))
+	}
+
 	var installations []struct {
 		ID int64 `json:"id"`
 	}
@@ -125,11 +130,20 @@ func (c *TokenClient) GetInstallationToken(ctx context.Context) (string, error) 
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("failed to create installation token: %s - %s", resp.Status, string(body))
+	}
+
 	var tokenResp struct {
 		Token string `json:"token"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
 		return "", fmt.Errorf("failed to decode token response: %w", err)
+	}
+
+	if tokenResp.Token == "" {
+		return "", fmt.Errorf("GitHub API returned empty installation token")
 	}
 
 	return tokenResp.Token, nil

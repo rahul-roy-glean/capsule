@@ -187,7 +187,7 @@ docs/                    Documentation
 
 ### MMDS
 
-Firecracker's Metadata Data Store (MMDS) passes configuration to the guest VM via a virtual network device at `169.254.169.254`. The manager writes runner config (network, job details, git-cache paths) into MMDS before starting or restoring a VM. The thaw agent reads it on boot.
+Firecracker's Metadata Data Store (MMDS) passes configuration to the guest VM via a virtual network device at `169.254.169.254` (when IP is this, instead of routing this the request through TAP, firecracker has a user mode TCP impl to handle these. TAP, terminal access point, for Guest OS is like a ethernet adaptor, but for host OS, its just a file description where firecracker is writing to and reading from). The manager writes runner config (network, job details, git-cache paths) into MMDS before starting or restoring a VM. The thaw agent reads it on boot.
 
 ### Runner Pooling
 
@@ -195,7 +195,7 @@ When enabled, completed runners are paused instead of destroyed. The next job wi
 
 ### Git Cache
 
-An ext4 image containing bare git mirrors of the target repository. Attached as a read-only block device to each microVM. The thaw agent uses it as a `--reference` for `git clone`, avoiding network fetches for most objects. Enables fast cloning of private repos without network auth tokens in the snapshot.
+An ext4 image containing bare git mirrors of the target repository. Attached as a read-only block device to each microVM. The thaw agent uses it as a `--reference` for `git clone`, avoiding network fetches for most objects. Enables fast cloning of private repos without network auth tokens in the snapshot. When git tries to fetch any object, it first look at the referenced local path, and if object is present at the referenced path it reduces network i/o.
 
 ## Useful Make Targets
 
