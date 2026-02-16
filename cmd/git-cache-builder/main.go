@@ -403,7 +403,7 @@ func gsutilCopy(src, dst string, log *logrus.Entry) error {
 		"dst": dst,
 	}).Debug("Uploading to GCS")
 
-	cmd := exec.Command("gsutil", "-o", "GSUtil:parallel_composite_upload_threshold=150M", "cp", src, dst)
+	cmd := exec.Command("gcloud", "storage", "cp", src, dst)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()

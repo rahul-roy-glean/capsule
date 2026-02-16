@@ -57,25 +57,9 @@ RUN add-apt-repository -y ppa:deadsnakes/ppa \
 # Install build tools and languages
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    python3.10 \
-    python3.10-dev \
-    python3.10-distutils \
     python3.12 \
-    python3.12-dev \
-    python3.12-venv \
-    openjdk-17-jdk-headless \
-    golang-1.22-go \
-    maven \
     && rm -rf /var/lib/apt/lists/*
 
-# Setup Go
-RUN ln -s /usr/lib/go-1.22/bin/go /usr/bin/go
-
-# Install gcloud CLI
-RUN curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
-    && echo 'deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main' > /etc/apt/sources.list.d/google-cloud-sdk.list \
-    && apt-get update && apt-get install -y google-cloud-cli google-cloud-cli-gke-gcloud-auth-plugin \
-    && rm -rf /var/lib/apt/lists/*
 
 # Install Bazelisk
 ARG BAZELISK_VERSION=1.27.0
@@ -118,29 +102,6 @@ RUN mkdir -p /workspace /var/run/thaw-agent /var/log/thaw-agent \
 RUN echo 'build --repository_cache=/mnt/ephemeral/caches/repository' > /home/gleanuser/.bazelrc \
     && chown gleanuser:gleanuser /home/gleanuser/.bazelrc
 
-# Install crane (for OCI image operations)
-RUN curl -sL "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz" \
-    | tar -xzf - -C /usr/local/bin/ crane
-
-# Install cloud-sql-proxy
-RUN curl -o /usr/local/bin/cloud-sql-proxy \
-    'https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.20.0/cloud-sql-proxy.linux.amd64' \
-    && chmod +x /usr/local/bin/cloud-sql-proxy
-
-# Install kubectl
-RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
-    && chmod +x kubectl && mv kubectl /usr/local/bin/
-
-# Install terraform
-RUN curl -LO https://releases.hashicorp.com/terraform/1.10.4/terraform_1.10.4_linux_amd64.zip \
-    && unzip terraform_1.10.4_linux_amd64.zip && mv terraform /usr/local/bin/ && rm terraform_1.10.4_linux_amd64.zip
-
-# Install AWS CLI
-RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
-    && unzip awscliv2.zip && ./aws/install && rm -rf aws awscliv2.zip
-
-# Install Azure CLI
-RUN curl -sL https://aka.ms/InstallAzureCLIDeb | bash
 
 # Configure systemd
 RUN systemctl set-default multi-user.target \

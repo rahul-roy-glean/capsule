@@ -358,10 +358,10 @@ func copyFromGCS(ctx context.Context, gcsPath, destDir string) error {
 	if !strings.HasSuffix(gcsPath, "/") {
 		gcsPath += "/"
 	}
-	cmd := exec.CommandContext(ctx, "gsutil", "-m", "rsync", "-r", gcsPath, destDir)
+	cmd := exec.CommandContext(ctx, "gcloud", "storage", "rsync", "-r", gcsPath, destDir)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("gsutil rsync failed: %s: %w", string(output), err)
+		return fmt.Errorf("gcloud storage rsync failed: %s: %w", string(output), err)
 	}
 	return nil
 }
@@ -495,9 +495,9 @@ func uploadMetadataToGCS(ctx context.Context, metadata []byte, gcsPath string) e
 	}
 	tmpFile.Close()
 
-	cmd := exec.CommandContext(ctx, "gsutil", "cp", tmpFile.Name(), gcsPath)
+	cmd := exec.CommandContext(ctx, "gcloud", "storage", "cp", tmpFile.Name(), gcsPath)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("gsutil cp failed: %s: %w", string(output), err)
+		return fmt.Errorf("gcloud storage cp failed: %s: %w", string(output), err)
 	}
 	return nil
 }

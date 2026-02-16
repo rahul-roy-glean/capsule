@@ -107,6 +107,30 @@ func (b *WarmupLogBuffer) Since(afterSeq int64) ([]string, int64) {
 
 var globalWarmupLogs = &WarmupLogBuffer{}
 
+// globalLogBuffer captures all logrus log entries for the /logs HTTP endpoint.
+// This allows debugging thaw-agent behavior from the host via:
+//   curl http://<vm-ip>:8081/logs
+var globalLogBuffer = &WarmupLogBuffer{}
+
+// logCaptureHook is a logrus hook that captures log entries into globalLogBuffer.
+type logCaptureHook struct{}
+
+func (h *logCaptureHook) Levels() []logrus.Level {
+	return logrus.AllLevels
+}
+
+func (h *logCaptureHook) Fire(entry *logrus.Entry) error {
+	msg := fmt.Sprintf("[%s] %s: %s", entry.Time.Format("15:04:05"), entry.Level.String(), entry.Message)
+	for k, v := range entry.Data {
+		if k == "component" {
+			continue
+		}
+		msg += fmt.Sprintf(" %s=%v", k, v)
+	}
+	globalLogBuffer.Add(msg)
+	return nil
+}
+
 var globalWarmupState = &WarmupState{
 	Phase:     "initializing",
 	StartedAt: time.Now(),
@@ -141,7 +165,8 @@ type MMDSData struct {
 			RunnerID    string `json:"runner_id"`
 			HostID      string `json:"host_id"`
 			Environment string `json:"environment"`
-			Mode        string `json:"mode,omitempty"` // "warmup" for snapshot building, empty for normal runner
+			Mode        string `json:"mode,omitempty"`         // "warmup" for snapshot building, empty for normal runner
+			CurrentTime string `json:"current_time,omitempty"` // RFC3339 timestamp from host for clock sync
 		} `json:"meta"`
 		Buildbarn struct {
 			CertsMountPath string `json:"certs_mount_path,omitempty"`
@@ -203,6 +228,7 @@ func main() {
 		level = logrus.InfoLevel
 	}
 	log.SetLevel(level)
+	log.AddHook(&logCaptureHook{})
 
 	// Start boot timer immediately
 	bootTimer = telemetry.NewTimer()
@@ -232,6 +258,13 @@ func main() {
 			stepMutex.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]string{"step": step})
+		})
+		http.HandleFunc("/logs", func(w http.ResponseWriter, r *http.Request) {
+			lines, _ := globalLogBuffer.Since(0)
+			w.Header().Set("Content-Type", "text/plain")
+			for _, line := range lines {
+				fmt.Fprintln(w, line)
+			}
 		})
 		if err := http.ListenAndServe(":8081", nil); err != nil {
 			log.WithError(err).Debug("Early health server failed")
@@ -318,7 +351,7 @@ func main() {
 
 	// Resync clock
 	log.Info("Resyncing clock...")
-	if err := resyncClock(); err != nil {
+	if err := resyncClock(mmdsData); err != nil {
 		log.WithError(err).Warn("Failed to resync clock")
 	}
 	bootTimer.Phase("clock_sync")
@@ -569,6 +602,11 @@ func main() {
 		"total_ms": bootTimer.Total().Milliseconds(),
 		"phases":   bootTimer.PhaseMap(),
 	}).Info("Thaw agent initialization complete")
+
+	// After snapshot restore, this process resumes from here (not from main()).
+	// The host sets new MMDS data (including current_time) after restore.
+	// Poll MMDS for clock sync and re-run initialization if we detect a restore.
+	go watchForSnapshotRestore()
 
 	// Block forever - health server runs in background, runner runs as separate process
 	select {}
@@ -847,6 +885,7 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					HostID      string `json:"host_id"`
 					Environment string `json:"environment"`
 					Mode        string `json:"mode,omitempty"`
+					CurrentTime string `json:"current_time,omitempty"`
 				} `json:"meta"`
 				Buildbarn struct {
 					CertsMountPath string `json:"certs_mount_path,omitempty"`
@@ -1070,16 +1109,202 @@ func regenerateHostname(runnerID string) error {
 	return exec.Command("hostname", hostname).Run()
 }
 
-func resyncClock() error {
-	// Try to sync with NTP
-	if err := exec.Command("hwclock", "--hctosys").Run(); err != nil {
-		log.WithError(err).Debug("hwclock sync failed, trying ntpdate")
+// watchForSnapshotRestore polls MMDS for a current_time field and syncs the
+// guest clock when it appears. After snapshot restore, the thaw-agent process
+// resumes from where it was paused (at select{} in main). The host manager
+// sets new MMDS data (including current_time) after restore. This goroutine
+// detects that and syncs the clock so GitHub runner registration can succeed.
+func watchForSnapshotRestore() {
+	endpoint := *mmdsEndpoint + "/latest/meta/current_time"
+	lastTime := ""
+
+	for {
+		time.Sleep(1 * time.Second)
+
+		req, err := http.NewRequest("GET", endpoint, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Accept", "application/json")
+
+		// Use a fresh client per request — after snapshot restore, pooled
+		// connections in http.DefaultClient are stale/dead.
+		client := &http.Client{
+			Timeout: 3 * time.Second,
+			Transport: &http.Transport{
+				DisableKeepAlives: true,
+			},
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil || resp.StatusCode != 200 {
+			continue
+		}
+
+		// MMDS V1 returns the value as a JSON string (quoted) or plain text
+		ct := strings.TrimSpace(string(body))
+		ct = strings.Trim(ct, "\"") // Remove JSON quotes if present
+		if ct == "" || ct == lastTime {
+			continue
+		}
+
+		// New current_time detected — this means we were restored from a snapshot
+		lastTime = ct
+		hostTime, err := time.Parse(time.RFC3339, ct)
+		if err != nil {
+			log.WithError(err).Warn("watchForSnapshotRestore: failed to parse current_time")
+			continue
+		}
+
+		tv := syscall.Timeval{
+			Sec:  hostTime.Unix(),
+			Usec: 0,
+		}
+		if err := syscall.Settimeofday(&tv); err != nil {
+			// Fallback: use date command
+			formatted := hostTime.UTC().Format("2006-01-02 15:04:05")
+			if output, err := exec.Command("date", "-u", "-s", formatted).CombinedOutput(); err != nil {
+				log.WithError(err).WithField("output", string(output)).Warn("watchForSnapshotRestore: date command failed")
+				continue
+			}
+		}
+
+		log.WithFields(logrus.Fields{
+			"source":      "mmds-watcher",
+			"server_time": hostTime.UTC().Format(time.RFC3339),
+		}).Info("Clock synced from MMDS after snapshot restore")
+	}
+}
+
+func resyncClock(mmdsData *MMDSData) error {
+	// After snapshot restore, the guest clock is stuck at snapshot creation time.
+	// We need to set it to current time before GitHub runner registration (which
+	// rejects clocks skewed >5 minutes).
+
+	// Method 1: Use the host timestamp from MMDS (most reliable, no network needed).
+	// The host manager sets meta.current_time when building MMDS data.
+	if mmdsData != nil && mmdsData.Latest.Meta.CurrentTime != "" {
+		hostTime, err := time.Parse(time.RFC3339, mmdsData.Latest.Meta.CurrentTime)
+		if err == nil {
+			tv := syscall.Timeval{
+				Sec:  hostTime.Unix(),
+				Usec: 0,
+			}
+			if err := syscall.Settimeofday(&tv); err == nil {
+				log.WithFields(logrus.Fields{
+					"source":      "mmds",
+					"server_time": hostTime.UTC().Format(time.RFC3339),
+				}).Info("Clock synced from MMDS host timestamp")
+				return nil
+			}
+			// Fallback: use date command
+			formatted := hostTime.UTC().Format("2006-01-02 15:04:05")
+			if output, err := exec.Command("date", "-u", "-s", formatted).CombinedOutput(); err == nil {
+				log.WithFields(logrus.Fields{
+					"source":      "mmds+date",
+					"server_time": hostTime.UTC().Format(time.RFC3339),
+				}).Info("Clock synced from MMDS host timestamp via date command")
+				return nil
+			} else {
+				log.WithError(err).WithField("output", string(output)).Warn("Clock sync: date command failed for MMDS time")
+			}
+		} else {
+			log.WithError(err).WithField("time_str", mmdsData.Latest.Meta.CurrentTime).Warn("Clock sync: failed to parse MMDS timestamp")
+		}
 	}
 
-	// Try ntpdate if available
-	exec.Command("ntpdate", "-u", "pool.ntp.org").Run()
+	// Method 2: Fetch time from an HTTP server via Date header.
+	// IMPORTANT: Use plain HTTP (not HTTPS) because clock skew breaks TLS.
+	// Retry multiple times because network may not be fully ready.
+	sources := []string{
+		"http://connectivitycheck.gstatic.com/generate_204",
+		"http://www.gstatic.com/generate_204",
+		"http://www.google.com",
+	}
 
-	return nil
+	// Disable redirects so we get the Date header from the first response
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// Retry up to 5 times with increasing delays, because the network
+	// stack may need time to settle after snapshot restore + reconfiguration.
+	for attempt := 0; attempt < 5; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(attempt) * time.Second
+			log.WithFields(logrus.Fields{
+				"attempt": attempt + 1,
+				"delay":   delay,
+			}).Debug("Clock sync: retrying after delay")
+			time.Sleep(delay)
+		}
+
+		for _, url := range sources {
+			req, err := http.NewRequest("HEAD", url, nil)
+			if err != nil {
+				continue
+			}
+
+			resp, err := client.Do(req)
+			if err != nil {
+				log.WithError(err).WithField("url", url).Debug("Clock sync: failed to reach server")
+				continue
+			}
+			resp.Body.Close()
+
+			dateStr := resp.Header.Get("Date")
+			if dateStr == "" {
+				log.WithField("url", url).Debug("Clock sync: no Date header")
+				continue
+			}
+
+			// Parse HTTP date (RFC1123 format: "Sat, 14 Feb 2026 15:00:00 GMT")
+			serverTime, err := http.ParseTime(dateStr)
+			if err != nil {
+				log.WithError(err).WithField("date", dateStr).Debug("Clock sync: failed to parse Date header")
+				continue
+			}
+
+			// Set system clock
+			tv := syscall.Timeval{
+				Sec:  serverTime.Unix(),
+				Usec: 0,
+			}
+			if err := syscall.Settimeofday(&tv); err != nil {
+				log.WithError(err).Debug("Clock sync: settimeofday failed, trying date command")
+				// Fallback: use date command
+				formatted := serverTime.UTC().Format("2006-01-02 15:04:05")
+				if output, err := exec.Command("date", "-u", "-s", formatted).CombinedOutput(); err != nil {
+					log.WithError(err).WithField("output", string(output)).Warn("Clock sync: date command failed")
+					continue
+				}
+			}
+
+			log.WithFields(logrus.Fields{
+				"source":      url,
+				"server_time": serverTime.UTC().Format(time.RFC3339),
+				"attempt":     attempt + 1,
+			}).Info("Clock synced from HTTP Date header")
+			return nil
+		}
+	}
+
+	// Last resort: try ntpdate if available
+	if output, err := exec.Command("ntpdate", "-u", "pool.ntp.org").CombinedOutput(); err == nil {
+		log.Info("Clock synced via ntpdate")
+		return nil
+	} else {
+		log.WithError(err).WithField("output", string(output)).Debug("ntpdate fallback failed")
+	}
+
+	return fmt.Errorf("failed to sync clock from any source")
 }
 
 func mountGitCache(data *MMDSData) error {
@@ -1600,26 +1825,51 @@ build --local_resources=cpu=HOST_CPUS
 
 	bazelEnv := append(os.Environ(), "HOME=/home/"+*runnerUsername)
 
-	// Configure GCP auth if access token is available (for Artifact Registry PyPI access)
+	// Configure GCP auth if access token is available (for Artifact Registry access)
 	if data.Latest.Job.GCPAccessToken != "" {
-		log.Info("Configuring GCP Application Default Credentials for Artifact Registry access")
-		globalWarmupLogs.Add("[auth] Configuring GCP ADC for Artifact Registry")
+		log.Info("Configuring GCP auth for Artifact Registry access")
+		globalWarmupLogs.Add("[auth] Configuring GCP auth for Artifact Registry")
 
-		// Write ADC JSON that tools like pip/keyring can use
-		adcJSON := fmt.Sprintf(`{"type":"authorized_user","token":"%s"}`, data.Latest.Job.GCPAccessToken)
-		adcPath := "/tmp/gcp-adc.json"
-		if err := os.WriteFile(adcPath, []byte(adcJSON), 0600); err != nil {
-			log.WithError(err).Warn("Failed to write ADC file")
+		token := data.Latest.Job.GCPAccessToken
+
+		// The scio repo's .bazelrc uses credential helpers:
+		//   common --credential_helper="*.us-central1-python.pkg.dev=%workspace%/tools/ci_registry_cred_helper.sh"
+		// That script calls `gcloud auth print-access-token`, but gcloud isn't in the microVM.
+		// Fix: install a fake `gcloud` shim that returns our access token.
+		// This makes the existing credential helper work without modification.
+		shimDir := "/usr/local/bin"
+		shimScript := fmt.Sprintf(`#!/bin/sh
+# Shim installed by thaw-agent for Artifact Registry auth in microVM
+# Returns the access token passed via MMDS from the host
+case "$1" in
+  auth)
+    case "$2" in
+      print-access-token) echo '%s' ;;
+      application-default) echo '%s' ;;
+      *) echo '%s' ;;
+    esac
+    ;;
+  config)
+    # keyrings.google-artifactregistry-auth calls:
+    #   gcloud config config-helper --format=json(credential)
+    # and parses credential.access_token + credential.token_expiry from JSON
+    echo '{"credential":{"access_token":"%s","token_expiry":"2099-12-31T23:59:59Z"}}'
+    ;;
+  *) echo '%s' ;;
+esac
+`, token, token, token, token, token)
+
+		shimPath := filepath.Join(shimDir, "gcloud")
+		if err := os.WriteFile(shimPath, []byte(shimScript), 0755); err != nil {
+			log.WithError(err).Warn("Failed to write gcloud shim")
 		} else {
-			bazelEnv = append(bazelEnv,
-				"GOOGLE_APPLICATION_CREDENTIALS="+adcPath,
-				"CLOUDSDK_AUTH_ACCESS_TOKEN="+data.Latest.Job.GCPAccessToken,
-			)
-			// Also configure gcloud with the access token so credential helpers work
-			exec.Command("gcloud", "config", "set", "auth/access_token_file", adcPath).Run()
-			exec.Command("gcloud", "config", "set", "project", "scio-engineering").Run()
-			log.Info("GCP auth configured for warmup")
+			log.Info("Installed gcloud shim for credential helper")
 		}
+
+		// Also set env vars as fallback
+		bazelEnv = append(bazelEnv, "CLOUDSDK_AUTH_ACCESS_TOKEN="+token)
+
+		log.Info("GCP auth configured for warmup")
 	} else {
 		log.Warn("No GCP access token available - Artifact Registry deps will fail")
 		globalWarmupLogs.Add("[auth] No GCP access token - private PyPI deps will be skipped")

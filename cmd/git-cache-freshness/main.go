@@ -139,9 +139,9 @@ func downloadMetadata(ctx context.Context, bucket string) (*GitCacheMetadata, er
 	defer os.Remove(tmpFile.Name())
 	tmpFile.Close()
 
-	cmd := exec.CommandContext(ctx, "gsutil", "cp", gcsPath, tmpFile.Name())
+	cmd := exec.CommandContext(ctx, "gcloud", "storage", "cp", gcsPath, tmpFile.Name())
 	if output, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("gsutil cp failed: %s: %w", string(output), err)
+		return nil, fmt.Errorf("gcloud storage cp failed: %s: %w", string(output), err)
 	}
 
 	data, err := os.ReadFile(tmpFile.Name())

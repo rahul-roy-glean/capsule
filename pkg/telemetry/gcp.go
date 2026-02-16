@@ -136,6 +136,13 @@ func (c *Client) Flush(ctx context.Context) {
 	c.buffer = make([]*monitoringpb.TimeSeries, 0, c.config.BufferSize)
 	c.mu.Unlock()
 
+	// Deduplicate: Cloud Monitoring rejects multiple points for the same
+	// TimeSeries (metric type + labels + resource) in a single request.
+	// This happens when gauge metrics are recorded more frequently than the
+	// flush interval (e.g., autoscaler records every 5s, flush every 10s).
+	// Keep only the last (most recent) entry for each unique TimeSeries key.
+	timeSeries = deduplicateTimeSeries(timeSeries)
+
 	// Cloud Monitoring API limits to 200 time series per request
 	const batchSize = 200
 	for i := 0; i < len(timeSeries); i += batchSize {
@@ -156,6 +163,37 @@ func (c *Client) Flush(ctx context.Context) {
 			c.logger.WithField("count", len(batch)).Debug("Flushed metrics")
 		}
 	}
+}
+
+// timeSeriesKey returns a string key that uniquely identifies a TimeSeries
+// (metric type + sorted labels). Two entries with the same key cannot coexist
+// in a single CreateTimeSeries request.
+func timeSeriesKey(ts *monitoringpb.TimeSeries) string {
+	key := ts.Metric.Type
+	for k, v := range ts.Metric.Labels {
+		key += "|" + k + "=" + v
+	}
+	return key
+}
+
+// deduplicateTimeSeries removes duplicate TimeSeries entries, keeping the last
+// (most recent) entry for each unique metric type + labels combination.
+func deduplicateTimeSeries(series []*monitoringpb.TimeSeries) []*monitoringpb.TimeSeries {
+	seen := make(map[string]int, len(series)) // key -> index in result
+	result := make([]*monitoringpb.TimeSeries, 0, len(series))
+
+	for _, ts := range series {
+		key := timeSeriesKey(ts)
+		if idx, exists := seen[key]; exists {
+			// Replace earlier entry with this newer one
+			result[idx] = ts
+		} else {
+			seen[key] = len(result)
+			result = append(result, ts)
+		}
+	}
+
+	return result
 }
 
 // metricType returns the full metric type string.

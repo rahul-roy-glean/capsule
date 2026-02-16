@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -45,7 +45,7 @@ func NewUploader(ctx context.Context, cfg UploaderConfig) (*Uploader, error) {
 	}, nil
 }
 
-// UploadSnapshot uploads a snapshot to GCS
+// UploadSnapshot uploads a snapshot to GCS using parallel gcloud storage cp calls
 func (u *Uploader) UploadSnapshot(ctx context.Context, localDir string, metadata SnapshotMetadata) error {
 	version := metadata.Version
 	u.logger.WithField("version", version).Info("Uploading snapshot to GCS")
@@ -64,15 +64,6 @@ func (u *Uploader) UploadSnapshot(ctx context.Context, localDir string, metadata
 		{filepath.Join(localDir, "repo-cache-seed.img"), fmt.Sprintf("%s/repo-cache-seed.img", version)},
 	}
 
-	bucket := u.gcsClient.Bucket(u.gcsBucket)
-
-	// Upload each file
-	for _, f := range files {
-		if err := u.uploadFile(ctx, bucket, f.local, f.remote); err != nil {
-			return fmt.Errorf("failed to upload %s: %w", f.local, err)
-		}
-	}
-
 	// Calculate total size
 	var totalSize int64
 	for _, f := range files {
@@ -83,12 +74,37 @@ func (u *Uploader) UploadSnapshot(ctx context.Context, localDir string, metadata
 	}
 	metadata.SizeBytes = totalSize
 
-	// Upload metadata
+	// Upload all files concurrently
+	type uploadResult struct {
+		file string
+		err  error
+	}
+	ch := make(chan uploadResult, len(files))
+	for _, f := range files {
+		f := f // capture loop variable
+		go func() {
+			ch <- uploadResult{f.local, u.uploadFile(ctx, f.local, f.remote)}
+		}()
+	}
+
+	var uploadErrors []string
+	for range files {
+		r := <-ch
+		if r.err != nil {
+			uploadErrors = append(uploadErrors, fmt.Sprintf("%s: %v", r.file, r.err))
+		}
+	}
+	if len(uploadErrors) > 0 {
+		return fmt.Errorf("failed to upload files: %s", joinErrors(uploadErrors))
+	}
+
+	// Upload metadata (small file, use Go client directly)
 	metadataJSON, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal metadata: %w", err)
 	}
 
+	bucket := u.gcsClient.Bucket(u.gcsBucket)
 	metadataObj := bucket.Object(fmt.Sprintf("%s/metadata.json", version))
 	writer := metadataObj.NewWriter(ctx)
 	writer.ContentType = "application/json"
@@ -110,59 +126,60 @@ func (u *Uploader) UploadSnapshot(ctx context.Context, localDir string, metadata
 	return nil
 }
 
-// uploadFile uploads a single file to GCS
-func (u *Uploader) uploadFile(ctx context.Context, bucket *storage.BucketHandle, localPath, remotePath string) error {
+func joinErrors(errs []string) string {
+	result := ""
+	for i, e := range errs {
+		if i > 0 {
+			result += "; "
+		}
+		result += e
+	}
+	return result
+}
+
+// uploadFile uploads a single file to GCS using gcloud storage cp with parallel composite upload
+func (u *Uploader) uploadFile(ctx context.Context, localPath, remotePath string) error {
+	gcsURI := fmt.Sprintf("gs://%s/%s", u.gcsBucket, remotePath)
 	u.logger.WithFields(logrus.Fields{
 		"local":  localPath,
-		"remote": remotePath,
-	}).Debug("Uploading file")
+		"remote": gcsURI,
+	}).Info("Uploading file via gcloud storage")
 
-	file, err := os.Open(localPath)
-	if err != nil {
-		return fmt.Errorf("failed to open file: %w", err)
-	}
-	defer file.Close()
+	cmd := exec.CommandContext(ctx, "gcloud", "storage", "cp", localPath, gcsURI)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 
-	obj := bucket.Object(remotePath)
-	writer := obj.NewWriter(ctx)
-
-	// Set content type based on extension
-	switch filepath.Ext(localPath) {
-	case ".json":
-		writer.ContentType = "application/json"
-	default:
-		writer.ContentType = "application/octet-stream"
-	}
-
-	if _, err := io.Copy(writer, file); err != nil {
-		writer.Close()
-		return fmt.Errorf("failed to copy file: %w", err)
-	}
-
-	if err := writer.Close(); err != nil {
-		return fmt.Errorf("failed to close writer: %w", err)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("gcloud storage cp failed for %s: %w", filepath.Base(localPath), err)
 	}
 
 	return nil
 }
 
-// UpdateCurrentPointer updates the "current" pointer to a new version
+// UpdateCurrentPointer updates the "current" pointer to a new version by writing
+// a small JSON pointer file instead of copying all snapshot objects (~58GB).
 func (u *Uploader) UpdateCurrentPointer(ctx context.Context, version string) error {
 	u.logger.WithField("version", version).Info("Updating current pointer")
 
+	pointer := struct {
+		Version string `json:"version"`
+	}{Version: version}
+
+	pointerJSON, err := json.Marshal(pointer)
+	if err != nil {
+		return fmt.Errorf("failed to marshal pointer: %w", err)
+	}
+
 	bucket := u.gcsClient.Bucket(u.gcsBucket)
-
-	// Copy all files from version to current
-	files := []string{"kernel.bin", "rootfs.img", "snapshot.mem", "snapshot.state", "repo-cache-seed.img", "metadata.json"}
-
-	for _, file := range files {
-		src := bucket.Object(fmt.Sprintf("%s/%s", version, file))
-		dst := bucket.Object(fmt.Sprintf("current/%s", file))
-
-		copier := dst.CopierFrom(src)
-		if _, err := copier.Run(ctx); err != nil {
-			return fmt.Errorf("failed to copy %s to current: %w", file, err)
-		}
+	obj := bucket.Object("current-pointer.json")
+	writer := obj.NewWriter(ctx)
+	writer.ContentType = "application/json"
+	if _, err := writer.Write(pointerJSON); err != nil {
+		writer.Close()
+		return fmt.Errorf("failed to write pointer: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("failed to close pointer writer: %w", err)
 	}
 
 	u.logger.Info("Current pointer updated successfully")

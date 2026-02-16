@@ -182,13 +182,28 @@ resource "google_compute_instance_template" "firecracker_host" {
       # Download from GCS
       if [ -n "$SNAPSHOT_BUCKET" ]; then
         echo "Downloading Firecracker snapshot artifacts from GCS..."
-        gsutil -m rsync -r "gs://$SNAPSHOT_BUCKET/current/" /mnt/data/snapshots/ || true
-        
+
+        # Try to resolve versioned directory via pointer file
+        SNAPSHOT_VERSION=""
+        POINTER_FILE=$(mktemp)
+        if gcloud storage cp "gs://$SNAPSHOT_BUCKET/current-pointer.json" "$POINTER_FILE" 2>/dev/null; then
+          SNAPSHOT_VERSION=$(python3 -c "import json; print(json.load(open('$POINTER_FILE'))['version'])" 2>/dev/null || true)
+        fi
+        rm -f "$POINTER_FILE"
+
+        if [ -n "$SNAPSHOT_VERSION" ]; then
+          echo "Resolved current pointer to version: $SNAPSHOT_VERSION"
+          gcloud storage rsync -r "gs://$SNAPSHOT_BUCKET/$SNAPSHOT_VERSION/" /mnt/data/snapshots/ || true
+        else
+          echo "No pointer file found, falling back to current/ directory"
+          gcloud storage rsync -r "gs://$SNAPSHOT_BUCKET/current/" /mnt/data/snapshots/ || true
+        fi
+
         # Download git-cache.img if it exists
         GIT_CACHE_GCS="gs://$SNAPSHOT_BUCKET/git-cache/current/git-cache.img"
-        if gsutil -q stat "$GIT_CACHE_GCS" 2>/dev/null; then
+        if gcloud storage ls "$GIT_CACHE_GCS" 2>/dev/null; then
           echo "Downloading git-cache.img from GCS..."
-          gsutil cp "$GIT_CACHE_GCS" /mnt/data/git-cache.img
+          gcloud storage cp "$GIT_CACHE_GCS" /mnt/data/git-cache.img
         fi
       fi
     fi

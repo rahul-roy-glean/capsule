@@ -378,7 +378,7 @@ apt-get install -y -qq git
 
 # Download snapshot-builder binary (should be in the image or GCS)
 if [ ! -f /usr/local/bin/snapshot-builder ]; then
-    gsutil cp gs://%s/bin/snapshot-builder /usr/local/bin/snapshot-builder
+    gcloud storage cp gs://%s/bin/snapshot-builder /usr/local/bin/snapshot-builder
     chmod +x /usr/local/bin/snapshot-builder
 fi
 
@@ -903,29 +903,29 @@ func (sm *SnapshotManager) checkHostHealth(ctx context.Context, host *Host) (boo
 	return resp.StatusCode == http.StatusOK, nil
 }
 
-// updateGCSCurrentPointer updates the "current" folder in GCS to point to the new version
+// updateGCSCurrentPointer writes a small JSON pointer file instead of copying
+// all snapshot objects (~58GB), reducing pointer update from minutes to <1 second.
 func (sm *SnapshotManager) updateGCSCurrentPointer(ctx context.Context, version string) error {
 	bucket := sm.gcsClient.Bucket(sm.gcsBucket)
 
-	files := []string{"kernel.bin", "rootfs.img", "repo-cache-seed.img", "metadata.json"}
+	pointer := struct {
+		Version string `json:"version"`
+	}{Version: version}
 
-	// Optional snapshot files
-	optionalFiles := []string{"snapshot.mem", "snapshot.state"}
-	for _, f := range optionalFiles {
-		src := bucket.Object(fmt.Sprintf("%s/%s", version, f))
-		if _, err := src.Attrs(ctx); err == nil {
-			files = append(files, f)
-		}
+	pointerJSON, err := json.Marshal(pointer)
+	if err != nil {
+		return fmt.Errorf("failed to marshal pointer: %w", err)
 	}
 
-	for _, file := range files {
-		src := bucket.Object(fmt.Sprintf("%s/%s", version, file))
-		dst := bucket.Object(fmt.Sprintf("current/%s", file))
-
-		copier := dst.CopierFrom(src)
-		if _, err := copier.Run(ctx); err != nil {
-			return fmt.Errorf("failed to copy %s to current: %w", file, err)
-		}
+	obj := bucket.Object("current-pointer.json")
+	writer := obj.NewWriter(ctx)
+	writer.ContentType = "application/json"
+	if _, err := writer.Write(pointerJSON); err != nil {
+		writer.Close()
+		return fmt.Errorf("failed to write pointer: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("failed to close pointer writer: %w", err)
 	}
 
 	sm.logger.WithField("version", version).Info("Updated GCS current pointer")

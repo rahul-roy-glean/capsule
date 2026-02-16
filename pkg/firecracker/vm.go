@@ -173,8 +173,11 @@ func (vm *VM) Start(ctx context.Context) error {
 }
 
 // RestoreFromSnapshot restores the microVM from a snapshot.
-// It loads the snapshot, patches drive paths to match the current host layout,
-// then resumes the VM.
+//
+// The caller must ensure that drive backing files are accessible at the paths
+// baked into the snapshot state file. The snapshot-builder creates drives at
+// /tmp/snapshot/*.img, so symlinks from those paths to the actual host paths
+// must exist before calling this function (see Manager.setupSnapshotSymlinks).
 func (vm *VM) RestoreFromSnapshot(ctx context.Context, snapshotPath, memPath string, resume bool) error {
 	vm.logger.WithFields(logrus.Fields{
 		"snapshot": snapshotPath,
@@ -194,47 +197,18 @@ func (vm *VM) RestoreFromSnapshot(ctx context.Context, snapshotPath, memPath str
 		return fmt.Errorf("failed to start firecracker: %w", err)
 	}
 
-	// Load snapshot WITHOUT resuming so we can patch drives first.
-	// The snapshot bakes in the original drive paths (e.g., /tmp/snapshot/*),
-	// but the host has them at different locations (e.g., /mnt/data/snapshots/*).
+	// Load snapshot and optionally resume. Firecracker opens drive backing files
+	// during LoadSnapshot at the paths recorded in the snapshot state file.
+	// These paths must exist (the caller sets up symlinks to handle path differences).
 	if err := vm.client.LoadSnapshot(ctx, SnapshotLoadParams{
 		SnapshotPath: snapshotPath,
 		MemBackend: &MemBackend{
 			BackendPath: memPath,
 			BackendType: "File",
 		},
-		ResumeVM: false, // Don't resume yet - need to patch drives first
+		ResumeVM: resume,
 	}); err != nil {
 		return fmt.Errorf("failed to load snapshot: %w", err)
-	}
-
-	// Patch root drive to point to the correct path on this host
-	if vm.config.RootfsPath != "" {
-		vm.logger.WithFields(logrus.Fields{
-			"drive_id": "rootfs",
-			"path":     vm.config.RootfsPath,
-		}).Debug("Patching rootfs drive path")
-		if err := vm.client.PatchDrive(ctx, "rootfs", vm.config.RootfsPath); err != nil {
-			vm.logger.WithError(err).Warn("Failed to patch rootfs drive (may already be correct)")
-		}
-	}
-
-	// Patch additional drives (repo-cache, credentials, git-cache, etc.)
-	for _, drive := range vm.config.Drives {
-		vm.logger.WithFields(logrus.Fields{
-			"drive_id": drive.DriveID,
-			"path":     drive.PathOnHost,
-		}).Debug("Patching drive path")
-		if err := vm.client.PatchDrive(ctx, drive.DriveID, drive.PathOnHost); err != nil {
-			vm.logger.WithError(err).Warn("Failed to patch drive (may already be correct)")
-		}
-	}
-
-	// Resume the VM now that drives are patched
-	if resume {
-		if err := vm.client.ResumeVM(ctx); err != nil {
-			return fmt.Errorf("failed to resume VM after snapshot load: %w", err)
-		}
 	}
 
 	// IMPORTANT: Network interface host_dev_name CANNOT be changed after snapshot load.

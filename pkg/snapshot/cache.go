@@ -99,18 +99,27 @@ func (c *Cache) SyncFromGCS(ctx context.Context, version string) error {
 		version = "current"
 	}
 
+	// If version is "current", try to resolve via pointer file first
+	if version == "current" {
+		if resolved, err := c.resolveCurrentPointer(ctx); err == nil && resolved != "" {
+			c.logger.WithField("resolved_version", resolved).Info("Resolved current pointer to versioned directory")
+			version = resolved
+		} else {
+			c.logger.Info("No current-pointer.json found, falling back to current/ directory")
+		}
+	}
+
 	c.logger.WithField("version", version).Info("Syncing snapshot from GCS")
 
 	start := time.Now()
 
-	// Use gsutil for efficient sync (parallel, resumable)
 	gcsPath := fmt.Sprintf("gs://%s/%s/", c.gcsBucket, version)
-	cmd := exec.CommandContext(ctx, "gsutil", "-m", "rsync", "-r", gcsPath, c.localPath+"/")
+	cmd := exec.CommandContext(ctx, "gcloud", "storage", "rsync", "-r", gcsPath, c.localPath+"/")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("gsutil rsync failed: %w", err)
+		return fmt.Errorf("gcloud storage rsync failed: %w", err)
 	}
 
 	duration := time.Since(start)
@@ -125,6 +134,33 @@ func (c *Cache) SyncFromGCS(ctx context.Context, version string) error {
 	}
 
 	return nil
+}
+
+// resolveCurrentPointer reads the current-pointer.json file from GCS to find
+// the versioned directory. Returns empty string if pointer file doesn't exist.
+func (c *Cache) resolveCurrentPointer(ctx context.Context) (string, error) {
+	bucket := c.gcsClient.Bucket(c.gcsBucket)
+	obj := bucket.Object("current-pointer.json")
+
+	reader, err := obj.NewReader(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer reader.Close()
+
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return "", err
+	}
+
+	var pointer struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(data, &pointer); err != nil {
+		return "", err
+	}
+
+	return pointer.Version, nil
 }
 
 // loadLocalMetadata loads metadata from local cache
@@ -262,6 +298,13 @@ func (c *Cache) IsStale(ctx context.Context) (bool, error) {
 	localVer := c.currentVer
 	c.mu.RUnlock()
 
+	// Try to resolve the current version via pointer file first
+	remoteVer, err := c.resolveCurrentPointer(ctx)
+	if err == nil && remoteVer != "" {
+		return localVer != remoteVer, nil
+	}
+
+	// Fall back to reading metadata from current/ directory
 	remoteMetadata, err := c.GetRemoteMetadata(ctx, "current")
 	if err != nil {
 		return false, err

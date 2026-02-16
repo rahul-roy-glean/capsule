@@ -384,8 +384,38 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 			"state":     snapshotPaths.State,
 		}).Info("Restoring runner from snapshot (fast path)")
 
-		if err := vm.RestoreFromSnapshot(ctx, snapshotPaths.State, snapshotPaths.Mem, true); err != nil {
-			m.logger.WithError(err).Warn("Snapshot restore failed, falling back to cold boot")
+		// Setup symlinks and TAP rename for snapshot restore.
+		// AllocateRunner holds m.mu, which serializes these shared-resource operations.
+		//
+		// Drives: The snapshot bakes in drive paths at /tmp/snapshot/*.img.
+		// Symlinks redirect these to actual host paths.
+		//
+		// TAP: The snapshot bakes in host_dev_name="tap-slot-0". If this runner
+		// uses a different slot, we temporarily rename its TAP to tap-slot-0
+		// for LoadSnapshot, then rename it back. Running VMs are unaffected
+		// because they hold TAP FDs (kernel tracks by ifindex, not name).
+		restoreOK := false
+		cleanup, symlinkErr := m.setupSnapshotSymlinks(overlayPath, repoCacheUpperPath, snapshotPaths)
+		if symlinkErr != nil {
+			m.logger.WithError(symlinkErr).Warn("Failed to setup snapshot symlinks, falling back to cold boot")
+		} else {
+			tapRestore, tapErr := m.setupSnapshotTAPRename(tap.Name)
+			if tapErr != nil {
+				cleanup()
+				m.logger.WithError(tapErr).Warn("Failed to setup TAP rename for snapshot, falling back to cold boot")
+			} else {
+				restoreErr := vm.RestoreFromSnapshot(ctx, snapshotPaths.State, snapshotPaths.Mem, true)
+				tapRestore()
+				cleanup()
+				if restoreErr != nil {
+					m.logger.WithError(restoreErr).Warn("Snapshot restore failed, falling back to cold boot")
+				} else {
+					restoreOK = true
+				}
+			}
+		}
+
+		if !restoreOK {
 			// Stop the failed Firecracker process before retry
 			vm.Stop()
 			// Recreate VM for cold boot
@@ -439,6 +469,7 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 	data.Latest.Meta.RunnerID = runner.ID
 	data.Latest.Meta.HostID = m.config.HostID
 	data.Latest.Meta.Environment = m.config.Environment
+	data.Latest.Meta.CurrentTime = time.Now().UTC().Format(time.RFC3339)
 	data.Latest.Buildbarn.CertsMountPath = m.config.BuildbarnCertsMountPath
 	data.Latest.Network.IP = netCfg.IP
 	data.Latest.Network.Gateway = netCfg.Gateway
@@ -858,6 +889,146 @@ func (m *Manager) buildDrives(repoCacheSeedPath, repoCacheUpperPath string) []fi
 	}
 
 	return drives
+}
+
+// snapshotSymlinkDir is the directory where symlinks are created to match the
+// snapshot-builder's output paths baked into the snapshot state file.
+// Must match snapshot-builder's --output-dir flag (default: /tmp/snapshot).
+const snapshotSymlinkDir = "/tmp/snapshot"
+
+// snapshotTAPName is the TAP device name baked into the snapshot state file.
+// Must match the TAP name used by the snapshot-builder (always "tap-slot-0").
+const snapshotTAPName = "tap-slot-0"
+
+// setupSnapshotSymlinks creates symlinks from the snapshot's baked-in drive paths
+// to the actual host paths. Firecracker validates (opens) drive backing files during
+// LoadSnapshot at the paths recorded in the snapshot state. Since the snapshot was
+// built with drives at /tmp/snapshot/*.img but the host has them at different locations,
+// symlinks bridge the gap.
+//
+// This function must be called while m.mu is held (AllocateRunner holds it),
+// which serializes access to the shared /tmp/snapshot/ directory.
+//
+// Returns a cleanup function that removes the symlinks. The cleanup should be
+// called after LoadSnapshot returns, as Firecracker holds open file descriptors
+// and no longer needs the symlink paths.
+func (m *Manager) setupSnapshotSymlinks(overlayPath, repoCacheUpperPath string, snapshotPaths *snapshot.SnapshotPaths) (func(), error) {
+	if err := os.MkdirAll(snapshotSymlinkDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create snapshot symlink dir: %w", err)
+	}
+
+	// Resolve git-cache image path (same logic as buildDrives)
+	gitCacheImg := m.gitCacheImage
+	if gitCacheImg == "" {
+		gitCacheImg = m.getOrCreateGitCachePlaceholder()
+	}
+
+	// Map snapshot filenames to actual host paths.
+	// These filenames must match what snapshot-builder creates in its output dir.
+	symlinks := []struct {
+		name   string // filename in /tmp/snapshot/
+		target string // actual path on host
+	}{
+		{"rootfs.img", overlayPath},
+		{"repo-cache-seed.img", snapshotPaths.RepoCacheSeed},
+		{"repo-cache-upper.img", repoCacheUpperPath},
+		{"credentials.img", m.credentialsImage},
+		{"git-cache.img", gitCacheImg},
+	}
+
+	var created []string
+	for _, s := range symlinks {
+		if s.target == "" {
+			continue
+		}
+		linkPath := filepath.Join(snapshotSymlinkDir, s.name)
+		// Remove any existing file/symlink at the path
+		os.Remove(linkPath)
+		if err := os.Symlink(s.target, linkPath); err != nil {
+			// Cleanup on failure
+			for _, c := range created {
+				os.Remove(c)
+			}
+			return nil, fmt.Errorf("symlink %s -> %s: %w", linkPath, s.target, err)
+		}
+		created = append(created, linkPath)
+		m.logger.WithFields(logrus.Fields{
+			"link":   linkPath,
+			"target": s.target,
+		}).Debug("Created snapshot symlink")
+	}
+
+	cleanup := func() {
+		for _, c := range created {
+			os.Remove(c)
+		}
+	}
+	return cleanup, nil
+}
+
+// setupSnapshotTAPRename temporarily renames TAP devices so that this runner's
+// TAP has the name baked into the snapshot (tap-slot-0). Firecracker opens the
+// TAP device by name during LoadSnapshot via TUNSETIFF, so the name must match.
+//
+// If tap-slot-0 is already held by another runner's Firecracker process, we
+// rename it to a temporary name first, then restore it after. Firecracker holds
+// TAP devices by file descriptor, so renames are transparent to running VMs.
+// Bridge membership (fcbr0) is also preserved since the kernel tracks ports
+// by ifindex, not by name.
+//
+// This function must be called while m.mu is held.
+// Returns a restore function that undoes the renames (call after LoadSnapshot).
+func (m *Manager) setupSnapshotTAPRename(currentTAP string) (func(), error) {
+	if currentTAP == snapshotTAPName {
+		// Already has the right name (slot 0), no rename needed
+		return func() {}, nil
+	}
+
+	// Check if tap-slot-0 already exists (held by another runner)
+	_, err := net.InterfaceByName(snapshotTAPName)
+	existingTAPInUse := err == nil
+
+	tempName := snapshotTAPName + "-tmp"
+
+	if existingTAPInUse {
+		// Rename existing tap-slot-0 → tap-slot-0-tmp
+		m.logger.WithFields(logrus.Fields{
+			"from": snapshotTAPName,
+			"to":   tempName,
+		}).Debug("Temporarily renaming existing TAP for snapshot restore")
+		if output, err := exec.Command("ip", "link", "set", snapshotTAPName, "name", tempName).CombinedOutput(); err != nil {
+			return nil, fmt.Errorf("rename %s → %s: %s: %w", snapshotTAPName, tempName, strings.TrimSpace(string(output)), err)
+		}
+	}
+
+	// Rename our TAP → tap-slot-0
+	m.logger.WithFields(logrus.Fields{
+		"from": currentTAP,
+		"to":   snapshotTAPName,
+	}).Debug("Renaming TAP for snapshot restore")
+	if output, err := exec.Command("ip", "link", "set", currentTAP, "name", snapshotTAPName).CombinedOutput(); err != nil {
+		// Undo the temp rename if we did it
+		if existingTAPInUse {
+			exec.Command("ip", "link", "set", tempName, "name", snapshotTAPName).Run()
+		}
+		return nil, fmt.Errorf("rename %s → %s: %s: %w", currentTAP, snapshotTAPName, strings.TrimSpace(string(output)), err)
+	}
+
+	restore := func() {
+		// Rename tap-slot-0 back to our real name
+		if output, err := exec.Command("ip", "link", "set", snapshotTAPName, "name", currentTAP).CombinedOutput(); err != nil {
+			m.logger.WithError(err).WithField("output", strings.TrimSpace(string(output))).Warn("Failed to restore TAP name after snapshot")
+		}
+
+		// Restore original tap-slot-0 if we moved it
+		if existingTAPInUse {
+			if output, err := exec.Command("ip", "link", "set", tempName, "name", snapshotTAPName).CombinedOutput(); err != nil {
+				m.logger.WithError(err).WithField("output", strings.TrimSpace(string(output))).Warn("Failed to restore original tap-slot-0 name")
+			}
+		}
+	}
+
+	return restore, nil
 }
 
 // getOrCreateGitCachePlaceholder ensures a placeholder git-cache image exists for snapshot restore compatibility.

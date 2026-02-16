@@ -85,6 +85,7 @@ type MMDSData struct {
 			RunnerID    string `json:"runner_id"`
 			HostID      string `json:"host_id"`
 			Environment string `json:"environment"`
+			CurrentTime string `json:"current_time,omitempty"` // RFC3339 timestamp from host for clock sync
 		} `json:"meta"`
 		Buildbarn struct {
 			// CertsMountPath is where Buildbarn mTLS certs will be mounted inside the microVM.
