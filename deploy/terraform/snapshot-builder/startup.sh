@@ -43,7 +43,8 @@ echo "Downloading kernel and rootfs from GCS..."
 mkdir -p /opt/firecracker
 if [ -n "$SNAPSHOT_BUCKET" ]; then
   # Try build-artifacts first, fall back to current/
-  gcloud storage cp "gs://${SNAPSHOT_BUCKET}/current/kernel.bin" /opt/firecracker/kernel.bin 2>/dev/null \
+  gcloud storage cp "gs://${SNAPSHOT_BUCKET}/build-artifacts/kernel.bin" /opt/firecracker/kernel.bin 2>/dev/null \
+    || gcloud storage cp "gs://${SNAPSHOT_BUCKET}/current/kernel.bin" /opt/firecracker/kernel.bin 2>/dev/null \
     || echo "WARNING: kernel.bin not found in GCS"
 
   gcloud storage cp "gs://${SNAPSHOT_BUCKET}/build-artifacts/rootfs.img" /opt/firecracker/rootfs.img 2>/dev/null \

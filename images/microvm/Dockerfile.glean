@@ -1,18 +1,5 @@
 # MicroVM Rootfs - Glean CI Environment
 # Based on the same tooling as ci-runner-ubuntu-2204.pkr.hcl
-
-# ============================================================================
-# Build stage for thaw-agent (must be first so other stages can copy from it)
-# ============================================================================
-FROM golang:1.24 AS thaw-agent-builder
-
-WORKDIR /build
-COPY cmd/thaw-agent/ ./cmd/thaw-agent/
-COPY pkg/ ./pkg/
-COPY go.mod go.sum ./
-
-RUN CGO_ENABLED=0 GOOS=linux go build -o /thaw-agent ./cmd/thaw-agent
-
 # ============================================================================
 # Base stage with all tools
 # ============================================================================
@@ -118,8 +105,8 @@ COPY images/microvm/rootfs/etc/systemd/network/10-eth0.network /etc/systemd/netw
 COPY images/microvm/rootfs/etc/systemd/system/thaw-agent.service /etc/systemd/system/
 RUN systemctl enable thaw-agent.service
 
-# Copy thaw-agent binary (built in multi-stage)
-COPY --from=thaw-agent-builder /thaw-agent /usr/local/bin/thaw-agent
+# Copy thaw-agent binary (built locally)
+COPY bin/thaw-agent /usr/local/bin/thaw-agent
 
 # Configure serial console for Firecracker
 RUN echo "ttyS0" >> /etc/securetty \

@@ -17,10 +17,14 @@ echo "Repo root: $REPO_ROOT"
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
+# Build the thaw-agent binary
+echo "Building thaw-agent binary..."
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o "$OUTPUT_DIR/thaw-agent" "$REPO_ROOT/cmd/thaw-agent"
+
 # Build the Docker image from repo root (needed for go.mod, cmd/, pkg/)
 # Force linux/amd64 since Firecracker VMs are x86_64
 echo "Building Docker image for linux/amd64..."
-docker build --platform linux/amd64 -t "$IMAGE_NAME" -f "$SCRIPT_DIR/Dockerfile.glean" "$REPO_ROOT"
+docker buildx build --platform linux/amd64 --load -t "$IMAGE_NAME" -f "$SCRIPT_DIR/Dockerfile.glean" "$REPO_ROOT"
 
 # Create a container (don't run it)
 echo "Creating container..."
@@ -60,11 +64,11 @@ echo "Rootfs created: $ROOTFS_IMG"
 # Note: Firecracker recommends 6.1 kernels for v1.14+. The quickstart URL only
 # provides 5.10, which works but is past official support. To use 6.1, build one
 # with: ./tools/devtool build_ci_artifacts kernels 6.1
-KERNEL_VERSION="${KERNEL_VERSION:-5.10.217}"
+KERNEL_VERSION="${KERNEL_VERSION:-5.10.242}"
 KERNEL_FILE="$OUTPUT_DIR/kernel.bin"
 if [ ! -f "$KERNEL_FILE" ]; then
     echo "Downloading kernel $KERNEL_VERSION..."
-    curl -fsSL "https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux.bin" \
+    curl -fsSL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.14-def/x86_64/vmlinux-${KERNEL_VERSION}" \
         -o "$KERNEL_FILE"
 fi
 
