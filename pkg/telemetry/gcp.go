@@ -3,6 +3,7 @@ package telemetry
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -170,8 +171,13 @@ func (c *Client) Flush(ctx context.Context) {
 // in a single CreateTimeSeries request.
 func timeSeriesKey(ts *monitoringpb.TimeSeries) string {
 	key := ts.Metric.Type
-	for k, v := range ts.Metric.Labels {
-		key += "|" + k + "=" + v
+	keys := make([]string, 0, len(ts.Metric.Labels))
+	for k := range ts.Metric.Labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		key += "|" + k + "=" + ts.Metric.Labels[k]
 	}
 	return key
 }
