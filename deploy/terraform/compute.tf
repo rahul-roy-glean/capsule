@@ -140,8 +140,8 @@ resource "google_compute_instance_template" "firecracker_host" {
       if [ -b "$DATA_DISK" ]; then
         # Disk from snapshot is already formatted, just mount it
         mount "$DATA_DISK" /mnt/data
-        echo "$DATA_DISK /mnt/data ext4 defaults,nofail 0 2" >> /etc/fstab
-        
+        echo "$DATA_DISK /mnt/data xfs defaults,nofail 0 0" >> /etc/fstab
+
         # Verify expected files exist
         if [ -d "/mnt/data/snapshots" ] && [ -f "/mnt/data/git-cache.img" ]; then
           echo "Snapshot data verified OK:"
@@ -168,13 +168,13 @@ resource "google_compute_instance_template" "firecracker_host" {
       
       if [ -b "$DATA_DISK" ]; then
         echo "Formatting data disk..."
-        mkfs.ext4 -F -L RUNNER_DATA "$DATA_DISK"
+        mkfs.xfs -f -L RUNNER_DATA "$DATA_DISK"
         mount "$DATA_DISK" /mnt/data
-        echo "$DATA_DISK /mnt/data ext4 defaults,nofail 0 2" >> /etc/fstab
+        echo "$DATA_DISK /mnt/data xfs defaults,nofail 0 0" >> /etc/fstab
       elif [ -b "/dev/sdb" ]; then
-        mkfs.ext4 -F -L RUNNER_DATA /dev/sdb
+        mkfs.xfs -f -L RUNNER_DATA /dev/sdb
         mount /dev/sdb /mnt/data
-        echo "/dev/sdb /mnt/data ext4 defaults,nofail 0 2" >> /etc/fstab
+        echo "/dev/sdb /mnt/data xfs defaults,nofail 0 0" >> /etc/fstab
       else
         echo "WARNING: No data disk found"
       fi

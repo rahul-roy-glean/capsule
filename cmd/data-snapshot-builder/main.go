@@ -320,8 +320,8 @@ func waitForDevice(path string, timeout time.Duration) error {
 
 func formatAndMount(device, mountPoint string) error {
 	// Format
-	if output, err := exec.Command("mkfs.ext4", "-F", "-L", "RUNNER_DATA", device).CombinedOutput(); err != nil {
-		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(output), err)
+	if output, err := exec.Command("mkfs.xfs", "-f", "-L", "RUNNER_DATA", device).CombinedOutput(); err != nil {
+		return fmt.Errorf("mkfs.xfs failed: %s: %w", string(output), err)
 	}
 
 	// Create mount point

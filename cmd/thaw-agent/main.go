@@ -1093,6 +1093,18 @@ func configureNetwork(data *MMDSData) error {
 		iface = "eth0"
 	}
 
+	// Set MAC address if provided. Snapshot-restored VMs all share the same
+	// MAC baked into the snapshot. Each slot gets a unique MAC via MMDS to
+	// avoid bridge forwarding table collisions when multiple VMs run on the
+	// same host.
+	if net.MAC != "" {
+		if err := exec.Command("ip", "link", "set", iface, "address", net.MAC).Run(); err != nil {
+			log.WithError(err).WithField("mac", net.MAC).Warn("Failed to set MAC address")
+		} else {
+			log.WithField("mac", net.MAC).Info("MAC address configured")
+		}
+	}
+
 	// Check if kernel already configured the network (via ip= boot parameter)
 	// If so, skip IP reconfiguration but still ensure DNS is configured
 	out, _ := exec.Command("ip", "addr", "show", "dev", iface).Output()
@@ -1146,6 +1158,7 @@ func configureNetwork(data *MMDSData) error {
 		"ip":        net.IP,
 		"gateway":   net.Gateway,
 		"dns":       net.DNS,
+		"mac":       net.MAC,
 	}).Info("Network configured")
 
 	return nil
