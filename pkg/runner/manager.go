@@ -468,6 +468,7 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 	var data MMDSData
 	data.Latest.Meta.RunnerID = runner.ID
 	data.Latest.Meta.HostID = m.config.HostID
+	data.Latest.Meta.InstanceName = m.config.InstanceName
 	data.Latest.Meta.Environment = m.config.Environment
 	data.Latest.Meta.CurrentTime = time.Now().UTC().Format(time.RFC3339)
 	data.Latest.Buildbarn.CertsMountPath = m.config.BuildbarnCertsMountPath
@@ -1064,7 +1065,7 @@ func createExt4Image(path string, sizeGB int, label string) error {
 	if err := exec.Command("truncate", "-s", fmt.Sprintf("%dG", sizeGB), path).Run(); err != nil {
 		return fmt.Errorf("truncate failed: %w", err)
 	}
-	if output, err := exec.Command("mkfs.ext4", "-F", "-L", label, path).CombinedOutput(); err != nil {
+	if output, err := exec.Command("mkfs.ext4", "-F", "-L", label, "-E", "lazy_itable_init=1,lazy_journal_init=1", path).CombinedOutput(); err != nil {
 		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(output), err)
 	}
 	return nil
@@ -1116,7 +1117,7 @@ func createExt4ImageMB(path string, sizeMB int, label string) error {
 	if err := exec.Command("truncate", "-s", fmt.Sprintf("%dM", sizeMB), path).Run(); err != nil {
 		return fmt.Errorf("truncate failed: %w", err)
 	}
-	if output, err := exec.Command("mkfs.ext4", "-F", "-L", label, path).CombinedOutput(); err != nil {
+	if output, err := exec.Command("mkfs.ext4", "-F", "-L", label, "-E", "lazy_itable_init=1,lazy_journal_init=1", path).CombinedOutput(); err != nil {
 		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(output), err)
 	}
 	return nil

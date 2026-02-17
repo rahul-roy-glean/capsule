@@ -162,11 +162,12 @@ var globalSymlinkState = &SymlinkState{}
 type MMDSData struct {
 	Latest struct {
 		Meta struct {
-			RunnerID    string `json:"runner_id"`
-			HostID      string `json:"host_id"`
-			Environment string `json:"environment"`
-			Mode        string `json:"mode,omitempty"`         // "warmup" for snapshot building, empty for normal runner
-			CurrentTime string `json:"current_time,omitempty"` // RFC3339 timestamp from host for clock sync
+			RunnerID     string `json:"runner_id"`
+			HostID       string `json:"host_id"`
+			InstanceName string `json:"instance_name,omitempty"`
+			Environment  string `json:"environment"`
+			Mode         string `json:"mode,omitempty"`         // "warmup" for snapshot building, empty for normal runner
+			CurrentTime  string `json:"current_time,omitempty"` // RFC3339 timestamp from host for clock sync
 		} `json:"meta"`
 		Buildbarn struct {
 			CertsMountPath string `json:"certs_mount_path,omitempty"`
@@ -564,6 +565,10 @@ func main() {
 					}
 				}
 
+				// Reset boot timer so phase durations reflect post-restore time,
+				// not accumulated warmup time from before the snapshot.
+				bootTimer = telemetry.NewTimer()
+
 				break
 			}
 		}
@@ -581,9 +586,12 @@ func main() {
 	setStep("bazel_verification")
 	preClonedRepo := getPreClonedPath(mmdsData)
 	if preClonedRepo != "" {
+		log.Info("Starting Bazel server verification...")
+		verifyStart := time.Now()
 		if err := verifyBazelServer(preClonedRepo); err != nil {
 			log.WithError(err).Warn("Bazel server verification failed (will cold-start on first build)")
 		}
+		log.WithField("duration_ms", time.Since(verifyStart).Milliseconds()).Info("Bazel server verification completed")
 	}
 	bootTimer.Phase("bazel_verify")
 
@@ -932,11 +940,12 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 		if data.Latest.Meta.RunnerID == "" {
 			var inner struct {
 				Meta struct {
-					RunnerID    string `json:"runner_id"`
-					HostID      string `json:"host_id"`
-					Environment string `json:"environment"`
-					Mode        string `json:"mode,omitempty"`
-					CurrentTime string `json:"current_time,omitempty"`
+					RunnerID     string `json:"runner_id"`
+					HostID       string `json:"host_id"`
+					InstanceName string `json:"instance_name,omitempty"`
+					Environment  string `json:"environment"`
+					Mode         string `json:"mode,omitempty"`
+					CurrentTime  string `json:"current_time,omitempty"`
 				} `json:"meta"`
 				Buildbarn struct {
 					CertsMountPath string `json:"certs_mount_path,omitempty"`
@@ -1568,6 +1577,10 @@ func registerGitHubRunner(data *MMDSData) error {
 	for k := range job.Labels {
 		labels = append(labels, k)
 	}
+	// Add host machine name as a label for easier debugging
+	if hostName := data.Latest.Meta.InstanceName; hostName != "" {
+		labels = append(labels, hostName)
+	}
 	labelsStr := strings.Join(labels, ",")
 
 	// Get runner user UID/GID - GitHub runner refuses to run as root
@@ -1578,8 +1591,8 @@ func registerGitHubRunner(data *MMDSData) error {
 	uid, _ := strconv.ParseUint(runnerUser.Uid, 10, 32)
 	gid, _ := strconv.ParseUint(runnerUser.Gid, 10, 32)
 
-	// Ensure runner directory is owned by runner user
-	exec.Command("chown", "-R", *runnerUsername+":"+*runnerUsername, runnerPath).Run()
+	// NOTE: Runner directory ownership is set in the Dockerfile (chown -R gleanuser:gleanuser /home/gleanuser)
+	// and preserved across snapshot restore. No recursive chown needed here.
 
 	// Build config command arguments
 	configArgs := []string{
@@ -1622,18 +1635,23 @@ func registerGitHubRunner(data *MMDSData) error {
 		"run_path": runnerPath,
 	}).Info("Configuring GitHub runner (timeout: 120s)...")
 
+	configStart := time.Now()
 	output, err := configCmd.CombinedOutput()
 	if err != nil {
 		log.WithFields(logrus.Fields{
-			"error":  err.Error(),
-			"output": string(output),
+			"error":       err.Error(),
+			"output":      string(output),
+			"duration_ms": time.Since(configStart).Milliseconds(),
 		}).Error("config.sh failed")
 		if ctx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("runner config timed out after 120s")
 		}
 		return fmt.Errorf("runner config failed: %w (output: %s)", err, string(output))
 	}
-	log.WithField("output", string(output)).Info("config.sh completed successfully")
+	log.WithFields(logrus.Fields{
+		"output":      string(output),
+		"duration_ms": time.Since(configStart).Milliseconds(),
+	}).Info("config.sh completed successfully")
 
 	// Start runner in background as 'runner' user
 	// Use setsid to create a new session so runner survives if thaw-agent exits
@@ -1650,11 +1668,15 @@ func registerGitHubRunner(data *MMDSData) error {
 	}
 	runCmd.Env = append(os.Environ(), "HOME="+runnerUser.HomeDir)
 
-	log.Info("Starting GitHub runner...")
+	log.Info("Starting GitHub runner (run.sh)...")
+	runStart := time.Now()
 	if err := runCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start runner: %w", err)
 	}
-	log.WithField("pid", runCmd.Process.Pid).Info("GitHub runner started successfully")
+	log.WithFields(logrus.Fields{
+		"pid":         runCmd.Process.Pid,
+		"duration_ms": time.Since(runStart).Milliseconds(),
+	}).Info("GitHub runner started successfully")
 
 	return nil
 }

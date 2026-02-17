@@ -281,6 +281,25 @@ variable "github_org" {
   default     = ""
 }
 
+# Buildbarn remote build configuration
+variable "buildbarn_certs_project" {
+  description = "GCP project containing Buildbarn cert secrets. Defaults to var.project_id if not set."
+  type        = string
+  default     = ""
+}
+
+variable "buildbarn_certs_dir" {
+  description = "Directory on the host VM to store fetched Buildbarn mTLS certs"
+  type        = string
+  default     = "/etc/glean/ci/certs"
+}
+
+variable "buildbarn_certs" {
+  description = "Map of local filename to Secret Manager secret name for Buildbarn mTLS certs. Leave empty to disable. E.g. {'ca.crt': 'my-ca-cert', 'client.crt': 'my-client-cert', 'client.pem': 'my-client-key'}"
+  type        = map(string)
+  default     = {}
+}
+
 # Snapshot automation configuration
 variable "enable_snapshot_automation" {
   description = "Enable Cloud Scheduler for automated snapshot freshness checks and rebuild triggers"

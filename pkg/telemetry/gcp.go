@@ -23,9 +23,10 @@ type Client struct {
 	logger   *logrus.Entry
 	resource *monitoredres.MonitoredResource
 
-	mu     sync.Mutex
-	buffer []*monitoringpb.TimeSeries
-	done   chan struct{}
+	mu          sync.Mutex
+	buffer      []*monitoringpb.TimeSeries
+	bufferIndex map[string]int
+	done        chan struct{}
 }
 
 // NewClient creates a new telemetry Client.
@@ -68,8 +69,9 @@ func NewClient(ctx context.Context, config Config, logger *logrus.Logger) (*Clie
 			Type:   resourceType,
 			Labels: resourceLabels,
 		},
-		buffer: make([]*monitoringpb.TimeSeries, 0, config.BufferSize),
-		done:   make(chan struct{}),
+		buffer:      make([]*monitoringpb.TimeSeries, 0, config.BufferSize),
+		bufferIndex: make(map[string]int, config.BufferSize),
+		done:        make(chan struct{}),
 	}
 
 	// Start background flush loop
@@ -135,14 +137,8 @@ func (c *Client) Flush(ctx context.Context) {
 	}
 	timeSeries := c.buffer
 	c.buffer = make([]*monitoringpb.TimeSeries, 0, c.config.BufferSize)
+	c.bufferIndex = make(map[string]int, c.config.BufferSize)
 	c.mu.Unlock()
-
-	// Deduplicate: Cloud Monitoring rejects multiple points for the same
-	// TimeSeries (metric type + labels + resource) in a single request.
-	// This happens when gauge metrics are recorded more frequently than the
-	// flush interval (e.g., autoscaler records every 5s, flush every 10s).
-	// Keep only the last (most recent) entry for each unique TimeSeries key.
-	timeSeries = deduplicateTimeSeries(timeSeries)
 
 	// Cloud Monitoring API limits to 200 time series per request
 	const batchSize = 200
@@ -180,26 +176,6 @@ func timeSeriesKey(ts *monitoringpb.TimeSeries) string {
 		key += "|" + k + "=" + ts.Metric.Labels[k]
 	}
 	return key
-}
-
-// deduplicateTimeSeries removes duplicate TimeSeries entries, keeping the last
-// (most recent) entry for each unique metric type + labels combination.
-func deduplicateTimeSeries(series []*monitoringpb.TimeSeries) []*monitoringpb.TimeSeries {
-	seen := make(map[string]int, len(series)) // key -> index in result
-	result := make([]*monitoringpb.TimeSeries, 0, len(series))
-
-	for _, ts := range series {
-		key := timeSeriesKey(ts)
-		if idx, exists := seen[key]; exists {
-			// Replace earlier entry with this newer one
-			result[idx] = ts
-		} else {
-			seen[key] = len(result)
-			result = append(result, ts)
-		}
-	}
-
-	return result
 }
 
 // metricType returns the full metric type string.
@@ -318,9 +294,19 @@ func (c *Client) AddToCounter(ctx context.Context, metric string, value int64, l
 	c.addToBuffer(ts)
 }
 
-// addToBuffer adds a time series to the buffer, flushing if full.
+// addToBuffer adds a time series to the buffer, replacing any existing entry
+// with the same metric type + labels to prevent duplicate TimeSeries errors.
 func (c *Client) addToBuffer(ts *monitoringpb.TimeSeries) {
+	key := timeSeriesKey(ts)
+
 	c.mu.Lock()
+	if idx, exists := c.bufferIndex[key]; exists {
+		// Replace the existing entry with the newer value
+		c.buffer[idx] = ts
+		c.mu.Unlock()
+		return
+	}
+	c.bufferIndex[key] = len(c.buffer)
 	c.buffer = append(c.buffer, ts)
 	shouldFlush := len(c.buffer) >= c.config.BufferSize
 	c.mu.Unlock()

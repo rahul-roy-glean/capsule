@@ -172,16 +172,23 @@ release-host-image: packer-build
 .PHONY: mig-rolling-update
 mig-rolling-update:
 	@echo "Starting rolling update of host MIG..."
+	$(eval TEMPLATE := $(shell gcloud compute instance-templates list \
+		--project=$(PROJECT_ID) \
+		--filter="name~'^fc-runner-$(ENV)-host-'" \
+		--format="value(name)" \
+		--sort-by=~creationTimestamp \
+		--limit=1))
+	@echo "Using template: $(TEMPLATE)"
 	gcloud compute instance-groups managed rolling-action start-update \
-		firecracker-runner-$(ENV)-hosts \
-		--version=template=firecracker-runner-$(ENV)-host \
+		fc-runner-$(ENV)-hosts \
+		--version=template=$(TEMPLATE) \
 		--region=$(REGION) \
 		--project=$(PROJECT_ID) \
-		--max-surge=1 \
+		--max-surge=3 \
 		--max-unavailable=0
 	@echo ""
 	@echo "Rolling update initiated. Monitor with:"
-	@echo "  gcloud compute instance-groups managed list-instances firecracker-runner-$(ENV)-hosts --region=$(REGION)"
+	@echo "  gcloud compute instance-groups managed list-instances fc-runner-$(ENV)-hosts --region=$(REGION)"
 
 # Kubernetes
 k8s-deploy:

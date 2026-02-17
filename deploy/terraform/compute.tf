@@ -93,8 +93,11 @@ resource "google_compute_instance_template" "firecracker_host" {
     github-app-secret     = var.github_app_secret
     github-runner-labels  = var.github_runner_labels
     github-repo           = var.github_repo
-    github-runner-enabled = var.github_runner_enabled ? "true" : "false"
-    max-runners           = var.max_runners_per_host
+    github-runner-enabled   = var.github_runner_enabled ? "true" : "false"
+    buildbarn-certs-project = var.buildbarn_certs_project != "" ? var.buildbarn_certs_project : var.project_id
+    buildbarn-certs-dir     = var.buildbarn_certs_dir
+    buildbarn-certs         = jsonencode(var.buildbarn_certs)
+    max-runners             = var.max_runners_per_host
     idle-target           = var.idle_runners_target
     vcpus-per-runner      = var.vcpus_per_runner
     memory-per-runner     = var.memory_per_runner_mb
@@ -277,6 +280,33 @@ resource "google_compute_instance_template" "firecracker_host" {
     CONTROL_PLANE=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/control-plane || echo "")
 
+    # Fetch Buildbarn mTLS certs from Secret Manager (if configured)
+    BUILDBARN_CERTS_DIR=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/buildbarn-certs-dir || echo "/etc/glean/ci/certs")
+    BUILDBARN_CERTS_JSON=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/buildbarn-certs || echo "{}")
+    BUILDBARN_PROJECT=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/buildbarn-certs-project || echo "")
+
+    if [ "$BUILDBARN_CERTS_JSON" != "{}" ] && [ -n "$BUILDBARN_PROJECT" ]; then
+      echo "Fetching Buildbarn mTLS certs from project $BUILDBARN_PROJECT..."
+      mkdir -p "$BUILDBARN_CERTS_DIR"
+      FETCH_OK=true
+      for entry in $(echo "$BUILDBARN_CERTS_JSON" | python3 -c "import sys,json; [print(f'{k}={v}') for k,v in json.load(sys.stdin).items()]"); do
+        FILENAME="$${entry%%=*}"
+        SECRET="$${entry#*=}"
+        if ! gcloud secrets versions access latest --secret="$SECRET" --project="$BUILDBARN_PROJECT" > "$BUILDBARN_CERTS_DIR/$FILENAME"; then
+          echo "WARNING: Failed to fetch secret $SECRET"
+          FETCH_OK=false
+        fi
+      done
+      if [ "$FETCH_OK" = "true" ]; then
+        echo "Buildbarn certs fetched to $BUILDBARN_CERTS_DIR"
+      else
+        echo "WARNING: Some Buildbarn certs failed to fetch"
+      fi
+    fi
+
     # Stop firecracker-manager if already running (from Packer image auto-start)
     # This ensures the override is applied before the service runs
     systemctl stop firecracker-manager 2>/dev/null || true
@@ -295,7 +325,12 @@ resource "google_compute_instance_template" "firecracker_host" {
     EXEC_START="$EXEC_START --snapshot-cache=/mnt/data/snapshots"
     EXEC_START="$EXEC_START --workspace-dir=/mnt/data/workspaces"
     EXEC_START="$EXEC_START --git-cache-image=/mnt/data/git-cache.img"
-    
+
+    # Add Buildbarn certs dir if certs were fetched
+    if [ -d "$BUILDBARN_CERTS_DIR" ] && [ "$(ls -A $BUILDBARN_CERTS_DIR 2>/dev/null)" ]; then
+      EXEC_START="$EXEC_START --buildbarn-certs-dir=$BUILDBARN_CERTS_DIR"
+    fi
+
     # Add git-cache flags if enabled
     if [ "$GIT_CACHE_ENABLED" = "true" ]; then
       GIT_CACHE_REPOS_CFG=$(curl -sf -H "Metadata-Flavor: Google" \
