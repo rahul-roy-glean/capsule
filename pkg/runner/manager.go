@@ -182,49 +182,42 @@ func (m *Manager) SetDraining(draining bool) (changed bool) {
 
 // AllocateRunner allocates a new runner
 func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Runner, error) {
-	// Build pool key from request (before locking, as pool.Get needs the key)
-	var poolKey *RunnerKey
+	// Try to get from pool first (before acquiring main lock)
 	if m.pool != nil {
-		// Get snapshot version for pool key
 		snapshotPaths, err := m.snapshotCache.GetSnapshotPaths()
 		if err == nil {
-			poolKey = &RunnerKey{
+			poolKey := &RunnerKey{
 				SnapshotVersion: snapshotPaths.Version,
 				Platform:        "linux/amd64",
 				GitHubRepo:      req.Repo,
 				Labels:          req.Labels,
 			}
-		}
-	}
+			if pooled := m.pool.Get(ctx, poolKey); pooled != nil {
+				m.mu.Lock()
+				defer m.mu.Unlock()
 
-	// Try to get from pool first (before acquiring main lock)
-	if m.pool != nil && poolKey != nil {
-		if pooled := m.pool.Get(ctx, poolKey); pooled != nil {
-			m.mu.Lock()
-			defer m.mu.Unlock()
+				m.logger.WithField("runner_id", pooled.Runner.ID).Info("Reusing pooled runner")
 
-			m.logger.WithField("runner_id", pooled.Runner.ID).Info("Reusing pooled runner")
+				// Update runner state
+				pooled.Runner.State = StateBusy
+				pooled.Runner.TaskCount++
+				pooled.Runner.JobID = req.RequestID
 
-			// Update runner state
-			pooled.Runner.State = StateBusy
-			pooled.Runner.TaskCount++
-			pooled.Runner.JobID = req.RequestID
-
-			// Update MMDS with new task data
-			if vm, ok := m.vms[pooled.Runner.ID]; ok {
-				var tap *network.TapDevice
-				if slot, hasSlot := m.runnerToSlot[pooled.Runner.ID]; hasSlot {
-					tap, _ = m.network.GetOrCreateTapSlot(slot, pooled.Runner.ID)
-				}
-				if tap != nil {
+				// Update MMDS with new task data
+				vm := m.vms[pooled.Runner.ID]
+				slot, hasSlot := m.runnerToSlot[pooled.Runner.ID]
+				if !hasSlot {
+					m.logger.WithField("runner_id", pooled.Runner.ID).Warn("Pooled runner has no TAP slot, skipping MMDS update")
+				} else {
+					tap, _ := m.network.GetOrCreateTapSlot(slot, pooled.Runner.ID)
 					mmdsData := m.buildMMDSData(ctx, pooled.Runner, tap, req)
 					if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 						m.logger.WithError(err).Warn("Failed to update MMDS for pooled runner")
 					}
 				}
-			}
 
-			return pooled.Runner, nil
+				return pooled.Runner, nil
+			}
 		}
 	}
 
@@ -253,20 +246,63 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	useSnapshotRestore := snapshotPaths.Mem != "" && snapshotPaths.State != ""
 
 	// Allocate TAP device
-	// For snapshot restore, we MUST use slot-based allocation because Firecracker
-	// does not support changing host_dev_name after snapshot load. The snapshot was
-	// created with tap-slot-0, so we need to use matching slot names.
-	var tap *network.TapDevice
-	var slot int = -1
+	tap, slot, err := m.allocateTAP(runnerID, useSnapshotRestore)
+	if err != nil {
+		return nil, err
+	}
+
+	// Setup rootfs overlay and repo-cache-upper image
+	overlayPath, repoCacheUpperPath, err := m.setupRunnerStorage(runnerID, tap)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build runner record and VM configuration
+	runner, vmCfg := m.buildVMConfig(runnerID, req, tap, snapshotPaths, overlayPath, repoCacheUpperPath)
+	_ = slot // slot tracked in m.slotToRunner/m.runnerToSlot
+
+	// Create VM instance and start it (snapshot restore or cold boot)
+	vm, err := m.startOrRestoreVM(ctx, runnerID, vmCfg, tap, snapshotPaths, overlayPath, repoCacheUpperPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Inject MMDS data (VM is already running after Start() or RestoreFromSnapshot())
+	mmdsData := m.buildMMDSData(ctx, runner, tap, req)
+	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
+		vm.Stop()
+		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+		return nil, fmt.Errorf("failed to set MMDS data: %w", err)
+	}
+
+	runner.State = StateInitializing
+	runner.StartedAt = time.Now()
+
+	m.runners[runnerID] = runner
+	m.vms[runnerID] = vm
+
+	m.logger.WithFields(logrus.Fields{
+		"runner_id": runnerID,
+		"ip":        runner.InternalIP.String(),
+		"snapshot":  runner.SnapshotVersion,
+	}).Info("Runner allocated successfully")
+
+	return runner, nil
+}
+
+// allocateTAP allocates a TAP device for the runner. For snapshot restore, slot-based
+// allocation is used because Firecracker doesn't support changing host_dev_name after
+// snapshot load. For cold boot, dynamic TAP allocation is used.
+// Must be called with m.mu held.
+func (m *Manager) allocateTAP(runnerID string, useSnapshotRestore bool) (*network.TapDevice, int, error) {
 	if useSnapshotRestore {
-		// Find an available slot
-		slot = m.findAvailableSlot()
+		slot := m.findAvailableSlot()
 		if slot < 0 {
-			return nil, fmt.Errorf("no TAP slots available (all %d slots in use)", m.config.MaxRunners)
+			return nil, -1, fmt.Errorf("no TAP slots available (all %d slots in use)", m.config.MaxRunners)
 		}
-		tap, err = m.network.GetOrCreateTapSlot(slot, runnerID)
+		tap, err := m.network.GetOrCreateTapSlot(slot, runnerID)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get TAP slot %d: %w", slot, err)
+			return nil, -1, fmt.Errorf("failed to get TAP slot %d: %w", slot, err)
 		}
 		m.slotToRunner[slot] = runnerID
 		m.runnerToSlot[runnerID] = slot
@@ -275,37 +311,47 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 			"slot":      slot,
 			"tap":       tap.Name,
 		}).Debug("Using slot-based TAP for snapshot restore")
-	} else {
-		// Cold boot path - use dynamic TAP allocation
-		tap, err = m.network.CreateTapForVM(runnerID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create TAP device: %w", err)
-		}
-		m.logger.WithFields(logrus.Fields{
-			"runner_id": runnerID,
-			"tap":       tap.Name,
-		}).Debug("Using dynamic TAP for cold boot")
+		return tap, slot, nil
 	}
 
-	// Create rootfs overlay
-	overlayPath, err := m.snapshotCache.CreateOverlay(runnerID)
+	// Cold boot path - use dynamic TAP allocation
+	tap, err := m.network.CreateTapForVM(runnerID)
+	if err != nil {
+		return nil, -1, fmt.Errorf("failed to create TAP device: %w", err)
+	}
+	m.logger.WithFields(logrus.Fields{
+		"runner_id": runnerID,
+		"tap":       tap.Name,
+	}).Debug("Using dynamic TAP for cold boot")
+	return tap, -1, nil
+}
+
+// setupRunnerStorage creates the rootfs overlay and repo-cache-upper image for a runner.
+// On partial failure, previously created resources are cleaned up.
+// Must be called with m.mu held.
+func (m *Manager) setupRunnerStorage(runnerID string, tap *network.TapDevice) (overlayPath, repoCacheUpperPath string, err error) {
+	overlayPath, err = m.snapshotCache.CreateOverlay(runnerID)
 	if err != nil {
 		m.network.ReleaseTap(runnerID)
-		return nil, fmt.Errorf("failed to create rootfs overlay: %w", err)
+		return "", "", fmt.Errorf("failed to create rootfs overlay: %w", err)
 	}
 
-	// Create per-runner writable repo cache layer image (upperdir/workdir lives here)
-	repoCacheUpperPath := filepath.Join(m.config.WorkspaceDir, runnerID, "repo-cache-upper.img")
+	repoCacheUpperPath = filepath.Join(m.config.WorkspaceDir, runnerID, "repo-cache-upper.img")
 	if err := os.MkdirAll(filepath.Dir(repoCacheUpperPath), 0755); err != nil {
 		m.cleanupRunner(runnerID, tap.Name, overlayPath, "")
-		return nil, fmt.Errorf("failed to create repo-cache-upper directory: %w", err)
+		return "", "", fmt.Errorf("failed to create repo-cache-upper directory: %w", err)
 	}
 	if err := createExt4Image(repoCacheUpperPath, m.config.RepoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
 		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
-		return nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
+		return "", "", fmt.Errorf("failed to create repo-cache-upper image: %w", err)
 	}
 
-	// Create runner record
+	return overlayPath, repoCacheUpperPath, nil
+}
+
+// buildVMConfig creates the Runner record and Firecracker VM configuration.
+// Must be called with m.mu held.
+func (m *Manager) buildVMConfig(runnerID string, req AllocateRequest, tap *network.TapDevice, snapshotPaths *snapshot.SnapshotPaths, overlayPath, repoCacheUpperPath string) (*Runner, firecracker.VMConfig) {
 	runner := &Runner{
 		ID:              runnerID,
 		HostID:          m.config.HostID,
@@ -314,7 +360,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		TapDevice:       tap.Name,
 		MAC:             tap.MAC,
 		SnapshotVersion: snapshotPaths.Version,
-		GitHubRepo:      req.Repo, // For pool key matching
+		GitHubRepo:      req.Repo,
 		Resources: Resources{
 			VCPUs:    m.config.VCPUsPerRunner,
 			MemoryMB: m.config.MemoryMBPerRunner,
@@ -329,13 +375,11 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 
 	// Build kernel boot args with network configuration
 	// Format: ip=<client-ip>::<gateway-ip>:<netmask>::<interface>:off
-	// This configures networking at kernel boot time, before userspace starts
 	// See: https://github.com/firecracker-microvm/firecracker/blob/main/docs/network-setup.md
 	netCfg := tap.GetNetworkConfig()
-	// Extract IP without CIDR suffix (netCfg.IP is "172.16.0.2/24", we need "172.16.0.2")
 	guestIP := strings.Split(netCfg.IP, "/")[0]
-	gateway := netCfg.Gateway // e.g., "172.16.0.1"
-	netmask := netCfg.Netmask // e.g., "255.255.255.0"
+	gateway := netCfg.Gateway
+	netmask := netCfg.Netmask
 	bootArgs := fmt.Sprintf("console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off", guestIP, gateway, netmask)
 
 	m.logger.WithFields(logrus.Fields{
@@ -344,7 +388,6 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		"netmask":  netmask,
 	}).Debug("Configuring kernel network boot args")
 
-	// Create VM configuration
 	vmCfg := firecracker.VMConfig{
 		VMID:           runnerID,
 		SocketDir:      m.config.SocketDir,
@@ -360,7 +403,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 			GuestMAC:    tap.MAC,
 		},
 		MMDSConfig: &firecracker.MMDSConfig{
-			Version:           "V1", // V1 for simple GET requests (thaw-agent uses V1 protocol)
+			Version:           "V1",
 			NetworkInterfaces: []string{"eth0"},
 		},
 		Drives:      m.buildDrives(snapshotPaths.RepoCacheSeed, repoCacheUpperPath),
@@ -368,14 +411,19 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		MetricsPath: runner.MetricsPath,
 	}
 
-	// Create VM instance
+	return runner, vmCfg
+}
+
+// startOrRestoreVM creates a Firecracker VM and either restores from snapshot (fast path)
+// or cold boots it. On snapshot restore failure, it falls back to cold boot automatically.
+// Must be called with m.mu held.
+func (m *Manager) startOrRestoreVM(ctx context.Context, runnerID string, vmCfg firecracker.VMConfig, tap *network.TapDevice, snapshotPaths *snapshot.SnapshotPaths, overlayPath, repoCacheUpperPath string) (*firecracker.VM, error) {
 	vm, err := firecracker.NewVM(vmCfg, m.logger.Logger)
 	if err != nil {
 		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
-	// Try snapshot restore first (fast path), fall back to cold boot if needed
 	if snapshotPaths.Mem != "" && snapshotPaths.State != "" {
 		m.logger.WithFields(logrus.Fields{
 			"runner_id": runnerID,
@@ -416,9 +464,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		}
 
 		if !restoreOK {
-			// Stop the failed Firecracker process before retry
 			vm.Stop()
-			// Recreate VM for cold boot
 			vm, err = firecracker.NewVM(vmCfg, m.logger.Logger)
 			if err != nil {
 				m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
@@ -430,7 +476,6 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 			}
 		}
 	} else {
-		// No snapshot available, cold boot
 		m.logger.WithField("runner_id", runnerID).Info("Starting runner (cold boot - no snapshot available)")
 		if err := vm.Start(ctx); err != nil {
 			m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
@@ -438,27 +483,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		}
 	}
 
-	// Inject MMDS data (VM is already running after Start() or RestoreFromSnapshot())
-	mmdsData := m.buildMMDSData(ctx, runner, tap, req)
-	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
-		vm.Stop()
-		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
-		return nil, fmt.Errorf("failed to set MMDS data: %w", err)
-	}
-
-	runner.State = StateInitializing
-	runner.StartedAt = time.Now()
-
-	m.runners[runnerID] = runner
-	m.vms[runnerID] = vm
-
-	m.logger.WithFields(logrus.Fields{
-		"runner_id": runnerID,
-		"ip":        runner.InternalIP.String(),
-		"snapshot":  runner.SnapshotVersion,
-	}).Info("Runner allocated successfully")
-
-	return runner, nil
+	return vm, nil
 }
 
 // buildMMDSData builds the MMDS data structure for a runner
