@@ -241,6 +241,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	}
 
 	runnerID := uuid.New().String()
+	allocStart := time.Now()
 	m.logger.WithField("runner_id", runnerID).Info("Allocating new runner")
 
 	// Get snapshot paths first to determine if we should use slot-based TAP allocation
@@ -288,13 +289,16 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	}
 
 	// Create rootfs overlay
+	overlayStart := time.Now()
 	overlayPath, err := m.snapshotCache.CreateOverlay(runnerID)
 	if err != nil {
 		m.network.ReleaseTap(runnerID)
 		return nil, fmt.Errorf("failed to create rootfs overlay: %w", err)
 	}
+	overlayDur := time.Since(overlayStart)
 
 	// Create per-runner writable repo cache layer image (upperdir/workdir lives here)
+	repoCacheStart := time.Now()
 	repoCacheUpperPath := filepath.Join(m.config.WorkspaceDir, runnerID, "repo-cache-upper.img")
 	if err := os.MkdirAll(filepath.Dir(repoCacheUpperPath), 0755); err != nil {
 		m.cleanupRunner(runnerID, tap.Name, overlayPath, "")
@@ -304,6 +308,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
 		return nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
 	}
+	repoCacheDur := time.Since(repoCacheStart)
 
 	// Create runner record
 	runner := &Runner{
@@ -453,9 +458,12 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	m.vms[runnerID] = vm
 
 	m.logger.WithFields(logrus.Fields{
-		"runner_id": runnerID,
-		"ip":        runner.InternalIP.String(),
-		"snapshot":  runner.SnapshotVersion,
+		"runner_id":         runnerID,
+		"ip":                runner.InternalIP.String(),
+		"snapshot":          runner.SnapshotVersion,
+		"alloc_ms":          time.Since(allocStart).Milliseconds(),
+		"overlay_ms":        overlayDur.Milliseconds(),
+		"repo_cache_img_ms": repoCacheDur.Milliseconds(),
 	}).Info("Runner allocated successfully")
 
 	return runner, nil

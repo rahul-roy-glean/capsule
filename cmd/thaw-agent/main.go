@@ -582,16 +582,13 @@ func main() {
 	go startHealthServer(mmdsData)
 	log.Info("Health server started in background")
 
-	// Verify Bazel server survived snapshot restore
+	// Verify bazel server survived snapshot restore by running `bazel info server_pid`.
+	// This uses bazel's own logic to find its server — no hardcoded paths, works with
+	// any bazelrc config.
 	setStep("bazel_verification")
 	preClonedRepo := getPreClonedPath(mmdsData)
 	if preClonedRepo != "" {
-		log.Info("Starting Bazel server verification...")
-		verifyStart := time.Now()
-		if err := verifyBazelServer(preClonedRepo); err != nil {
-			log.WithError(err).Warn("Bazel server verification failed (will cold-start on first build)")
-		}
-		log.WithField("duration_ms", time.Since(verifyStart).Milliseconds()).Info("Bazel server verification completed")
+		verifyBazelServer(preClonedRepo)
 	}
 	bootTimer.Phase("bazel_verify")
 
@@ -727,6 +724,8 @@ func setupRepoCacheOverlay() error {
 	// Ensure the runner user can write into the repo cache path without recursively
 	// chowning (which would copy-up most of the seed into the upper layer).
 	_ = exec.Command("chown", *runnerUsername+":"+*runnerUsername, *repoCacheOverlayTarget).Run()
+	// Also chown the upper mount so bazel can create disk-cache dir under it.
+	_ = exec.Command("chown", *runnerUsername+":"+*runnerUsername, *repoCacheUpperMount).Run()
 
 	log.WithFields(logrus.Fields{
 		"seed_device":  seedDev,
@@ -1710,6 +1709,20 @@ func runWarmupMode(data *MMDSData) error {
 		return fmt.Errorf("no repo_url in warmup config")
 	}
 
+	// Look up runner user so we can clone as the correct user.
+	// This ensures the snapshot has proper ownership and workflows
+	// won't hit git's "dubious ownership" error.
+	runnerUser, err := user.Lookup(*runnerUsername)
+	if err != nil {
+		return fmt.Errorf("runner user not found: %w", err)
+	}
+	rUID, _ := strconv.ParseUint(runnerUser.Uid, 10, 32)
+	rGID, _ := strconv.ParseUint(runnerUser.Gid, 10, 32)
+	runnerCred := &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
+	}
+	runnerHome := "HOME=" + runnerUser.HomeDir
+
 	// Clone to rootfs (which has more space) but symlink to expected GitHub Actions location
 	// This allows the workflow to find the repo at /mnt/ephemeral/workdir/scio/scio
 	// while actually storing it on the persistent rootfs at /workspace/scio/scio
@@ -1754,10 +1767,13 @@ func runWarmupMode(data *MMDSData) error {
 		"job_repo":      data.Latest.Job.Repo,
 	}).Info("Cloning repository for warmup")
 
-	// Create parent directory for the clone target (e.g., /mnt/ephemeral/workdir/scio for scio/scio)
-	if err := os.MkdirAll(filepath.Dir(repoDir), 0755); err != nil {
+	// Create parent directory for the clone target (e.g., /workspace/scio for scio/scio)
+	// and chown it to the runner user so the clone (running as runner user) can write to it.
+	parentDir := filepath.Dir(repoDir)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
 		return fmt.Errorf("failed to create repo parent dir: %w", err)
 	}
+	os.Chown(parentDir, int(rUID), int(rGID))
 
 	branch := warmup.RepoBranch
 	if branch == "" {
@@ -1785,9 +1801,10 @@ func runWarmupMode(data *MMDSData) error {
 					"repo_dir":   repoDir,
 				}).Info("Using git-cache for local clone (no network auth needed)")
 
-				// Clone locally from the cache
+				// Clone locally from the cache as runner user
 				cloneCmd := exec.Command("git", "clone", "--branch", branch, "file://"+cachePath, repoDir)
-				cloneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+				cloneCmd.SysProcAttr = runnerCred
+				cloneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", runnerHome)
 				output, err := cloneCmd.CombinedOutput()
 				if err != nil {
 					log.WithFields(logrus.Fields{
@@ -1796,7 +1813,10 @@ func runWarmupMode(data *MMDSData) error {
 					}).Warn("Local clone from git-cache failed, will try network clone")
 				} else {
 					// Set the remote to the real GitHub URL for future fetches
-					exec.Command("git", "-C", repoDir, "remote", "set-url", "origin", "https://github.com/"+warmup.RepoURL).Run()
+					setURLCmd := exec.Command("git", "-C", repoDir, "remote", "set-url", "origin", "https://github.com/"+warmup.RepoURL)
+					setURLCmd.SysProcAttr = runnerCred
+					setURLCmd.Env = append(os.Environ(), runnerHome)
+					setURLCmd.Run()
 					cloned = true
 					log.Info("Local clone from git-cache completed successfully")
 				}
@@ -1835,22 +1855,26 @@ func runWarmupMode(data *MMDSData) error {
 				"repo_dir": repoDir,
 			}).Info("Starting git clone")
 
-			// Ensure HOME is set (systemd services may not have it, and git/GnuTLS need it)
-			if os.Getenv("HOME") == "" {
-				os.Setenv("HOME", "/root")
-				log.Info("HOME was not set, defaulting to /root")
+			// Configure git for reliability over NAT as the runner user
+			// (system-level config is already set in Dockerfile, these are user-level overrides)
+			gitConfigEnv := append(os.Environ(), runnerHome)
+			for _, kv := range [][2]string{
+				{"http.postBuffer", "524288000"},
+				{"http.lowSpeedLimit", "1000"},
+				{"http.lowSpeedTime", "60"},
+				{"http.version", "HTTP/1.1"},
+			} {
+				cfgCmd := exec.Command("git", "config", "--global", kv[0], kv[1])
+				cfgCmd.SysProcAttr = runnerCred
+				cfgCmd.Env = gitConfigEnv
+				cfgCmd.Run()
 			}
 
-			// Configure git for reliability over NAT (gnutls can drop during large transfers)
-			exec.Command("git", "config", "--global", "http.postBuffer", "524288000").Run()
-			exec.Command("git", "config", "--global", "http.lowSpeedLimit", "1000").Run()
-			exec.Command("git", "config", "--global", "http.lowSpeedTime", "60").Run()
-			exec.Command("git", "config", "--global", "http.version", "HTTP/1.1").Run()
-
 			cloneCmd := exec.Command("git", "clone", "--depth=1", "--branch", branch, cloneURL, repoDir)
+			cloneCmd.SysProcAttr = runnerCred
 			cloneCmd.Env = append(os.Environ(),
 				"GIT_TERMINAL_PROMPT=0",
-				"HOME=/root",
+				runnerHome,
 			)
 			output, err := cloneCmd.CombinedOutput()
 			if err != nil {
@@ -1867,7 +1891,10 @@ func runWarmupMode(data *MMDSData) error {
 			if data.Latest.Job.GitToken != "" {
 				repoPath := strings.TrimPrefix(warmup.RepoURL, "https://github.com/")
 				repoPath = strings.TrimPrefix(repoPath, "github.com/")
-				exec.Command("git", "-C", repoDir, "remote", "set-url", "origin", "https://github.com/"+repoPath).Run()
+				setURLCmd := exec.Command("git", "-C", repoDir, "remote", "set-url", "origin", "https://github.com/"+repoPath)
+				setURLCmd.SysProcAttr = runnerCred
+				setURLCmd.Env = append(os.Environ(), runnerHome)
+				setURLCmd.Run()
 			}
 		}
 	}
@@ -1908,6 +1935,7 @@ build --local_resources=cpu=HOST_CPUS
 	if err := os.WriteFile(bazelrcPath, []byte(bazelrcContent), 0644); err != nil {
 		log.WithError(err).Warn("Failed to write bazelrc.warmup")
 	}
+	os.Chown(bazelrcPath, int(rUID), int(rGID))
 
 	bazelEnv := append(os.Environ(), "HOME=/home/"+*runnerUsername)
 
@@ -1984,7 +2012,7 @@ esac
 	log.WithField("targets", fetchTargets).Info("Running bazel fetch")
 	globalWarmupLogs.Add("[phase] bazel fetch " + fetchTargets)
 
-	if err := runStreamedCommand(repoDir, bazelEnv, "bazel", fetchArgs[0:]...); err != nil {
+	if err := runStreamedCommand(repoDir, bazelEnv, runnerCred, "bazel", fetchArgs[0:]...); err != nil {
 		log.WithError(err).Warn("bazel fetch failed (continuing)")
 		globalWarmupLogs.Add("[error] bazel fetch failed: " + err.Error())
 	} else {
@@ -2012,7 +2040,7 @@ esac
 	log.WithField("targets", fetchTargets).Info("Running bazel build --nobuild")
 	globalWarmupLogs.Add("[phase] bazel build --nobuild " + fetchTargets)
 
-	if err := runStreamedCommand(repoDir, bazelEnv, "bazel", analyzeArgs[0:]...); err != nil {
+	if err := runStreamedCommand(repoDir, bazelEnv, runnerCred, "bazel", analyzeArgs[0:]...); err != nil {
 		log.WithError(err).Warn("bazel build --nobuild failed (continuing)")
 		globalWarmupLogs.Add("[error] bazel build --nobuild failed: " + err.Error())
 	} else {
@@ -2024,26 +2052,80 @@ esac
 	log.Info("Starting persistent Bazel server")
 	globalWarmupLogs.Add("[phase] bazel info")
 
-	if err := runStreamedCommand(repoDir, bazelEnv, "bazel", "--bazelrc="+bazelrcPath, "info"); err != nil {
+	if err := runStreamedCommand(repoDir, bazelEnv, runnerCred, "bazel", "--bazelrc="+bazelrcPath, "info"); err != nil {
 		log.WithError(err).Warn("bazel info failed")
 		globalWarmupLogs.Add("[error] bazel info failed: " + err.Error())
 	} else {
 		globalWarmupLogs.Add("[done] bazel info completed")
 	}
 
-	// Phase 6: Sync caches to disk
+	// Phase 6: Pre-warm .NET Runner.Listener pages into memory.
+	// The GitHub Actions runner is a .NET application. After snapshot restore,
+	// its pages need to be demand-faulted from UFFD, which takes ~2+ minutes.
+	// By briefly starting Runner.Listener during warmup, the .NET runtime,
+	// JIT'd code, and managed assemblies get loaded into guest memory and
+	// baked into snapshot.mem — making post-restore startup near-instant.
+	updateWarmupState("runner_prewarm", "Pre-warming .NET runner pages...")
+	preWarmRunnerPages(*runnerDir, runnerCred, runnerHome)
+
+	// Phase 7: Sync caches to disk
 	updateWarmupState("syncing", "Syncing caches to disk...")
 	exec.Command("sync").Run()
 
 	return nil
 }
 
+// preWarmRunnerPages loads the .NET Runner.Listener into memory so its pages
+// are baked into the Firecracker snapshot. After restore, demand-paging these
+// pages from UFFD is much faster than reading them from the rootfs disk.
+func preWarmRunnerPages(runnerPath string, cred *syscall.SysProcAttr, homeEnv string) {
+	start := time.Now()
+	log.WithField("runner_path", runnerPath).Info("Pre-warming .NET runner pages...")
+	globalWarmupLogs.Add("[phase] runner page pre-warm")
+
+	listenerBin := filepath.Join(runnerPath, "bin", "Runner.Listener")
+	if _, err := os.Stat(listenerBin); err != nil {
+		log.WithError(err).Warn("Runner.Listener binary not found, skipping pre-warm")
+		globalWarmupLogs.Add("[warn] Runner.Listener not found: " + err.Error())
+		return
+	}
+
+	// Start Runner.Listener briefly. It will fail quickly because config.sh
+	// hasn't been run (no .runner config file), but that's fine — the .NET
+	// runtime, JIT compiler, and managed assemblies all get loaded into memory
+	// before it exits, which is exactly what we need for the snapshot.
+	// Give it up to 15 seconds — .NET runtime typically loads within a few seconds,
+	// then Runner.Listener exits with an error because it's not configured.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, listenerBin)
+	cmd.Dir = runnerPath
+	cmd.Env = append(os.Environ(), homeEnv, "DOTNET_EnableDiagnostics=0")
+	if cred != nil {
+		cmd.SysProcAttr = cred
+	}
+
+	out, err := cmd.CombinedOutput()
+	elapsed := time.Since(start)
+
+	// We expect it to fail (no config) — that's fine, pages are loaded.
+	log.WithFields(logrus.Fields{
+		"duration_ms": elapsed.Milliseconds(),
+		"exit_error":  err,
+		"output":      strings.TrimSpace(string(out)),
+	}).Info("Runner.Listener pre-warm completed")
+	globalWarmupLogs.Add(fmt.Sprintf("[done] runner pre-warm completed in %dms", elapsed.Milliseconds()))
+}
+
 // runStreamedCommand runs a command, capturing stdout/stderr line by line
 // into the warmup log buffer and the structured logger.
-func runStreamedCommand(dir string, env []string, name string, args ...string) error {
+func runStreamedCommand(dir string, env []string, procAttr *syscall.SysProcAttr, name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	cmd.Dir = dir
 	cmd.Env = env
+	if procAttr != nil {
+		cmd.SysProcAttr = procAttr
+	}
 
 	// Create pipes for stdout and stderr
 	stdoutPipe, err := cmd.StdoutPipe()
@@ -2201,19 +2283,44 @@ func verifyConnectivity(repoURL string) error {
 	return nil
 }
 
-// verifyBazelServer checks that the Bazel JVM survived snapshot restore.
-func verifyBazelServer(repoDir string) error {
+// verifyBazelServer runs `bazel info server_pid` to check the bazel server
+// survived snapshot restore. Uses bazel's own server discovery — no hardcoded
+// paths, works with any bazelrc configuration.
+func verifyBazelServer(repoDir string) {
+	runnerUser, err := user.Lookup(*runnerUsername)
+	if err != nil {
+		log.WithError(err).Warn("Cannot look up runner user for bazel verify")
+		return
+	}
+	rUID, _ := strconv.ParseUint(runnerUser.Uid, 10, 32)
+	rGID, _ := strconv.ParseUint(runnerUser.Gid, 10, 32)
+
 	cmd := exec.Command("bazel", "info", "server_pid")
 	cmd.Dir = repoDir
-	cmd.Env = append(os.Environ(), "HOME=/home/"+*runnerUsername)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("bazel server not running: %w (output: %s)", err, string(output))
+	cmd.Env = append(os.Environ(), "HOME="+runnerUser.HomeDir)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
 	}
-	pid := strings.TrimSpace(string(output))
-	log.WithField("pid", pid).Info("Bazel server alive after restore")
-	return nil
+
+	start := time.Now()
+	out, err := cmd.CombinedOutput()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		log.WithFields(logrus.Fields{
+			"duration_ms": elapsed.Milliseconds(),
+			"error":       err,
+			"output":      strings.TrimSpace(string(out)),
+		}).Warn("Bazel server verify failed (will cold-start on first build)")
+	} else {
+		log.WithFields(logrus.Fields{
+			"duration_ms": elapsed.Milliseconds(),
+			"server_pid":  strings.TrimSpace(string(out)),
+		}).Info("Bazel server alive after restore")
+	}
 }
+
+
 
 // startHealthServer starts a simple HTTP server for health checks and testing
 func startHealthServer(mmdsData *MMDSData) {

@@ -207,8 +207,7 @@ build {
       "[Install]",
       "WantedBy=multi-user.target",
       "EOF",
-      "sudo systemctl daemon-reload",
-      "sudo systemctl enable firecracker-manager"
+      "sudo systemctl daemon-reload"
     ]
   }
 

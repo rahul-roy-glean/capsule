@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -326,19 +327,27 @@ func (c *Cache) CreateOverlay(runnerID string) (string, error) {
 		return "", fmt.Errorf("failed to create overlay directory: %w", err)
 	}
 
-	// Firecracker expects raw block images. Instead of qcow2 overlays, create a
-	// sparse copy of the base rootfs (and use reflink where supported).
-	if output, err := exec.Command("cp", "--reflink=auto", "--sparse=always", baseRootfs, overlayPath).CombinedOutput(); err != nil {
-		// Fallback for systems without reflink support/flag.
+	// Firecracker expects raw block images. Use reflink (instant, CoW clone) if
+	// supported by the filesystem, otherwise fall back to a sparse copy. Try
+	// --reflink=always first so we get an explicit error if reflink fails rather
+	// than silently falling back to a full data copy.
+	start := time.Now()
+	if output, err := exec.Command("cp", "--reflink=always", baseRootfs, overlayPath).CombinedOutput(); err != nil {
+		c.logger.WithFields(logrus.Fields{
+			"runner_id": runnerID,
+			"error":     strings.TrimSpace(string(output)),
+		}).Warn("Reflink copy failed, falling back to sparse copy")
 		if output2, err2 := exec.Command("cp", "--sparse=always", baseRootfs, overlayPath).CombinedOutput(); err2 != nil {
 			return "", fmt.Errorf("failed to copy rootfs overlay: %s / %s: %w", string(output), string(output2), err2)
 		}
 	}
+	elapsed := time.Since(start)
 
 	c.logger.WithFields(logrus.Fields{
-		"runner_id": runnerID,
-		"overlay":   overlayPath,
-	}).Debug("Created rootfs overlay")
+		"runner_id":   runnerID,
+		"overlay":     overlayPath,
+		"duration_ms": elapsed.Milliseconds(),
+	}).Info("Created rootfs overlay")
 
 	return overlayPath, nil
 }
