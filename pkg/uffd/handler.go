@@ -16,6 +16,7 @@ package uffd
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -30,6 +31,20 @@ import (
 
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
+
+// GuestRegionUFFDMapping represents a mapping between a VM memory address
+// and the offset in the memory snapshot file. Firecracker sends these over
+// the UFFD socket to tell the handler how to resolve page faults.
+type GuestRegionUFFDMapping struct {
+	BaseHostVirtAddr uintptr `json:"base_host_virt_addr"`
+	Size             uintptr `json:"size"`
+	Offset           uintptr `json:"offset"`
+}
+
+// ContainsGuestAddr returns true if addr falls within this mapping's range.
+func (g *GuestRegionUFFDMapping) ContainsGuestAddr(addr uintptr) bool {
+	return addr >= g.BaseHostVirtAddr && addr < g.BaseHostVirtAddr+g.Size
+}
 
 const (
 	// UFFD ioctl commands
@@ -101,16 +116,16 @@ type Handler struct {
 	chunkStore *snapshot.ChunkStore
 	metadata   *snapshot.ChunkedSnapshotMetadata
 
-	// Memory region info
-	memStart uint64
-	memSize  uint64
+	// Guest memory region mappings received from Firecracker.
+	// These map guest virtual addresses to snapshot file offsets.
+	mappings []GuestRegionUFFDMapping
 
 	// Chunk lookup table: chunk index -> ChunkRef
-	// Pre-computed for fast lookups
+	// Pre-computed for fast lookups (built after mappings are received)
 	chunkLookup []snapshot.ChunkRef
 
 	// LRU page cache for recently accessed pages
-	// Key is page offset, value is page data (4KB)
+	// Key is page offset (in snapshot file space), value is page data (4KB)
 	pageCache     *lru.Cache[uint64, []byte]
 	pageCacheSize int
 
@@ -136,9 +151,7 @@ type HandlerConfig struct {
 	SocketPath    string
 	ChunkStore    *snapshot.ChunkStore
 	Metadata      *snapshot.ChunkedSnapshotMetadata
-	MemStart      uint64 // Starting address of VM memory region
-	MemSize       uint64 // Size of VM memory region
-	PageCacheSize int    // Max pages to cache (default 50000 = ~200MB)
+	PageCacheSize int // Max pages to cache (default 50000 = ~200MB)
 	Logger        *logrus.Logger
 }
 
@@ -165,8 +178,6 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 	h := &Handler{
 		chunkStore:    cfg.ChunkStore,
 		metadata:      cfg.Metadata,
-		memStart:      cfg.MemStart,
-		memSize:       cfg.MemSize,
 		pageCache:     pageCache,
 		pageCacheSize: pageCacheSize,
 		socketPath:    cfg.SocketPath,
@@ -175,8 +186,8 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 		logger:        cfg.Logger.WithField("component", "uffd-handler"),
 	}
 
-	// Build chunk lookup table for fast access
-	h.buildChunkLookup()
+	// Chunk lookup is built after receiving memory mappings from Firecracker
+	// in handleConnection(), not here.
 
 	return h, nil
 }
@@ -192,6 +203,17 @@ func (h *Handler) buildChunkLookup() {
 	copy(h.chunkLookup, h.metadata.MemChunks)
 
 	h.logger.WithField("chunks", len(h.chunkLookup)).Debug("Built chunk lookup table")
+}
+
+// findMapping returns the GuestRegionUFFDMapping that contains the given
+// guest virtual address.
+func (h *Handler) findMapping(addr uintptr) (*GuestRegionUFFDMapping, error) {
+	for i := range h.mappings {
+		if h.mappings[i].ContainsGuestAddr(addr) {
+			return &h.mappings[i], nil
+		}
+	}
+	return nil, fmt.Errorf("address 0x%x not found in any guest region UFFD mapping", addr)
 }
 
 // findChunk finds the chunk containing the given offset using binary search
@@ -276,79 +298,91 @@ func (h *Handler) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// Receive the UFFD file descriptor
-	uffdFd, err := h.receiveUffdFd(unixConn)
+	// Receive the UFFD fd and guest memory region mappings
+	uffdFd, mappings, err := h.receiveUffdAndMappings(unixConn)
 	if err != nil {
-		h.logger.WithError(err).Error("Failed to receive UFFD fd")
+		h.logger.WithError(err).Error("Failed to receive UFFD setup message")
 		return
 	}
 	defer unix.Close(uffdFd)
 
-	h.logger.WithField("fd", uffdFd).Info("Received UFFD file descriptor")
+	// Store mappings and build chunk lookup now that we know the address layout
+	h.mappings = mappings
+	h.buildChunkLookup()
+
+	h.logger.WithFields(logrus.Fields{
+		"fd":       uffdFd,
+		"mappings": len(mappings),
+	}).Info("Received UFFD file descriptor and memory mappings")
 
 	// Handle page faults
 	h.handlePageFaults(uffdFd)
 }
 
-// receiveUffdFd receives the UFFD file descriptor from Firecracker via SCM_RIGHTS
-func (h *Handler) receiveUffdFd(conn *net.UnixConn) (int, error) {
-	// Get the underlying file to access the raw FD
-	rawConn, err := conn.SyscallConn()
+// receiveUffdAndMappings receives the UFFD file descriptor and guest memory
+// region mappings from Firecracker via the Unix socket. Firecracker sends:
+// - In-band data: JSON-encoded []GuestRegionUFFDMapping
+// - Out-of-band (SCM_RIGHTS): the UFFD file descriptor
+func (h *Handler) receiveUffdAndMappings(conn *net.UnixConn) (int, []GuestRegionUFFDMapping, error) {
+	// Read using the higher-level UnixConn API which handles SCM_RIGHTS parsing.
+	mappingsBuf := make([]byte, 4096) // enough for JSON mappings
+	oobBuf := make([]byte, unix.CmsgSpace(4)) // space for one fd
+
+	n, oobn, _, _, err := conn.ReadMsgUnix(mappingsBuf, oobBuf)
 	if err != nil {
-		return -1, fmt.Errorf("failed to get raw connection: %w", err)
+		return -1, nil, fmt.Errorf("failed to read unix msg: %w", err)
 	}
 
-	var uffdFd int = -1
-	var recvErr error
+	h.logger.WithFields(logrus.Fields{
+		"n":    n,
+		"oobn": oobn,
+	}).Debug("Received UFFD setup message")
 
-	err = rawConn.Read(func(fd uintptr) bool {
-		// Receive message with file descriptor
-		buf := make([]byte, 64)
-		oob := make([]byte, unix.CmsgSpace(4)) // Space for one fd
+	// Parse the guest memory region mappings from in-band data
+	var mappings []GuestRegionUFFDMapping
+	if n > 0 {
+		if err := json.Unmarshal(mappingsBuf[:n], &mappings); err != nil {
+			return -1, nil, fmt.Errorf("failed to parse memory mappings: %w", err)
+		}
+		h.logger.WithField("mappings", len(mappings)).Debug("Parsed guest region UFFD mappings")
+		for i, m := range mappings {
+			h.logger.WithFields(logrus.Fields{
+				"region":    i,
+				"base_addr": fmt.Sprintf("0x%x", m.BaseHostVirtAddr),
+				"size":      m.Size,
+				"offset":    m.Offset,
+			}).Debug("Guest region mapping")
+		}
+	}
 
-		n, oobn, _, _, err := unix.Recvmsg(int(fd), buf, oob, 0)
+	// Parse the UFFD fd from out-of-band (control message) data
+	uffdFd := -1
+	if oobn > 0 {
+		msgs, err := unix.ParseSocketControlMessage(oobBuf[:oobn])
 		if err != nil {
-			recvErr = err
-			return true
+			return -1, nil, fmt.Errorf("failed to parse control message: %w", err)
 		}
-
-		h.logger.WithFields(logrus.Fields{
-			"n":    n,
-			"oobn": oobn,
-		}).Debug("Received UFFD message")
-
-		// Parse the control message to extract the fd
-		if oobn > 0 {
-			msgs, err := unix.ParseSocketControlMessage(oob[:oobn])
+		for _, msg := range msgs {
+			fds, err := unix.ParseUnixRights(&msg)
 			if err != nil {
-				recvErr = fmt.Errorf("failed to parse control message: %w", err)
-				return true
+				continue
 			}
-
-			for _, msg := range msgs {
-				fds, err := unix.ParseUnixRights(&msg)
-				if err != nil {
-					continue
-				}
-				if len(fds) > 0 {
-					uffdFd = fds[0]
-					return true
-				}
+			if len(fds) > 0 {
+				uffdFd = fds[0]
+				break
 			}
 		}
-
-		recvErr = fmt.Errorf("no file descriptor received")
-		return true
-	})
-
-	if err != nil {
-		return -1, err
-	}
-	if recvErr != nil {
-		return -1, recvErr
 	}
 
-	return uffdFd, nil
+	if uffdFd < 0 {
+		return -1, nil, fmt.Errorf("no UFFD file descriptor received")
+	}
+
+	if len(mappings) == 0 {
+		return -1, nil, fmt.Errorf("no guest region mappings received")
+	}
+
+	return uffdFd, mappings, nil
 }
 
 // handlePageFaults reads and handles page fault events from the UFFD
@@ -417,12 +451,14 @@ func (h *Handler) handleSingleFault(uffdFd int, address uint64) error {
 	// Align to page boundary
 	pageAddr := address & ^uint64(PageSize-1)
 
-	// Calculate offset within memory region
-	if pageAddr < h.memStart || pageAddr >= h.memStart+h.memSize {
-		return fmt.Errorf("address 0x%x outside memory region [0x%x, 0x%x)",
-			pageAddr, h.memStart, h.memStart+h.memSize)
+	// Find which guest memory region contains this address
+	mapping, err := h.findMapping(uintptr(pageAddr))
+	if err != nil {
+		return err
 	}
-	offset := pageAddr - h.memStart
+
+	// Translate guest address to snapshot file offset using the mapping
+	offset := uint64(uintptr(pageAddr) - mapping.BaseHostVirtAddr + mapping.Offset)
 
 	// Queue eager fetch for upcoming chunks (async, non-blocking)
 	h.queueEagerFetch(offset)

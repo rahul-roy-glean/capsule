@@ -40,6 +40,8 @@ var (
 	gitCachePath        = flag.String("git-cache-path", "", "Path to pre-populated git-cache.img (from git-cache-builder). If set, uses this instead of cloning during warmup.")
 	fetchTargets        = flag.String("fetch-targets", "//...", "Bazel target pattern for fetch (e.g., '//... -- -//terraform/...' to exclude terraform)")
 	logLevel            = flag.String("log-level", "info", "Log level")
+	enableChunked       = flag.Bool("enable-chunked", true, "Also build a chunked snapshot for lazy loading")
+	chunkSize           = flag.Int64("chunk-size", 4194304, "Chunk size in bytes for chunked snapshots (default 4MB)")
 
 	// GitHub App authentication for private repos (used when git-cache is not available)
 	githubAppID     = flag.String("github-app-id", "", "GitHub App ID for private repo access")
@@ -370,6 +372,55 @@ func main() {
 	log.Info("Updating current pointer...")
 	if err := uploader.UpdateCurrentPointer(ctx, version); err != nil {
 		log.WithError(err).Fatal("Failed to update current pointer")
+	}
+
+	// Build and upload chunked snapshot for lazy loading
+	if *enableChunked {
+		log.Info("Building chunked snapshot for lazy loading...")
+
+		chunkStore, err := snapshot.NewChunkStore(ctx, snapshot.ChunkStoreConfig{
+			GCSBucket:      *gcsBucket,
+			LocalCachePath: filepath.Join(*outputDir, "chunk-cache"),
+			Logger:         logger,
+		})
+		if err != nil {
+			log.WithError(err).Fatal("Failed to create chunk store")
+		}
+		defer chunkStore.Close()
+
+		builder := snapshot.NewChunkedSnapshotBuilder(chunkStore, logger)
+		snapshotPaths := &snapshot.SnapshotPaths{
+			Kernel:        kernelOutput,
+			Rootfs:        workingRootfs,
+			Mem:           memPath,
+			State:         snapshotPath,
+			RepoCacheSeed: repoCacheSeedImg,
+			Version:       version,
+		}
+
+		chunkedMeta, err := builder.BuildChunkedSnapshot(ctx, snapshotPaths, version)
+		if err != nil {
+			log.WithError(err).Fatal("Failed to build chunked snapshot")
+		}
+
+		if err := builder.UploadChunkedMetadata(ctx, chunkedMeta); err != nil {
+			log.WithError(err).Fatal("Failed to upload chunked metadata")
+		}
+
+		// Also upload chunked metadata at "current" so hosts can find it
+		currentMeta := *chunkedMeta
+		currentMeta.Version = "current"
+		if err := builder.UploadChunkedMetadata(ctx, &currentMeta); err != nil {
+			log.WithError(err).Fatal("Failed to upload current chunked metadata")
+		}
+		// Restore the real version on the metadata object
+		currentMeta.Version = version
+
+		log.WithFields(logrus.Fields{
+			"mem_chunks":  len(chunkedMeta.MemChunks),
+			"disk_chunks": len(chunkedMeta.RootfsChunks),
+			"seed_chunks": len(chunkedMeta.RepoCacheSeedChunks),
+		}).Info("Chunked snapshot built and uploaded")
 	}
 
 	log.WithFields(logrus.Fields{

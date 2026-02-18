@@ -332,6 +332,34 @@ func main() {
 		}
 		defer chunkedMgr.Close()
 		mgr = chunkedMgr.Manager // Use embedded manager for compatibility
+
+		// When using chunked snapshots, eagerly fetch just the kernel from
+		// the chunk store so it's available as a local file for Firecracker
+		// boot config. Everything else (rootfs, memory) is loaded lazily
+		// via FUSE and UFFD. This replaces the traditional SyncFromGCS
+		// which would download the entire snapshot.
+		if *useChunkedSnapshots {
+			if meta := chunkedMgr.GetChunkedMetadata(); meta != nil && meta.KernelHash != "" {
+				log.Info("Eagerly fetching kernel from chunk store...")
+				kernelData, err := chunkedMgr.GetChunkStore().GetChunk(ctx, meta.KernelHash)
+				if err != nil {
+					log.WithError(err).Fatal("Failed to fetch kernel chunk")
+				}
+				kernelPath := filepath.Join(*snapshotCache, "kernel.bin")
+				if err := os.WriteFile(kernelPath, kernelData, 0644); err != nil {
+					log.WithError(err).Fatal("Failed to write kernel to local cache")
+				}
+				log.WithFields(logrus.Fields{
+					"kernel_size": len(kernelData),
+					"path":        kernelPath,
+				}).Info("Kernel fetched from chunk store")
+			} else {
+				log.Warn("No chunked metadata or kernel hash available, falling back to traditional sync")
+				if err := mgr.SyncSnapshot(ctx, "current"); err != nil {
+					log.WithError(err).Fatal("Failed to sync snapshot from GCS")
+				}
+			}
+		}
 	} else {
 		var err error
 		mgr, err = runner.NewManager(ctx, cfg, ciAdapter, logger)
