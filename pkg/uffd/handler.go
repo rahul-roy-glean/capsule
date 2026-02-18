@@ -111,6 +111,16 @@ type uffdioCopy struct {
 	Copy int64
 }
 
+// uffdioZeropage is the UFFDIO_ZEROPAGE ioctl structure.
+// This is faster than UFFDIO_COPY with zero data because the kernel
+// maps a shared zero page without copying any bytes.
+type uffdioZeropage struct {
+	Start    uint64 // range start
+	Len      uint64 // range length
+	Mode     uint64
+	Zeropage int64 // output: number of bytes zeroed
+}
+
 // Handler handles UFFD page faults by fetching memory chunks on demand
 type Handler struct {
 	chunkStore *snapshot.ChunkStore
@@ -463,23 +473,49 @@ func (h *Handler) handleSingleFault(uffdFd int, address uint64) error {
 	// Queue eager fetch for upcoming chunks (async, non-blocking)
 	h.queueEagerFetch(offset)
 
-	// Get page data
+	// Fast path: use UFFDIO_ZEROPAGE for zero/missing chunks.
+	// This is faster than UFFDIO_COPY because the kernel maps a shared zero
+	// page without copying any data.
+	chunk := h.findChunk(offset)
+	if chunk == nil || chunk.IsZeroChunk() {
+		return h.zeroFault(uffdFd, pageAddr)
+	}
+
+	// Get page data from chunk store
 	pageData, err := h.getPageData(offset)
 	if err != nil {
 		return fmt.Errorf("failed to get page data: %w", err)
 	}
 
 	// Copy data to faulting address using UFFDIO_COPY
-	copy := uffdioCopy{
+	cp := uffdioCopy{
 		Dst:  pageAddr,
 		Src:  uint64(uintptr(unsafe.Pointer(&pageData[0]))),
 		Len:  PageSize,
 		Mode: 0,
 	}
 
-	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffdFd), UFFDIO_COPY, uintptr(unsafe.Pointer(&copy)))
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffdFd), UFFDIO_COPY, uintptr(unsafe.Pointer(&cp)))
 	if errno != 0 {
 		return fmt.Errorf("UFFDIO_COPY failed: %w", errno)
+	}
+
+	return nil
+}
+
+// zeroFault resolves a page fault with a kernel-mapped zero page via
+// UFFDIO_ZEROPAGE. This avoids copying any data and is the fastest way to
+// satisfy faults on pages that were never written in the snapshot.
+func (h *Handler) zeroFault(uffdFd int, pageAddr uint64) error {
+	zp := uffdioZeropage{
+		Start: pageAddr,
+		Len:   PageSize,
+		Mode:  0,
+	}
+
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffdFd), UFFDIO_ZEROPAGE, uintptr(unsafe.Pointer(&zp)))
+	if errno != 0 {
+		return fmt.Errorf("UFFDIO_ZEROPAGE failed: %w", errno)
 	}
 
 	return nil
@@ -496,11 +532,11 @@ func (h *Handler) queueEagerFetch(currentOffset uint64) {
 		return
 	}
 
-	// Find current chunk and queue the next N chunks
+	// Find current chunk and queue the next N chunks (skip zero chunks)
 	var hashes []string
 	for i := 1; i <= numChunksToEagerFetch; i++ {
 		nextOffset := currentOffset + uint64(i)*chunkSize
-		if chunk := h.findChunk(nextOffset); chunk != nil {
+		if chunk := h.findChunk(nextOffset); chunk != nil && !chunk.IsZeroChunk() {
 			hashes = append(hashes, chunk.Hash)
 		}
 	}
@@ -520,8 +556,8 @@ func (h *Handler) getPageData(offset uint64) ([]byte, error) {
 
 	// Find the chunk containing this offset
 	chunk := h.findChunk(offset)
-	if chunk == nil {
-		// Return zero page for unmapped regions
+	if chunk == nil || chunk.IsZeroChunk() {
+		// Return zero page for unmapped regions or zero chunks
 		return make([]byte, PageSize), nil
 	}
 

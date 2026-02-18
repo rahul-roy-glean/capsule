@@ -104,6 +104,7 @@ resource "google_compute_instance_template" "firecracker_host" {
     runner-ephemeral      = var.runner_ephemeral ? "true" : "false"
     # Indicates whether data disk was created from snapshot (fast) or empty (needs GCS download)
     use-data-snapshot     = var.use_data_snapshot ? "true" : "false"
+    use-chunked-snapshots = var.use_chunked_snapshots ? "true" : "false"
   }
 
   metadata_startup_script = <<-EOF
@@ -307,6 +308,9 @@ resource "google_compute_instance_template" "firecracker_host" {
       fi
     fi
 
+    USE_CHUNKED_SNAPSHOTS=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/use-chunked-snapshots || echo "false")
+
     # Stop firecracker-manager if already running (from Packer image auto-start)
     # This ensures the override is applied before the service runs
     systemctl stop firecracker-manager 2>/dev/null || true
@@ -352,7 +356,13 @@ resource "google_compute_instance_template" "firecracker_host" {
     if [ -n "$CONTROL_PLANE" ]; then
       EXEC_START="$EXEC_START --control-plane=$CONTROL_PLANE"
     fi
-    
+
+    # Add chunked snapshot flag if enabled
+    if [ "$USE_CHUNKED_SNAPSHOTS" = "true" ]; then
+      EXEC_START="$EXEC_START --use-chunked-snapshots"
+      EXEC_START="$EXEC_START --snapshot-bucket=$SNAPSHOT_BUCKET"
+    fi
+
     cat > /etc/systemd/system/firecracker-manager.service.d/override.conf << OVERRIDE
 [Service]
 ExecStart=

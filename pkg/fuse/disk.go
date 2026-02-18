@@ -283,7 +283,7 @@ func (d *ChunkedDisk) queueEagerFetch(offset int64) {
 
 	for i := 1; i <= numChunksToEagerFetch; i++ {
 		idx := startChunk + i
-		if idx < len(d.chunks) {
+		if idx < len(d.chunks) && !d.chunks[idx].IsZeroChunk() {
 			hashes = append(hashes, d.chunks[idx].Hash)
 		}
 	}
@@ -349,8 +349,14 @@ func (d *ChunkedDisk) getChunkData(chunkIdx int) ([]byte, error) {
 		return make([]byte, d.chunkSize), nil
 	}
 
-	atomic.AddUint64(&d.chunkReads, 1)
 	chunk := &d.chunks[chunkIdx]
+
+	// Zero chunk (skipped during build) — return zeros without a network fetch
+	if chunk.IsZeroChunk() {
+		return make([]byte, chunk.Size), nil
+	}
+
+	atomic.AddUint64(&d.chunkReads, 1)
 	return d.chunkStore.GetChunk(d.ctx, chunk.Hash)
 }
 
@@ -369,10 +375,14 @@ func (d *ChunkedDisk) getOrCreateDirtyChunk(chunkIdx int) ([]byte, error) {
 	var originalData []byte
 	if chunkIdx < len(d.chunks) {
 		chunk := &d.chunks[chunkIdx]
-		var err error
-		originalData, err = d.chunkStore.GetChunk(d.ctx, chunk.Hash)
-		if err != nil {
-			return nil, err
+		if chunk.IsZeroChunk() {
+			originalData = make([]byte, d.chunkSize)
+		} else {
+			var err error
+			originalData, err = d.chunkStore.GetChunk(d.ctx, chunk.Hash)
+			if err != nil {
+				return nil, err
+			}
 		}
 	} else {
 		// Beyond stored chunks, start with zeros

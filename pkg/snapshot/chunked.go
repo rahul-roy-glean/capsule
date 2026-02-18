@@ -28,11 +28,20 @@ const (
 	// ChunksPrefix is the GCS prefix for chunk storage
 	ChunksPrefix = "chunks"
 
+	// ZeroChunkHash is the sentinel value for chunks that are entirely zero.
+	// These chunks are never uploaded or fetched — readers return zero-filled
+	// buffers when they encounter this hash.
+	ZeroChunkHash = ""
+
 	// Eager prefetching constants
 	eagerFetchBufferCapacity = 100  // Max chunks queued for prefetch
 	numChunksToEagerFetch    = 32   // Chunks to queue on each access
 	maxEagerFetchesPerSec    = 1000 // Rate limit for prefetch operations
 	eagerFetchConcurrency    = 32   // Parallel prefetch workers
+
+	// chunkFileUploadConcurrency controls how many chunks are uploaded in
+	// parallel during ChunkFile.
+	chunkFileUploadConcurrency = 16
 )
 
 // ChunkedSnapshotMetadata holds metadata for a chunked snapshot.
@@ -276,7 +285,25 @@ func (cs *ChunkStore) GetChunkToFile(ctx context.Context, hash string, file *os.
 	return err
 }
 
-// ChunkFile splits a file into chunks and stores them, returning chunk refs
+// IsZeroChunk returns true if the ChunkRef represents a zero chunk (never stored).
+func (r *ChunkRef) IsZeroChunk() bool {
+	return r.Hash == ZeroChunkHash
+}
+
+// isZeroChunk returns true if data is entirely zeros.
+func isZeroChunk(data []byte) bool {
+	for _, b := range data {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// ChunkFile splits a file into chunks and stores them, returning chunk refs.
+// Zero chunks (all-zero data) are detected and skipped — they are recorded with
+// Hash="" so that readers can serve zero-filled pages without a network fetch.
+// Non-zero chunks are uploaded in parallel for throughput.
 func (cs *ChunkStore) ChunkFile(ctx context.Context, path string, chunkSize int64) ([]ChunkRef, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -291,7 +318,6 @@ func (cs *ChunkStore) ChunkFile(ctx context.Context, path string, chunkSize int6
 
 	totalSize := stat.Size()
 	numChunks := (totalSize + chunkSize - 1) / chunkSize
-	refs := make([]ChunkRef, 0, numChunks)
 
 	cs.logger.WithFields(logrus.Fields{
 		"file":       path,
@@ -300,10 +326,17 @@ func (cs *ChunkStore) ChunkFile(ctx context.Context, path string, chunkSize int6
 		"num_chunks": numChunks,
 	}).Info("Chunking file")
 
-	buf := make([]byte, chunkSize)
-	var offset int64
+	// Pre-allocate the refs slice so goroutines can write by index.
+	refs := make([]ChunkRef, numChunks)
 
-	for offset < totalSize {
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(chunkFileUploadConcurrency)
+
+	var zeroChunks int64
+	buf := make([]byte, chunkSize) // reusable read buffer
+
+	for i := int64(0); i < numChunks; i++ {
+		offset := i * chunkSize
 		readSize := chunkSize
 		if offset+readSize > totalSize {
 			readSize = totalSize - offset
@@ -314,20 +347,48 @@ func (cs *ChunkStore) ChunkFile(ctx context.Context, path string, chunkSize int6
 			return nil, fmt.Errorf("failed to read at offset %d: %w", offset, err)
 		}
 
-		hash, compressedSize, err := cs.StoreChunk(ctx, buf[:n])
-		if err != nil {
-			return nil, fmt.Errorf("failed to store chunk at offset %d: %w", offset, err)
+		// Fast path: zero chunks are recorded with a sentinel hash and never uploaded.
+		if isZeroChunk(buf[:n]) {
+			refs[i] = ChunkRef{
+				Offset: offset,
+				Size:   int64(n),
+				Hash:   ZeroChunkHash,
+			}
+			zeroChunks++
+			continue
 		}
 
-		refs = append(refs, ChunkRef{
-			Offset:         offset,
-			Size:           int64(n),
-			CompressedSize: compressedSize,
-			Hash:           hash,
-		})
+		// Copy the data so the goroutine owns its buffer while we reuse buf.
+		chunkData := make([]byte, n)
+		copy(chunkData, buf[:n])
 
-		offset += int64(n)
+		idx := i
+		chunkOffset := offset
+		g.Go(func() error {
+			hash, compressedSize, err := cs.StoreChunk(gCtx, chunkData)
+			if err != nil {
+				return fmt.Errorf("failed to store chunk at offset %d: %w", chunkOffset, err)
+			}
+			refs[idx] = ChunkRef{
+				Offset:         chunkOffset,
+				Size:           int64(len(chunkData)),
+				CompressedSize: compressedSize,
+				Hash:           hash,
+			}
+			return nil
+		})
 	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	cs.logger.WithFields(logrus.Fields{
+		"file":         path,
+		"total_chunks": numChunks,
+		"zero_chunks":  zeroChunks,
+		"data_chunks":  numChunks - zeroChunks,
+	}).Info("Chunking complete")
 
 	return refs, nil
 }
