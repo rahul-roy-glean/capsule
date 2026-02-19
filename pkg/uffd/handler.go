@@ -519,19 +519,25 @@ func (h *Handler) handleSingleFault(uffdFd int, address uint64) error {
 	return nil
 }
 
-// zeroFault resolves a page fault with a kernel-mapped zero page via
-// UFFDIO_ZEROPAGE. This avoids copying any data and is the fastest way to
-// satisfy faults on pages that were never written in the snapshot.
+// zeroPage is a pre-allocated page of zeros reused for all zero-page faults.
+// This avoids allocating a new buffer per fault.
+var zeroPage = make([]byte, PageSize)
+
+// zeroFault resolves a page fault by copying a zero-filled page.
+// We use UFFDIO_COPY with a static zero buffer rather than UFFDIO_ZEROPAGE
+// because UFFDIO_ZEROPAGE only works with hugetlbfs/shmem, not the anonymous
+// memory mappings that Firecracker uses.
 func (h *Handler) zeroFault(uffdFd int, pageAddr uint64) error {
-	zp := uffdioZeropage{
-		Start: pageAddr,
-		Len:   PageSize,
-		Mode:  0,
+	cp := uffdioCopy{
+		Dst:  pageAddr,
+		Src:  uint64(uintptr(unsafe.Pointer(&zeroPage[0]))),
+		Len:  PageSize,
+		Mode: 0,
 	}
 
-	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffdFd), UFFDIO_ZEROPAGE, uintptr(unsafe.Pointer(&zp)))
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffdFd), UFFDIO_COPY, uintptr(unsafe.Pointer(&cp)))
 	if errno != 0 {
-		return fmt.Errorf("UFFDIO_ZEROPAGE failed: %w", errno)
+		return fmt.Errorf("UFFDIO_COPY (zero page) failed: %w", errno)
 	}
 
 	return nil

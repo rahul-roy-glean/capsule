@@ -313,12 +313,13 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		}).Debug("Fetched vmstate from chunk store")
 	}
 
-	// Get snapshot paths for kernel (still needed as a local file for boot config).
-	// The rootfs is served via FUSE, and memory is served via UFFD.
-	snapshotPaths, err := cm.snapshotCache.GetSnapshotPaths()
-	if err != nil {
+	// In chunked mode, rootfs and repo-cache-seed are served via FUSE, memory
+	// via UFFD, and state was eagerly fetched above. The only traditional local
+	// file we need is the kernel, which was eagerly fetched at manager startup.
+	kernelPath := filepath.Join(cm.config.SnapshotCachePath, "kernel.bin")
+	if _, err := os.Stat(kernelPath); err != nil {
 		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
-		return nil, fmt.Errorf("failed to get snapshot paths: %w", err)
+		return nil, fmt.Errorf("kernel not found at %s (should have been eagerly fetched at startup): %w", kernelPath, err)
 	}
 
 	// Create runner record
@@ -349,15 +350,25 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		guestIP, netCfg.Gateway, netCfg.Netmask)
 
 	// For repo-cache-seed drive: use FUSE-backed path if available,
-	// otherwise fall back to the traditional cached file.
-	repoCacheSeedPath := snapshotPaths.RepoCacheSeed
+	// otherwise fall back to a placeholder (should not happen in chunked mode).
+	var repoCacheSeedPath string
 	if fuseSeedDisk != nil {
 		repoCacheSeedPath = fuseSeedDisk.DiskImagePath()
+	} else {
+		repoCacheSeedPath = filepath.Join(cm.config.SnapshotCachePath, "repo-cache-seed.img")
 	}
 
 	// Build drives to match the snapshot's drive layout.
-	// Create per-runner repo-cache-upper image.
+	// Create per-runner writable repo cache upper image.
 	repoCacheUpperPath := filepath.Join(cm.config.WorkspaceDir, runnerID, "repo-cache-upper.img")
+	if err := os.MkdirAll(filepath.Dir(repoCacheUpperPath), 0755); err != nil {
+		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+		return nil, fmt.Errorf("failed to create repo-cache-upper directory: %w", err)
+	}
+	if err := createExt4Image(repoCacheUpperPath, cm.config.RepoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
+		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+		return nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
+	}
 	drives := cm.buildDrives(repoCacheSeedPath, repoCacheUpperPath)
 
 	// Create VM configuration
@@ -365,7 +376,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		VMID:           runnerID,
 		SocketDir:      cm.config.SocketDir,
 		FirecrackerBin: cm.config.FirecrackerBin,
-		KernelPath:     snapshotPaths.Kernel,
+		KernelPath:     kernelPath,
 		RootfsPath:     fuseDisk.DiskImagePath(), // FUSE-backed disk
 		BootArgs:       bootArgs,
 		VCPUs:          runner.Resources.VCPUs,
@@ -391,49 +402,76 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
-	// Use the eagerly-fetched local vmstate for restore (or fall back to cached).
+	// Use the eagerly-fetched local vmstate for restore.
 	restoreStatePath := localStatePath
-	if cm.chunkedMeta.StateHash == "" {
-		restoreStatePath = snapshotPaths.State
+
+	// Setup symlinks from the snapshot's baked-in drive paths (/tmp/snapshot/*.img)
+	// to the actual FUSE-backed / local paths. Firecracker opens drives by the paths
+	// recorded in the snapshot state file during LoadSnapshot.
+	symlinkCleanup, err := cm.setupChunkedSymlinks(
+		fuseDisk.DiskImagePath(),
+		repoCacheSeedPath,
+		repoCacheUpperPath,
+	)
+	if err != nil {
+		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+		return nil, fmt.Errorf("failed to setup snapshot symlinks: %w", err)
 	}
 
-	// Restore from snapshot with UFFD backend for memory
+	// Setup TAP rename: the snapshot bakes in host_dev_name="tap-slot-0".
+	// If this runner uses a different slot, temporarily rename its TAP.
+	tapRestore, err := cm.setupSnapshotTAPRename(tap.Name)
+	if err != nil {
+		symlinkCleanup()
+		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+		return nil, fmt.Errorf("failed to setup TAP rename: %w", err)
+	}
+
+	// Restore from snapshot with UFFD backend for memory.
+	// Load WITHOUT resuming so we can inject MMDS data before the guest
+	// thaw-agent wakes up. Otherwise the agent reads stale MMDS from the
+	// snapshot and skips runner registration.
 	cm.chunkedLogger.WithFields(logrus.Fields{
 		"runner_id":   runnerID,
 		"snapshot":    restoreStatePath,
 		"uffd_socket": uffdSocketPath,
 	}).Info("Restoring VM with UFFD memory backend")
 
-	if err := vm.RestoreFromSnapshotWithUFFD(ctx, restoreStatePath, uffdSocketPath, true); err != nil {
-		cm.chunkedLogger.WithError(err).Warn("UFFD restore failed, trying traditional restore")
+	restoreErr := vm.RestoreFromSnapshotWithUFFD(ctx, restoreStatePath, uffdSocketPath, false)
+	tapRestore()
+	symlinkCleanup()
+
+	if restoreErr != nil {
+		cm.chunkedLogger.WithError(restoreErr).Warn("UFFD restore failed, trying cold boot fallback")
 		vm.Stop()
 
-		// Fallback to traditional restore
 		vm, err = firecracker.NewVM(vmCfg, cm.logger.Logger)
 		if err != nil {
 			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
 			return nil, fmt.Errorf("failed to recreate VM: %w", err)
 		}
 
-		if snapshotPaths.Mem != "" && snapshotPaths.State != "" {
-			if err := vm.RestoreFromSnapshot(ctx, snapshotPaths.State, snapshotPaths.Mem, true); err != nil {
-				cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
-				return nil, fmt.Errorf("traditional restore also failed: %w", err)
-			}
-		} else {
-			if err := vm.Start(ctx); err != nil {
-				cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
-				return nil, fmt.Errorf("cold boot failed: %w", err)
-			}
+		if err := vm.Start(ctx); err != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+			return nil, fmt.Errorf("cold boot fallback failed: %w", err)
 		}
 	}
 
-	// Inject MMDS data
+	// Inject MMDS data BEFORE resuming so the thaw-agent sees fresh config
 	mmdsData := cm.buildMMDSData(ctx, runner, tap, req)
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
 		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
 		return nil, fmt.Errorf("failed to set MMDS data: %w", err)
+	}
+
+	// Now resume the VM — thaw-agent will read the fresh MMDS data
+	if restoreErr == nil {
+		if err := vm.Resume(ctx); err != nil {
+			vm.Stop()
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+			return nil, fmt.Errorf("failed to resume VM after MMDS injection: %w", err)
+		}
 	}
 
 	runner.State = StateInitializing
@@ -573,6 +611,60 @@ func (cm *ChunkedManager) cleanupChunkedRunner(
 	}
 	workspaceDir := filepath.Join(cm.config.WorkspaceDir, runnerID)
 	os.RemoveAll(workspaceDir)
+}
+
+// setupChunkedSymlinks creates symlinks from the snapshot's baked-in drive paths
+// (/tmp/snapshot/*.img) to the actual FUSE-backed or local paths on this host.
+// Firecracker opens drive backing files during LoadSnapshot at the paths recorded
+// in the snapshot state file. Returns a cleanup function to remove the symlinks
+// after restore (Firecracker holds open fds, so symlinks can be removed).
+func (cm *ChunkedManager) setupChunkedSymlinks(rootfsPath, repoCacheSeedPath, repoCacheUpperPath string) (func(), error) {
+	if err := os.MkdirAll(snapshotSymlinkDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create snapshot symlink dir: %w", err)
+	}
+
+	// Resolve git-cache image path
+	gitCacheImg := cm.gitCacheImage
+	if gitCacheImg == "" {
+		gitCacheImg = cm.getOrCreateGitCachePlaceholder()
+	}
+
+	symlinks := []struct {
+		name   string
+		target string
+	}{
+		{"rootfs.img", rootfsPath},
+		{"repo-cache-seed.img", repoCacheSeedPath},
+		{"repo-cache-upper.img", repoCacheUpperPath},
+		{"credentials.img", cm.credentialsImage},
+		{"git-cache.img", gitCacheImg},
+	}
+
+	var created []string
+	for _, s := range symlinks {
+		if s.target == "" {
+			continue
+		}
+		linkPath := filepath.Join(snapshotSymlinkDir, s.name)
+		os.Remove(linkPath)
+		if err := os.Symlink(s.target, linkPath); err != nil {
+			for _, c := range created {
+				os.Remove(c)
+			}
+			return nil, fmt.Errorf("symlink %s -> %s: %w", linkPath, s.target, err)
+		}
+		created = append(created, linkPath)
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"link":   linkPath,
+			"target": s.target,
+		}).Debug("Created snapshot symlink")
+	}
+
+	return func() {
+		for _, c := range created {
+			os.Remove(c)
+		}
+	}, nil
 }
 
 // GetChunkedStats returns statistics for chunked snapshot system

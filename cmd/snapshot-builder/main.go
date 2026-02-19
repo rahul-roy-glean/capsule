@@ -354,7 +354,6 @@ func main() {
 	}
 
 	// Upload to GCS
-	log.Info("Uploading to GCS...")
 	uploader, err := snapshot.NewUploader(ctx, snapshot.UploaderConfig{
 		GCSBucket: *gcsBucket,
 		Logger:    logger,
@@ -364,8 +363,17 @@ func main() {
 	}
 	defer uploader.Close()
 
-	if err := uploader.UploadSnapshot(ctx, *outputDir, metadata); err != nil {
-		log.WithError(err).Fatal("Failed to upload snapshot")
+	if *enableChunked {
+		// With chunked snapshots, the large files (rootfs, mem, repo-cache-seed)
+		// are served lazily from the chunk store via FUSE and UFFD. Only upload
+		// kernel and state as small legacy files for discoverability, then build
+		// and upload the chunked snapshot.
+		log.Info("Chunked mode: skipping legacy full-file upload (rootfs, mem, repo-cache-seed)")
+	} else {
+		log.Info("Uploading full snapshot to GCS...")
+		if err := uploader.UploadSnapshot(ctx, *outputDir, metadata); err != nil {
+			log.WithError(err).Fatal("Failed to upload snapshot")
+		}
 	}
 
 	// Update current pointer

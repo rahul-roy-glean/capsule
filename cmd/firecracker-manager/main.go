@@ -459,7 +459,7 @@ func main() {
 	}()
 
 	// Start autoscaler loop
-	go autoscaleLoop(ctx, mgr, *idleTarget, logger, metricsClient)
+	go autoscaleLoop(ctx, mgr, chunkedMgr, *idleTarget, logger, metricsClient)
 
 	// Start heartbeat loop if control plane is configured
 	if *controlPlane != "" {
@@ -544,7 +544,7 @@ func snapshotSyncHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handle
 	}
 }
 
-func autoscaleLoop(ctx context.Context, mgr *runner.Manager, idleTarget int, logger *logrus.Logger, metricsClient *telemetry.Client) {
+func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, idleTarget int, logger *logrus.Logger, metricsClient *telemetry.Client) {
 	log := logger.WithField("component", "autoscaler")
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -560,7 +560,12 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, idleTarget int, log
 			if !mgr.IsDraining() && status.IdleRunners < idleTarget && mgr.CanAddRunner() {
 				log.Debug("Adding runner to maintain idle pool")
 				allocTimer := telemetry.NewStopwatch()
-				_, err := mgr.AllocateRunner(ctx, runner.AllocateRequest{})
+				var err error
+				if chunkedMgr != nil {
+					_, err = chunkedMgr.AllocateRunnerChunked(ctx, runner.AllocateRequest{})
+				} else {
+					_, err = mgr.AllocateRunner(ctx, runner.AllocateRequest{})
+				}
 				if err != nil {
 					log.WithError(err).Warn("Failed to allocate idle runner")
 					if metricsClient != nil {
