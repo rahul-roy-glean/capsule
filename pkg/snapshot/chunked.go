@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -185,7 +186,6 @@ func (cs *ChunkStore) StoreChunk(ctx context.Context, data []byte) (string, int6
 
 	writer := obj.NewWriter(ctx)
 	writer.ContentType = "application/octet-stream"
-	writer.ContentEncoding = "zstd"
 
 	if _, err := writer.Write(compressed); err != nil {
 		writer.Close()
@@ -290,14 +290,13 @@ func (r *ChunkRef) IsZeroChunk() bool {
 	return r.Hash == ZeroChunkHash
 }
 
+// zeroRef is a pre-allocated zero buffer used for fast zero-chunk detection.
+// bytes.Equal uses SIMD-accelerated comparison internally.
+var zeroRef = make([]byte, DefaultChunkSize)
+
 // isZeroChunk returns true if data is entirely zeros.
 func isZeroChunk(data []byte) bool {
-	for _, b := range data {
-		if b != 0 {
-			return false
-		}
-	}
-	return true
+	return bytes.Equal(data, zeroRef[:len(data)])
 }
 
 // ChunkFile splits a file into chunks and stores them, returning chunk refs.
@@ -414,34 +413,23 @@ func (cs *ChunkStore) ReassembleFile(ctx context.Context, refs []ChunkRef, destP
 	}).Info("Reassembling file from chunks")
 
 	// Fetch chunks in parallel
-	const maxParallel = 8
-	sem := make(chan struct{}, maxParallel)
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(refs))
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(chunkFileUploadConcurrency)
 
 	for _, ref := range refs {
-		wg.Add(1)
-		sem <- struct{}{}
-
-		go func(r ChunkRef) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			if err := cs.GetChunkToFile(ctx, r.Hash, file, r.Offset); err != nil {
-				errCh <- fmt.Errorf("failed to write chunk at offset %d: %w", r.Offset, err)
+		r := ref
+		if r.IsZeroChunk() {
+			continue // file already zeroed by Truncate
+		}
+		g.Go(func() error {
+			if err := cs.GetChunkToFile(gCtx, r.Hash, file, r.Offset); err != nil {
+				return fmt.Errorf("failed to write chunk at offset %d: %w", r.Offset, err)
 			}
-		}(ref)
+			return nil
+		})
 	}
 
-	wg.Wait()
-	close(errCh)
-
-	// Check for errors
-	for err := range errCh {
-		return err
-	}
-
-	return nil
+	return g.Wait()
 }
 
 // chunkPath returns the GCS path for a chunk

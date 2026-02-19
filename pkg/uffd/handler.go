@@ -71,7 +71,13 @@ const (
 
 	// Page size (4KB on x86_64)
 	PageSize = 4096
+)
 
+// zeroPage is a shared zero-filled page used for zero chunk reads.
+// Safe to share because UFFDIO_COPY only reads from the source buffer.
+var zeroPage = make([]byte, PageSize)
+
+const (
 	// Eager prefetching constants
 	numChunksToEagerFetch = 32
 )
@@ -149,9 +155,10 @@ type Handler struct {
 	listener   net.Listener
 
 	// Control
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	connected chan struct{} // closed when Firecracker connects
 
 	logger *logrus.Entry
 }
@@ -193,6 +200,7 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 		socketPath:    cfg.SocketPath,
 		ctx:           ctx,
 		cancel:        cancel,
+		connected:     make(chan struct{}),
 		logger:        cfg.Logger.WithField("component", "uffd-handler"),
 	}
 
@@ -289,6 +297,14 @@ func (h *Handler) acceptLoop() {
 		}
 
 		h.logger.Info("Firecracker connected to UFFD handler")
+
+		// Signal that a connection has been received
+		select {
+		case <-h.connected:
+			// already closed
+		default:
+			close(h.connected)
+		}
 
 		// Handle this connection
 		h.wg.Add(1)
@@ -557,8 +573,9 @@ func (h *Handler) getPageData(offset uint64) ([]byte, error) {
 	// Find the chunk containing this offset
 	chunk := h.findChunk(offset)
 	if chunk == nil || chunk.IsZeroChunk() {
-		// Return zero page for unmapped regions or zero chunks
-		return make([]byte, PageSize), nil
+		// Return shared zero page for unmapped regions or zero chunks.
+		// Safe because UFFDIO_COPY only reads from the source buffer.
+		return zeroPage, nil
 	}
 
 	// Fetch the chunk
@@ -635,8 +652,12 @@ func (h *Handler) SocketPath() string {
 
 // WaitForConnection waits for Firecracker to connect with a timeout
 func (h *Handler) WaitForConnection(timeout time.Duration) error {
-	// This is a simple implementation - the acceptLoop handles connections
-	// In practice, you might want to use a channel to signal when connected
-	time.Sleep(100 * time.Millisecond)
-	return nil
+	select {
+	case <-h.connected:
+		return nil
+	case <-time.After(timeout):
+		return fmt.Errorf("timed out waiting for Firecracker UFFD connection after %v", timeout)
+	case <-h.ctx.Done():
+		return h.ctx.Err()
+	}
 }
