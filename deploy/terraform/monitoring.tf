@@ -391,8 +391,8 @@ resource "google_monitoring_dashboard" "vm_boot_phases" {
                       filter = "metric.type=\"logging.googleapis.com/user/firecracker/vm_boot_phase_from_logs\" resource.type=\"gce_instance\""
                       aggregation = {
                         alignmentPeriod    = "300s"
-                        perSeriesAligner   = "ALIGN_MEAN"
-                        crossSeriesReducer = "REDUCE_MEAN"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_PERCENTILE_50"
                         groupByFields      = ["metric.label.phase"]
                       }
                     }
