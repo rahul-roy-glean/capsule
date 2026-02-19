@@ -359,8 +359,16 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	}
 
 	// Build drives to match the snapshot's drive layout.
-	// Create per-runner repo-cache-upper image.
+	// Create per-runner writable repo cache upper image.
 	repoCacheUpperPath := filepath.Join(cm.config.WorkspaceDir, runnerID, "repo-cache-upper.img")
+	if err := os.MkdirAll(filepath.Dir(repoCacheUpperPath), 0755); err != nil {
+		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+		return nil, fmt.Errorf("failed to create repo-cache-upper directory: %w", err)
+	}
+	if err := createExt4Image(repoCacheUpperPath, cm.config.RepoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
+		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+		return nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
+	}
 	drives := cm.buildDrives(repoCacheSeedPath, repoCacheUpperPath)
 
 	// Create VM configuration
@@ -409,7 +417,15 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
 		return nil, fmt.Errorf("failed to setup snapshot symlinks: %w", err)
 	}
-	defer symlinkCleanup()
+
+	// Setup TAP rename: the snapshot bakes in host_dev_name="tap-slot-0".
+	// If this runner uses a different slot, temporarily rename its TAP.
+	tapRestore, err := cm.setupSnapshotTAPRename(tap.Name)
+	if err != nil {
+		symlinkCleanup()
+		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+		return nil, fmt.Errorf("failed to setup TAP rename: %w", err)
+	}
 
 	// Restore from snapshot with UFFD backend for memory
 	cm.chunkedLogger.WithFields(logrus.Fields{
@@ -418,19 +434,20 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		"uffd_socket": uffdSocketPath,
 	}).Info("Restoring VM with UFFD memory backend")
 
-	if err := vm.RestoreFromSnapshotWithUFFD(ctx, restoreStatePath, uffdSocketPath, true); err != nil {
-		cm.chunkedLogger.WithError(err).Warn("UFFD restore failed, trying traditional restore")
+	restoreErr := vm.RestoreFromSnapshotWithUFFD(ctx, restoreStatePath, uffdSocketPath, true)
+	tapRestore()
+	symlinkCleanup()
+
+	if restoreErr != nil {
+		cm.chunkedLogger.WithError(restoreErr).Warn("UFFD restore failed, trying cold boot fallback")
 		vm.Stop()
 
-		// Fallback to traditional restore
 		vm, err = firecracker.NewVM(vmCfg, cm.logger.Logger)
 		if err != nil {
 			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
 			return nil, fmt.Errorf("failed to recreate VM: %w", err)
 		}
 
-		// In chunked mode there are no local mem/state files for traditional
-		// restore — fall back to cold boot.
 		if err := vm.Start(ctx); err != nil {
 			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
 			return nil, fmt.Errorf("cold boot fallback failed: %w", err)
