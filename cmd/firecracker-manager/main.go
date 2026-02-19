@@ -459,7 +459,7 @@ func main() {
 	}()
 
 	// Start autoscaler loop
-	go autoscaleLoop(ctx, mgr, *idleTarget, logger, metricsClient)
+	go autoscaleLoop(ctx, mgr, chunkedMgr, *idleTarget, logger, metricsClient)
 
 	// Start heartbeat loop if control plane is configured
 	if *controlPlane != "" {
@@ -544,7 +544,7 @@ func snapshotSyncHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handle
 	}
 }
 
-func autoscaleLoop(ctx context.Context, mgr *runner.Manager, idleTarget int, logger *logrus.Logger, metricsClient *telemetry.Client) {
+func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, idleTarget int, logger *logrus.Logger, metricsClient *telemetry.Client) {
 	log := logger.WithField("component", "autoscaler")
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -598,6 +598,36 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, idleTarget int, log
 					IdleRunners: status.IdleRunners,
 					BusyRunners: status.BusyRunners,
 				})
+
+				// Record chunked snapshot metrics
+				if chunkedMgr != nil {
+					cs := chunkedMgr.GetChunkedStats()
+					metricsClient.RecordChunkedMetrics(ctx, telemetry.ChunkedMetrics{
+						CacheSize:    cs.CacheSize,
+						CacheMaxSize: cs.CacheMaxSize,
+						CacheItems:   cs.CacheItems,
+						PageFaults:   cs.TotalPageFaults,
+						CacheHits:    cs.TotalCacheHits,
+						ChunkFetches: cs.TotalChunkFetches,
+						DiskReads:    cs.TotalDiskReads,
+						DiskWrites:   cs.TotalDiskWrites,
+						DirtyChunks:  cs.TotalDirtyChunks,
+					})
+				}
+
+				// Record runner pool metrics
+				if pool := mgr.GetPool(); pool != nil {
+					ps := pool.Stats()
+					metricsClient.RecordPoolMetrics(ctx, telemetry.PoolMetrics{
+						PooledRunners:   ps.PooledRunners,
+						PoolHits:        ps.PoolHits,
+						PoolMisses:      ps.PoolMisses,
+						Evictions:       ps.Evictions,
+						RecycleFailures: ps.RecycleFailures,
+						MemoryUsedBytes: ps.MemoryUsageBytes,
+						MemoryMaxBytes:  ps.MaxMemoryBytes,
+					})
+				}
 			}
 		}
 	}

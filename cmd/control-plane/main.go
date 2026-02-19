@@ -219,7 +219,7 @@ func main() {
 	go snapshotManager.FreshnessCheckLoop(ctx)
 	go startDownscaler(ctx, db, hostRegistry, logger)
 	if metricsClient != nil {
-		go controlPlaneMetricsLoop(ctx, hostRegistry, snapshotManager, metricsClient, logger)
+		go controlPlaneMetricsLoop(ctx, hostRegistry, scheduler, snapshotManager, metricsClient, logger)
 	}
 
 	// Wait for shutdown
@@ -479,7 +479,7 @@ func (s *ControlPlaneServer) HandleGitHubWebhook(w http.ResponseWriter, r *http.
 }
 
 // controlPlaneMetricsLoop periodically records control plane metrics to GCP Cloud Monitoring
-func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sm *SnapshotManager, mc *telemetry.Client, logger *logrus.Logger) {
+func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Scheduler, sm *SnapshotManager, mc *telemetry.Client, logger *logrus.Logger) {
 	log := logger.WithField("component", "metrics-loop")
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -521,6 +521,9 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sm *Snapshot
 			mc.RecordInt(ctx, telemetry.MetricCPRunnersTotal, totalBusy, telemetry.Labels{
 				telemetry.LabelStatus: "busy",
 			})
+
+			// Record queue depth
+			mc.RecordInt(ctx, telemetry.MetricCPQueueDepth, int64(sched.GetQueueDepth()), nil)
 
 			// Record snapshot age
 			currentVersion := sm.GetCurrentVersion()

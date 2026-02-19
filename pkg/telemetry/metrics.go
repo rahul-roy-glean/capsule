@@ -57,6 +57,28 @@ const (
 	MetricNetworkConnections = "network/nat_connections"
 	MetricNetworkBytesTx     = "network/bytes_tx_total"
 	MetricNetworkBytesRx     = "network/bytes_rx_total"
+
+	// Chunked snapshot metrics
+	MetricChunkCacheSize       = "chunked/cache_size_bytes"
+	MetricChunkCacheMaxSize    = "chunked/cache_max_size_bytes"
+	MetricChunkCacheItems      = "chunked/cache_items"
+	MetricChunkPageFaults      = "chunked/page_faults_total"
+	MetricChunkCacheHits       = "chunked/cache_hits_total"
+	MetricChunkFetches         = "chunked/chunk_fetches_total"
+	MetricChunkDiskReads       = "chunked/disk_reads_total"
+	MetricChunkDiskWrites      = "chunked/disk_writes_total"
+	MetricChunkDirtyChunks     = "chunked/dirty_chunks"
+	MetricChunkCacheHitRatio   = "chunked/cache_hit_ratio"
+
+	// Runner pool metrics
+	MetricPoolRunners        = "pool/runners"
+	MetricPoolHits           = "pool/hits_total"
+	MetricPoolMisses         = "pool/misses_total"
+	MetricPoolEvictions      = "pool/evictions_total"
+	MetricPoolRecycleFails   = "pool/recycle_failures_total"
+	MetricPoolMemoryUsed     = "pool/memory_used_bytes"
+	MetricPoolMemoryMax      = "pool/memory_max_bytes"
+	MetricPoolHitRatio       = "pool/hit_ratio"
 )
 
 // Well-known label keys for consistency.
