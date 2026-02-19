@@ -353,6 +353,20 @@ func main() {
 					"kernel_size": len(kernelData),
 					"path":        kernelPath,
 				}).Info("Kernel fetched from chunk store")
+
+				// If a raw memory file path is set, download and decompress it
+				// to local disk so VMs can use file-backed restore instead of UFFD.
+				if meta.MemFilePath != "" {
+					memPath := filepath.Join(*snapshotCache, "snapshot.mem")
+					log.WithFields(logrus.Fields{
+						"gcs_path":   meta.MemFilePath,
+						"local_path": memPath,
+					}).Info("Downloading raw memory file from GCS...")
+					if err := chunkedMgr.GetChunkStore().DownloadRawFile(ctx, meta.MemFilePath, memPath); err != nil {
+						log.WithError(err).Fatal("Failed to download raw memory file")
+					}
+					log.WithField("path", memPath).Info("Raw memory file downloaded and decompressed")
+				}
 			} else {
 				log.Warn("No chunked metadata or kernel hash available, falling back to traditional sync")
 				if err := mgr.SyncSnapshot(ctx, "current"); err != nil {

@@ -267,26 +267,44 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		cm.chunkedLogger.WithField("runner_id", runnerID).Info("Mounted FUSE-backed repo-cache-seed")
 	}
 
-	// Setup UFFD handler for lazy memory loading.
-	// MemStart/MemSize are no longer needed here -- the handler parses
-	// GuestRegionUFFDMapping directly from Firecracker's setup message.
-	uffdSocketPath := filepath.Join(cm.config.SocketDir, runnerID+".uffd.sock")
-	uffdHandler, err := uffd.NewHandler(uffd.HandlerConfig{
-		SocketPath: uffdSocketPath,
-		ChunkStore: cm.chunkStore,
-		Metadata:   cm.chunkedMeta,
-		Logger:     cm.logger.Logger,
-	})
-	if err != nil {
-		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
-		return nil, fmt.Errorf("failed to create UFFD handler: %w", err)
-	}
+	// Setup memory backend: either file-backed (new) or UFFD lazy loading (legacy).
+	useFileBackedMem := cm.chunkedMeta.MemFilePath != ""
+	var uffdHandler *uffd.Handler
+	var uffdSocketPath string
+	var localMemPath string
 
-	if err := uffdHandler.Start(); err != nil {
-		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
-		return nil, fmt.Errorf("failed to start UFFD handler: %w", err)
+	if useFileBackedMem {
+		// New-style: memory was downloaded as a single file at manager startup.
+		// Use file-backed restore — no UFFD handler needed.
+		localMemPath = filepath.Join(cm.config.SnapshotCachePath, "snapshot.mem")
+		if _, err := os.Stat(localMemPath); err != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
+			return nil, fmt.Errorf("raw memory file not found at %s (should have been downloaded at startup): %w", localMemPath, err)
+		}
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"runner_id": runnerID,
+			"mem_path":  localMemPath,
+		}).Info("Using file-backed memory restore")
+	} else {
+		// Legacy: UFFD lazy memory loading from chunk store.
+		uffdSocketPath = filepath.Join(cm.config.SocketDir, runnerID+".uffd.sock")
+		uffdHandler, err = uffd.NewHandler(uffd.HandlerConfig{
+			SocketPath: uffdSocketPath,
+			ChunkStore: cm.chunkStore,
+			Metadata:   cm.chunkedMeta,
+			Logger:     cm.logger.Logger,
+		})
+		if err != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
+			return nil, fmt.Errorf("failed to create UFFD handler: %w", err)
+		}
+
+		if err := uffdHandler.Start(); err != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
+			return nil, fmt.Errorf("failed to start UFFD handler: %w", err)
+		}
+		cm.uffdHandlers[runnerID] = uffdHandler
 	}
-	cm.uffdHandlers[runnerID] = uffdHandler
 
 	// Eagerly fetch the VM state (CPU/device state) from the ChunkStore.
 	// This is small (~100KB) and required as a local file for Firecracker restore.
@@ -427,17 +445,26 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		return nil, fmt.Errorf("failed to setup TAP rename: %w", err)
 	}
 
-	// Restore from snapshot with UFFD backend for memory.
+	// Restore from snapshot.
 	// Load WITHOUT resuming so we can inject MMDS data before the guest
 	// thaw-agent wakes up. Otherwise the agent reads stale MMDS from the
 	// snapshot and skips runner registration.
-	cm.chunkedLogger.WithFields(logrus.Fields{
-		"runner_id":   runnerID,
-		"snapshot":    restoreStatePath,
-		"uffd_socket": uffdSocketPath,
-	}).Info("Restoring VM with UFFD memory backend")
-
-	restoreErr := vm.RestoreFromSnapshotWithUFFD(ctx, restoreStatePath, uffdSocketPath, false)
+	var restoreErr error
+	if useFileBackedMem {
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"runner_id": runnerID,
+			"snapshot":  restoreStatePath,
+			"mem_path":  localMemPath,
+		}).Info("Restoring VM with file-backed memory")
+		restoreErr = vm.RestoreFromSnapshot(ctx, restoreStatePath, localMemPath, false)
+	} else {
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"runner_id":   runnerID,
+			"snapshot":    restoreStatePath,
+			"uffd_socket": uffdSocketPath,
+		}).Info("Restoring VM with UFFD memory backend")
+		restoreErr = vm.RestoreFromSnapshotWithUFFD(ctx, restoreStatePath, uffdSocketPath, false)
+	}
 	tapRestore()
 	symlinkCleanup()
 
