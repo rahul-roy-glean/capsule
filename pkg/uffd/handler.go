@@ -519,10 +519,6 @@ func (h *Handler) handleSingleFault(uffdFd int, address uint64) error {
 	return nil
 }
 
-// zeroPage is a pre-allocated page of zeros reused for all zero-page faults.
-// This avoids allocating a new buffer per fault.
-var zeroPage = make([]byte, PageSize)
-
 // zeroFault resolves a page fault by copying a zero-filled page.
 // We use UFFDIO_COPY with a static zero buffer rather than UFFDIO_ZEROPAGE
 // because UFFDIO_ZEROPAGE only works with hugetlbfs/shmem, not the anonymous

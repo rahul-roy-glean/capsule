@@ -215,7 +215,7 @@ variable "use_chunked_snapshots" {
 variable "runner_ephemeral" {
   description = "Whether GitHub runners are ephemeral (one job per VM) or persistent (multiple jobs)"
   type        = bool
-  default     = true
+  default     = false
 }
 
 # Container Registry configuration
