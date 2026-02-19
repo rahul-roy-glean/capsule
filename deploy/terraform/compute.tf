@@ -194,21 +194,52 @@ resource "google_compute_instance_template" "firecracker_host" {
         fi
         rm -f "$POINTER_FILE"
 
-        if [ -n "$SNAPSHOT_VERSION" ]; then
-          echo "Resolved current pointer to version: $SNAPSHOT_VERSION"
-          gcloud storage rsync -r "gs://$SNAPSHOT_BUCKET/$SNAPSHOT_VERSION/" /mnt/data/snapshots/ || true
-        else
+        if [ -z "$SNAPSHOT_VERSION" ]; then
+          SNAPSHOT_VERSION="current"
           echo "No pointer file found, falling back to current/ directory"
-          gcloud storage rsync -r "gs://$SNAPSHOT_BUCKET/current/" /mnt/data/snapshots/ || true
+        else
+          echo "Resolved current pointer to version: $SNAPSHOT_VERSION"
         fi
 
-        # Download git-cache.img if it exists
+        echo "Downloading snapshot files from gs://$SNAPSHOT_BUCKET/$SNAPSHOT_VERSION/ ..."
+        gcloud storage cp "gs://$SNAPSHOT_BUCKET/$SNAPSHOT_VERSION/*" /mnt/data/snapshots/ || true
+
+        # Decompress zstd-compressed snapshot images (parallel)
+        DECOMPRESS_PIDS=""
+        for ZST_FILE in /mnt/data/snapshots/*.zst; do
+          [ -f "$ZST_FILE" ] || continue
+          echo "Decompressing $(basename $ZST_FILE)..."
+          zstd -d -T0 --rm -f "$ZST_FILE" &
+          DECOMPRESS_PIDS="$DECOMPRESS_PIDS $!"
+        done
+        if [ -n "$DECOMPRESS_PIDS" ]; then
+          for PID in $DECOMPRESS_PIDS; do
+            wait $PID
+          done
+          echo "Decompression complete"
+        fi
+
+        # Download git-cache.img (separate path in GCS)
         GIT_CACHE_GCS="gs://$SNAPSHOT_BUCKET/git-cache/current/git-cache.img"
         if gcloud storage ls "$GIT_CACHE_GCS" 2>/dev/null; then
           echo "Downloading git-cache.img from GCS..."
           gcloud storage cp "$GIT_CACHE_GCS" /mnt/data/git-cache.img
         fi
+
+        echo "Download complete"
       fi
+    fi
+
+    # Flush only rootfs.img to disk in the background.
+    # Only rootfs uses reflink (cp --reflink=always) for per-runner overlays.
+    # All other files are either passed directly to Firecracker or use overlayfs,
+    # so they don't need pages flushed to disk. Syncing just one file is much
+    # faster than a full filesystem sync.
+    if [ -f /mnt/data/snapshots/rootfs.img ]; then
+      sync /mnt/data/snapshots/rootfs.img &
+      SYNC_PID=$!
+    else
+      SYNC_PID=""
     fi
 
     # Create workspaces directory (per-VM, not in snapshot)
@@ -358,6 +389,13 @@ resource "google_compute_instance_template" "firecracker_host" {
 ExecStart=
 ExecStart=$EXEC_START
 OVERRIDE
+
+    # Wait for rootfs.img sync to complete so reflink copies are instant
+    if [ -n "$SYNC_PID" ]; then
+      echo "Waiting for rootfs.img sync to complete..."
+      wait $SYNC_PID
+      echo "rootfs.img sync complete"
+    fi
 
     # Reload and restart firecracker-manager service with new config
     echo "Starting firecracker-manager with: max-runners=$MAX_RUNNERS, idle-target=$IDLE_TARGET, vcpus=$VCPUS_PER_RUNNER, memory=$MEMORY_PER_RUNNER"

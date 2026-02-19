@@ -91,7 +91,7 @@ build {
       "set -o errexit -o nounset -o xtrace",
       "sudo apt-get update",
       "sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y",
-      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget gnupg2 software-properties-common apt-transport-https ca-certificates jq git xfsprogs"
+      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget gnupg2 software-properties-common apt-transport-https ca-certificates jq git xfsprogs zstd"
     ]
   }
 

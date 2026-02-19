@@ -81,7 +81,9 @@ RUN mkdir -p /workspace /var/run/thaw-agent /var/log/thaw-agent \
     /mnt/ephemeral/caches/repository \
     /mnt/ephemeral/bazel \
     /mnt/ephemeral/output \
-    && chown -R runner:runner /workspace /mnt/ephemeral
+    /mnt/bazel-output \
+    /mnt/bazel-output-upper \
+    && chown -R runner:runner /workspace /mnt/ephemeral /mnt/bazel-output /mnt/bazel-output-upper
 
 # Default Bazel user config: align repository_cache to the shared overlay target.
 RUN echo 'build --repository_cache=/mnt/ephemeral/caches/repository' > /home/runner/.bazelrc \

@@ -301,14 +301,49 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	repoCacheStart := time.Now()
 	repoCacheUpperPath := filepath.Join(m.config.WorkspaceDir, runnerID, "repo-cache-upper.img")
 	if err := os.MkdirAll(filepath.Dir(repoCacheUpperPath), 0755); err != nil {
-		m.cleanupRunner(runnerID, tap.Name, overlayPath, "")
+		m.cleanupRunner(runnerID, tap.Name, overlayPath, "", "", "")
 		return nil, fmt.Errorf("failed to create repo-cache-upper directory: %w", err)
 	}
 	if err := createExt4Image(repoCacheUpperPath, m.config.RepoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
-		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath, "", "")
 		return nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
 	}
 	repoCacheDur := time.Since(repoCacheStart)
+
+	// Bazel output uses the overlay pattern (same as repo-cache):
+	//   - bazel_output (seed): shared read-only from snapshot, warm analysis cache
+	//   - bazel_output_upper: per-runner writable layer for incremental writes
+	// If no seed exists, create a standalone drive instead.
+	bazelOutputPath := ""
+	if snapshotPaths.BazelOutput != "" {
+		// Seed available: use shared read-only image (no copy needed)
+		bazelOutputPath = snapshotPaths.BazelOutput
+	} else if m.config.BazelOutputSizeGB > 0 {
+		// No seed: create a standalone writable drive
+		bazelOutputPath = filepath.Join(m.config.WorkspaceDir, runnerID, "bazel-output.img")
+		if err := createExt4Image(bazelOutputPath, m.config.BazelOutputSizeGB, "BAZEL_OUTPUT"); err != nil {
+			m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath, "", "")
+			return nil, fmt.Errorf("failed to create bazel-output image: %w", err)
+		}
+	} else {
+		// Create a small placeholder to match snapshot drive layout
+		bazelOutputPath = filepath.Join(m.config.WorkspaceDir, runnerID, "bazel-output.img")
+		if err := createExt4ImageMB(bazelOutputPath, 64, "BAZEL_OUTPUT"); err != nil {
+			m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath, "", "")
+			return nil, fmt.Errorf("failed to create bazel-output placeholder image: %w", err)
+		}
+	}
+
+	// Create per-runner writable upper layer for bazel output overlay
+	bazelOutputUpperPath := filepath.Join(m.config.WorkspaceDir, runnerID, "bazel-output-upper.img")
+	upperSizeGB := m.config.BazelOutputUpperSizeGB
+	if upperSizeGB <= 0 {
+		upperSizeGB = 10 // default 10GB
+	}
+	if err := createExt4Image(bazelOutputUpperPath, upperSizeGB, "BAZEL_OUT_UPPER"); err != nil {
+		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath, bazelOutputPath, "")
+		return nil, fmt.Errorf("failed to create bazel-output-upper image: %w", err)
+	}
 
 	// Create runner record
 	runner := &Runner{
@@ -328,8 +363,10 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		SocketPath:     filepath.Join(m.config.SocketDir, runnerID+".sock"),
 		LogPath:        filepath.Join(m.config.LogDir, runnerID+".log"),
 		MetricsPath:    filepath.Join(m.config.LogDir, runnerID+".metrics"),
-		RootfsOverlay:  overlayPath,
-		RepoCacheUpper: repoCacheUpperPath,
+		RootfsOverlay:    overlayPath,
+		RepoCacheUpper:   repoCacheUpperPath,
+		BazelOutput:      bazelOutputPath,
+		BazelOutputUpper: bazelOutputUpperPath,
 	}
 
 	// Build kernel boot args with network configuration
@@ -368,7 +405,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 			Version:           "V1", // V1 for simple GET requests (thaw-agent uses V1 protocol)
 			NetworkInterfaces: []string{"eth0"},
 		},
-		Drives:      m.buildDrives(snapshotPaths.RepoCacheSeed, repoCacheUpperPath),
+		Drives:      m.buildDrives(snapshotPaths.RepoCacheSeed, repoCacheUpperPath, bazelOutputPath, bazelOutputUpperPath),
 		LogPath:     runner.LogPath,
 		MetricsPath: runner.MetricsPath,
 	}
@@ -376,7 +413,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	// Create VM instance
 	vm, err := firecracker.NewVM(vmCfg, m.logger.Logger)
 	if err != nil {
-		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath, bazelOutputPath, bazelOutputUpperPath)
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
@@ -400,7 +437,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		// for LoadSnapshot, then rename it back. Running VMs are unaffected
 		// because they hold TAP FDs (kernel tracks by ifindex, not name).
 		restoreOK := false
-		cleanup, symlinkErr := m.setupSnapshotSymlinks(overlayPath, repoCacheUpperPath, snapshotPaths)
+		cleanup, symlinkErr := m.setupSnapshotSymlinks(overlayPath, repoCacheUpperPath, bazelOutputPath, bazelOutputUpperPath, snapshotPaths)
 		if symlinkErr != nil {
 			m.logger.WithError(symlinkErr).Warn("Failed to setup snapshot symlinks, falling back to cold boot")
 		} else {
@@ -426,11 +463,11 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 			// Recreate VM for cold boot
 			vm, err = firecracker.NewVM(vmCfg, m.logger.Logger)
 			if err != nil {
-				m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+				m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath, bazelOutputPath, bazelOutputUpperPath)
 				return nil, fmt.Errorf("failed to recreate VM for cold boot: %w", err)
 			}
 			if err := vm.Start(ctx); err != nil {
-				m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+				m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath, bazelOutputPath, bazelOutputUpperPath)
 				return nil, fmt.Errorf("failed to start VM (cold boot fallback): %w", err)
 			}
 		}
@@ -438,7 +475,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		// No snapshot available, cold boot
 		m.logger.WithField("runner_id", runnerID).Info("Starting runner (cold boot - no snapshot available)")
 		if err := vm.Start(ctx); err != nil {
-			m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+			m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath, bazelOutputPath, bazelOutputUpperPath)
 			return nil, fmt.Errorf("failed to start VM: %w", err)
 		}
 	}
@@ -447,7 +484,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	mmdsData := m.buildMMDSData(ctx, runner, tap, req)
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
-		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath, bazelOutputPath, bazelOutputUpperPath)
 		return nil, fmt.Errorf("failed to set MMDS data: %w", err)
 	}
 
@@ -577,7 +614,7 @@ func (m *Manager) ReleaseRunner(runnerID string, destroy bool) error {
 		delete(m.vms, runnerID)
 	}
 
-	m.cleanupRunner(runnerID, runner.TapDevice, runner.RootfsOverlay, runner.RepoCacheUpper)
+	m.cleanupRunner(runnerID, runner.TapDevice, runner.RootfsOverlay, runner.RepoCacheUpper, runner.BazelOutput, runner.BazelOutputUpper)
 	delete(m.runners, runnerID)
 
 	return nil
@@ -820,7 +857,7 @@ func errorsToStrings(errs []error) []string {
 }
 
 // cleanupRunner cleans up runner resources
-func (m *Manager) cleanupRunner(runnerID, tapDevice, overlayPath, repoCacheUpperPath string) {
+func (m *Manager) cleanupRunner(runnerID, tapDevice, overlayPath, repoCacheUpperPath, bazelOutputPath, bazelOutputUpperPath string) {
 	// Release TAP slot if using slot-based allocation
 	if slot, ok := m.runnerToSlot[runnerID]; ok {
 		m.network.ReleaseTapSlot(slot, runnerID)
@@ -841,9 +878,22 @@ func (m *Manager) cleanupRunner(runnerID, tapDevice, overlayPath, repoCacheUpper
 		os.Remove(repoCacheUpperPath)
 	}
 
+	// Remove bazel output images (only per-runner ones, not shared seed)
+	if bazelOutputPath != "" && !m.isSeedPath(bazelOutputPath) {
+		os.Remove(bazelOutputPath)
+	}
+	if bazelOutputUpperPath != "" {
+		os.Remove(bazelOutputUpperPath)
+	}
+
 	// Remove socket
 	socketPath := filepath.Join(m.config.SocketDir, runnerID+".sock")
 	os.Remove(socketPath)
+}
+
+// isSeedPath checks if a path points to the shared snapshot cache (not a per-runner file).
+func (m *Manager) isSeedPath(p string) bool {
+	return strings.HasPrefix(p, m.config.SnapshotCachePath)
 }
 
 // findAvailableSlot finds the first available TAP slot for snapshot restore.
@@ -859,7 +909,7 @@ func (m *Manager) findAvailableSlot() int {
 
 // buildDrives constructs the list of block devices to attach to a microVM.
 // All drives must be present to match the snapshot's drive layout for restore to work.
-func (m *Manager) buildDrives(repoCacheSeedPath, repoCacheUpperPath string) []firecracker.Drive {
+func (m *Manager) buildDrives(repoCacheSeedPath, repoCacheUpperPath, bazelOutputPath, bazelOutputUpperPath string) []firecracker.Drive {
 	drives := []firecracker.Drive{
 		{
 			DriveID:      "repo_cache_seed",
@@ -897,6 +947,27 @@ func (m *Manager) buildDrives(repoCacheSeedPath, repoCacheUpperPath string) []fi
 		})
 	}
 
+	// Always add bazel-output drives to match snapshot drive layout.
+	// The seed is read-only (shared), the upper is writable (per-runner).
+	if bazelOutputPath != "" {
+		// Seed is read-only when shared from snapshot cache
+		isReadOnly := m.isSeedPath(bazelOutputPath)
+		drives = append(drives, firecracker.Drive{
+			DriveID:      "bazel_output",
+			PathOnHost:   bazelOutputPath,
+			IsRootDevice: false,
+			IsReadOnly:   isReadOnly,
+		})
+	}
+	if bazelOutputUpperPath != "" {
+		drives = append(drives, firecracker.Drive{
+			DriveID:      "bazel_output_upper",
+			PathOnHost:   bazelOutputUpperPath,
+			IsRootDevice: false,
+			IsReadOnly:   false,
+		})
+	}
+
 	return drives
 }
 
@@ -921,7 +992,7 @@ const snapshotTAPName = "tap-slot-0"
 // Returns a cleanup function that removes the symlinks. The cleanup should be
 // called after LoadSnapshot returns, as Firecracker holds open file descriptors
 // and no longer needs the symlink paths.
-func (m *Manager) setupSnapshotSymlinks(overlayPath, repoCacheUpperPath string, snapshotPaths *snapshot.SnapshotPaths) (func(), error) {
+func (m *Manager) setupSnapshotSymlinks(overlayPath, repoCacheUpperPath, bazelOutputPath, bazelOutputUpperPath string, snapshotPaths *snapshot.SnapshotPaths) (func(), error) {
 	if err := os.MkdirAll(snapshotSymlinkDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create snapshot symlink dir: %w", err)
 	}
@@ -943,6 +1014,8 @@ func (m *Manager) setupSnapshotSymlinks(overlayPath, repoCacheUpperPath string, 
 		{"repo-cache-upper.img", repoCacheUpperPath},
 		{"credentials.img", m.credentialsImage},
 		{"git-cache.img", gitCacheImg},
+		{"bazel-output.img", bazelOutputPath},
+		{"bazel-output-upper.img", bazelOutputUpperPath},
 	}
 
 	var created []string
@@ -1399,7 +1472,11 @@ func (m *Manager) getRunnerVMStats(ctx context.Context, runnerID string) (*VMSta
 	memoryUsage := int64(runner.Resources.MemoryMB) * 1024 * 1024
 
 	// Disk usage would be the overlay size, but for now just estimate
-	diskUsage := int64(m.config.RepoCacheUpperSizeGB) * 1024 * 1024 * 1024
+	upperGB := m.config.BazelOutputUpperSizeGB
+	if upperGB <= 0 {
+		upperGB = 10
+	}
+	diskUsage := int64(m.config.RepoCacheUpperSizeGB+upperGB) * 1024 * 1024 * 1024
 
 	return &VMStats{
 		MemoryUsageBytes: memoryUsage,

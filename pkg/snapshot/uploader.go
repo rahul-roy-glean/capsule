@@ -45,26 +45,30 @@ func NewUploader(ctx context.Context, cfg UploaderConfig) (*Uploader, error) {
 	}, nil
 }
 
-// UploadSnapshot uploads a snapshot to GCS using parallel gcloud storage cp calls
+// UploadSnapshot uploads a snapshot to GCS using parallel gcloud storage cp calls.
+// Large image files are compressed with zstd before upload to reduce transfer size.
 func (u *Uploader) UploadSnapshot(ctx context.Context, localDir string, metadata SnapshotMetadata) error {
 	version := metadata.Version
 	u.logger.WithField("version", version).Info("Uploading snapshot to GCS")
 
 	start := time.Now()
 
-	// Files to upload
-	files := []struct {
-		local  string
-		remote string
-	}{
-		{filepath.Join(localDir, "kernel.bin"), fmt.Sprintf("%s/kernel.bin", version)},
-		{filepath.Join(localDir, "rootfs.img"), fmt.Sprintf("%s/rootfs.img", version)},
-		{filepath.Join(localDir, "snapshot.mem"), fmt.Sprintf("%s/snapshot.mem", version)},
-		{filepath.Join(localDir, "snapshot.state"), fmt.Sprintf("%s/snapshot.state", version)},
-		{filepath.Join(localDir, "repo-cache-seed.img"), fmt.Sprintf("%s/repo-cache-seed.img", version)},
+	// Files to upload — large images are compressed with zstd
+	type fileEntry struct {
+		local    string
+		remote   string
+		compress bool // whether to zstd-compress before upload
+	}
+	files := []fileEntry{
+		{filepath.Join(localDir, "kernel.bin"), fmt.Sprintf("%s/kernel.bin", version), false},
+		{filepath.Join(localDir, "rootfs.img"), fmt.Sprintf("%s/rootfs.img.zst", version), true},
+		{filepath.Join(localDir, "snapshot.mem"), fmt.Sprintf("%s/snapshot.mem.zst", version), true},
+		{filepath.Join(localDir, "snapshot.state"), fmt.Sprintf("%s/snapshot.state", version), false},
+		{filepath.Join(localDir, "repo-cache-seed.img"), fmt.Sprintf("%s/repo-cache-seed.img.zst", version), true},
+		{filepath.Join(localDir, "bazel-output.img"), fmt.Sprintf("%s/bazel-output.img.zst", version), true},
 	}
 
-	// Calculate total size
+	// Calculate total uncompressed size
 	var totalSize int64
 	for _, f := range files {
 		info, err := os.Stat(f.local)
@@ -74,7 +78,7 @@ func (u *Uploader) UploadSnapshot(ctx context.Context, localDir string, metadata
 	}
 	metadata.SizeBytes = totalSize
 
-	// Upload all files concurrently
+	// Compress and upload all files concurrently
 	type uploadResult struct {
 		file string
 		err  error
@@ -83,7 +87,17 @@ func (u *Uploader) UploadSnapshot(ctx context.Context, localDir string, metadata
 	for _, f := range files {
 		f := f // capture loop variable
 		go func() {
-			ch <- uploadResult{f.local, u.uploadFile(ctx, f.local, f.remote)}
+			uploadPath := f.local
+			if f.compress {
+				compressed, err := u.compressFile(ctx, f.local)
+				if err != nil {
+					ch <- uploadResult{f.local, fmt.Errorf("compression failed: %w", err)}
+					return
+				}
+				uploadPath = compressed
+				defer os.Remove(compressed)
+			}
+			ch <- uploadResult{f.local, u.uploadFile(ctx, uploadPath, f.remote)}
 		}()
 	}
 
@@ -135,6 +149,45 @@ func joinErrors(errs []string) string {
 		result += e
 	}
 	return result
+}
+
+// compressFile compresses a file with zstd and returns the path to the compressed file.
+// Uses multi-threaded compression for speed on large images.
+func (u *Uploader) compressFile(ctx context.Context, localPath string) (string, error) {
+	compressedPath := localPath + ".zst"
+	u.logger.WithField("file", filepath.Base(localPath)).Info("Compressing with zstd")
+
+	// Stat original before compression
+	origInfo, _ := os.Stat(localPath)
+	var origSize int64
+	if origInfo != nil {
+		origSize = origInfo.Size()
+	}
+
+	start := time.Now()
+	cmd := exec.CommandContext(ctx, "zstd", "-T0", "-f", localPath, "-o", compressedPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("zstd compression failed for %s: %w", filepath.Base(localPath), err)
+	}
+
+	compInfo, _ := os.Stat(compressedPath)
+	var ratio float64
+	if origSize > 0 && compInfo != nil {
+		ratio = float64(compInfo.Size()) / float64(origSize) * 100
+	}
+
+	u.logger.WithFields(logrus.Fields{
+		"file":             filepath.Base(localPath),
+		"original_bytes":   origSize,
+		"compressed_bytes": compInfo.Size(),
+		"ratio_pct":        fmt.Sprintf("%.1f", ratio),
+		"duration":         time.Since(start),
+	}).Info("Compression complete")
+
+	return compressedPath, nil
 }
 
 // uploadFile uploads a single file to GCS using gcloud storage cp with parallel composite upload

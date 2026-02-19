@@ -263,14 +263,14 @@ func TestBuildDrives_WithGitCache(t *testing.T) {
 		m.gitCacheImage = "/path/to/git-cache.img"
 	})
 
-	drives := m.buildDrives("/path/to/seed.img", "/path/to/upper.img")
+	drives := m.buildDrives("/path/to/seed.img", "/path/to/upper.img", "/path/to/bazel-output.img", "/path/to/bazel-output-upper.img")
 
-	if len(drives) != 4 {
-		t.Fatalf("buildDrives() returned %d drives, want 4", len(drives))
+	if len(drives) != 6 {
+		t.Fatalf("buildDrives() returned %d drives, want 6", len(drives))
 	}
 
 	// Check drive IDs
-	wantIDs := []string{"repo_cache_seed", "repo_cache_upper", "credentials", "git_cache"}
+	wantIDs := []string{"repo_cache_seed", "repo_cache_upper", "credentials", "git_cache", "bazel_output", "bazel_output_upper"}
 	for i, wantID := range wantIDs {
 		if drives[i].DriveID != wantID {
 			t.Errorf("drives[%d].DriveID = %q, want %q", i, drives[i].DriveID, wantID)
@@ -302,13 +302,13 @@ func TestBuildDrives_WithoutGitCache(t *testing.T) {
 		m.config.WorkspaceDir = t.TempDir()
 	})
 
-	drives := m.buildDrives("/path/to/seed.img", "/path/to/upper.img")
+	drives := m.buildDrives("/path/to/seed.img", "/path/to/upper.img", "/path/to/bazel-output.img", "/path/to/bazel-output-upper.img")
 
 	// Without a git cache image, buildDrives calls getOrCreateGitCachePlaceholder which
 	// tries to create an ext4 image. On macOS (or systems without mkfs.ext4) this will
-	// fail silently and return only 3 drives. On Linux it would return 4.
-	if len(drives) < 3 {
-		t.Fatalf("buildDrives() returned %d drives, want at least 3", len(drives))
+	// fail silently and return only 4 drives. On Linux it would return 5.
+	if len(drives) < 5 {
+		t.Fatalf("buildDrives() returned %d drives, want at least 5", len(drives))
 	}
 
 	// First 3 drives should always be present
@@ -326,7 +326,7 @@ func TestBuildDrives_PathsCorrect(t *testing.T) {
 		m.gitCacheImage = "/git/cache.img"
 	})
 
-	drives := m.buildDrives("/seed/path.img", "/upper/path.img")
+	drives := m.buildDrives("/seed/path.img", "/upper/path.img", "/bazel/output.img", "/bazel/output-upper.img")
 
 	if drives[0].PathOnHost != "/seed/path.img" {
 		t.Errorf("repo_cache_seed path = %q, want %q", drives[0].PathOnHost, "/seed/path.img")
@@ -348,7 +348,7 @@ func TestBuildDrives_NoDrivesAreRootDevice(t *testing.T) {
 		m.gitCacheImage = "/path/to/git-cache.img"
 	})
 
-	drives := m.buildDrives("/path/to/seed.img", "/path/to/upper.img")
+	drives := m.buildDrives("/path/to/seed.img", "/path/to/upper.img", "/path/to/bazel-output.img", "/path/to/bazel-output-upper.img")
 
 	for i, d := range drives {
 		if d.IsRootDevice {

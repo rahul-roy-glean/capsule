@@ -39,6 +39,8 @@ var (
 	repoCacheSeedDir    = flag.String("repo-cache-seed-dir", "", "Optional directory to seed into repo-cache-seed.img (copied into image root)")
 	gitCachePath        = flag.String("git-cache-path", "", "Path to pre-populated git-cache.img (from git-cache-builder). If set, uses this instead of cloning during warmup.")
 	fetchTargets        = flag.String("fetch-targets", "//...", "Bazel target pattern for fetch (e.g., '//... -- -//terraform/...' to exclude terraform)")
+	bazelBazelrc        = flag.String("bazel-bazelrc", ".bazelrc", "Path to repo bazelrc file (relative to repo root), passed to thaw-agent for output_user_root discovery")
+	bazelOutputSizeGB   = flag.Int("bazel-output-size-gb", 25, "Size in GB of the bazel output drive used during warmup for output_user_root")
 	logLevel            = flag.String("log-level", "info", "Log level")
 
 	// GitHub App authentication for private repos (used when git-cache is not available)
@@ -213,6 +215,23 @@ func main() {
 		}
 	}
 
+	// Create bazel-output seed image for the warmup VM. During warmup, bazel's
+	// output_user_root is redirected here so that the rootfs stays small.
+	// After warmup the image is shrunk and uploaded to GCS as a shared read-only
+	// seed. Each runner gets a small writable upper layer via overlayfs.
+	bazelOutputImg := filepath.Join(*outputDir, "bazel-output.img")
+	if err := createExt4Image(bazelOutputImg, *bazelOutputSizeGB, "BAZEL_OUTPUT"); err != nil {
+		log.WithError(err).Fatal("Failed to create bazel-output image")
+	}
+
+	// Create a small placeholder upper image for the warmup VM.
+	// At runtime each runner gets its own upper image, but the snapshot must
+	// include the same device layout (drive IDs) for snapshot restore compatibility.
+	bazelOutputUpperImg := filepath.Join(*outputDir, "bazel-output-upper.img")
+	if err := createExt4ImageMB(bazelOutputUpperImg, 64, "BAZEL_OUT_UPPER"); err != nil {
+		log.WithError(err).Fatal("Failed to create bazel-output-upper image")
+	}
+
 	// Create TAP device for warmup VM networking
 	// IMPORTANT: Use slot-based TAP name (tap-slot-0) so the snapshot is compatible
 	// with the manager's slot-based allocation. Firecracker does NOT support changing
@@ -278,6 +297,18 @@ func main() {
 				IsRootDevice: false,
 				IsReadOnly:   true,
 			},
+			{
+				DriveID:      "bazel_output",
+				PathOnHost:   bazelOutputImg,
+				IsRootDevice: false,
+				IsReadOnly:   false,
+			},
+			{
+				DriveID:      "bazel_output_upper",
+				PathOnHost:   bazelOutputUpperImg,
+				IsRootDevice: false,
+				IsReadOnly:   false,
+			},
 		},
 	}
 
@@ -293,7 +324,7 @@ func main() {
 	}
 
 	// Inject MMDS data for warmup configuration
-	mmdsData := buildWarmupMMDS(*repoURL, *repoBranch, *bazelVersion, *fetchTargets, gitToken, gcpAccessToken, gitCacheEnabled)
+	mmdsData := buildWarmupMMDS(*repoURL, *repoBranch, *bazelVersion, *fetchTargets, *bazelBazelrc, gitToken, gcpAccessToken, gitCacheEnabled)
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
 		log.WithError(err).Fatal("Failed to set MMDS data")
@@ -321,6 +352,12 @@ func main() {
 
 	// Stop VM
 	vm.Stop()
+
+	// NOTE: We intentionally do NOT shrink bazel-output.img here.
+	// The guest kernel's snapshot memory (snapshot.mem) contains cached
+	// filesystem metadata (superblock, journal) for the original drive size.
+	// Shrinking the image would cause the restored VM's kernel to reference
+	// blocks beyond the truncated file, leading to I/O errors.
 
 	// Copy kernel to output
 	kernelOutput := filepath.Join(*outputDir, "kernel.bin")
@@ -614,6 +651,9 @@ func createExt4ImageMB(path string, sizeMB int, label string) error {
 	return nil
 }
 
+// shrinkExt4Image shrinks an ext4 image to its minimum size plus a small margin.
+// This runs e2fsck, resize2fs -M to shrink the filesystem, then truncates the
+// file to match. The result is a compact image suitable for GCS upload.
 func seedExt4ImageFromDir(imgPath, seedDir string, log *logrus.Entry) error {
 	info, err := os.Stat(seedDir)
 	if err != nil {
@@ -752,7 +792,7 @@ func cleanupWarmupNetwork(tapName string) {
 }
 
 // buildWarmupMMDS creates the MMDS data for warmup mode
-func buildWarmupMMDS(repoURL, repoBranch, bazelVersion, fetchTargets, gitToken, gcpAccessToken string, gitCacheEnabled bool) map[string]interface{} {
+func buildWarmupMMDS(repoURL, repoBranch, bazelVersion, fetchTargets, bazelBazelrc, gitToken, gcpAccessToken string, gitCacheEnabled bool) map[string]interface{} {
 	// Extract repo name for git-cache lookup (e.g., "askscio/scio" -> "scio")
 	repoName := filepath.Base(strings.TrimSuffix(repoURL, ".git"))
 
@@ -768,6 +808,7 @@ func buildWarmupMMDS(repoURL, repoBranch, bazelVersion, fetchTargets, gitToken, 
 				"repo_branch":    repoBranch,
 				"bazel_version":  bazelVersion,
 				"warmup_targets": fetchTargets,
+				"bazel_bazelrc":  bazelBazelrc,
 			},
 			"network": map[string]interface{}{
 				"ip":        "172.16.0.2/24",

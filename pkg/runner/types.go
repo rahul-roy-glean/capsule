@@ -44,6 +44,8 @@ type Runner struct {
 	MetricsPath             string
 	RootfsOverlay           string
 	RepoCacheUpper          string
+	BazelOutput             string // seed (read-only shared) or standalone drive
+	BazelOutputUpper        string // per-runner writable overlay layer
 	QuarantineReason        string
 	QuarantinedAt           time.Time
 	QuarantineDir           string
@@ -165,6 +167,15 @@ type HostConfig struct {
 	// RepoCacheUpperSizeGB controls the per-runner writable layer size for the
 	// Bazel repository cache overlay.
 	RepoCacheUpperSizeGB int
+	// BazelOutputSizeGB controls the per-runner ephemeral drive size for
+	// bazel build output (bazel-bin, bazel-out, sandbox, action_cache).
+	// When a seed image is available from the snapshot, this is ignored
+	// (the seed is mounted read-only and shared across runners).
+	BazelOutputSizeGB int
+	// BazelOutputUpperSizeGB controls the per-runner writable overlay layer
+	// for bazel output. This captures incremental writes on top of the
+	// shared read-only seed. Typical builds need 5-10GB of delta.
+	BazelOutputUpperSizeGB int
 	// BuildbarnCertsDir is a host directory containing Buildbarn certificates
 	// (e.g. ca.crt, client.crt, client.pem). If set, the host agent will package
 	// this directory into an ext4 image and attach it read-only to each microVM.

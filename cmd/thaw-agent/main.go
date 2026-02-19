@@ -55,6 +55,18 @@ var (
 	gitCacheDevice = flag.String("git-cache-device", "/dev/vde", "Block device for git-cache (read-only mount inside VM)")
 	gitCacheMount  = flag.String("git-cache-mount", "/mnt/git-cache", "Mount point for git-cache inside the microVM")
 	gitCacheLabel  = flag.String("git-cache-label", "GIT_CACHE", "Filesystem label for git-cache drive")
+
+	// Bazel output flags (overlay pattern: read-only seed + writable upper)
+	skipBazelOutput        = flag.Bool("skip-bazel-output", false, "Skip mounting bazel output drives")
+	bazelOutputDevice      = flag.String("bazel-output-device", "/dev/vdf", "Block device for bazel output seed (read-only)")
+	bazelOutputMount       = flag.String("bazel-output-mount", "/mnt/bazel-output", "Mount point for bazel output seed")
+	bazelOutputLabel       = flag.String("bazel-output-label", "BAZEL_OUTPUT", "Filesystem label for bazel output seed")
+	bazelOutputUpperDevice = flag.String("bazel-output-upper-device", "/dev/vdg", "Block device for bazel output upper (writable)")
+	bazelOutputUpperMount  = flag.String("bazel-output-upper-mount", "/mnt/bazel-output-upper", "Mount point for bazel output upper")
+	bazelOutputUpperLabel  = flag.String("bazel-output-upper-label", "BAZEL_OUT_UPPER", "Filesystem label for bazel output upper")
+
+	// Bazel configuration
+	bazelBazelrc = flag.String("bazel-bazelrc", ".bazelrc", "Path to repo bazelrc file (relative to repo root), used to discover output_user_root")
 )
 
 // WarmupState tracks the current warmup progress (for snapshot building)
@@ -210,6 +222,7 @@ type MMDSData struct {
 			RepoBranch    string `json:"repo_branch,omitempty"`
 			BazelVersion  string `json:"bazel_version,omitempty"`
 			WarmupTargets string `json:"warmup_targets,omitempty"`
+			BazelBazelrc  string `json:"bazel_bazelrc,omitempty"`
 		} `json:"warmup,omitempty"`
 	} `json:"latest"`
 }
@@ -347,6 +360,25 @@ func main() {
 		}
 	}
 	bootTimer.Phase("git_cache_mount")
+
+	// Mount bazel output drives. The seed is mounted read-write during warmup
+	// (so bazel fetch/build can populate it) and read-only after restore (shared
+	// warm analysis cache). The upper is always writable (per-runner delta).
+	isWarmupMode := mmdsData.Latest.Meta.Mode == "warmup"
+	if !*skipBazelOutput {
+		seedReadOnly := !isWarmupMode // rw during warmup, ro after restore
+		log.WithField("read_only", seedReadOnly).Info("Mounting bazel output seed drive...")
+		if err := mountBazelOutput(seedReadOnly); err != nil {
+			log.WithError(err).Error("Failed to mount bazel output seed drive")
+		}
+		if !isWarmupMode {
+			log.Info("Mounting bazel output upper drive...")
+			if err := mountBazelOutputUpper(); err != nil {
+				log.WithError(err).Error("Failed to mount bazel output upper drive")
+			}
+		}
+	}
+	bootTimer.Phase("bazel_output_mount")
 
 	// Configure network
 	setStep("network_config")
@@ -581,6 +613,16 @@ func main() {
 	// Start health server in background FIRST so we can always monitor the VM
 	go startHealthServer(mmdsData)
 	log.Info("Health server started in background")
+
+	// Mount overlayfs combining read-only seed (warm analysis cache from snapshot)
+	// with per-runner writable upper at bazel's output_user_root.
+	if !*skipBazelOutput {
+		log.Info("Setting up overlayfs for bazel output_user_root...")
+		if err := overlayBazelOutputRoot(mmdsData); err != nil {
+			log.WithError(err).Error("Failed to overlay bazel output drive")
+		}
+	}
+	bootTimer.Phase("bazel_output_overlay")
 
 	// Verify bazel server survived snapshot restore by running `bazel info server_pid`.
 	// This uses bazel's own logic to find its server — no hardcoded paths, works with
@@ -886,6 +928,186 @@ func setupCredentialSymlinks(mountPath string, data *MMDSData) {
 	}
 }
 
+// mountBazelOutput mounts the per-VM ephemeral bazel output drive.
+// mountBazelOutput mounts the bazel-output seed device. During warmup it is
+// mounted read-write (the VM populates the analysis cache). After snapshot
+// restore (normal runner mode) it is mounted read-only — writes go to the
+// upper overlay layer instead.
+func mountBazelOutput(readOnly bool) error {
+	mountPath := *bazelOutputMount
+
+	if err := os.MkdirAll(mountPath, 0755); err != nil {
+		return fmt.Errorf("failed to create bazel-output mount dir: %w", err)
+	}
+
+	dev := resolveDevice(*bazelOutputDevice, *bazelOutputLabel)
+
+	if err := exec.Command("mountpoint", "-q", mountPath).Run(); err == nil {
+		return nil // already mounted
+	}
+
+	mountArgs := []string{dev, mountPath}
+	if readOnly {
+		mountArgs = []string{"-o", "ro", dev, mountPath}
+	}
+	if output, err := exec.Command("mount", mountArgs...).CombinedOutput(); err != nil {
+		return fmt.Errorf("mount failed: %s: %w", string(output), err)
+	}
+
+	// chown to runner user (only meaningful for rw mounts)
+	if !readOnly {
+		_ = exec.Command("chown", *runnerUsername+":"+*runnerUsername, mountPath).Run()
+	}
+
+	log.WithFields(logrus.Fields{
+		"device":    dev,
+		"mount":     mountPath,
+		"read_only": readOnly,
+	}).Info("Bazel output seed drive mounted")
+
+	return nil
+}
+
+// mountBazelOutputUpper mounts the per-runner writable upper device.
+func mountBazelOutputUpper() error {
+	mountPath := *bazelOutputUpperMount
+
+	if err := os.MkdirAll(mountPath, 0755); err != nil {
+		return fmt.Errorf("failed to create bazel-output-upper mount dir: %w", err)
+	}
+
+	dev := resolveDevice(*bazelOutputUpperDevice, *bazelOutputUpperLabel)
+
+	if err := exec.Command("mountpoint", "-q", mountPath).Run(); err == nil {
+		return nil // already mounted
+	}
+	if output, err := exec.Command("mount", dev, mountPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("mount upper failed: %s: %w", string(output), err)
+	}
+
+	// chown to runner user
+	_ = exec.Command("chown", *runnerUsername+":"+*runnerUsername, mountPath).Run()
+
+	log.WithFields(logrus.Fields{
+		"device": dev,
+		"mount":  mountPath,
+	}).Info("Bazel output upper drive mounted")
+
+	return nil
+}
+
+// discoverOutputUserRoot discovers bazel's output_user_root using the repo's .bazelrc.
+func discoverOutputUserRoot(data *MMDSData) string {
+	preClonedRepo := getPreClonedPath(data)
+
+	if preClonedRepo != "" {
+		u, err := user.Lookup(*runnerUsername)
+		if err != nil {
+			log.WithError(err).Warn("Failed to lookup runner user, falling back to default bazel output root")
+		} else {
+			uid, _ := strconv.Atoi(u.Uid)
+			gid, _ := strconv.Atoi(u.Gid)
+
+			bazelrcRel := *bazelBazelrc
+			if data.Latest.Warmup.BazelBazelrc != "" {
+				bazelrcRel = data.Latest.Warmup.BazelBazelrc
+			}
+			bazelrcPath := filepath.Join(preClonedRepo, bazelrcRel)
+			bazelArgs := []string{"info", "output_user_root"}
+			if _, err := os.Stat(bazelrcPath); err == nil {
+				bazelArgs = append([]string{"--bazelrc=" + bazelrcPath}, bazelArgs...)
+			} else {
+				log.WithFields(logrus.Fields{
+					"bazelrc": bazelrcPath,
+				}).Debug("Bazelrc not found, running bazel info without explicit --bazelrc")
+			}
+
+			cmd := exec.Command("bazel", bazelArgs...)
+			cmd.Dir = preClonedRepo
+			cmd.Env = append(os.Environ(), "HOME="+u.HomeDir, "USER="+u.Username)
+			cmd.SysProcAttr = &syscall.SysProcAttr{
+				Credential: &syscall.Credential{
+					Uid: uint32(uid),
+					Gid: uint32(gid),
+				},
+			}
+
+			out, err := cmd.Output()
+			if err != nil {
+				log.WithError(err).Warn("Failed to discover bazel output_user_root, falling back to default")
+			} else {
+				return strings.TrimSpace(string(out))
+			}
+		}
+	}
+
+	// Fall back to default ~/.cache/bazel for the runner user
+	u, err := user.Lookup(*runnerUsername)
+	if err != nil {
+		log.WithError(err).Warn("Failed to lookup runner user for default output root")
+		return "/home/" + *runnerUsername + "/.cache/bazel"
+	}
+	return filepath.Join(u.HomeDir, ".cache", "bazel")
+}
+
+// bindBazelOutputRoot discovers bazel's output_user_root and bind-mounts the
+// bazel-output drive over it. In warmup mode (no overlay), this is a simple
+// bind mount of the seed drive. In normal runner mode, this is not called —
+// overlayBazelOutputRoot is used instead.
+func bindBazelOutputRoot(data *MMDSData) error {
+	outputUserRoot := discoverOutputUserRoot(data)
+
+	if err := os.MkdirAll(outputUserRoot, 0755); err != nil {
+		return fmt.Errorf("failed to create output_user_root dir %s: %w", outputUserRoot, err)
+	}
+
+	if output, err := exec.Command("mount", "--bind", *bazelOutputMount, outputUserRoot).CombinedOutput(); err != nil {
+		return fmt.Errorf("bind mount %s -> %s failed: %s: %w", *bazelOutputMount, outputUserRoot, string(output), err)
+	}
+
+	log.WithFields(logrus.Fields{
+		"source": *bazelOutputMount,
+		"target": outputUserRoot,
+	}).Info("Bind-mounted bazel output drive over output_user_root")
+
+	return nil
+}
+
+// overlayBazelOutputRoot creates an overlayfs mount combining the read-only
+// seed (warm analysis cache from snapshot) with the per-runner writable upper
+// layer at bazel's output_user_root.
+func overlayBazelOutputRoot(data *MMDSData) error {
+	outputUserRoot := discoverOutputUserRoot(data)
+
+	if err := os.MkdirAll(outputUserRoot, 0755); err != nil {
+		return fmt.Errorf("failed to create output_user_root dir %s: %w", outputUserRoot, err)
+	}
+
+	// Create workdir for overlayfs (must be on same filesystem as upperdir)
+	workDir := filepath.Join(*bazelOutputUpperMount, "work")
+	upperDir := filepath.Join(*bazelOutputUpperMount, "upper")
+	for _, d := range []string{workDir, upperDir} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			return fmt.Errorf("failed to create overlay dir %s: %w", d, err)
+		}
+		_ = exec.Command("chown", *runnerUsername+":"+*runnerUsername, d).Run()
+	}
+
+	// Mount overlayfs: lowerdir=seed(ro), upperdir=upper(rw), merged at output_user_root
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", *bazelOutputMount, upperDir, workDir)
+	if output, err := exec.Command("mount", "-t", "overlay", "overlay", "-o", opts, outputUserRoot).CombinedOutput(); err != nil {
+		return fmt.Errorf("overlayfs mount failed: %s: %w", string(output), err)
+	}
+
+	log.WithFields(logrus.Fields{
+		"lowerdir": *bazelOutputMount,
+		"upperdir": upperDir,
+		"target":   outputUserRoot,
+	}).Info("Overlayfs mounted for bazel output_user_root")
+
+	return nil
+}
+
 func resolveDevice(defaultDev string, label string) string {
 	// Prefer by-label path if present.
 	byLabel := filepath.Join("/dev/disk/by-label", label)
@@ -985,6 +1207,7 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					RepoBranch    string `json:"repo_branch,omitempty"`
 					BazelVersion  string `json:"bazel_version,omitempty"`
 					WarmupTargets string `json:"warmup_targets,omitempty"`
+					BazelBazelrc  string `json:"bazel_bazelrc,omitempty"`
 				} `json:"warmup,omitempty"`
 			}
 			if err := json.Unmarshal(body, &inner); err != nil {
@@ -1919,6 +2142,16 @@ func runWarmupMode(data *MMDSData) error {
 		}
 	}
 
+	// Bind-mount bazel output drive over output_user_root before any bazel
+	// commands run. This redirects the output_base off rootfs so that rootfs
+	// stays small. The drive content will be baked into the snapshot.
+	if !*skipBazelOutput {
+		log.Info("Binding bazel output drive to output_user_root for warmup...")
+		if err := bindBazelOutputRoot(data); err != nil {
+			log.WithError(err).Error("Failed to bind bazel output drive for warmup")
+		}
+	}
+
 	// Phase 2: Configure Bazel
 	updateWarmupState("configuring", "Configuring Bazel...")
 
@@ -1990,9 +2223,13 @@ esac
 	}
 
 	// Log repo's bazelrc and .bazelversion for debugging
-	if data, err := os.ReadFile(filepath.Join(repoDir, ".bazelrc")); err == nil {
-		log.WithField("content", string(data)).Debug("Repo .bazelrc")
-		globalWarmupLogs.Add("[repo .bazelrc]\n" + string(data))
+	repoBazelrc := warmup.BazelBazelrc
+	if repoBazelrc == "" {
+		repoBazelrc = ".bazelrc"
+	}
+	if data, err := os.ReadFile(filepath.Join(repoDir, repoBazelrc)); err == nil {
+		log.WithField("content", string(data)).WithField("path", repoBazelrc).Debug("Repo bazelrc")
+		globalWarmupLogs.Add("[repo " + repoBazelrc + "]\n" + string(data))
 	}
 	if data, err := os.ReadFile(filepath.Join(repoDir, ".bazelversion")); err == nil {
 		log.WithField("version", strings.TrimSpace(string(data))).Info("Repo .bazelversion")

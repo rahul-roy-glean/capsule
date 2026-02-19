@@ -47,6 +47,8 @@ var (
 	snapshotBucket       = flag.String("snapshot-bucket", "", "GCS bucket for snapshots")
 	snapshotCache        = flag.String("snapshot-cache", "/mnt/data/snapshots", "Local snapshot cache path")
 	repoCacheUpperSizeGB = flag.Int("repo-cache-upper-size-gb", 10, "Size in GB of the per-runner repo cache writable layer (upper)")
+	bazelOutputSizeGB    = flag.Int("bazel-output-size-gb", 15, "Size in GB of the per-runner bazel output drive (used only when no seed image exists)")
+	bazelOutputUpperSizeGB = flag.Int("bazel-output-upper-size-gb", 10, "Size in GB of the per-runner writable overlay for bazel output")
 	buildbarnCertsDir    = flag.String("buildbarn-certs-dir", "", "Host directory containing Buildbarn certs to mount into microVMs (e.g. /etc/glean/ci/certs)")
 	buildbarnCertsMount  = flag.String("buildbarn-certs-mount", "/etc/bazel-firecracker/certs/buildbarn", "Guest mount path for Buildbarn certs inside the microVM")
 	buildbarnCertsSizeMB = flag.Int("buildbarn-certs-image-size-mb", 32, "Size in MB of the generated Buildbarn certs ext4 image")
@@ -230,6 +232,8 @@ func main() {
 		SnapshotBucket:            *snapshotBucket,
 		SnapshotCachePath:         *snapshotCache,
 		RepoCacheUpperSizeGB:      *repoCacheUpperSizeGB,
+		BazelOutputSizeGB:         *bazelOutputSizeGB,
+		BazelOutputUpperSizeGB:    *bazelOutputUpperSizeGB,
 		BuildbarnCertsDir:         *buildbarnCertsDir,
 		BuildbarnCertsMountPath:   *buildbarnCertsMount,
 		BuildbarnCertsImageSizeMB: *buildbarnCertsSizeMB,

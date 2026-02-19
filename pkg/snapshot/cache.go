@@ -40,6 +40,7 @@ type SnapshotPaths struct {
 	Mem           string
 	State         string
 	RepoCacheSeed string
+	BazelOutput   string
 	Version       string
 }
 
@@ -196,6 +197,7 @@ func (c *Cache) GetSnapshotPaths() (*SnapshotPaths, error) {
 	memPath := filepath.Join(c.localPath, "snapshot.mem")
 	statePath := filepath.Join(c.localPath, "snapshot.state")
 	repoCacheSeedPath := filepath.Join(c.localPath, "repo-cache-seed.img")
+	bazelOutputPath := filepath.Join(c.localPath, "bazel-output.img")
 
 	// Required files for any boot mode
 	for _, path := range []string{kernelPath, rootfsPath, repoCacheSeedPath} {
@@ -210,6 +212,13 @@ func (c *Cache) GetSnapshotPaths() (*SnapshotPaths, error) {
 		Rootfs:        rootfsPath,
 		RepoCacheSeed: repoCacheSeedPath,
 		Version:       c.currentVer,
+	}
+
+	// Bazel output seed image is optional — if present, it's mounted read-only
+	// and shared across runners (overlayfs upper captures per-runner writes).
+	// If missing, a fresh standalone ext4 image is created per runner.
+	if _, err := os.Stat(bazelOutputPath); err == nil {
+		paths.BazelOutput = bazelOutputPath
 	}
 
 	// Only include mem/state if BOTH exist (partial snapshot is invalid)

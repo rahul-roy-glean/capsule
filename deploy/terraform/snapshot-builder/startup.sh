@@ -21,6 +21,10 @@ GITHUB_APP_SECRET=$(meta github-app-secret "")
 GCP_PROJECT=$(meta gcp-project "")
 ROOTFS_SIZE_GB=$(meta rootfs-size-gb "0")
 
+# ---- 0. Install dependencies ----
+echo "Installing zstd for snapshot compression..."
+apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq zstd >/dev/null
+
 # ---- 1. Install Firecracker ----
 echo "Installing Firecracker v${FIRECRACKER_VERSION}..."
 ARCH=$(uname -m)
