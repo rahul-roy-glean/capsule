@@ -427,14 +427,17 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		return nil, fmt.Errorf("failed to setup TAP rename: %w", err)
 	}
 
-	// Restore from snapshot with UFFD backend for memory
+	// Restore from snapshot with UFFD backend for memory.
+	// Load WITHOUT resuming so we can inject MMDS data before the guest
+	// thaw-agent wakes up. Otherwise the agent reads stale MMDS from the
+	// snapshot and skips runner registration.
 	cm.chunkedLogger.WithFields(logrus.Fields{
 		"runner_id":   runnerID,
 		"snapshot":    restoreStatePath,
 		"uffd_socket": uffdSocketPath,
 	}).Info("Restoring VM with UFFD memory backend")
 
-	restoreErr := vm.RestoreFromSnapshotWithUFFD(ctx, restoreStatePath, uffdSocketPath, true)
+	restoreErr := vm.RestoreFromSnapshotWithUFFD(ctx, restoreStatePath, uffdSocketPath, false)
 	tapRestore()
 	symlinkCleanup()
 
@@ -454,12 +457,21 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		}
 	}
 
-	// Inject MMDS data
+	// Inject MMDS data BEFORE resuming so the thaw-agent sees fresh config
 	mmdsData := cm.buildMMDSData(ctx, runner, tap, req)
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
 		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
 		return nil, fmt.Errorf("failed to set MMDS data: %w", err)
+	}
+
+	// Now resume the VM — thaw-agent will read the fresh MMDS data
+	if restoreErr == nil {
+		if err := vm.Resume(ctx); err != nil {
+			vm.Stop()
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+			return nil, fmt.Errorf("failed to resume VM after MMDS injection: %w", err)
+		}
 	}
 
 	runner.State = StateInitializing
