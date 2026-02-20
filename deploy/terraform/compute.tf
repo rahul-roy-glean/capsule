@@ -203,6 +203,13 @@ resource "google_compute_instance_template" "firecracker_host" {
           gcloud storage rsync -r "gs://$SNAPSHOT_BUCKET/current/" /mnt/data/snapshots/ || true
         fi
 
+        # Pre-decompress snapshot.mem.zst so firecracker-manager doesn't re-download it
+        if [ -f "/mnt/data/snapshots/snapshot.mem.zst" ] && [ ! -f "/mnt/data/snapshots/snapshot.mem" ]; then
+          echo "Decompressing snapshot.mem.zst in background..."
+          zstd -d /mnt/data/snapshots/snapshot.mem.zst -o /mnt/data/snapshots/snapshot.mem --no-progress &
+          ZSTD_PID=$!
+        fi
+
         # Download git-cache.img if it exists
         GIT_CACHE_GCS="gs://$SNAPSHOT_BUCKET/git-cache/current/git-cache.img"
         if gcloud storage ls "$GIT_CACHE_GCS" 2>/dev/null; then
@@ -368,6 +375,12 @@ resource "google_compute_instance_template" "firecracker_host" {
 ExecStart=
 ExecStart=$EXEC_START
 OVERRIDE
+
+    # Wait for background mem decompression before starting firecracker-manager
+    if [ -n "$${ZSTD_PID:-}" ]; then
+      echo "Waiting for snapshot.mem decompression to finish..."
+      wait $ZSTD_PID && echo "snapshot.mem decompressed OK" || echo "WARNING: snapshot.mem decompression failed"
+    fi
 
     # Reload and restart firecracker-manager service with new config
     echo "Starting firecracker-manager with: max-runners=$MAX_RUNNERS, idle-target=$IDLE_TARGET, vcpus=$VCPUS_PER_RUNNER, memory=$MEMORY_PER_RUNNER"

@@ -108,3 +108,9 @@ variable "firecracker_version" {
   type        = string
   default     = "1.14.1"
 }
+
+variable "incremental" {
+  description = "Restore from previous snapshot for incremental rebuild (skips cold boot when previous snapshot exists)"
+  type        = bool
+  default     = true
+}

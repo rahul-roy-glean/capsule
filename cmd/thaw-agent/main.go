@@ -477,7 +477,34 @@ func main() {
 				}).Info("MMDS poll result")
 			}
 
-			// Check if mode changed from warmup (indicates snapshot was restored)
+			// Check if mode changed from warmup OR runner_id changed
+			// (runner_id change with mode still "warmup" = incremental re-warmup)
+			if newData.Latest.Meta.Mode != "warmup" ||
+				newData.Latest.Meta.RunnerID != mmdsData.Latest.Meta.RunnerID {
+				if newData.Latest.Meta.Mode == "warmup" {
+					// Incremental re-warmup: runner_id changed but mode still warmup
+					mmdsData.Latest = newData.Latest
+					log.WithField("new_runner_id", newData.Latest.Meta.RunnerID).Info("Re-warmup: incremental snapshot build detected")
+					globalWarmupState = &WarmupState{StartedAt: time.Now()}
+					if err := runWarmupMode(mmdsData); err != nil {
+						globalWarmupState.Error = err.Error()
+						globalWarmupState.Phase = "failed"
+						log.WithError(err).Error("Re-warmup failed")
+					} else {
+						globalWarmupState.Complete = true
+						globalWarmupState.Phase = "complete"
+						globalWarmupState.CompletedAt = time.Now()
+						globalWarmupState.Duration = time.Since(globalWarmupState.StartedAt).String()
+						log.Info("Re-warmup completed successfully")
+					}
+					if err := signalReady(); err != nil {
+						log.WithError(err).Error("Failed to signal ready after re-warmup")
+					}
+					pollInterval = 10 * time.Millisecond // Reset poll interval
+					continue                             // Keep polling for next restore
+				}
+			}
+
 			if newData.Latest.Meta.Mode != "warmup" {
 				log.WithFields(logrus.Fields{
 					"old_mode":      "warmup",
@@ -583,18 +610,22 @@ func main() {
 	go startHealthServer(mmdsData)
 	log.Info("Health server started in background")
 
-	// Verify bazel server survived snapshot restore by running `bazel info server_pid`.
-	// This uses bazel's own logic to find its server — no hardcoded paths, works with
-	// any bazelrc config.
-	setStep("bazel_verification")
-	preClonedRepo := getPreClonedPath(mmdsData)
-	if preClonedRepo != "" {
-		verifyBazelServer(preClonedRepo)
-	}
-	bootTimer.Phase("bazel_verify")
+	// Run bazel verification and CI runner registration in parallel.
+	// These are independent: bazel_verify checks the Bazel server survived restore,
+	// while ci_runner registers with GitHub and starts run.sh.
+	setStep("bazel_verify_and_ci_registration")
 
-	// Register CI runner based on configured CI system
-	setStep("ci_registration")
+	// Start bazel verification in background
+	bazelDone := make(chan struct{})
+	preClonedRepo := getPreClonedPath(mmdsData)
+	go func() {
+		defer close(bazelDone)
+		if preClonedRepo != "" {
+			verifyBazelServer(preClonedRepo)
+		}
+	}()
+
+	// Run CI runner registration concurrently
 	ciSystem := mmdsData.Latest.Runner.CISystem
 	if ciSystem == "" && mmdsData.Latest.Job.GitHubRunnerToken != "" {
 		ciSystem = "github-actions" // backwards compat
@@ -640,6 +671,9 @@ func main() {
 			log.WithField("ci_system", ciSystem).Warn("Unknown CI system, skipping runner registration")
 		}
 	}
+
+	// Wait for bazel verification to finish (usually completes before CI registration)
+	<-bazelDone
 	bootTimer.Phase("ci_runner")
 
 	// Signal ready

@@ -233,7 +233,7 @@ build {
       "sudo systemctl disable snap.lxd.activate.service || true",
       "sudo systemctl disable snapd.service snapd.socket snapd.seeded.service || true",
       "sudo systemctl disable apport.service || true",
-      "sudo systemctl mask snap.lxd.activate.service snapd.service snapd.socket snapd.seeded.service apport.service",
+      "sudo systemctl mask snap.lxd.activate.service snapd.service snapd.socket snapd.seeded.service apport.service || true",
       "sudo apt-get purge -y snapd lxd-agent-loader apport || true",
       "sudo apt-get autoremove -y"
     ]

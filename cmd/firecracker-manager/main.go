@@ -358,14 +358,21 @@ func main() {
 				// to local disk so VMs can use file-backed restore instead of UFFD.
 				if meta.MemFilePath != "" {
 					memPath := filepath.Join(*snapshotCache, "snapshot.mem")
-					log.WithFields(logrus.Fields{
-						"gcs_path":   meta.MemFilePath,
-						"local_path": memPath,
-					}).Info("Downloading raw memory file from GCS...")
-					if err := chunkedMgr.GetChunkStore().DownloadRawFile(ctx, meta.MemFilePath, memPath); err != nil {
-						log.WithError(err).Fatal("Failed to download raw memory file")
+					if info, err := os.Stat(memPath); err == nil && info.Size() > 0 {
+						log.WithFields(logrus.Fields{
+							"path": memPath,
+							"size": info.Size(),
+						}).Info("snapshot.mem already exists locally, skipping download")
+					} else {
+						log.WithFields(logrus.Fields{
+							"gcs_path":   meta.MemFilePath,
+							"local_path": memPath,
+						}).Info("Downloading raw memory file from GCS...")
+						if err := chunkedMgr.GetChunkStore().DownloadRawFile(ctx, meta.MemFilePath, memPath); err != nil {
+							log.WithError(err).Fatal("Failed to download raw memory file")
+						}
+						log.WithField("path", memPath).Info("Raw memory file downloaded and decompressed")
 					}
-					log.WithField("path", memPath).Info("Raw memory file downloaded and decompressed")
 				}
 			} else {
 				log.Warn("No chunked metadata or kernel hash available, falling back to traditional sync")
@@ -560,7 +567,7 @@ func snapshotSyncHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handle
 
 func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, idleTarget int, logger *logrus.Logger, metricsClient *telemetry.Client) {
 	log := logger.WithField("component", "autoscaler")
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {

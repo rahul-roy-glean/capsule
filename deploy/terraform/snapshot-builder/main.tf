@@ -102,6 +102,7 @@ resource "google_compute_instance" "snapshot_builder" {
     firecracker-version = var.firecracker_version
     rootfs-size-gb      = var.rootfs_size_gb
     bazelrc             = var.bazelrc
+    incremental         = var.incremental ? "true" : "false"
   }
 
   metadata_startup_script = file("${path.module}/startup.sh")

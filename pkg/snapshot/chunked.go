@@ -66,6 +66,10 @@ type ChunkedSnapshotMetadata struct {
 	MemFilePath string `json:"mem_file_path,omitempty"`
 	// RepoCacheSeedChunks holds chunks for the shared Bazel repo cache seed image
 	RepoCacheSeedChunks []ChunkRef `json:"repo_cache_seed_chunks,omitempty"`
+	// RootfsSourceHash is the SHA-256 hash of the original base rootfs.img used
+	// to build this snapshot. Used by incremental builds to detect rootfs changes
+	// and fall back to cold boot when the base image has been updated.
+	RootfsSourceHash string `json:"rootfs_source_hash,omitempty"`
 }
 
 // ChunkRef references a single chunk by its content hash
