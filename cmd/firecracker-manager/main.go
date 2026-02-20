@@ -466,6 +466,7 @@ func main() {
 	httpMux.HandleFunc("/api/v1/gc", gcHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/pool/flush", poolFlushHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/pool/stats", poolStatsHandler(mgr, logger))
+	httpMux.HandleFunc("/api/v1/runners/", appProxyHandler(mgr, logger))
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *httpPort),

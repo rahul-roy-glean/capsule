@@ -39,6 +39,7 @@ type AllocateRunnerRequest struct {
 	GitHubRunnerToken string
 	VCPUs             int
 	MemoryMB          int
+	Application       *pb.ApplicationConfig // optional application to run in the VM
 }
 
 // AllocateRunnerResponse represents the response from runner allocation
@@ -94,6 +95,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		Commit:            req.Commit,
 		Labels:            req.Labels,
 		GithubRunnerToken: req.GitHubRunnerToken,
+		Application:       req.Application,
 	}
 	if req.VCPUs > 0 || req.MemoryMB > 0 {
 		protoReq.Resources = &pb.Resources{

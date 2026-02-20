@@ -50,6 +50,9 @@ var (
 	credentialsMount  = flag.String("credentials-mount", "/mnt/credentials", "Mount point for credentials")
 	credentialsLabel  = flag.String("credentials-label", "CREDENTIALS", "Filesystem label for credentials drive")
 
+	// Application flags
+	skipApplication = flag.Bool("skip-application", false, "Skip starting application")
+
 	// Git cache flags
 	skipGitCache   = flag.Bool("skip-git-cache", false, "Skip git-cache setup and reference cloning")
 	gitCacheDevice = flag.String("git-cache-device", "/dev/vde", "Block device for git-cache (read-only mount inside VM)")
@@ -212,6 +215,13 @@ type MMDSData struct {
 			WarmupTargets string `json:"warmup_targets,omitempty"`
 			Bazelrc       string `json:"bazelrc,omitempty"`
 		} `json:"warmup,omitempty"`
+		Application struct {
+			Command    string            `json:"command,omitempty"`
+			Port       int               `json:"port,omitempty"`
+			WorkingDir string            `json:"working_dir,omitempty"`
+			Env        map[string]string `json:"env,omitempty"`
+			HealthPath string            `json:"health_path,omitempty"`
+		} `json:"application,omitempty"`
 	} `json:"latest"`
 }
 
@@ -672,6 +682,14 @@ func main() {
 		}
 	}
 
+	// Start application if configured
+	if !*skipApplication && mmdsData.Latest.Application.Command != "" {
+		log.WithField("command", mmdsData.Latest.Application.Command).Info("Starting application...")
+		if err := startApplication(mmdsData); err != nil {
+			log.WithError(err).Error("Failed to start application")
+		}
+	}
+
 	// Wait for bazel verification to finish (usually completes before CI registration)
 	<-bazelDone
 	bootTimer.Phase("ci_runner")
@@ -1022,6 +1040,13 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					WarmupTargets string `json:"warmup_targets,omitempty"`
 					Bazelrc       string `json:"bazelrc,omitempty"`
 				} `json:"warmup,omitempty"`
+				Application struct {
+					Command    string            `json:"command,omitempty"`
+					Port       int               `json:"port,omitempty"`
+					WorkingDir string            `json:"working_dir,omitempty"`
+					Env        map[string]string `json:"env,omitempty"`
+					HealthPath string            `json:"health_path,omitempty"`
+				} `json:"application,omitempty"`
 			}
 			if err := json.Unmarshal(body, &inner); err != nil {
 				return nil, fmt.Errorf("failed to parse MMDS data: %w", err)
@@ -1727,6 +1752,57 @@ func registerGitHubRunner(data *MMDSData) error {
 	}).Info("GitHub runner started successfully")
 
 	return nil
+}
+
+func startApplication(data *MMDSData) error {
+	app := data.Latest.Application
+	workDir := app.WorkingDir
+	if workDir == "" {
+		workDir = *workspaceDir
+	}
+
+	cmd := exec.Command("sh", "-c", app.Command)
+	cmd.Dir = workDir
+	cmd.Stdout = os.Stdout // serial console (same as GitHub runner)
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
+	// Inherit env + add app-specific vars
+	cmd.Env = os.Environ()
+	for k, v := range app.Env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start application: %w", err)
+	}
+	log.WithField("pid", cmd.Process.Pid).Info("Application started")
+
+	// Wait for health check if configured
+	if app.HealthPath != "" && app.Port > 0 {
+		url := fmt.Sprintf("http://localhost:%d%s", app.Port, app.HealthPath)
+		if err := waitForHealth(url, 30*time.Second); err != nil {
+			return fmt.Errorf("application health check failed: %w", err)
+		}
+		log.Info("Application health check passed")
+	}
+	return nil
+}
+
+func waitForHealth(url string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(url)
+		if err == nil && resp.StatusCode == 200 {
+			resp.Body.Close()
+			return nil
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("health check %s not ready after %s", url, timeout)
 }
 
 func signalReady() error {

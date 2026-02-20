@@ -63,6 +63,16 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		}
 	}
 
+	if req.Application != nil {
+		allocReq.Application = &runner.ApplicationConfig{
+			Command:    req.Application.Command,
+			Port:       int(req.Application.Port),
+			WorkingDir: req.Application.WorkingDir,
+			Env:        req.Application.Env,
+			HealthPath: req.Application.HealthPath,
+		}
+	}
+
 	var r *runner.Runner
 	var err error
 
@@ -304,6 +314,7 @@ func runnerToProto(r *runner.Runner) *pb.Runner {
 			MemoryMb: int32(r.Resources.MemoryMB),
 			DiskGb:   int32(r.Resources.DiskGB),
 		},
+		ApplicationPort: int32(r.ApplicationPort),
 	}
 
 	if !r.StartedAt.IsZero() {

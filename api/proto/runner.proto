@@ -100,6 +100,7 @@ message Runner {
   google.protobuf.Timestamp created_at = 8;
   google.protobuf.Timestamp started_at = 9;
   Resources resources = 10;
+  int32 application_port = 11;   // port the application listens on (0 = no app)
 }
 
 // HostStatus represents the current status of a host
@@ -145,6 +146,15 @@ message Snapshot {
   google.protobuf.Timestamp created_at = 7;
 }
 
+// ApplicationConfig specifies an application to run inside the microVM
+message ApplicationConfig {
+  string command = 1;              // e.g., "/opt/sandbox/service --port 9090"
+  int32 port = 2;                  // port the app listens on inside the VM
+  string working_dir = 3;          // working directory (default: /workspace)
+  map<string, string> env = 4;     // environment variables
+  string health_path = 5;          // health check path (e.g., "/health")
+}
+
 // AllocateRunnerRequest
 message AllocateRunnerRequest {
   string request_id = 1;
@@ -156,6 +166,7 @@ message AllocateRunnerRequest {
   string github_runner_token = 7; // Deprecated: use ci_runner_token
   string ci_runner_token = 8;     // Generic CI runner registration token
   string ci_system = 9;           // CI system identifier (e.g., "github-actions", "none")
+  ApplicationConfig application = 10; // Optional application to run in the VM
 }
 
 // AllocateRunnerResponse

@@ -454,6 +454,10 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	runner.State = StateInitializing
 	runner.StartedAt = time.Now()
 
+	if req.Application != nil {
+		runner.ApplicationPort = req.Application.Port
+	}
+
 	m.runners[runnerID] = runner
 	m.vms[runnerID] = vm
 
@@ -544,6 +548,15 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 	data.Latest.Runner.Ephemeral = m.config.GitHubRunnerEphemeral
 	if m.ciAdapter != nil {
 		data.Latest.Runner.CISystem = m.ciAdapter.Name()
+	}
+
+	// Application configuration
+	if req.Application != nil {
+		data.Latest.Application.Command = req.Application.Command
+		data.Latest.Application.Port = req.Application.Port
+		data.Latest.Application.WorkingDir = req.Application.WorkingDir
+		data.Latest.Application.Env = req.Application.Env
+		data.Latest.Application.HealthPath = req.Application.HealthPath
 	}
 
 	return data

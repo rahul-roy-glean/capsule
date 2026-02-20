@@ -51,6 +51,9 @@ type Runner struct {
 	QuarantineEgressBlocked bool
 	QuarantinePaused        bool
 
+	// Application port (0 = no application configured)
+	ApplicationPort int
+
 	// Pool-related fields
 	PoolKey          *RunnerKey `json:"pool_key,omitempty"`
 	PausedAt         time.Time  `json:"paused_at,omitempty"`
@@ -66,6 +69,15 @@ type Resources struct {
 	DiskGB   int
 }
 
+// ApplicationConfig specifies an application to run inside the microVM
+type ApplicationConfig struct {
+	Command    string
+	Port       int
+	WorkingDir string
+	Env        map[string]string
+	HealthPath string
+}
+
 // AllocateRequest represents a request to allocate a runner
 type AllocateRequest struct {
 	RequestID         string
@@ -75,7 +87,8 @@ type AllocateRequest struct {
 	Resources         Resources
 	Labels            map[string]string
 	GitHubRunnerToken string
-	CISystem          string // CI system identifier
+	CISystem          string             // CI system identifier
+	Application       *ApplicationConfig // nil = no application
 }
 
 // MMDSData represents data to inject into the microVM via MMDS
@@ -130,6 +143,13 @@ type MMDSData struct {
 			// (baked into the snapshot rootfs). Thaw-agent creates a symlink from WorkspaceDir to here.
 			PreClonedPath string `json:"pre_cloned_path,omitempty"`
 		} `json:"git_cache,omitempty"`
+		Application struct {
+			Command    string            `json:"command,omitempty"`
+			Port       int               `json:"port,omitempty"`
+			WorkingDir string            `json:"working_dir,omitempty"`
+			Env        map[string]string `json:"env,omitempty"`
+			HealthPath string            `json:"health_path,omitempty"`
+		} `json:"application,omitempty"`
 	} `json:"latest"`
 }
 
