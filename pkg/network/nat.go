@@ -221,6 +221,42 @@ func (n *NATNetwork) setupNAT() error {
 		}
 	}
 
+	// --- MicroVM isolation ---
+	//
+	// Block VM-to-host: DROP all traffic from VMs arriving on the bridge.
+	// MMDS (169.254.169.254) is unaffected — Firecracker intercepts it in
+	// the VMM before packets reach the host network stack.
+	inputDropCheck := []string{"-C", "INPUT", "-i", n.bridgeName, "-s", subnetCIDR, "-j", "DROP"}
+	if err := exec.Command("iptables", inputDropCheck...).Run(); err != nil {
+		inputDropAdd := []string{"-I", "INPUT", "1", "-i", n.bridgeName, "-s", subnetCIDR, "-j", "DROP"}
+		if err := exec.Command("iptables", inputDropAdd...).Run(); err != nil {
+			return fmt.Errorf("failed to add INPUT drop rule for VM-to-host: %w", err)
+		}
+	}
+
+	// Block VM-to-VM: DROP traffic where both source and destination are in
+	// the VM subnet. This catches both L2 bridged and routed paths because
+	// the IP addresses match regardless of which interfaces iptables sees.
+	// VM-to-internet (dest is public IP) and internet-to-VM (src is public
+	// IP) are unaffected.
+	//
+	// br_netfilter is required so L2-bridged frames enter the iptables
+	// FORWARD chain at all.
+	if err := exec.Command("modprobe", "br_netfilter").Run(); err != nil {
+		n.logger.WithError(err).Warn("Failed to load br_netfilter module; VM-to-VM isolation may not work")
+	}
+	if err := exec.Command("sysctl", "-w", "net.bridge.bridge-nf-call-iptables=1").Run(); err != nil {
+		return fmt.Errorf("failed to enable bridge-nf-call-iptables: %w (is br_netfilter loaded?)", err)
+	}
+
+	interVMCheck := []string{"-C", "FORWARD", "-s", subnetCIDR, "-d", subnetCIDR, "-j", "DROP"}
+	if err := exec.Command("iptables", interVMCheck...).Run(); err != nil {
+		interVMAdd := []string{"-A", "FORWARD", "-s", subnetCIDR, "-d", subnetCIDR, "-j", "DROP"}
+		if err := exec.Command("iptables", interVMAdd...).Run(); err != nil {
+			return fmt.Errorf("failed to add FORWARD drop rule for VM-to-VM: %w", err)
+		}
+	}
+
 	n.logger.Info("NAT rules configured successfully")
 	return nil
 }
@@ -582,6 +618,12 @@ func (n *NATNetwork) Cleanup() error {
 	exec.Command("iptables", "-D", "FORWARD",
 		"-i", n.externalIface, "-o", n.bridgeName,
 		"-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT").Run()
+
+	// Remove VM isolation rules
+	exec.Command("iptables", "-D", "INPUT",
+		"-i", n.bridgeName, "-s", subnetCIDR, "-j", "DROP").Run()
+	exec.Command("iptables", "-D", "FORWARD",
+		"-s", subnetCIDR, "-d", subnetCIDR, "-j", "DROP").Run()
 
 	return nil
 }

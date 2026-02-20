@@ -216,6 +216,30 @@ func (n *NetNSNetwork) setupBridgeNAT() error {
 		}
 	}
 
+	// Block VM-to-host and VM-to-VM traffic (see nat.go setupNAT for explanation)
+	inputDropCheck := []string{"-C", "INPUT", "-i", n.bridgeName, "-s", subnetCIDR, "-j", "DROP"}
+	if err := exec.Command("iptables", inputDropCheck...).Run(); err != nil {
+		inputDropAdd := []string{"-I", "INPUT", "1", "-i", n.bridgeName, "-s", subnetCIDR, "-j", "DROP"}
+		if err := exec.Command("iptables", inputDropAdd...).Run(); err != nil {
+			return fmt.Errorf("failed to add INPUT drop rule for VM-to-host: %w", err)
+		}
+	}
+
+	if err := exec.Command("modprobe", "br_netfilter").Run(); err != nil {
+		n.logger.WithError(err).Warn("Failed to load br_netfilter module; VM-to-VM isolation may not work")
+	}
+	if err := exec.Command("sysctl", "-w", "net.bridge.bridge-nf-call-iptables=1").Run(); err != nil {
+		return fmt.Errorf("failed to enable bridge-nf-call-iptables: %w (is br_netfilter loaded?)", err)
+	}
+
+	interVMCheck := []string{"-C", "FORWARD", "-s", subnetCIDR, "-d", subnetCIDR, "-j", "DROP"}
+	if err := exec.Command("iptables", interVMCheck...).Run(); err != nil {
+		interVMAdd := []string{"-A", "FORWARD", "-s", subnetCIDR, "-d", subnetCIDR, "-j", "DROP"}
+		if err := exec.Command("iptables", interVMAdd...).Run(); err != nil {
+			return fmt.Errorf("failed to add FORWARD drop rule for VM-to-VM: %w", err)
+		}
+	}
+
 	n.logger.Info("Bridge NAT rules configured successfully")
 	return nil
 }
@@ -565,6 +589,12 @@ func (n *NetNSNetwork) Cleanup() error {
 	exec.Command("iptables", "-D", "FORWARD",
 		"-i", n.externalIface, "-o", n.bridgeName,
 		"-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT").Run()
+
+	// Remove VM isolation rules
+	exec.Command("iptables", "-D", "INPUT",
+		"-i", n.bridgeName, "-s", subnetCIDR, "-j", "DROP").Run()
+	exec.Command("iptables", "-D", "FORWARD",
+		"-s", subnetCIDR, "-d", subnetCIDR, "-j", "DROP").Run()
 
 	return nil
 }
