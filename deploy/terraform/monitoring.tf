@@ -7,7 +7,7 @@ locals {
 
 # Dashboard for Firecracker Runner Overview
 resource "google_monitoring_dashboard" "firecracker_overview" {
-  count        = var.enable_monitoring ? 1 : 0
+  count = var.enable_monitoring ? 1 : 0
   dashboard_json = jsonencode({
     displayName = "Firecracker Runner Overview"
     labels = {
@@ -92,7 +92,7 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
             }
           }
         },
-        # Row 2: VM Boot Time
+        # Row 2: VM Boot Time (from host-side allocation timer)
         {
           yPos   = 2
           width  = 6
@@ -104,7 +104,7 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/vm/ready_duration_seconds\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/vm/boot_duration_seconds\" resource.type=\"gce_instance\""
                       aggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_PERCENTILE_50"
@@ -117,7 +117,7 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/vm/ready_duration_seconds\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/vm/boot_duration_seconds\" resource.type=\"gce_instance\""
                       aggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_PERCENTILE_95"
@@ -130,7 +130,7 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/vm/ready_duration_seconds\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/vm/boot_duration_seconds\" resource.type=\"gce_instance\""
                       aggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_PERCENTILE_99"
@@ -147,45 +147,45 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
             }
           }
         },
-        # Allocation Latency
+        # VM Allocations (success/failure)
         {
           yPos   = 2
           xPos   = 6
           width  = 6
           height = 4
           widget = {
-            title = "Runner Allocation Latency"
+            title = "VM Allocations"
             xyChart = {
               dataSets = [
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/control_plane/allocation_latency_seconds\" resource.type=\"global\""
+                      filter = "metric.type=\"${local.metric_prefix}/vm/allocations_total\" resource.type=\"gce_instance\" metric.label.result=\"success\""
                       aggregation = {
                         alignmentPeriod    = "60s"
-                        perSeriesAligner   = "ALIGN_PERCENTILE_50"
-                        crossSeriesReducer = "REDUCE_MEAN"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
                       }
                     }
                   }
-                  legendTemplate = "p50"
+                  legendTemplate = "Success"
                 },
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/control_plane/allocation_latency_seconds\" resource.type=\"global\""
+                      filter = "metric.type=\"${local.metric_prefix}/vm/allocations_total\" resource.type=\"gce_instance\" metric.label.result=\"failure\""
                       aggregation = {
                         alignmentPeriod    = "60s"
-                        perSeriesAligner   = "ALIGN_PERCENTILE_95"
-                        crossSeriesReducer = "REDUCE_MEAN"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
                       }
                     }
                   }
-                  legendTemplate = "p95"
+                  legendTemplate = "Failure"
                 }
               ]
               yAxis = {
-                label = "seconds"
+                label = "allocations/min"
               }
             }
           }
@@ -275,84 +275,57 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
             }
           }
         },
-        # Row 4: Cache Performance
+        # Row 4: Chunk Cache + Pool Performance
         {
           yPos   = 10
           width  = 6
           height = 4
           widget = {
-            title = "Cache Hit Rate"
+            title = "Chunk Cache Hit Ratio"
             xyChart = {
-              dataSets = [
-                {
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/cache/bazel_repo_hits_total\" resource.type=\"gce_instance\""
-                      aggregation = {
-                        alignmentPeriod    = "60s"
-                        perSeriesAligner   = "ALIGN_RATE"
-                        crossSeriesReducer = "REDUCE_SUM"
-                      }
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "metric.type=\"${local.metric_prefix}/chunked/cache_hit_ratio\" resource.type=\"gce_instance\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_MEAN"
+                      crossSeriesReducer = "REDUCE_MEAN"
                     }
                   }
-                  legendTemplate = "Hits/sec"
-                },
-                {
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/cache/bazel_repo_misses_total\" resource.type=\"gce_instance\""
-                      aggregation = {
-                        alignmentPeriod    = "60s"
-                        perSeriesAligner   = "ALIGN_RATE"
-                        crossSeriesReducer = "REDUCE_SUM"
-                      }
-                    }
-                  }
-                  legendTemplate = "Misses/sec"
                 }
-              ]
+                legendTemplate = "Hit Ratio"
+              }]
+              yAxis = {
+                label = "ratio (0-1)"
+              }
             }
           }
         },
-        # Webhook Latency
+        # Pool Hit Ratio
         {
           yPos   = 10
           xPos   = 6
           width  = 6
           height = 4
           widget = {
-            title = "GitHub Webhook Latency"
+            title = "Runner Pool Hit Ratio"
             xyChart = {
-              dataSets = [
-                {
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/control_plane/webhook_latency_seconds\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "60s"
-                        perSeriesAligner   = "ALIGN_PERCENTILE_50"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                      }
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "metric.type=\"${local.metric_prefix}/pool/hit_ratio\" resource.type=\"gce_instance\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_MEAN"
+                      crossSeriesReducer = "REDUCE_MEAN"
                     }
                   }
-                  legendTemplate = "p50"
-                },
-                {
-                  timeSeriesQuery = {
-                    timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/control_plane/webhook_latency_seconds\" resource.type=\"global\""
-                      aggregation = {
-                        alignmentPeriod    = "60s"
-                        perSeriesAligner   = "ALIGN_PERCENTILE_95"
-                        crossSeriesReducer = "REDUCE_MEAN"
-                      }
-                    }
-                  }
-                  legendTemplate = "p95"
                 }
-              ]
+                legendTemplate = "Hit Ratio"
+              }]
               yAxis = {
-                label = "seconds"
+                label = "ratio (0-1)"
               }
             }
           }
@@ -363,8 +336,11 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
 }
 
 # Dashboard for VM Boot Phases (debugging)
+# Boot phase data comes from log-based metrics (thaw-agent runs inside the VM
+# without Cloud Monitoring API credentials, so it emits structured JSON logs
+# that are extracted by the log-based metric defined below).
 resource "google_monitoring_dashboard" "vm_boot_phases" {
-  count        = var.enable_monitoring ? 1 : 0
+  count = var.enable_monitoring ? 1 : 0
   dashboard_json = jsonencode({
     displayName = "Firecracker VM Boot Phases"
     labels = {
@@ -377,13 +353,13 @@ resource "google_monitoring_dashboard" "vm_boot_phases" {
           width  = 12
           height = 6
           widget = {
-            title = "Boot Phase Duration by Phase"
+            title = "Boot Phase Duration by Phase (p50)"
             xyChart = {
               dataSets = [
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/vm/boot_phase_duration_seconds\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"logging.googleapis.com/user/firecracker/vm_boot_phase_from_logs\" resource.type=\"gce_instance\""
                       aggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_PERCENTILE_50"
@@ -396,7 +372,7 @@ resource "google_monitoring_dashboard" "vm_boot_phases" {
                 }
               ]
               yAxis = {
-                label = "seconds"
+                label = "ms"
               }
             }
           }
@@ -412,11 +388,11 @@ resource "google_monitoring_dashboard" "vm_boot_phases" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/vm/boot_phase_duration_seconds\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"logging.googleapis.com/user/firecracker/vm_boot_phase_from_logs\" resource.type=\"gce_instance\""
                       aggregation = {
                         alignmentPeriod    = "300s"
-                        perSeriesAligner   = "ALIGN_MEAN"
-                        crossSeriesReducer = "REDUCE_MEAN"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_PERCENTILE_50"
                         groupByFields      = ["metric.label.phase"]
                       }
                     }
@@ -426,7 +402,7 @@ resource "google_monitoring_dashboard" "vm_boot_phases" {
                 }
               ]
               yAxis = {
-                label = "seconds"
+                label = "ms"
               }
             }
           }
@@ -441,22 +417,22 @@ resource "google_monitoring_alert_policy" "vm_boot_slow" {
   count        = var.enable_monitoring && var.enable_monitoring_alerts ? 1 : 0
   display_name = "Firecracker VM Boot Time > ${var.alert_vm_boot_threshold_seconds}s"
   combiner     = "OR"
-  
+
   conditions {
     display_name = "VM boot p95 above threshold"
     condition_threshold {
-      filter          = "metric.type=\"${local.metric_prefix}/vm/ready_duration_seconds\" resource.type=\"gce_instance\""
+      filter          = "metric.type=\"${local.metric_prefix}/vm/boot_duration_seconds\" resource.type=\"gce_instance\""
       comparison      = "COMPARISON_GT"
       threshold_value = var.alert_vm_boot_threshold_seconds
       duration        = "300s"
       aggregations {
-        alignment_period   = "60s"
-        per_series_aligner = "ALIGN_PERCENTILE_95"
+        alignment_period     = "60s"
+        per_series_aligner   = "ALIGN_PERCENTILE_95"
         cross_series_reducer = "REDUCE_MEAN"
       }
     }
   }
-  
+
   notification_channels = var.monitoring_notification_channels
 
   documentation {
@@ -474,7 +450,7 @@ resource "google_monitoring_alert_policy" "no_idle_runners" {
   count        = var.enable_monitoring && var.enable_monitoring_alerts ? 1 : 0
   display_name = "Firecracker No Idle Runners Available"
   combiner     = "OR"
-  
+
   conditions {
     display_name = "No idle runners for 5 minutes"
     condition_threshold {
@@ -483,13 +459,13 @@ resource "google_monitoring_alert_policy" "no_idle_runners" {
       threshold_value = 1
       duration        = "300s"
       aggregations {
-        alignment_period   = "60s"
-        per_series_aligner = "ALIGN_MEAN"
+        alignment_period     = "60s"
+        per_series_aligner   = "ALIGN_MEAN"
         cross_series_reducer = "REDUCE_SUM"
       }
     }
   }
-  
+
   notification_channels = var.monitoring_notification_channels
 
   documentation {
@@ -503,7 +479,7 @@ resource "google_monitoring_alert_policy" "high_queue_depth" {
   count        = var.enable_monitoring && var.enable_monitoring_alerts ? 1 : 0
   display_name = "Firecracker High Queue Depth"
   combiner     = "OR"
-  
+
   conditions {
     display_name = "Queue depth above threshold"
     condition_threshold {
@@ -517,7 +493,7 @@ resource "google_monitoring_alert_policy" "high_queue_depth" {
       }
     }
   }
-  
+
   notification_channels = var.monitoring_notification_channels
 
   documentation {
@@ -531,7 +507,7 @@ resource "google_monitoring_alert_policy" "snapshot_stale" {
   count        = var.enable_monitoring && var.enable_monitoring_alerts ? 1 : 0
   display_name = "Firecracker Snapshot Too Old"
   combiner     = "OR"
-  
+
   conditions {
     display_name = "Snapshot age above threshold"
     condition_threshold {
@@ -545,7 +521,7 @@ resource "google_monitoring_alert_policy" "snapshot_stale" {
       }
     }
   }
-  
+
   notification_channels = var.monitoring_notification_channels
 
   documentation {
@@ -559,7 +535,7 @@ resource "google_monitoring_alert_policy" "host_unhealthy" {
   count        = var.enable_monitoring && var.enable_monitoring_alerts ? 1 : 0
   display_name = "Firecracker Host Unhealthy"
   combiner     = "OR"
-  
+
   conditions {
     display_name = "Host heartbeat missing"
     condition_absent {
@@ -572,7 +548,7 @@ resource "google_monitoring_alert_policy" "host_unhealthy" {
       }
     }
   }
-  
+
   notification_channels = var.monitoring_notification_channels
 
   documentation {
@@ -586,8 +562,8 @@ resource "google_monitoring_alert_policy" "host_unhealthy" {
 # ============================================================================
 
 resource "google_monitoring_dashboard" "firecracker_operations" {
-  count          = var.enable_monitoring ? 1 : 0
-  project        = var.project_id
+  count   = var.enable_monitoring ? 1 : 0
+  project = var.project_id
   dashboard_json = jsonencode({
     displayName = "Firecracker Runner Operations"
     labels = {
@@ -646,7 +622,7 @@ resource "google_monitoring_dashboard" "firecracker_operations" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/vm/ready_duration_seconds\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/vm/boot_duration_seconds\" resource.type=\"gce_instance\""
                       aggregation = {
                         alignmentPeriod    = "300s"
                         perSeriesAligner   = "ALIGN_PERCENTILE_50"
@@ -660,7 +636,7 @@ resource "google_monitoring_dashboard" "firecracker_operations" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/vm/ready_duration_seconds\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/vm/boot_duration_seconds\" resource.type=\"gce_instance\""
                       aggregation = {
                         alignmentPeriod    = "300s"
                         perSeriesAligner   = "ALIGN_PERCENTILE_95"
@@ -757,15 +733,29 @@ resource "google_monitoring_dashboard" "firecracker_operations" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/control_plane/allocation_latency_seconds\" resource.type=\"global\""
+                      filter = "metric.type=\"${local.metric_prefix}/vm/allocations_total\" resource.type=\"gce_instance\" metric.label.result=\"success\""
                       aggregation = {
                         alignmentPeriod    = "300s"
-                        perSeriesAligner   = "ALIGN_COUNT"
+                        perSeriesAligner   = "ALIGN_DELTA"
                         crossSeriesReducer = "REDUCE_SUM"
                       }
                     }
                   }
-                  legendTemplate = "Allocations"
+                  legendTemplate = "Success"
+                  plotType       = "STACKED_BAR"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/vm/allocations_total\" resource.type=\"gce_instance\" metric.label.result=\"failure\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Failure"
                   plotType       = "STACKED_BAR"
                 }
               ]
@@ -776,6 +766,454 @@ resource "google_monitoring_dashboard" "firecracker_operations" {
       ]
     }
   })
+}
+
+# ============================================================================
+# Chunked Snapshot & Pool Dashboard
+# ============================================================================
+
+resource "google_monitoring_dashboard" "chunked_snapshot" {
+  count   = var.enable_monitoring ? 1 : 0
+  project = var.project_id
+  dashboard_json = jsonencode({
+    displayName = "Firecracker Chunked Snapshots & Pool"
+    labels = {
+      environment = var.environment
+    }
+    mosaicLayout = {
+      columns = 12
+      tiles = [
+        # Row 1: Chunk cache scorecards
+        {
+          width  = 3
+          height = 2
+          widget = {
+            title = "Chunk Cache Hit Ratio"
+            scorecard = {
+              timeSeriesQuery = {
+                timeSeriesFilter = {
+                  filter = "metric.type=\"${local.metric_prefix}/chunked/cache_hit_ratio\" resource.type=\"gce_instance\""
+                  aggregation = {
+                    alignmentPeriod  = "60s"
+                    perSeriesAligner = "ALIGN_MEAN"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          xPos   = 3
+          width  = 3
+          height = 2
+          widget = {
+            title = "Page Faults Total"
+            scorecard = {
+              timeSeriesQuery = {
+                timeSeriesFilter = {
+                  filter = "metric.type=\"${local.metric_prefix}/chunked/page_faults_total\" resource.type=\"gce_instance\""
+                  aggregation = {
+                    alignmentPeriod    = "60s"
+                    perSeriesAligner   = "ALIGN_MEAN"
+                    crossSeriesReducer = "REDUCE_SUM"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          width  = 3
+          height = 2
+          widget = {
+            title = "Pool Hit Ratio"
+            scorecard = {
+              timeSeriesQuery = {
+                timeSeriesFilter = {
+                  filter = "metric.type=\"${local.metric_prefix}/pool/hit_ratio\" resource.type=\"gce_instance\""
+                  aggregation = {
+                    alignmentPeriod  = "60s"
+                    perSeriesAligner = "ALIGN_MEAN"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          xPos   = 9
+          width  = 3
+          height = 2
+          widget = {
+            title = "Pooled Runners"
+            scorecard = {
+              timeSeriesQuery = {
+                timeSeriesFilter = {
+                  filter = "metric.type=\"${local.metric_prefix}/pool/runners\" resource.type=\"gce_instance\""
+                  aggregation = {
+                    alignmentPeriod    = "60s"
+                    perSeriesAligner   = "ALIGN_MEAN"
+                    crossSeriesReducer = "REDUCE_SUM"
+                  }
+                }
+              }
+            }
+          }
+        },
+        # Row 2: Cache hit ratio over time + page faults rate
+        {
+          yPos   = 2
+          width  = 6
+          height = 4
+          widget = {
+            title = "Chunk Cache Hit Ratio Over Time"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "metric.type=\"${local.metric_prefix}/chunked/cache_hit_ratio\" resource.type=\"gce_instance\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_MEAN"
+                      crossSeriesReducer = "REDUCE_MEAN"
+                    }
+                  }
+                }
+                legendTemplate = "Hit Ratio"
+                plotType       = "LINE"
+              }]
+              yAxis = { label = "ratio (0-1)" }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 2
+          width  = 6
+          height = 4
+          widget = {
+            title = "UFFD Page Faults & Chunk Fetches"
+            xyChart = {
+              dataSets = [
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/chunked/page_faults_total\" resource.type=\"gce_instance\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Page Faults"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/chunked/chunk_fetches_total\" resource.type=\"gce_instance\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Chunk Fetches (GCS)"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/chunked/cache_hits_total\" resource.type=\"gce_instance\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Cache Hits"
+                }
+              ]
+              yAxis = { label = "count/min" }
+            }
+          }
+        },
+        # Row 3: FUSE disk I/O + cache size
+        {
+          yPos   = 6
+          width  = 6
+          height = 4
+          widget = {
+            title = "FUSE Disk I/O"
+            xyChart = {
+              dataSets = [
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/chunked/disk_reads_total\" resource.type=\"gce_instance\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Reads"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/chunked/disk_writes_total\" resource.type=\"gce_instance\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Writes"
+                }
+              ]
+              yAxis = { label = "ops/min" }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 6
+          width  = 6
+          height = 4
+          widget = {
+            title = "Chunk Cache Size"
+            xyChart = {
+              dataSets = [
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/chunked/cache_size_bytes\" resource.type=\"gce_instance\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MEAN"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Used"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/chunked/cache_max_size_bytes\" resource.type=\"gce_instance\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MEAN"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Max"
+                }
+              ]
+              yAxis = { label = "bytes" }
+            }
+          }
+        },
+        # Row 4: Pool hit ratio over time + pool hits/misses
+        {
+          yPos   = 10
+          width  = 6
+          height = 4
+          widget = {
+            title = "Pool Hit Ratio Over Time"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "metric.type=\"${local.metric_prefix}/pool/hit_ratio\" resource.type=\"gce_instance\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_MEAN"
+                      crossSeriesReducer = "REDUCE_MEAN"
+                    }
+                  }
+                }
+                legendTemplate = "Hit Ratio"
+                plotType       = "LINE"
+              }]
+              yAxis = { label = "ratio (0-1)" }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 10
+          width  = 6
+          height = 4
+          widget = {
+            title = "Pool Hits vs Misses vs Evictions"
+            xyChart = {
+              dataSets = [
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/pool/hits_total\" resource.type=\"gce_instance\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Hits"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/pool/misses_total\" resource.type=\"gce_instance\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Misses"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/pool/evictions_total\" resource.type=\"gce_instance\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Evictions"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/pool/recycle_failures_total\" resource.type=\"gce_instance\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Recycle Failures"
+                }
+              ]
+              yAxis = { label = "count/min" }
+            }
+          }
+        },
+        # Row 5: Pool memory usage + dirty chunks
+        {
+          yPos   = 14
+          width  = 6
+          height = 4
+          widget = {
+            title = "Pool Memory Usage"
+            xyChart = {
+              dataSets = [
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/pool/memory_used_bytes\" resource.type=\"gce_instance\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MEAN"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Used"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/pool/memory_max_bytes\" resource.type=\"gce_instance\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MEAN"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Max"
+                }
+              ]
+              yAxis = { label = "bytes" }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 14
+          width  = 6
+          height = 4
+          widget = {
+            title = "FUSE Dirty Chunks"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "metric.type=\"${local.metric_prefix}/chunked/dirty_chunks\" resource.type=\"gce_instance\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_MEAN"
+                      crossSeriesReducer = "REDUCE_SUM"
+                    }
+                  }
+                }
+                legendTemplate = "Dirty Chunks"
+                plotType       = "LINE"
+              }]
+              yAxis = { label = "chunks" }
+            }
+          }
+        }
+      ]
+    }
+  })
+}
+
+# Alert: Chunk Cache Hit Ratio Low
+resource "google_monitoring_alert_policy" "chunk_cache_low_hit_ratio" {
+  count        = var.enable_monitoring && var.enable_monitoring_alerts ? 1 : 0
+  display_name = "Firecracker Chunk Cache Hit Ratio Low"
+  combiner     = "OR"
+
+  conditions {
+    display_name = "Chunk cache hit ratio below 50%"
+    condition_threshold {
+      filter          = "metric.type=\"${local.metric_prefix}/chunked/cache_hit_ratio\" resource.type=\"gce_instance\""
+      comparison      = "COMPARISON_LT"
+      threshold_value = 0.5
+      duration        = "300s"
+      aggregations {
+        alignment_period     = "60s"
+        per_series_aligner   = "ALIGN_MEAN"
+        cross_series_reducer = "REDUCE_MEAN"
+      }
+    }
+  }
+
+  notification_channels = var.monitoring_notification_channels
+
+  documentation {
+    content   = "Chunk cache hit ratio dropped below 50%. VMs are fetching most chunks from GCS, increasing page fault latency. Consider increasing chunk cache size or investigating access patterns."
+    mime_type = "text/markdown"
+  }
+
+  alert_strategy {
+    auto_close = "1800s"
+  }
 }
 
 # Log-based metric for thaw-agent boot phases (runs inside VM)
@@ -859,7 +1297,7 @@ resource "google_logging_metric" "job_complete_from_logs" {
     exponential_buckets {
       num_finite_buckets = 64
       growth_factor      = 1.4
-      scale              = 1000  # Scale for milliseconds (job durations can be long)
+      scale              = 1000 # Scale for milliseconds (job durations can be long)
     }
   }
 }

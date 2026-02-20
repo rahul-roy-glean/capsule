@@ -353,6 +353,27 @@ func main() {
 					"kernel_size": len(kernelData),
 					"path":        kernelPath,
 				}).Info("Kernel fetched from chunk store")
+
+				// If a raw memory file path is set, download and decompress it
+				// to local disk so VMs can use file-backed restore instead of UFFD.
+				if meta.MemFilePath != "" {
+					memPath := filepath.Join(*snapshotCache, "snapshot.mem")
+					if info, err := os.Stat(memPath); err == nil && info.Size() > 0 {
+						log.WithFields(logrus.Fields{
+							"path": memPath,
+							"size": info.Size(),
+						}).Info("snapshot.mem already exists locally, skipping download")
+					} else {
+						log.WithFields(logrus.Fields{
+							"gcs_path":   meta.MemFilePath,
+							"local_path": memPath,
+						}).Info("Downloading raw memory file from GCS...")
+						if err := chunkedMgr.GetChunkStore().DownloadRawFile(ctx, meta.MemFilePath, memPath); err != nil {
+							log.WithError(err).Fatal("Failed to download raw memory file")
+						}
+						log.WithField("path", memPath).Info("Raw memory file downloaded and decompressed")
+					}
+				}
 			} else {
 				log.Warn("No chunked metadata or kernel hash available, falling back to traditional sync")
 				if err := mgr.SyncSnapshot(ctx, "current"); err != nil {
@@ -546,7 +567,7 @@ func snapshotSyncHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handle
 
 func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, idleTarget int, logger *logrus.Logger, metricsClient *telemetry.Client) {
 	log := logger.WithField("component", "autoscaler")
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -603,6 +624,36 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 					IdleRunners: status.IdleRunners,
 					BusyRunners: status.BusyRunners,
 				})
+
+				// Record chunked snapshot metrics
+				if chunkedMgr != nil {
+					cs := chunkedMgr.GetChunkedStats()
+					metricsClient.RecordChunkedMetrics(ctx, telemetry.ChunkedMetrics{
+						CacheSize:    cs.CacheSize,
+						CacheMaxSize: cs.CacheMaxSize,
+						CacheItems:   cs.CacheItems,
+						PageFaults:   cs.TotalPageFaults,
+						CacheHits:    cs.TotalCacheHits,
+						ChunkFetches: cs.TotalChunkFetches,
+						DiskReads:    cs.TotalDiskReads,
+						DiskWrites:   cs.TotalDiskWrites,
+						DirtyChunks:  cs.TotalDirtyChunks,
+					})
+				}
+
+				// Record runner pool metrics
+				if pool := mgr.GetPool(); pool != nil {
+					ps := pool.Stats()
+					metricsClient.RecordPoolMetrics(ctx, telemetry.PoolMetrics{
+						PooledRunners:   ps.PooledRunners,
+						PoolHits:        ps.PoolHits,
+						PoolMisses:      ps.PoolMisses,
+						Evictions:       ps.Evictions,
+						RecycleFailures: ps.RecycleFailures,
+						MemoryUsedBytes: ps.MemoryUsageBytes,
+						MemoryMaxBytes:  ps.MaxMemoryBytes,
+					})
+				}
 			}
 		}
 	}

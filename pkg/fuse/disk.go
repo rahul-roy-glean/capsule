@@ -31,7 +31,7 @@ import (
 
 const (
 	// Eager prefetching constants
-	numChunksToEagerFetch = 32
+	numChunksToEagerFetch = 64
 )
 
 // ChunkedDisk implements a FUSE filesystem backed by chunked snapshots

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -14,9 +16,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/fuse"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/github"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
@@ -39,9 +43,12 @@ var (
 	repoCacheSeedDir    = flag.String("repo-cache-seed-dir", "", "Optional directory to seed into repo-cache-seed.img (copied into image root)")
 	gitCachePath        = flag.String("git-cache-path", "", "Path to pre-populated git-cache.img (from git-cache-builder). If set, uses this instead of cloning during warmup.")
 	fetchTargets        = flag.String("fetch-targets", "//...", "Bazel target pattern for fetch (e.g., '//... -- -//terraform/...' to exclude terraform)")
+	bazelrc             = flag.String("bazelrc", "", "Path to .bazelrc file relative to repo root. If empty, uses repo's .bazelrc if it exists.")
 	logLevel            = flag.String("log-level", "info", "Log level")
 	enableChunked       = flag.Bool("enable-chunked", true, "Also build a chunked snapshot for lazy loading")
 	chunkSize           = flag.Int64("chunk-size", 4194304, "Chunk size in bytes for chunked snapshots (default 4MB)")
+
+	incremental = flag.Bool("incremental", false, "Restore from previous snapshot for incremental rebuild")
 
 	// GitHub App authentication for private repos (used when git-cache is not available)
 	githubAppID     = flag.String("github-app-id", "", "GitHub App ID for private repo access")
@@ -144,82 +151,7 @@ func main() {
 		log.WithError(err).Fatal("Failed to create output directory")
 	}
 
-	// Create working rootfs (copy of base, optionally expanded)
-	workingRootfs := filepath.Join(*outputDir, "rootfs.img")
-	log.Info("Creating working rootfs...")
-	if err := copyFile(*rootfsPath, workingRootfs); err != nil {
-		log.WithError(err).Fatal("Failed to copy rootfs")
-	}
-	if *rootfsSizeGB > 0 {
-		log.WithField("size_gb", *rootfsSizeGB).Info("Expanding rootfs...")
-		if err := exec.Command("truncate", "-s", fmt.Sprintf("%dG", *rootfsSizeGB), workingRootfs).Run(); err != nil {
-			log.WithError(err).Fatal("Failed to expand rootfs")
-		}
-		if output, err := exec.Command("e2fsck", "-fy", workingRootfs).CombinedOutput(); err != nil {
-			log.WithField("output", string(output)).Warn("e2fsck returned non-zero (may be OK)")
-		}
-		if output, err := exec.Command("resize2fs", workingRootfs).CombinedOutput(); err != nil {
-			log.WithField("output", string(output)).Fatal("Failed to resize2fs rootfs")
-		}
-		log.Info("Rootfs expanded successfully")
-	}
-
-	// Create (or seed) shared repo cache seed image
-	repoCacheSeedImg := filepath.Join(*outputDir, "repo-cache-seed.img")
-	log.WithFields(logrus.Fields{
-		"path":     repoCacheSeedImg,
-		"size_gb":  *repoCacheSeedSizeGB,
-		"seed_dir": *repoCacheSeedDir,
-	}).Info("Creating repo-cache seed image")
-	if err := createExt4Image(repoCacheSeedImg, *repoCacheSeedSizeGB, "BAZEL_REPO_SEED"); err != nil {
-		log.WithError(err).Fatal("Failed to create repo-cache seed image")
-	}
-	if *repoCacheSeedDir != "" {
-		if err := seedExt4ImageFromDir(repoCacheSeedImg, *repoCacheSeedDir, log); err != nil {
-			// Seeding can require root privileges (mount loop). We log and proceed with an empty seed image.
-			log.WithError(err).Warn("Failed to seed repo-cache image from directory; continuing with empty seed")
-		}
-	}
-
-	// Create a placeholder per-VM repo cache upper image for the snapshot-build VM.
-	// At runtime each runner gets its own upper image, but the snapshot should
-	// include the same device layout (drive IDs) for compatibility.
-	repoCacheUpperImg := filepath.Join(*outputDir, "repo-cache-upper.img")
-	if err := createExt4Image(repoCacheUpperImg, *repoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
-		log.WithError(err).Fatal("Failed to create repo-cache upper image")
-	}
-
-	// Create a placeholder credentials image so the snapshot includes the same
-	// device layout (drive ID) as the restore path. Hosts may override the backing
-	// file at restore time with an image built from secret material.
-	credentialsImg := filepath.Join(*outputDir, "credentials.img")
-	if err := createExt4ImageMB(credentialsImg, 32, "CREDENTIALS"); err != nil {
-		log.WithError(err).Fatal("Failed to create credentials image")
-	}
-
-	// Create or copy git-cache image.
-	// If --git-cache-path is provided, use the pre-populated image (enables local clone from cache).
-	// Otherwise, create a placeholder so the snapshot has the same device layout.
-	gitCacheImg := filepath.Join(*outputDir, "git-cache.img")
-	gitCacheEnabled := false
-	if *gitCachePath != "" {
-		log.WithField("source", *gitCachePath).Info("Copying pre-populated git-cache image...")
-		if err := copyFile(*gitCachePath, gitCacheImg); err != nil {
-			log.WithError(err).Fatal("Failed to copy git-cache image")
-		}
-		gitCacheEnabled = true
-	} else {
-		log.Info("Creating placeholder git-cache image...")
-		if err := createExt4ImageMB(gitCacheImg, 64, "GIT_CACHE"); err != nil {
-			log.WithError(err).Fatal("Failed to create git-cache image")
-		}
-	}
-
-	// Create TAP device for warmup VM networking
-	// IMPORTANT: Use slot-based TAP name (tap-slot-0) so the snapshot is compatible
-	// with the manager's slot-based allocation. Firecracker does NOT support changing
-	// host_dev_name after snapshot load, so the TAP name in the snapshot must match
-	// what the manager uses at restore time.
+	// Network constants shared by both cold boot and incremental paths
 	vmID := "snapshot-builder"
 	tapName := "tap-slot-0"         // Must match manager's slot naming for snapshot compatibility
 	guestIP := "172.16.0.2"         // Slot 0 always gets .2
@@ -233,75 +165,172 @@ func main() {
 	}
 	defer cleanupWarmupNetwork(tapName)
 
-	// Build kernel boot args with network configuration
 	bootArgs := fmt.Sprintf("console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off",
 		guestIP, hostIP, netmask)
 
-	vmCfg := firecracker.VMConfig{
-		VMID:           vmID,
-		SocketDir:      *outputDir,
-		FirecrackerBin: *firecrackerBin,
-		KernelPath:     *kernelPath,
-		RootfsPath:     workingRootfs,
-		VCPUs:          *vcpus,
-		MemoryMB:       *memoryMB,
-		BootArgs:       bootArgs,
-		NetworkIface: &firecracker.NetworkInterface{
-			IfaceID:     "eth0",
-			HostDevName: tapName,
-			GuestMAC:    guestMAC,
-		},
-		MMDSConfig: &firecracker.MMDSConfig{
-			Version:           "V1",
-			NetworkInterfaces: []string{"eth0"},
-		},
-		Drives: []firecracker.Drive{
-			{
-				DriveID:      "repo_cache_seed",
-				PathOnHost:   repoCacheSeedImg,
-				IsRootDevice: false,
-				IsReadOnly:   false, // Writable during warmup to populate cache
-			},
-			{
-				DriveID:      "repo_cache_upper",
-				PathOnHost:   repoCacheUpperImg,
-				IsRootDevice: false,
-				IsReadOnly:   false,
-			},
-			{
-				DriveID:      "credentials",
-				PathOnHost:   credentialsImg,
-				IsRootDevice: false,
-				IsReadOnly:   true,
-			},
-			{
-				DriveID:      "git_cache",
-				PathOnHost:   gitCacheImg,
-				IsRootDevice: false,
-				IsReadOnly:   true,
-			},
-		},
+	// Track FUSE disks for cleanup and incremental chunking
+	var vm *firecracker.VM
+	var fuseDisk *fuse.ChunkedDisk
+	var fuseSeedDisk *fuse.ChunkedDisk
+
+	// Paths used by both paths and for final snapshot creation
+	workingRootfs := filepath.Join(*outputDir, "rootfs.img")
+	repoCacheSeedImg := filepath.Join(*outputDir, "repo-cache-seed.img")
+
+	// rootfsSourceHash is lazily computed and stored in chunked metadata
+	// so future incremental builds can detect rootfs changes.
+	var rootfsSourceHash string
+
+	// Try incremental restore from previous snapshot
+	if *incremental {
+		log.Info("Attempting incremental restore from previous snapshot...")
+		var incrementalErr error
+		vm, fuseDisk, fuseSeedDisk, incrementalErr = restoreFromPreviousSnapshot(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken)
+		if incrementalErr != nil {
+			log.WithError(incrementalErr).Warn("Incremental restore failed, falling back to cold boot")
+			vm = nil
+			if fuseDisk != nil {
+				fuseDisk.Unmount()
+				fuseDisk = nil
+			}
+			if fuseSeedDisk != nil {
+				fuseSeedDisk.Unmount()
+				fuseSeedDisk = nil
+			}
+		}
 	}
 
-	vm, err := firecracker.NewVM(vmCfg, logger)
-	if err != nil {
-		log.WithError(err).Fatal("Failed to create VM")
+	// Cold boot path (default or fallback from failed incremental)
+	if vm == nil {
+		log.Info("Using cold boot path...")
+
+		// Create working rootfs (copy of base, optionally expanded)
+		log.Info("Creating working rootfs...")
+		if err := copyFile(*rootfsPath, workingRootfs); err != nil {
+			log.WithError(err).Fatal("Failed to copy rootfs")
+		}
+		if *rootfsSizeGB > 0 {
+			log.WithField("size_gb", *rootfsSizeGB).Info("Expanding rootfs...")
+			if err := exec.Command("truncate", "-s", fmt.Sprintf("%dG", *rootfsSizeGB), workingRootfs).Run(); err != nil {
+				log.WithError(err).Fatal("Failed to expand rootfs")
+			}
+			if output, err := exec.Command("e2fsck", "-fy", workingRootfs).CombinedOutput(); err != nil {
+				log.WithField("output", string(output)).Warn("e2fsck returned non-zero (may be OK)")
+			}
+			if output, err := exec.Command("resize2fs", workingRootfs).CombinedOutput(); err != nil {
+				log.WithField("output", string(output)).Fatal("Failed to resize2fs rootfs")
+			}
+			log.Info("Rootfs expanded successfully")
+		}
+
+		// Create (or seed) shared repo cache seed image
+		log.WithFields(logrus.Fields{
+			"path":     repoCacheSeedImg,
+			"size_gb":  *repoCacheSeedSizeGB,
+			"seed_dir": *repoCacheSeedDir,
+		}).Info("Creating repo-cache seed image")
+		if err := createExt4Image(repoCacheSeedImg, *repoCacheSeedSizeGB, "BAZEL_REPO_SEED"); err != nil {
+			log.WithError(err).Fatal("Failed to create repo-cache seed image")
+		}
+		if *repoCacheSeedDir != "" {
+			if err := seedExt4ImageFromDir(repoCacheSeedImg, *repoCacheSeedDir, log); err != nil {
+				log.WithError(err).Warn("Failed to seed repo-cache image from directory; continuing with empty seed")
+			}
+		}
+
+		// Create a placeholder per-VM repo cache upper image
+		repoCacheUpperImg := filepath.Join(*outputDir, "repo-cache-upper.img")
+		if err := createExt4Image(repoCacheUpperImg, *repoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
+			log.WithError(err).Fatal("Failed to create repo-cache upper image")
+		}
+
+		// Create a placeholder credentials image
+		credentialsImg := filepath.Join(*outputDir, "credentials.img")
+		if err := createExt4ImageMB(credentialsImg, 32, "CREDENTIALS"); err != nil {
+			log.WithError(err).Fatal("Failed to create credentials image")
+		}
+
+		// Create or copy git-cache image
+		gitCacheImg := filepath.Join(*outputDir, "git-cache.img")
+		gitCacheEnabled := false
+		if *gitCachePath != "" {
+			log.WithField("source", *gitCachePath).Info("Copying pre-populated git-cache image...")
+			if err := copyFile(*gitCachePath, gitCacheImg); err != nil {
+				log.WithError(err).Fatal("Failed to copy git-cache image")
+			}
+			gitCacheEnabled = true
+		} else {
+			log.Info("Creating placeholder git-cache image...")
+			if err := createExt4ImageMB(gitCacheImg, 64, "GIT_CACHE"); err != nil {
+				log.WithError(err).Fatal("Failed to create git-cache image")
+			}
+		}
+
+		vmCfg := firecracker.VMConfig{
+			VMID:           vmID,
+			SocketDir:      *outputDir,
+			FirecrackerBin: *firecrackerBin,
+			KernelPath:     *kernelPath,
+			RootfsPath:     workingRootfs,
+			VCPUs:          *vcpus,
+			MemoryMB:       *memoryMB,
+			BootArgs:       bootArgs,
+			NetworkIface: &firecracker.NetworkInterface{
+				IfaceID:     "eth0",
+				HostDevName: tapName,
+				GuestMAC:    guestMAC,
+			},
+			MMDSConfig: &firecracker.MMDSConfig{
+				Version:           "V1",
+				NetworkInterfaces: []string{"eth0"},
+			},
+			Drives: []firecracker.Drive{
+				{
+					DriveID:      "repo_cache_seed",
+					PathOnHost:   repoCacheSeedImg,
+					IsRootDevice: false,
+					IsReadOnly:   false,
+				},
+				{
+					DriveID:      "repo_cache_upper",
+					PathOnHost:   repoCacheUpperImg,
+					IsRootDevice: false,
+					IsReadOnly:   false,
+				},
+				{
+					DriveID:      "credentials",
+					PathOnHost:   credentialsImg,
+					IsRootDevice: false,
+					IsReadOnly:   true,
+				},
+				{
+					DriveID:      "git_cache",
+					PathOnHost:   gitCacheImg,
+					IsRootDevice: false,
+					IsReadOnly:   true,
+				},
+			},
+		}
+
+		var err error
+		vm, err = firecracker.NewVM(vmCfg, logger)
+		if err != nil {
+			log.WithError(err).Fatal("Failed to create VM")
+		}
+
+		log.Info("Starting warmup VM...")
+		if err := vm.Start(ctx); err != nil {
+			log.WithError(err).Fatal("Failed to start VM")
+		}
+
+		mmdsData := buildWarmupMMDS(*repoURL, *repoBranch, *bazelVersion, *fetchTargets, *bazelrc, gitToken, gcpAccessToken, gitCacheEnabled)
+		if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
+			vm.Stop()
+			log.WithError(err).Fatal("Failed to set MMDS data")
+		}
 	}
 
-	// Start VM
-	log.Info("Starting warmup VM...")
-	if err := vm.Start(ctx); err != nil {
-		log.WithError(err).Fatal("Failed to start VM")
-	}
-
-	// Inject MMDS data for warmup configuration
-	mmdsData := buildWarmupMMDS(*repoURL, *repoBranch, *bazelVersion, *fetchTargets, gitToken, gcpAccessToken, gitCacheEnabled)
-	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
-		vm.Stop()
-		log.WithError(err).Fatal("Failed to set MMDS data")
-	}
-
-	// Wait for VM to boot and run warmup
+	// Shared path: wait for warmup, snapshot, upload
 	log.Info("Waiting for warmup to complete...")
 	warmupCtx, warmupCancel := context.WithTimeout(ctx, *warmupTimeout)
 	defer warmupCancel()
@@ -324,13 +353,54 @@ func main() {
 	// Stop VM
 	vm.Stop()
 
-	// Copy kernel to output
-	kernelOutput := filepath.Join(*outputDir, "kernel.bin")
-	if err := copyFile(*kernelPath, kernelOutput); err != nil {
-		log.WithError(err).Fatal("Failed to copy kernel")
+	// If we used FUSE-backed rootfs (incremental), save dirty chunks to the chunk store.
+	// This uploads only the changed chunks. We store the updated chunk refs for use
+	// when building the chunked metadata (avoids re-reading the entire rootfs).
+	var incrementalRootfsChunks []snapshot.ChunkRef
+	var incrementalSeedChunks []snapshot.ChunkRef
+	wasIncremental := fuseDisk != nil
+
+	if fuseDisk != nil {
+		log.WithField("dirty_chunks", fuseDisk.DirtyChunkCount()).Info("Saving FUSE rootfs dirty chunks to chunk store...")
+		var err error
+		incrementalRootfsChunks, err = fuseDisk.SaveDirtyChunks(ctx)
+		if err != nil {
+			log.WithError(err).Fatal("Failed to save dirty rootfs chunks")
+		}
+		log.WithFields(logrus.Fields{
+			"total_chunks": len(incrementalRootfsChunks),
+			"dirty_chunks": fuseDisk.DirtyChunkCount(),
+		}).Info("Rootfs dirty chunks saved to chunk store")
+		fuseDisk.Unmount()
+		fuseDisk = nil
+	}
+	if fuseSeedDisk != nil {
+		log.WithField("dirty_chunks", fuseSeedDisk.DirtyChunkCount()).Info("Saving FUSE seed dirty chunks to chunk store...")
+		var err error
+		incrementalSeedChunks, err = fuseSeedDisk.SaveDirtyChunks(ctx)
+		if err != nil {
+			log.WithError(err).Fatal("Failed to save dirty seed chunks")
+		}
+		fuseSeedDisk.Unmount()
+		fuseSeedDisk = nil
 	}
 
-	// Get file sizes
+	// Copy kernel to output
+	kernelOutput := filepath.Join(*outputDir, "kernel.bin")
+	if wasIncremental {
+		// Incremental: kernel was downloaded to incremental subdir, copy to output
+		incrKernel := filepath.Join(*outputDir, "incremental", "kernel.bin")
+		if err := copyFile(incrKernel, kernelOutput); err != nil {
+			log.WithError(err).Fatal("Failed to copy kernel from incremental dir")
+		}
+	} else {
+		// Cold boot: copy kernel from flag path
+		if err := copyFile(*kernelPath, kernelOutput); err != nil {
+			log.WithError(err).Fatal("Failed to copy kernel")
+		}
+	}
+
+	// Get file sizes (some files may not exist in incremental mode)
 	var totalSize int64
 	for _, f := range []string{kernelOutput, workingRootfs, snapshotPath, memPath, repoCacheSeedImg} {
 		info, _ := os.Stat(f)
@@ -364,12 +434,9 @@ func main() {
 	defer uploader.Close()
 
 	if *enableChunked {
-		// With chunked snapshots, the large files (rootfs, mem, repo-cache-seed)
-		// are served lazily from the chunk store via FUSE and UFFD. Only upload
-		// kernel and state as small legacy files for discoverability, then build
-		// and upload the chunked snapshot.
 		log.Info("Chunked mode: skipping legacy full-file upload (rootfs, mem, repo-cache-seed)")
-	} else {
+	} else if !wasIncremental {
+		// Legacy upload only works with cold boot (needs full files on disk)
 		log.Info("Uploading full snapshot to GCS...")
 		if err := uploader.UploadSnapshot(ctx, *outputDir, metadata); err != nil {
 			log.WithError(err).Fatal("Failed to upload snapshot")
@@ -397,38 +464,122 @@ func main() {
 		defer chunkStore.Close()
 
 		builder := snapshot.NewChunkedSnapshotBuilder(chunkStore, logger)
-		snapshotPaths := &snapshot.SnapshotPaths{
-			Kernel:        kernelOutput,
-			Rootfs:        workingRootfs,
-			Mem:           memPath,
-			State:         snapshotPath,
-			RepoCacheSeed: repoCacheSeedImg,
-			Version:       version,
+
+		// Compute rootfs source hash for storing in metadata (enables incremental change detection).
+		// Only needed at upload time — the incremental path hashes independently for comparison.
+		if rootfsSourceHash == "" {
+			if h, err := hashFile(*rootfsPath); err == nil {
+				rootfsSourceHash = h
+				log.WithField("hash", rootfsSourceHash[:12]).Info("Base rootfs hash computed for metadata")
+			} else {
+				log.WithError(err).Warn("Failed to hash base rootfs, future incremental builds won't detect rootfs changes")
+			}
 		}
 
-		chunkedMeta, err := builder.BuildChunkedSnapshot(ctx, snapshotPaths, version)
-		if err != nil {
-			log.WithError(err).Fatal("Failed to build chunked snapshot")
-		}
+		if wasIncremental && incrementalRootfsChunks != nil {
+			// Incremental: rootfs chunks already in chunk store (original + dirty).
+			// Only chunk kernel, state, and mem (which are new). Skip rootfs chunking.
+			log.Info("Incremental chunked snapshot: reusing rootfs chunks, chunking mem/state/kernel...")
 
-		if err := builder.UploadChunkedMetadata(ctx, chunkedMeta); err != nil {
-			log.WithError(err).Fatal("Failed to upload chunked metadata")
-		}
+			chunkedMeta := &snapshot.ChunkedSnapshotMetadata{
+				Version:          version,
+				CreatedAt:        time.Now(),
+				ChunkSize:        snapshot.DefaultChunkSize,
+				RootfsSourceHash: rootfsSourceHash,
+			}
 
-		// Also upload chunked metadata at "current" so hosts can find it
-		currentMeta := *chunkedMeta
-		currentMeta.Version = "current"
-		if err := builder.UploadChunkedMetadata(ctx, &currentMeta); err != nil {
-			log.WithError(err).Fatal("Failed to upload current chunked metadata")
-		}
-		// Restore the real version on the metadata object
-		currentMeta.Version = version
+			// Chunk kernel
+			kernelData, err := os.ReadFile(kernelOutput)
+			if err != nil {
+				log.WithError(err).Fatal("Failed to read kernel for chunking")
+			}
+			kernelHash, _, err := chunkStore.StoreChunk(ctx, kernelData)
+			if err != nil {
+				log.WithError(err).Fatal("Failed to store kernel chunk")
+			}
+			chunkedMeta.KernelHash = kernelHash
 
-		log.WithFields(logrus.Fields{
-			"mem_chunks":  len(chunkedMeta.MemChunks),
-			"disk_chunks": len(chunkedMeta.RootfsChunks),
-			"seed_chunks": len(chunkedMeta.RepoCacheSeedChunks),
-		}).Info("Chunked snapshot built and uploaded")
+			// Chunk state
+			stateData, err := os.ReadFile(snapshotPath)
+			if err != nil {
+				log.WithError(err).Fatal("Failed to read state for chunking")
+			}
+			stateHash, _, err := chunkStore.StoreChunk(ctx, stateData)
+			if err != nil {
+				log.WithError(err).Fatal("Failed to store state chunk")
+			}
+			chunkedMeta.StateHash = stateHash
+
+			// Upload memory as compressed raw file
+			memGCSPath := fmt.Sprintf("%s/snapshot.mem.zst", version)
+			_, _, err = chunkStore.UploadRawFile(ctx, memPath, memGCSPath)
+			if err != nil {
+				log.WithError(err).Fatal("Failed to upload raw memory file")
+			}
+			chunkedMeta.MemFilePath = memGCSPath
+			memStat, _ := os.Stat(memPath)
+			if memStat != nil {
+				chunkedMeta.TotalMemSize = memStat.Size()
+			}
+
+			// Use rootfs chunks from FUSE (original + dirty writes already uploaded)
+			chunkedMeta.RootfsChunks = incrementalRootfsChunks
+			chunkedMeta.TotalDiskSize = int64(len(incrementalRootfsChunks)) * chunkedMeta.ChunkSize
+
+			// Use seed chunks from FUSE if available
+			if incrementalSeedChunks != nil {
+				chunkedMeta.RepoCacheSeedChunks = incrementalSeedChunks
+			}
+
+			if err := builder.UploadChunkedMetadata(ctx, chunkedMeta); err != nil {
+				log.WithError(err).Fatal("Failed to upload chunked metadata")
+			}
+
+			currentMeta := *chunkedMeta
+			currentMeta.Version = "current"
+			if err := builder.UploadChunkedMetadata(ctx, &currentMeta); err != nil {
+				log.WithError(err).Fatal("Failed to upload current chunked metadata")
+			}
+
+			log.WithFields(logrus.Fields{
+				"mem_file":    chunkedMeta.MemFilePath,
+				"disk_chunks": len(chunkedMeta.RootfsChunks),
+				"seed_chunks": len(chunkedMeta.RepoCacheSeedChunks),
+			}).Info("Incremental chunked snapshot built and uploaded")
+		} else {
+			// Cold boot: chunk everything from full files on disk
+			snapshotPaths := &snapshot.SnapshotPaths{
+				Kernel:        kernelOutput,
+				Rootfs:        workingRootfs,
+				Mem:           memPath,
+				State:         snapshotPath,
+				RepoCacheSeed: repoCacheSeedImg,
+				Version:       version,
+			}
+
+			chunkedMeta, err := builder.BuildChunkedSnapshot(ctx, snapshotPaths, version)
+			if err != nil {
+				log.WithError(err).Fatal("Failed to build chunked snapshot")
+			}
+			chunkedMeta.RootfsSourceHash = rootfsSourceHash
+
+			if err := builder.UploadChunkedMetadata(ctx, chunkedMeta); err != nil {
+				log.WithError(err).Fatal("Failed to upload chunked metadata")
+			}
+
+			currentMeta := *chunkedMeta
+			currentMeta.Version = "current"
+			if err := builder.UploadChunkedMetadata(ctx, &currentMeta); err != nil {
+				log.WithError(err).Fatal("Failed to upload current chunked metadata")
+			}
+			currentMeta.Version = version
+
+			log.WithFields(logrus.Fields{
+				"mem_chunks":  len(chunkedMeta.MemChunks),
+				"disk_chunks": len(chunkedMeta.RootfsChunks),
+				"seed_chunks": len(chunkedMeta.RepoCacheSeedChunks),
+			}).Info("Chunked snapshot built and uploaded")
+		}
 	}
 
 	log.WithFields(logrus.Fields{
@@ -645,6 +796,20 @@ func copyFile(src, dst string) error {
 	return cmd.Run()
 }
 
+// hashFile computes SHA-256 of a file and returns hex string.
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 func createExt4Image(path string, sizeGB int, label string) error {
 	if sizeGB <= 0 {
 		return fmt.Errorf("invalid sizeGB: %d", sizeGB)
@@ -810,8 +975,346 @@ func cleanupWarmupNetwork(tapName string) {
 	exec.Command("iptables", "-D", "FORWARD", "-o", tapName, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT").Run()
 }
 
+// snapshotSymlinkDir matches the path used by the manager for snapshot symlinks.
+// Firecracker opens drive backing files at the paths baked into the snapshot state,
+// which are /tmp/snapshot/*.img.
+const snapshotSymlinkDir = "/tmp/snapshot"
+
+// restoreFromPreviousSnapshot downloads the previous chunked snapshot from GCS,
+// mounts rootfs and repo-cache-seed via FUSE, restores the VM from snapshot,
+// injects fresh MMDS data with mode=warmup and a new runner_id, and resumes.
+// The thaw-agent detects the runner_id change and re-runs warmup incrementally.
+func restoreFromPreviousSnapshot(
+	ctx context.Context,
+	logger *logrus.Logger,
+	log *logrus.Entry,
+	vmID, tapName, guestMAC, bootArgs string,
+	gitToken, gcpAccessToken string,
+) (*firecracker.VM, *fuse.ChunkedDisk, *fuse.ChunkedDisk, error) {
+	// Use a subdirectory for incremental working files to avoid colliding
+	// with the symlinks in /tmp/snapshot/ that Firecracker expects.
+	incrDir := filepath.Join(*outputDir, "incremental")
+	if err := os.MkdirAll(incrDir, 0755); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to create incremental dir: %w", err)
+	}
+
+	// 1. Create chunk store and load previous chunked metadata
+	chunkStore, err := snapshot.NewChunkStore(ctx, snapshot.ChunkStoreConfig{
+		GCSBucket:      *gcsBucket,
+		LocalCachePath: filepath.Join(incrDir, "chunk-cache"),
+		Logger:         logger,
+	})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to create chunk store: %w", err)
+	}
+
+	chunkedMeta, err := chunkStore.LoadChunkedMetadata(ctx, "current")
+	if err != nil {
+		chunkStore.Close()
+		return nil, nil, nil, fmt.Errorf("no previous chunked snapshot found: %w", err)
+	}
+	log.WithFields(logrus.Fields{
+		"version":       chunkedMeta.Version,
+		"rootfs_chunks": len(chunkedMeta.RootfsChunks),
+		"seed_chunks":   len(chunkedMeta.RepoCacheSeedChunks),
+	}).Info("Loaded previous chunked snapshot metadata")
+
+	// Check if base rootfs has changed since previous snapshot.
+	// If it has (e.g. new thaw-agent binary, new packages), we must cold boot
+	// to pick up the changes — snapshot restore uses the old rootfs.
+	if chunkedMeta.RootfsSourceHash != "" {
+		currentHash, err := hashFile(*rootfsPath)
+		if err != nil {
+			chunkStore.Close()
+			return nil, nil, nil, fmt.Errorf("failed to hash current rootfs: %w", err)
+		}
+		if currentHash != chunkedMeta.RootfsSourceHash {
+			chunkStore.Close()
+			log.WithFields(logrus.Fields{
+				"previous": chunkedMeta.RootfsSourceHash[:12],
+				"current":  currentHash[:12],
+			}).Warn("Base rootfs has changed, incremental restore would use stale image")
+			return nil, nil, nil, fmt.Errorf("rootfs changed (previous=%s current=%s)", chunkedMeta.RootfsSourceHash[:12], currentHash[:12])
+		}
+		log.WithField("hash", currentHash[:12]).Info("Base rootfs unchanged, safe to restore incrementally")
+	} else {
+		chunkStore.Close()
+		return nil, nil, nil, fmt.Errorf("previous snapshot has no rootfs source hash, cannot verify rootfs unchanged — forcing cold boot")
+	}
+
+	// 2. Download snapshot.mem (raw file)
+	localMemPath := filepath.Join(incrDir, "snapshot.mem")
+	if chunkedMeta.MemFilePath != "" {
+		log.Info("Downloading previous snapshot memory file...")
+		if err := chunkStore.DownloadRawFile(ctx, chunkedMeta.MemFilePath, localMemPath); err != nil {
+			chunkStore.Close()
+			return nil, nil, nil, fmt.Errorf("failed to download memory file: %w", err)
+		}
+	} else {
+		chunkStore.Close()
+		return nil, nil, nil, fmt.Errorf("previous snapshot has no mem_file_path (UFFD-only snapshots not supported for incremental)")
+	}
+
+	// 3. Fetch state chunk and write to local file
+	localStatePath := filepath.Join(incrDir, "snapshot.state")
+	if chunkedMeta.StateHash != "" {
+		stateData, err := chunkStore.GetChunk(ctx, chunkedMeta.StateHash)
+		if err != nil {
+			chunkStore.Close()
+			return nil, nil, nil, fmt.Errorf("failed to fetch vmstate chunk: %w", err)
+		}
+		if err := os.WriteFile(localStatePath, stateData, 0644); err != nil {
+			chunkStore.Close()
+			return nil, nil, nil, fmt.Errorf("failed to write vmstate: %w", err)
+		}
+		log.WithField("state_size", len(stateData)).Info("Fetched previous vmstate")
+	}
+
+	// 4. Fetch kernel chunk and write to local file
+	localKernelPath := filepath.Join(incrDir, "kernel.bin")
+	if chunkedMeta.KernelHash != "" {
+		kernelData, err := chunkStore.GetChunk(ctx, chunkedMeta.KernelHash)
+		if err != nil {
+			chunkStore.Close()
+			return nil, nil, nil, fmt.Errorf("failed to fetch kernel chunk: %w", err)
+		}
+		if err := os.WriteFile(localKernelPath, kernelData, 0644); err != nil {
+			chunkStore.Close()
+			return nil, nil, nil, fmt.Errorf("failed to write kernel: %w", err)
+		}
+		log.WithField("kernel_size", len(kernelData)).Info("Fetched kernel from chunk store")
+	} else {
+		// Fall back to local kernel
+		if err := copyFile(*kernelPath, localKernelPath); err != nil {
+			chunkStore.Close()
+			return nil, nil, nil, fmt.Errorf("failed to copy kernel: %w", err)
+		}
+	}
+
+	// 5. Mount rootfs via FUSE (lazy loading with CoW)
+	fuseMountDir := filepath.Join(incrDir, "fuse-rootfs")
+	fuseDisk, err := fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
+		ChunkStore: chunkStore,
+		Chunks:     chunkedMeta.RootfsChunks,
+		TotalSize:  chunkedMeta.TotalDiskSize,
+		ChunkSize:  chunkedMeta.ChunkSize,
+		MountPoint: fuseMountDir,
+		Logger:     logger,
+	})
+	if err != nil {
+		chunkStore.Close()
+		return nil, nil, nil, fmt.Errorf("failed to create FUSE rootfs disk: %w", err)
+	}
+	if err := fuseDisk.Mount(); err != nil {
+		chunkStore.Close()
+		return nil, nil, nil, fmt.Errorf("failed to mount FUSE rootfs: %w", err)
+	}
+	log.Info("Mounted FUSE-backed rootfs from previous snapshot")
+
+	// 6. Mount repo-cache-seed via FUSE (if chunks exist)
+	var fuseSeedDisk *fuse.ChunkedDisk
+	var repoCacheSeedPath string
+	if len(chunkedMeta.RepoCacheSeedChunks) > 0 {
+		fuseSeedMountDir := filepath.Join(incrDir, "fuse-seed")
+		var totalSeedSize int64
+		for _, c := range chunkedMeta.RepoCacheSeedChunks {
+			end := c.Offset + c.Size
+			if end > totalSeedSize {
+				totalSeedSize = end
+			}
+		}
+
+		fuseSeedDisk, err = fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
+			ChunkStore: chunkStore,
+			Chunks:     chunkedMeta.RepoCacheSeedChunks,
+			TotalSize:  totalSeedSize,
+			ChunkSize:  chunkedMeta.ChunkSize,
+			MountPoint: fuseSeedMountDir,
+			Logger:     logger,
+		})
+		if err != nil {
+			fuseDisk.Unmount()
+			chunkStore.Close()
+			return nil, nil, nil, fmt.Errorf("failed to create FUSE seed disk: %w", err)
+		}
+		if err := fuseSeedDisk.Mount(); err != nil {
+			fuseDisk.Unmount()
+			chunkStore.Close()
+			return nil, nil, nil, fmt.Errorf("failed to mount FUSE seed disk: %w", err)
+		}
+		repoCacheSeedPath = fuseSeedDisk.DiskImagePath()
+		log.Info("Mounted FUSE-backed repo-cache-seed from previous snapshot")
+	} else {
+		// Create a fresh placeholder
+		repoCacheSeedPath = filepath.Join(incrDir, "repo-cache-seed.img")
+		if err := createExt4Image(repoCacheSeedPath, *repoCacheSeedSizeGB, "BAZEL_REPO_SEED"); err != nil {
+			fuseDisk.Unmount()
+			chunkStore.Close()
+			return nil, nil, nil, fmt.Errorf("failed to create repo-cache-seed image: %w", err)
+		}
+	}
+
+	// 7. Create fresh repo-cache-upper, credentials, and git-cache images
+	repoCacheUpperPath := filepath.Join(incrDir, "repo-cache-upper.img")
+	if err := createExt4Image(repoCacheUpperPath, *repoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
+		fuseDisk.Unmount()
+		if fuseSeedDisk != nil {
+			fuseSeedDisk.Unmount()
+		}
+		chunkStore.Close()
+		return nil, nil, nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
+	}
+
+	credentialsPath := filepath.Join(incrDir, "credentials.img")
+	if err := createExt4ImageMB(credentialsPath, 32, "CREDENTIALS"); err != nil {
+		fuseDisk.Unmount()
+		if fuseSeedDisk != nil {
+			fuseSeedDisk.Unmount()
+		}
+		chunkStore.Close()
+		return nil, nil, nil, fmt.Errorf("failed to create credentials image: %w", err)
+	}
+
+	gitCachePath := filepath.Join(incrDir, "git-cache.img")
+	if err := createExt4ImageMB(gitCachePath, 64, "GIT_CACHE"); err != nil {
+		fuseDisk.Unmount()
+		if fuseSeedDisk != nil {
+			fuseSeedDisk.Unmount()
+		}
+		chunkStore.Close()
+		return nil, nil, nil, fmt.Errorf("failed to create git-cache image: %w", err)
+	}
+
+	// 8. Create symlinks in /tmp/snapshot/ so Firecracker can find drives at baked-in paths
+	if err := os.MkdirAll(snapshotSymlinkDir, 0755); err != nil {
+		fuseDisk.Unmount()
+		if fuseSeedDisk != nil {
+			fuseSeedDisk.Unmount()
+		}
+		chunkStore.Close()
+		return nil, nil, nil, fmt.Errorf("failed to create snapshot symlink dir: %w", err)
+	}
+
+	symlinks := []struct {
+		name   string
+		target string
+	}{
+		{"rootfs.img", fuseDisk.DiskImagePath()},
+		{"repo-cache-seed.img", repoCacheSeedPath},
+		{"repo-cache-upper.img", repoCacheUpperPath},
+		{"credentials.img", credentialsPath},
+		{"git-cache.img", gitCachePath},
+	}
+	var createdSymlinks []string
+	for _, s := range symlinks {
+		linkPath := filepath.Join(snapshotSymlinkDir, s.name)
+		os.Remove(linkPath)
+		if err := os.Symlink(s.target, linkPath); err != nil {
+			for _, c := range createdSymlinks {
+				os.Remove(c)
+			}
+			fuseDisk.Unmount()
+			if fuseSeedDisk != nil {
+				fuseSeedDisk.Unmount()
+			}
+			chunkStore.Close()
+			return nil, nil, nil, fmt.Errorf("symlink %s -> %s: %w", linkPath, s.target, err)
+		}
+		createdSymlinks = append(createdSymlinks, linkPath)
+		log.WithFields(logrus.Fields{
+			"link":   linkPath,
+			"target": s.target,
+		}).Debug("Created snapshot symlink")
+	}
+
+	// 9. Create VM and restore from snapshot
+	vmCfg := firecracker.VMConfig{
+		VMID:           vmID,
+		SocketDir:      *outputDir,
+		FirecrackerBin: *firecrackerBin,
+		KernelPath:     localKernelPath,
+		RootfsPath:     fuseDisk.DiskImagePath(),
+		VCPUs:          *vcpus,
+		MemoryMB:       *memoryMB,
+		BootArgs:       bootArgs,
+		NetworkIface: &firecracker.NetworkInterface{
+			IfaceID:     "eth0",
+			HostDevName: tapName,
+			GuestMAC:    guestMAC,
+		},
+		MMDSConfig: &firecracker.MMDSConfig{
+			Version:           "V1",
+			NetworkInterfaces: []string{"eth0"},
+		},
+	}
+
+	vm, err := firecracker.NewVM(vmCfg, logger)
+	if err != nil {
+		for _, c := range createdSymlinks {
+			os.Remove(c)
+		}
+		fuseDisk.Unmount()
+		if fuseSeedDisk != nil {
+			fuseSeedDisk.Unmount()
+		}
+		chunkStore.Close()
+		return nil, nil, nil, fmt.Errorf("failed to create VM: %w", err)
+	}
+
+	log.Info("Restoring VM from previous snapshot...")
+	if err := vm.RestoreFromSnapshot(ctx, localStatePath, localMemPath, false); err != nil {
+		for _, c := range createdSymlinks {
+			os.Remove(c)
+		}
+		vm.Stop()
+		fuseDisk.Unmount()
+		if fuseSeedDisk != nil {
+			fuseSeedDisk.Unmount()
+		}
+		chunkStore.Close()
+		return nil, nil, nil, fmt.Errorf("failed to restore from snapshot: %w", err)
+	}
+
+	// 10. Clean up symlinks (Firecracker holds fds after LoadSnapshot)
+	for _, c := range createdSymlinks {
+		os.Remove(c)
+	}
+
+	// 11. Set MMDS with mode=warmup, fresh bazelrc, and new runner_id
+	newRunnerID := fmt.Sprintf("snapshot-builder-incr-%s", uuid.New().String()[:8])
+	gitCacheEnabled := false
+	mmdsData := buildWarmupMMDS(*repoURL, *repoBranch, *bazelVersion, *fetchTargets, *bazelrc, gitToken, gcpAccessToken, gitCacheEnabled)
+	// Override runner_id so thaw-agent detects the change and re-runs warmup
+	mmdsData["latest"].(map[string]interface{})["meta"].(map[string]interface{})["runner_id"] = newRunnerID
+
+	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
+		vm.Stop()
+		fuseDisk.Unmount()
+		if fuseSeedDisk != nil {
+			fuseSeedDisk.Unmount()
+		}
+		chunkStore.Close()
+		return nil, nil, nil, fmt.Errorf("failed to set MMDS data: %w", err)
+	}
+
+	// 12. Resume VM — thaw-agent wakes up, detects runner_id change, re-runs warmup
+	log.WithField("runner_id", newRunnerID).Info("Resuming VM for incremental warmup...")
+	if err := vm.Resume(ctx); err != nil {
+		vm.Stop()
+		fuseDisk.Unmount()
+		if fuseSeedDisk != nil {
+			fuseSeedDisk.Unmount()
+		}
+		chunkStore.Close()
+		return nil, nil, nil, fmt.Errorf("failed to resume VM: %w", err)
+	}
+
+	log.Info("VM restored and resumed for incremental warmup")
+	return vm, fuseDisk, fuseSeedDisk, nil
+}
+
 // buildWarmupMMDS creates the MMDS data for warmup mode
-func buildWarmupMMDS(repoURL, repoBranch, bazelVersion, fetchTargets, gitToken, gcpAccessToken string, gitCacheEnabled bool) map[string]interface{} {
+func buildWarmupMMDS(repoURL, repoBranch, bazelVersion, fetchTargets, bazelrc, gitToken, gcpAccessToken string, gitCacheEnabled bool) map[string]interface{} {
 	// Extract repo name for git-cache lookup (e.g., "askscio/scio" -> "scio")
 	repoName := filepath.Base(strings.TrimSuffix(repoURL, ".git"))
 
@@ -827,6 +1330,7 @@ func buildWarmupMMDS(repoURL, repoBranch, bazelVersion, fetchTargets, gitToken, 
 				"repo_branch":    repoBranch,
 				"bazel_version":  bazelVersion,
 				"warmup_targets": fetchTargets,
+				"bazelrc":        bazelrc,
 			},
 			"network": map[string]interface{}{
 				"ip":        "172.16.0.2/24",
