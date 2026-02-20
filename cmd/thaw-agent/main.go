@@ -210,6 +210,7 @@ type MMDSData struct {
 			RepoBranch    string `json:"repo_branch,omitempty"`
 			BazelVersion  string `json:"bazel_version,omitempty"`
 			WarmupTargets string `json:"warmup_targets,omitempty"`
+			Bazelrc       string `json:"bazelrc,omitempty"`
 		} `json:"warmup,omitempty"`
 	} `json:"latest"`
 }
@@ -476,7 +477,34 @@ func main() {
 				}).Info("MMDS poll result")
 			}
 
-			// Check if mode changed from warmup (indicates snapshot was restored)
+			// Check if mode changed from warmup OR runner_id changed
+			// (runner_id change with mode still "warmup" = incremental re-warmup)
+			if newData.Latest.Meta.Mode != "warmup" ||
+				newData.Latest.Meta.RunnerID != mmdsData.Latest.Meta.RunnerID {
+				if newData.Latest.Meta.Mode == "warmup" {
+					// Incremental re-warmup: runner_id changed but mode still warmup
+					mmdsData.Latest = newData.Latest
+					log.WithField("new_runner_id", newData.Latest.Meta.RunnerID).Info("Re-warmup: incremental snapshot build detected")
+					globalWarmupState = &WarmupState{StartedAt: time.Now()}
+					if err := runWarmupMode(mmdsData); err != nil {
+						globalWarmupState.Error = err.Error()
+						globalWarmupState.Phase = "failed"
+						log.WithError(err).Error("Re-warmup failed")
+					} else {
+						globalWarmupState.Complete = true
+						globalWarmupState.Phase = "complete"
+						globalWarmupState.CompletedAt = time.Now()
+						globalWarmupState.Duration = time.Since(globalWarmupState.StartedAt).String()
+						log.Info("Re-warmup completed successfully")
+					}
+					if err := signalReady(); err != nil {
+						log.WithError(err).Error("Failed to signal ready after re-warmup")
+					}
+					pollInterval = 10 * time.Millisecond // Reset poll interval
+					continue                             // Keep polling for next restore
+				}
+			}
+
 			if newData.Latest.Meta.Mode != "warmup" {
 				log.WithFields(logrus.Fields{
 					"old_mode":      "warmup",
@@ -582,18 +610,22 @@ func main() {
 	go startHealthServer(mmdsData)
 	log.Info("Health server started in background")
 
-	// Verify bazel server survived snapshot restore by running `bazel info server_pid`.
-	// This uses bazel's own logic to find its server — no hardcoded paths, works with
-	// any bazelrc config.
-	setStep("bazel_verification")
-	preClonedRepo := getPreClonedPath(mmdsData)
-	if preClonedRepo != "" {
-		verifyBazelServer(preClonedRepo)
-	}
-	bootTimer.Phase("bazel_verify")
+	// Run bazel verification and CI runner registration in parallel.
+	// These are independent: bazel_verify checks the Bazel server survived restore,
+	// while ci_runner registers with GitHub and starts run.sh.
+	setStep("bazel_verify_and_ci_registration")
 
-	// Register CI runner based on configured CI system
-	setStep("ci_registration")
+	// Start bazel verification in background
+	bazelDone := make(chan struct{})
+	preClonedRepo := getPreClonedPath(mmdsData)
+	go func() {
+		defer close(bazelDone)
+		if preClonedRepo != "" {
+			verifyBazelServer(preClonedRepo)
+		}
+	}()
+
+	// Run CI runner registration concurrently
 	ciSystem := mmdsData.Latest.Runner.CISystem
 	if ciSystem == "" && mmdsData.Latest.Job.GitHubRunnerToken != "" {
 		ciSystem = "github-actions" // backwards compat
@@ -639,6 +671,9 @@ func main() {
 			log.WithField("ci_system", ciSystem).Warn("Unknown CI system, skipping runner registration")
 		}
 	}
+
+	// Wait for bazel verification to finish (usually completes before CI registration)
+	<-bazelDone
 	bootTimer.Phase("ci_runner")
 
 	// Signal ready
@@ -985,6 +1020,7 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					RepoBranch    string `json:"repo_branch,omitempty"`
 					BazelVersion  string `json:"bazel_version,omitempty"`
 					WarmupTargets string `json:"warmup_targets,omitempty"`
+					Bazelrc       string `json:"bazelrc,omitempty"`
 				} `json:"warmup,omitempty"`
 			}
 			if err := json.Unmarshal(body, &inner); err != nil {
@@ -1922,20 +1958,32 @@ func runWarmupMode(data *MMDSData) error {
 	// Phase 2: Configure Bazel
 	updateWarmupState("configuring", "Configuring Bazel...")
 
-	// Create bazelrc for warmup
-	bazelrcContent := `# Warmup-specific Bazel configuration
-build --repository_cache=/mnt/ephemeral/caches/repository
-build --disk_cache=/mnt/bazel-repo-upper/disk-cache
-build --experimental_repository_cache_hardlinks
-build --jobs=auto
-build --local_resources=memory=HOST_RAM*.8
-build --local_resources=cpu=HOST_CPUS
-`
-	bazelrcPath := filepath.Join(repoDir, ".bazelrc.warmup")
-	if err := os.WriteFile(bazelrcPath, []byte(bazelrcContent), 0644); err != nil {
-		log.WithError(err).Warn("Failed to write bazelrc.warmup")
+	// Resolve bazelrc path:
+	// 1. If MMDS warmup.bazelrc is set, use <repoDir>/<bazelrc> (error if missing)
+	// 2. Else if <repoDir>/.bazelrc exists, use it
+	// 3. Else don't pass --bazelrc at all
+	var bazelrcPath string
+	if warmup.Bazelrc != "" {
+		candidate := filepath.Join(repoDir, warmup.Bazelrc)
+		if _, err := os.Stat(candidate); err != nil {
+			log.WithFields(logrus.Fields{
+				"bazelrc": warmup.Bazelrc,
+				"path":    candidate,
+			}).WithError(err).Error("Specified bazelrc file not found")
+			globalWarmupLogs.Add("[error] bazelrc not found: " + candidate)
+			return fmt.Errorf("specified bazelrc %q not found: %w", warmup.Bazelrc, err)
+		}
+		bazelrcPath = candidate
+		log.WithField("bazelrc", bazelrcPath).Info("Using bazelrc from MMDS")
+		globalWarmupLogs.Add("[config] Using bazelrc: " + warmup.Bazelrc)
+	} else if _, err := os.Stat(filepath.Join(repoDir, ".bazelrc")); err == nil {
+		bazelrcPath = filepath.Join(repoDir, ".bazelrc")
+		log.WithField("bazelrc", bazelrcPath).Info("Using repo .bazelrc")
+		globalWarmupLogs.Add("[config] Using repo .bazelrc")
+	} else {
+		log.Info("No bazelrc found, not passing --bazelrc flag")
+		globalWarmupLogs.Add("[config] No bazelrc")
 	}
-	os.Chown(bazelrcPath, int(rUID), int(rGID))
 
 	bazelEnv := append(os.Environ(), "HOME=/home/"+*runnerUsername)
 
@@ -2005,7 +2053,11 @@ esac
 	if fetchTargets == "" {
 		fetchTargets = "//..."
 	}
-	fetchArgs := []string{"--bazelrc=" + bazelrcPath, "fetch"}
+	var fetchArgs []string
+	if bazelrcPath != "" {
+		fetchArgs = append(fetchArgs, "--bazelrc="+bazelrcPath)
+	}
+	fetchArgs = append(fetchArgs, "fetch")
 	fetchArgs = append(fetchArgs, strings.Fields(fetchTargets)...)
 
 	updateWarmupState("fetching", "Fetching external dependencies...")
@@ -2033,7 +2085,11 @@ esac
 	}
 
 	// Phase 4: Run analysis (same targets as fetch)
-	analyzeArgs := []string{"--bazelrc=" + bazelrcPath, "build", "--nobuild"}
+	var analyzeArgs []string
+	if bazelrcPath != "" {
+		analyzeArgs = append(analyzeArgs, "--bazelrc="+bazelrcPath)
+	}
+	analyzeArgs = append(analyzeArgs, "build", "--nobuild")
 	analyzeArgs = append(analyzeArgs, strings.Fields(fetchTargets)...)
 
 	updateWarmupState("analyzing", "Running Bazel analysis (--nobuild)...")
@@ -2052,7 +2108,12 @@ esac
 	log.Info("Starting persistent Bazel server")
 	globalWarmupLogs.Add("[phase] bazel info")
 
-	if err := runStreamedCommand(repoDir, bazelEnv, runnerCred, "bazel", "--bazelrc="+bazelrcPath, "info"); err != nil {
+	bazelInfoArgs := []string{}
+	if bazelrcPath != "" {
+		bazelInfoArgs = append(bazelInfoArgs, "--bazelrc="+bazelrcPath)
+	}
+	bazelInfoArgs = append(bazelInfoArgs, "info")
+	if err := runStreamedCommand(repoDir, bazelEnv, runnerCred, "bazel", bazelInfoArgs...); err != nil {
 		log.WithError(err).Warn("bazel info failed")
 		globalWarmupLogs.Add("[error] bazel info failed: " + err.Error())
 	} else {

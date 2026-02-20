@@ -346,8 +346,70 @@ type HostMetrics struct {
 
 // RecordHostMetrics records host-level runner metrics.
 func (c *Client) RecordHostMetrics(ctx context.Context, m HostMetrics) {
-	c.RecordInt(ctx, "host/slots_total", int64(m.TotalSlots), nil)
-	c.RecordInt(ctx, "host/slots_used", int64(m.UsedSlots), nil)
-	c.RecordInt(ctx, "host/runners_idle", int64(m.IdleRunners), nil)
-	c.RecordInt(ctx, "host/runners_busy", int64(m.BusyRunners), nil)
+	c.RecordInt(ctx, MetricHostSlotsTotal, int64(m.TotalSlots), nil)
+	c.RecordInt(ctx, MetricHostSlotsUsed, int64(m.UsedSlots), nil)
+	c.RecordInt(ctx, MetricHostRunnersIdle, int64(m.IdleRunners), nil)
+	c.RecordInt(ctx, MetricHostRunnersBusy, int64(m.BusyRunners), nil)
+}
+
+// ChunkedMetrics holds chunked snapshot system metrics.
+type ChunkedMetrics struct {
+	CacheSize       int64
+	CacheMaxSize    int64
+	CacheItems      int
+	PageFaults      uint64
+	CacheHits       uint64
+	ChunkFetches    uint64
+	DiskReads       uint64
+	DiskWrites      uint64
+	DirtyChunks     int
+}
+
+// RecordChunkedMetrics records chunked snapshot system metrics.
+func (c *Client) RecordChunkedMetrics(ctx context.Context, m ChunkedMetrics) {
+	c.RecordInt(ctx, MetricChunkCacheSize, m.CacheSize, nil)
+	c.RecordInt(ctx, MetricChunkCacheMaxSize, m.CacheMaxSize, nil)
+	c.RecordInt(ctx, MetricChunkCacheItems, int64(m.CacheItems), nil)
+	c.RecordInt(ctx, MetricChunkPageFaults, int64(m.PageFaults), nil)
+	c.RecordInt(ctx, MetricChunkCacheHits, int64(m.CacheHits), nil)
+	c.RecordInt(ctx, MetricChunkFetches, int64(m.ChunkFetches), nil)
+	c.RecordInt(ctx, MetricChunkDiskReads, int64(m.DiskReads), nil)
+	c.RecordInt(ctx, MetricChunkDiskWrites, int64(m.DiskWrites), nil)
+	c.RecordInt(ctx, MetricChunkDirtyChunks, int64(m.DirtyChunks), nil)
+
+	// Compute and record cache hit ratio
+	total := m.CacheHits + m.ChunkFetches
+	if total > 0 {
+		ratio := float64(m.CacheHits) / float64(total)
+		c.RecordFloat(ctx, MetricChunkCacheHitRatio, ratio, nil)
+	}
+}
+
+// PoolMetrics holds runner pool metrics.
+type PoolMetrics struct {
+	PooledRunners    int
+	PoolHits         int64
+	PoolMisses       int64
+	Evictions        int64
+	RecycleFailures  int64
+	MemoryUsedBytes  int64
+	MemoryMaxBytes   int64
+}
+
+// RecordPoolMetrics records runner pool metrics.
+func (c *Client) RecordPoolMetrics(ctx context.Context, m PoolMetrics) {
+	c.RecordInt(ctx, MetricPoolRunners, int64(m.PooledRunners), nil)
+	c.RecordInt(ctx, MetricPoolHits, m.PoolHits, nil)
+	c.RecordInt(ctx, MetricPoolMisses, m.PoolMisses, nil)
+	c.RecordInt(ctx, MetricPoolEvictions, m.Evictions, nil)
+	c.RecordInt(ctx, MetricPoolRecycleFails, m.RecycleFailures, nil)
+	c.RecordInt(ctx, MetricPoolMemoryUsed, m.MemoryUsedBytes, nil)
+	c.RecordInt(ctx, MetricPoolMemoryMax, m.MemoryMaxBytes, nil)
+
+	// Compute and record hit ratio
+	total := m.PoolHits + m.PoolMisses
+	if total > 0 {
+		ratio := float64(m.PoolHits) / float64(total)
+		c.RecordFloat(ctx, MetricPoolHitRatio, ratio, nil)
+	}
 }

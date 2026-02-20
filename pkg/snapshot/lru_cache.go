@@ -5,14 +5,24 @@ import (
 	"sync"
 )
 
-// LRUCache is a thread-safe LRU cache for chunk data
+const numShards = 64
+
+// LRUCache is a thread-safe, sharded LRU cache for chunk data.
+// It distributes keys across multiple shards to reduce lock contention
+// when many goroutines (UFFD handlers, FUSE disks, eager fetchers) access
+// the cache concurrently.
 type LRUCache struct {
-	capacity int
-	size     int64 // Current size in bytes
-	maxSize  int64 // Maximum size in bytes
-	items    map[string]*list.Element
-	order    *list.List
-	mu       sync.RWMutex
+	shards  [numShards]*lruShard
+	maxSize int64
+}
+
+// lruShard is a single shard of the LRU cache with its own lock.
+type lruShard struct {
+	size    int64 // Current size in bytes
+	maxSize int64 // Maximum size in bytes for this shard
+	items   map[string]*list.Element
+	order   *list.List
+	mu      sync.Mutex
 }
 
 type cacheEntry struct {
@@ -20,23 +30,45 @@ type cacheEntry struct {
 	data []byte
 }
 
-// NewLRUCache creates a new LRU cache with the given maximum size in bytes
+// NewLRUCache creates a new sharded LRU cache with the given maximum size in bytes.
+// The total capacity is distributed evenly across shards. Individual shards may
+// temporarily exceed their quota slightly, but the aggregate stays bounded.
 func NewLRUCache(maxSizeBytes int64) *LRUCache {
-	return &LRUCache{
-		maxSize: maxSizeBytes,
-		items:   make(map[string]*list.Element),
-		order:   list.New(),
+	c := &LRUCache{maxSize: maxSizeBytes}
+	// Each shard gets an equal share, with remainder going to the last shard.
+	perShard := maxSizeBytes / numShards
+	remainder := maxSizeBytes % numShards
+	for i := range c.shards {
+		shardMax := perShard
+		if i == numShards-1 {
+			shardMax += remainder
+		}
+		c.shards[i] = &lruShard{
+			maxSize: shardMax,
+			items:   make(map[string]*list.Element),
+			order:   list.New(),
+		}
 	}
+	return c
+}
+
+// shard returns the shard for a given key using FNV-inspired hash.
+func (c *LRUCache) shard(key string) *lruShard {
+	var h uint32
+	for i := 0; i < len(key); i++ {
+		h = h*31 + uint32(key[i])
+	}
+	return c.shards[h%numShards]
 }
 
 // Get retrieves an item from the cache
 func (c *LRUCache) Get(key string) ([]byte, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	s := c.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	if elem, ok := c.items[key]; ok {
-		// Move to front (most recently used)
-		c.order.MoveToFront(elem)
+	if elem, ok := s.items[key]; ok {
+		s.order.MoveToFront(elem)
 		return elem.Value.(*cacheEntry).data, true
 	}
 	return nil, false
@@ -44,107 +76,112 @@ func (c *LRUCache) Get(key string) ([]byte, bool) {
 
 // Put adds an item to the cache
 func (c *LRUCache) Put(key string, data []byte) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	s := c.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	dataSize := int64(len(data))
 
-	// If this single item is larger than max size, don't cache it
-	if dataSize > c.maxSize {
+	if dataSize > s.maxSize {
 		return
 	}
 
 	// If key exists, update it
-	if elem, ok := c.items[key]; ok {
-		c.order.MoveToFront(elem)
+	if elem, ok := s.items[key]; ok {
+		s.order.MoveToFront(elem)
 		entry := elem.Value.(*cacheEntry)
-		c.size -= int64(len(entry.data))
+		s.size -= int64(len(entry.data))
 		entry.data = data
-		c.size += dataSize
-		c.evictIfNeeded()
+		s.size += dataSize
+		s.evictIfNeeded()
 		return
 	}
 
 	// Evict items until we have room
-	for c.size+dataSize > c.maxSize && c.order.Len() > 0 {
-		c.evictOldest()
+	for s.size+dataSize > s.maxSize && s.order.Len() > 0 {
+		s.evictOldest()
 	}
 
 	// Add new item
 	entry := &cacheEntry{key: key, data: data}
-	elem := c.order.PushFront(entry)
-	c.items[key] = elem
-	c.size += dataSize
-	c.capacity = c.order.Len()
+	elem := s.order.PushFront(entry)
+	s.items[key] = elem
+	s.size += dataSize
 }
 
 // evictOldest removes the least recently used item
-func (c *LRUCache) evictOldest() {
-	elem := c.order.Back()
+func (s *lruShard) evictOldest() {
+	elem := s.order.Back()
 	if elem != nil {
-		c.removeElement(elem)
+		s.removeElement(elem)
 	}
 }
 
 // evictIfNeeded evicts items until under max size
-func (c *LRUCache) evictIfNeeded() {
-	for c.size > c.maxSize && c.order.Len() > 0 {
-		c.evictOldest()
+func (s *lruShard) evictIfNeeded() {
+	for s.size > s.maxSize && s.order.Len() > 0 {
+		s.evictOldest()
 	}
 }
 
-// removeElement removes an element from the cache
-func (c *LRUCache) removeElement(elem *list.Element) {
-	c.order.Remove(elem)
+// removeElement removes an element from the shard
+func (s *lruShard) removeElement(elem *list.Element) {
+	s.order.Remove(elem)
 	entry := elem.Value.(*cacheEntry)
-	delete(c.items, entry.key)
-	c.size -= int64(len(entry.data))
-	c.capacity = c.order.Len()
+	delete(s.items, entry.key)
+	s.size -= int64(len(entry.data))
 }
 
 // Remove removes a specific item from the cache
 func (c *LRUCache) Remove(key string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	s := c.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	if elem, ok := c.items[key]; ok {
-		c.removeElement(elem)
+	if elem, ok := s.items[key]; ok {
+		s.removeElement(elem)
 	}
 }
 
-// Clear clears the cache
+// Clear clears the entire cache
 func (c *LRUCache) Clear() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.items = make(map[string]*list.Element)
-	c.order.Init()
-	c.size = 0
-	c.capacity = 0
+	for _, s := range c.shards {
+		s.mu.Lock()
+		s.items = make(map[string]*list.Element)
+		s.order.Init()
+		s.size = 0
+		s.mu.Unlock()
+	}
 }
 
 // Size returns the current size of the cache in bytes
 func (c *LRUCache) Size() int64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.size
+	var total int64
+	for _, s := range c.shards {
+		s.mu.Lock()
+		total += s.size
+		s.mu.Unlock()
+	}
+	return total
 }
 
 // Len returns the number of items in the cache
 func (c *LRUCache) Len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.order.Len()
+	var total int
+	for _, s := range c.shards {
+		s.mu.Lock()
+		total += s.order.Len()
+		s.mu.Unlock()
+	}
+	return total
 }
 
 // Stats returns cache statistics
 func (c *LRUCache) Stats() CacheStats {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
 	return CacheStats{
-		Size:      c.size,
+		Size:      c.Size(),
 		MaxSize:   c.maxSize,
-		ItemCount: c.order.Len(),
+		ItemCount: c.Len(),
 	}
 }
 

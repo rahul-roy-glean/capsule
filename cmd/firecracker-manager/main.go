@@ -332,6 +332,55 @@ func main() {
 		}
 		defer chunkedMgr.Close()
 		mgr = chunkedMgr.Manager // Use embedded manager for compatibility
+
+		// When using chunked snapshots, eagerly fetch just the kernel from
+		// the chunk store so it's available as a local file for Firecracker
+		// boot config. Everything else (rootfs, memory) is loaded lazily
+		// via FUSE and UFFD. This replaces the traditional SyncFromGCS
+		// which would download the entire snapshot.
+		if *useChunkedSnapshots {
+			if meta := chunkedMgr.GetChunkedMetadata(); meta != nil && meta.KernelHash != "" {
+				log.Info("Eagerly fetching kernel from chunk store...")
+				kernelData, err := chunkedMgr.GetChunkStore().GetChunk(ctx, meta.KernelHash)
+				if err != nil {
+					log.WithError(err).Fatal("Failed to fetch kernel chunk")
+				}
+				kernelPath := filepath.Join(*snapshotCache, "kernel.bin")
+				if err := os.WriteFile(kernelPath, kernelData, 0644); err != nil {
+					log.WithError(err).Fatal("Failed to write kernel to local cache")
+				}
+				log.WithFields(logrus.Fields{
+					"kernel_size": len(kernelData),
+					"path":        kernelPath,
+				}).Info("Kernel fetched from chunk store")
+
+				// If a raw memory file path is set, download and decompress it
+				// to local disk so VMs can use file-backed restore instead of UFFD.
+				if meta.MemFilePath != "" {
+					memPath := filepath.Join(*snapshotCache, "snapshot.mem")
+					if info, err := os.Stat(memPath); err == nil && info.Size() > 0 {
+						log.WithFields(logrus.Fields{
+							"path": memPath,
+							"size": info.Size(),
+						}).Info("snapshot.mem already exists locally, skipping download")
+					} else {
+						log.WithFields(logrus.Fields{
+							"gcs_path":   meta.MemFilePath,
+							"local_path": memPath,
+						}).Info("Downloading raw memory file from GCS...")
+						if err := chunkedMgr.GetChunkStore().DownloadRawFile(ctx, meta.MemFilePath, memPath); err != nil {
+							log.WithError(err).Fatal("Failed to download raw memory file")
+						}
+						log.WithField("path", memPath).Info("Raw memory file downloaded and decompressed")
+					}
+				}
+			} else {
+				log.Warn("No chunked metadata or kernel hash available, falling back to traditional sync")
+				if err := mgr.SyncSnapshot(ctx, "current"); err != nil {
+					log.WithError(err).Fatal("Failed to sync snapshot from GCS")
+				}
+			}
+		}
 	} else {
 		var err error
 		mgr, err = runner.NewManager(ctx, cfg, ciAdapter, logger)
@@ -431,7 +480,7 @@ func main() {
 	}()
 
 	// Start autoscaler loop
-	go autoscaleLoop(ctx, mgr, *idleTarget, logger, metricsClient)
+	go autoscaleLoop(ctx, mgr, chunkedMgr, *idleTarget, logger, metricsClient)
 
 	// Start heartbeat loop if control plane is configured
 	if *controlPlane != "" {
@@ -516,9 +565,9 @@ func snapshotSyncHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handle
 	}
 }
 
-func autoscaleLoop(ctx context.Context, mgr *runner.Manager, idleTarget int, logger *logrus.Logger, metricsClient *telemetry.Client) {
+func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, idleTarget int, logger *logrus.Logger, metricsClient *telemetry.Client) {
 	log := logger.WithField("component", "autoscaler")
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -532,7 +581,12 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, idleTarget int, log
 			if !mgr.IsDraining() && status.IdleRunners < idleTarget && mgr.CanAddRunner() {
 				log.Debug("Adding runner to maintain idle pool")
 				allocTimer := telemetry.NewStopwatch()
-				_, err := mgr.AllocateRunner(ctx, runner.AllocateRequest{})
+				var err error
+				if chunkedMgr != nil {
+					_, err = chunkedMgr.AllocateRunnerChunked(ctx, runner.AllocateRequest{})
+				} else {
+					_, err = mgr.AllocateRunner(ctx, runner.AllocateRequest{})
+				}
 				if err != nil {
 					log.WithError(err).Warn("Failed to allocate idle runner")
 					if metricsClient != nil {
@@ -570,6 +624,36 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, idleTarget int, log
 					IdleRunners: status.IdleRunners,
 					BusyRunners: status.BusyRunners,
 				})
+
+				// Record chunked snapshot metrics
+				if chunkedMgr != nil {
+					cs := chunkedMgr.GetChunkedStats()
+					metricsClient.RecordChunkedMetrics(ctx, telemetry.ChunkedMetrics{
+						CacheSize:    cs.CacheSize,
+						CacheMaxSize: cs.CacheMaxSize,
+						CacheItems:   cs.CacheItems,
+						PageFaults:   cs.TotalPageFaults,
+						CacheHits:    cs.TotalCacheHits,
+						ChunkFetches: cs.TotalChunkFetches,
+						DiskReads:    cs.TotalDiskReads,
+						DiskWrites:   cs.TotalDiskWrites,
+						DirtyChunks:  cs.TotalDirtyChunks,
+					})
+				}
+
+				// Record runner pool metrics
+				if pool := mgr.GetPool(); pool != nil {
+					ps := pool.Stats()
+					metricsClient.RecordPoolMetrics(ctx, telemetry.PoolMetrics{
+						PooledRunners:   ps.PooledRunners,
+						PoolHits:        ps.PoolHits,
+						PoolMisses:      ps.PoolMisses,
+						Evictions:       ps.Evictions,
+						RecycleFailures: ps.RecycleFailures,
+						MemoryUsedBytes: ps.MemoryUsageBytes,
+						MemoryMaxBytes:  ps.MaxMemoryBytes,
+					})
+				}
 			}
 		}
 	}

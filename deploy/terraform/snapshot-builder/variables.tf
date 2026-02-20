@@ -94,11 +94,23 @@ variable "debug_mode" {
 variable "rootfs_size_gb" {
   description = "Expand rootfs to this size in GB during snapshot build. Must be large enough for OS + repo clone + Bazel. 0 = keep original size (8GB)."
   type        = number
-  default     = 30
+  default     = 50
+}
+
+variable "bazelrc" {
+  description = "Path to .bazelrc file relative to repo root. If empty, uses repo's .bazelrc if it exists."
+  type        = string
+  default     = ""
 }
 
 variable "firecracker_version" {
   description = "Firecracker binary version (must match across snapshot-builder and hosts)"
   type        = string
   default     = "1.14.1"
+}
+
+variable "incremental" {
+  description = "Restore from previous snapshot for incremental rebuild (skips cold boot when previous snapshot exists)"
+  type        = bool
+  default     = true
 }
