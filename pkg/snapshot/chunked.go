@@ -35,10 +35,10 @@ const (
 	ZeroChunkHash = ""
 
 	// Eager prefetching constants
-	eagerFetchBufferCapacity = 100  // Max chunks queued for prefetch
-	numChunksToEagerFetch    = 32   // Chunks to queue on each access
-	maxEagerFetchesPerSec    = 1000 // Rate limit for prefetch operations
-	eagerFetchConcurrency    = 32   // Parallel prefetch workers
+	eagerFetchBufferCapacity = 1000  // Max chunks queued for prefetch
+	numChunksToEagerFetch    = 64    // Chunks to queue on each access
+	maxEagerFetchesPerSec    = 5000  // Rate limit for prefetch operations
+	eagerFetchConcurrency    = 64    // Parallel prefetch workers
 
 	// chunkFileUploadConcurrency controls how many chunks are uploaded in
 	// parallel during ChunkFile.

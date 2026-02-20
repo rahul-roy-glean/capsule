@@ -86,7 +86,7 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 		// Create chunk store with in-memory LRU cache
 		cacheSize := cfg.ChunkCacheSizeBytes
 		if cacheSize <= 0 {
-			cacheSize = 2 * 1024 * 1024 * 1024 // 2GB default
+			cacheSize = 8 * 1024 * 1024 * 1024 // 8GB default
 		}
 
 		chunkStore, err := snapshot.NewChunkStore(ctx, snapshot.ChunkStoreConfig{

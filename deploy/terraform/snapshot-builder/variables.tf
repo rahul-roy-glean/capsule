@@ -94,7 +94,13 @@ variable "debug_mode" {
 variable "rootfs_size_gb" {
   description = "Expand rootfs to this size in GB during snapshot build. Must be large enough for OS + repo clone + Bazel. 0 = keep original size (8GB)."
   type        = number
-  default     = 30
+  default     = 50
+}
+
+variable "bazelrc" {
+  description = "Path to .bazelrc file relative to repo root. If empty, uses repo's .bazelrc if it exists."
+  type        = string
+  default     = ""
 }
 
 variable "firecracker_version" {

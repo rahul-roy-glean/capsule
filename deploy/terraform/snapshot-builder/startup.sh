@@ -20,6 +20,7 @@ GITHUB_APP_ID=$(meta github-app-id "")
 GITHUB_APP_SECRET=$(meta github-app-secret "")
 GCP_PROJECT=$(meta gcp-project "")
 ROOTFS_SIZE_GB=$(meta rootfs-size-gb "0")
+BAZELRC=$(meta bazelrc "")
 
 # ---- 1. Install Firecracker ----
 echo "Installing Firecracker v${FIRECRACKER_VERSION}..."
@@ -116,6 +117,7 @@ GITHUB_APP_ID=$(meta github-app-id "")
 GITHUB_APP_SECRET=$(meta github-app-secret "")
 GCP_PROJECT=$(meta gcp-project "")
 ROOTFS_SIZE_GB=$(meta rootfs-size-gb "0")
+BAZELRC=$(meta bazelrc "")
 
 CMD=(/usr/local/bin/snapshot-builder
   -kernel-path=/opt/firecracker/kernel.bin
@@ -132,6 +134,7 @@ CMD=(/usr/local/bin/snapshot-builder
 [ -n "$GITHUB_APP_SECRET" ] && CMD+=("-github-app-secret=$GITHUB_APP_SECRET")
 [ -n "$GCP_PROJECT" ]       && CMD+=("-gcp-project=$GCP_PROJECT")
 [ "$ROOTFS_SIZE_GB" != "0" ] && CMD+=("-rootfs-size-gb=$ROOTFS_SIZE_GB")
+[ -n "$BAZELRC" ]            && CMD+=("-bazelrc=$BAZELRC")
 
 echo "Running: ${CMD[*]}"
 exec "${CMD[@]}"
@@ -154,6 +157,7 @@ else
   [ -n "$GITHUB_APP_SECRET" ] && CMD+=("-github-app-secret=$GITHUB_APP_SECRET")
   [ -n "$GCP_PROJECT" ]       && CMD+=("-gcp-project=$GCP_PROJECT")
   [ "$ROOTFS_SIZE_GB" != "0" ] && CMD+=("-rootfs-size-gb=$ROOTFS_SIZE_GB")
+  [ -n "$BAZELRC" ]            && CMD+=("-bazelrc=$BAZELRC")
 
   echo "Running: ${CMD[*]}"
   "${CMD[@]}"

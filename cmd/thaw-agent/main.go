@@ -210,6 +210,7 @@ type MMDSData struct {
 			RepoBranch    string `json:"repo_branch,omitempty"`
 			BazelVersion  string `json:"bazel_version,omitempty"`
 			WarmupTargets string `json:"warmup_targets,omitempty"`
+			Bazelrc       string `json:"bazelrc,omitempty"`
 		} `json:"warmup,omitempty"`
 	} `json:"latest"`
 }
@@ -985,6 +986,7 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					RepoBranch    string `json:"repo_branch,omitempty"`
 					BazelVersion  string `json:"bazel_version,omitempty"`
 					WarmupTargets string `json:"warmup_targets,omitempty"`
+					Bazelrc       string `json:"bazelrc,omitempty"`
 				} `json:"warmup,omitempty"`
 			}
 			if err := json.Unmarshal(body, &inner); err != nil {
@@ -1922,20 +1924,32 @@ func runWarmupMode(data *MMDSData) error {
 	// Phase 2: Configure Bazel
 	updateWarmupState("configuring", "Configuring Bazel...")
 
-	// Create bazelrc for warmup
-	bazelrcContent := `# Warmup-specific Bazel configuration
-build --repository_cache=/mnt/ephemeral/caches/repository
-build --disk_cache=/mnt/bazel-repo-upper/disk-cache
-build --experimental_repository_cache_hardlinks
-build --jobs=auto
-build --local_resources=memory=HOST_RAM*.8
-build --local_resources=cpu=HOST_CPUS
-`
-	bazelrcPath := filepath.Join(repoDir, ".bazelrc.warmup")
-	if err := os.WriteFile(bazelrcPath, []byte(bazelrcContent), 0644); err != nil {
-		log.WithError(err).Warn("Failed to write bazelrc.warmup")
+	// Resolve bazelrc path:
+	// 1. If MMDS warmup.bazelrc is set, use <repoDir>/<bazelrc> (error if missing)
+	// 2. Else if <repoDir>/.bazelrc exists, use it
+	// 3. Else don't pass --bazelrc at all
+	var bazelrcPath string
+	if warmup.Bazelrc != "" {
+		candidate := filepath.Join(repoDir, warmup.Bazelrc)
+		if _, err := os.Stat(candidate); err != nil {
+			log.WithFields(logrus.Fields{
+				"bazelrc": warmup.Bazelrc,
+				"path":    candidate,
+			}).WithError(err).Error("Specified bazelrc file not found")
+			globalWarmupLogs.Add("[error] bazelrc not found: " + candidate)
+			return fmt.Errorf("specified bazelrc %q not found: %w", warmup.Bazelrc, err)
+		}
+		bazelrcPath = candidate
+		log.WithField("bazelrc", bazelrcPath).Info("Using bazelrc from MMDS")
+		globalWarmupLogs.Add("[config] Using bazelrc: " + warmup.Bazelrc)
+	} else if _, err := os.Stat(filepath.Join(repoDir, ".bazelrc")); err == nil {
+		bazelrcPath = filepath.Join(repoDir, ".bazelrc")
+		log.WithField("bazelrc", bazelrcPath).Info("Using repo .bazelrc")
+		globalWarmupLogs.Add("[config] Using repo .bazelrc")
+	} else {
+		log.Info("No bazelrc found, not passing --bazelrc flag")
+		globalWarmupLogs.Add("[config] No bazelrc")
 	}
-	os.Chown(bazelrcPath, int(rUID), int(rGID))
 
 	bazelEnv := append(os.Environ(), "HOME=/home/"+*runnerUsername)
 
@@ -2005,7 +2019,11 @@ esac
 	if fetchTargets == "" {
 		fetchTargets = "//..."
 	}
-	fetchArgs := []string{"--bazelrc=" + bazelrcPath, "fetch"}
+	var fetchArgs []string
+	if bazelrcPath != "" {
+		fetchArgs = append(fetchArgs, "--bazelrc="+bazelrcPath)
+	}
+	fetchArgs = append(fetchArgs, "fetch")
 	fetchArgs = append(fetchArgs, strings.Fields(fetchTargets)...)
 
 	updateWarmupState("fetching", "Fetching external dependencies...")
@@ -2033,7 +2051,11 @@ esac
 	}
 
 	// Phase 4: Run analysis (same targets as fetch)
-	analyzeArgs := []string{"--bazelrc=" + bazelrcPath, "build", "--nobuild"}
+	var analyzeArgs []string
+	if bazelrcPath != "" {
+		analyzeArgs = append(analyzeArgs, "--bazelrc="+bazelrcPath)
+	}
+	analyzeArgs = append(analyzeArgs, "build", "--nobuild")
 	analyzeArgs = append(analyzeArgs, strings.Fields(fetchTargets)...)
 
 	updateWarmupState("analyzing", "Running Bazel analysis (--nobuild)...")
@@ -2052,7 +2074,12 @@ esac
 	log.Info("Starting persistent Bazel server")
 	globalWarmupLogs.Add("[phase] bazel info")
 
-	if err := runStreamedCommand(repoDir, bazelEnv, runnerCred, "bazel", "--bazelrc="+bazelrcPath, "info"); err != nil {
+	bazelInfoArgs := []string{}
+	if bazelrcPath != "" {
+		bazelInfoArgs = append(bazelInfoArgs, "--bazelrc="+bazelrcPath)
+	}
+	bazelInfoArgs = append(bazelInfoArgs, "info")
+	if err := runStreamedCommand(repoDir, bazelEnv, runnerCred, "bazel", bazelInfoArgs...); err != nil {
 		log.WithError(err).Warn("bazel info failed")
 		globalWarmupLogs.Add("[error] bazel info failed: " + err.Error())
 	} else {

@@ -227,6 +227,18 @@ build {
     ]
   }
 
+  # Disable unnecessary services to speed up boot (~35s savings)
+  provisioner "shell" {
+    inline = [
+      "sudo systemctl disable snap.lxd.activate.service || true",
+      "sudo systemctl disable snapd.service snapd.socket snapd.seeded.service || true",
+      "sudo systemctl disable apport.service || true",
+      "sudo systemctl mask snap.lxd.activate.service snapd.service snapd.socket snapd.seeded.service apport.service",
+      "sudo apt-get purge -y snapd lxd-agent-loader apport || true",
+      "sudo apt-get autoremove -y"
+    ]
+  }
+
   # Cleanup
   provisioner "shell" {
     inline = [

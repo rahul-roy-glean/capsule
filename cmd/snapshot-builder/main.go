@@ -39,6 +39,7 @@ var (
 	repoCacheSeedDir    = flag.String("repo-cache-seed-dir", "", "Optional directory to seed into repo-cache-seed.img (copied into image root)")
 	gitCachePath        = flag.String("git-cache-path", "", "Path to pre-populated git-cache.img (from git-cache-builder). If set, uses this instead of cloning during warmup.")
 	fetchTargets        = flag.String("fetch-targets", "//...", "Bazel target pattern for fetch (e.g., '//... -- -//terraform/...' to exclude terraform)")
+	bazelrc             = flag.String("bazelrc", "", "Path to .bazelrc file relative to repo root. If empty, uses repo's .bazelrc if it exists.")
 	logLevel            = flag.String("log-level", "info", "Log level")
 	enableChunked       = flag.Bool("enable-chunked", true, "Also build a chunked snapshot for lazy loading")
 	chunkSize           = flag.Int64("chunk-size", 4194304, "Chunk size in bytes for chunked snapshots (default 4MB)")
@@ -295,7 +296,7 @@ func main() {
 	}
 
 	// Inject MMDS data for warmup configuration
-	mmdsData := buildWarmupMMDS(*repoURL, *repoBranch, *bazelVersion, *fetchTargets, gitToken, gcpAccessToken, gitCacheEnabled)
+	mmdsData := buildWarmupMMDS(*repoURL, *repoBranch, *bazelVersion, *fetchTargets, *bazelrc, gitToken, gcpAccessToken, gitCacheEnabled)
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
 		log.WithError(err).Fatal("Failed to set MMDS data")
@@ -811,7 +812,7 @@ func cleanupWarmupNetwork(tapName string) {
 }
 
 // buildWarmupMMDS creates the MMDS data for warmup mode
-func buildWarmupMMDS(repoURL, repoBranch, bazelVersion, fetchTargets, gitToken, gcpAccessToken string, gitCacheEnabled bool) map[string]interface{} {
+func buildWarmupMMDS(repoURL, repoBranch, bazelVersion, fetchTargets, bazelrc, gitToken, gcpAccessToken string, gitCacheEnabled bool) map[string]interface{} {
 	// Extract repo name for git-cache lookup (e.g., "askscio/scio" -> "scio")
 	repoName := filepath.Base(strings.TrimSuffix(repoURL, ".git"))
 
@@ -827,6 +828,7 @@ func buildWarmupMMDS(repoURL, repoBranch, bazelVersion, fetchTargets, gitToken, 
 				"repo_branch":    repoBranch,
 				"bazel_version":  bazelVersion,
 				"warmup_targets": fetchTargets,
+				"bazelrc":        bazelrc,
 			},
 			"network": map[string]interface{}{
 				"ip":        "172.16.0.2/24",

@@ -5,7 +5,7 @@ import (
 	"sync"
 )
 
-const numShards = 16
+const numShards = 64
 
 // LRUCache is a thread-safe, sharded LRU cache for chunk data.
 // It distributes keys across multiple shards to reduce lock contention
