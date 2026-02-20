@@ -57,7 +57,7 @@ RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /
 ENV PATH="/usr/local/go/bin:${PATH}"
 
 # Install Bazelisk (as bazel)
-ARG BAZELISK_VERSION=1.19.0
+ARG BAZELISK_VERSION=1.28.1
 RUN curl -fsSL "https://github.com/bazelbuild/bazelisk/releases/download/v${BAZELISK_VERSION}/bazelisk-linux-amd64" \
     -o /usr/local/bin/bazel \
     && chmod +x /usr/local/bin/bazel

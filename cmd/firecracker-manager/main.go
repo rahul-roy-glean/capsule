@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -40,15 +42,15 @@ var (
 	memoryPerRunner      = flag.Int("memory-per-runner", 8192, "Memory MB per runner")
 	firecrackerBin       = flag.String("firecracker-bin", "/usr/local/bin/firecracker", "Path to firecracker binary")
 	socketDir            = flag.String("socket-dir", "/var/run/firecracker", "Directory for VM sockets")
-	workspaceDir         = flag.String("workspace-dir", "/mnt/nvme/workspaces", "Directory for workspaces")
+	workspaceDir         = flag.String("workspace-dir", "/mnt/data/workspaces", "Directory for workspaces")
 	logDir               = flag.String("log-dir", "/var/log/firecracker", "Directory for VM logs")
 	snapshotBucket       = flag.String("snapshot-bucket", "", "GCS bucket for snapshots")
-	snapshotCache        = flag.String("snapshot-cache", "/mnt/nvme/snapshots", "Local snapshot cache path")
+	snapshotCache        = flag.String("snapshot-cache", "/mnt/data/snapshots", "Local snapshot cache path")
 	repoCacheUpperSizeGB = flag.Int("repo-cache-upper-size-gb", 10, "Size in GB of the per-runner repo cache writable layer (upper)")
 	buildbarnCertsDir    = flag.String("buildbarn-certs-dir", "", "Host directory containing Buildbarn certs to mount into microVMs (e.g. /etc/glean/ci/certs)")
 	buildbarnCertsMount  = flag.String("buildbarn-certs-mount", "/etc/bazel-firecracker/certs/buildbarn", "Guest mount path for Buildbarn certs inside the microVM")
 	buildbarnCertsSizeMB = flag.Int("buildbarn-certs-image-size-mb", 32, "Size in MB of the generated Buildbarn certs ext4 image")
-	quarantineDir        = flag.String("quarantine-dir", "/mnt/nvme/quarantine", "Directory to store quarantined runner manifests and debug metadata")
+	quarantineDir        = flag.String("quarantine-dir", "/mnt/data/quarantine", "Directory to store quarantined runner manifests and debug metadata")
 	microVMSubnet        = flag.String("microvm-subnet", "172.16.0.0/24", "Subnet for microVMs")
 	extInterface         = flag.String("ext-interface", "eth0", "External network interface")
 	bridgeName           = flag.String("bridge-name", "fcbr0", "Bridge name for microVMs")
@@ -58,8 +60,8 @@ var (
 
 	// Git cache flags
 	gitCacheEnabled       = flag.Bool("git-cache-enabled", false, "Enable git-cache reference cloning for faster repo setup")
-	gitCacheDir           = flag.String("git-cache-dir", "/mnt/nvme/git-cache", "Host directory containing git mirrors")
-	gitCacheImagePath     = flag.String("git-cache-image", "/mnt/nvme/git-cache.img", "Path to git-cache block device image")
+	gitCacheDir           = flag.String("git-cache-dir", "/mnt/data/git-cache", "Host directory containing git mirrors")
+	gitCacheImagePath     = flag.String("git-cache-image", "/mnt/data/git-cache.img", "Path to git-cache block device image")
 	gitCacheMountPath     = flag.String("git-cache-mount", "/mnt/git-cache", "Mount path inside microVMs for git-cache")
 	gitCacheRepos         = flag.String("git-cache-repos", "", "Comma-separated repo mappings (e.g. 'github.com/org/repo:repo-dir,github.com/org/other:other-dir')")
 	gitCacheWorkspaceDir  = flag.String("git-cache-workspace", "/mnt/ephemeral/workdir", "Target directory for cloned repos inside microVMs")
@@ -112,6 +114,13 @@ func main() {
 
 	log := logger.WithField("component", "firecracker-manager")
 	log.Info("Starting firecracker-manager")
+
+	// Wait for workspace directory to be on a real mount (not root fs).
+	// The startup script mounts /mnt/data before starting the manager, but
+	// if the service auto-starts before the startup script runs, /mnt/data
+	// won't be mounted and we'd create files on the root fs that get hidden
+	// when the data disk is later mounted over /mnt/data.
+	waitForDataMount(log, *workspaceDir)
 
 	// Get instance metadata
 	hostID, instanceName, zone := getInstanceMetadata()
@@ -323,6 +332,55 @@ func main() {
 		}
 		defer chunkedMgr.Close()
 		mgr = chunkedMgr.Manager // Use embedded manager for compatibility
+
+		// When using chunked snapshots, eagerly fetch just the kernel from
+		// the chunk store so it's available as a local file for Firecracker
+		// boot config. Everything else (rootfs, memory) is loaded lazily
+		// via FUSE and UFFD. This replaces the traditional SyncFromGCS
+		// which would download the entire snapshot.
+		if *useChunkedSnapshots {
+			if meta := chunkedMgr.GetChunkedMetadata(); meta != nil && meta.KernelHash != "" {
+				log.Info("Eagerly fetching kernel from chunk store...")
+				kernelData, err := chunkedMgr.GetChunkStore().GetChunk(ctx, meta.KernelHash)
+				if err != nil {
+					log.WithError(err).Fatal("Failed to fetch kernel chunk")
+				}
+				kernelPath := filepath.Join(*snapshotCache, "kernel.bin")
+				if err := os.WriteFile(kernelPath, kernelData, 0644); err != nil {
+					log.WithError(err).Fatal("Failed to write kernel to local cache")
+				}
+				log.WithFields(logrus.Fields{
+					"kernel_size": len(kernelData),
+					"path":        kernelPath,
+				}).Info("Kernel fetched from chunk store")
+
+				// If a raw memory file path is set, download and decompress it
+				// to local disk so VMs can use file-backed restore instead of UFFD.
+				if meta.MemFilePath != "" {
+					memPath := filepath.Join(*snapshotCache, "snapshot.mem")
+					if info, err := os.Stat(memPath); err == nil && info.Size() > 0 {
+						log.WithFields(logrus.Fields{
+							"path": memPath,
+							"size": info.Size(),
+						}).Info("snapshot.mem already exists locally, skipping download")
+					} else {
+						log.WithFields(logrus.Fields{
+							"gcs_path":   meta.MemFilePath,
+							"local_path": memPath,
+						}).Info("Downloading raw memory file from GCS...")
+						if err := chunkedMgr.GetChunkStore().DownloadRawFile(ctx, meta.MemFilePath, memPath); err != nil {
+							log.WithError(err).Fatal("Failed to download raw memory file")
+						}
+						log.WithField("path", memPath).Info("Raw memory file downloaded and decompressed")
+					}
+				}
+			} else {
+				log.Warn("No chunked metadata or kernel hash available, falling back to traditional sync")
+				if err := mgr.SyncSnapshot(ctx, "current"); err != nil {
+					log.WithError(err).Fatal("Failed to sync snapshot from GCS")
+				}
+			}
+		}
 	} else {
 		var err error
 		mgr, err = runner.NewManager(ctx, cfg, ciAdapter, logger)
@@ -422,7 +480,7 @@ func main() {
 	}()
 
 	// Start autoscaler loop
-	go autoscaleLoop(ctx, mgr, *idleTarget, logger, metricsClient)
+	go autoscaleLoop(ctx, mgr, chunkedMgr, *idleTarget, logger, metricsClient)
 
 	// Start heartbeat loop if control plane is configured
 	if *controlPlane != "" {
@@ -507,9 +565,9 @@ func snapshotSyncHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handle
 	}
 }
 
-func autoscaleLoop(ctx context.Context, mgr *runner.Manager, idleTarget int, logger *logrus.Logger, metricsClient *telemetry.Client) {
+func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, idleTarget int, logger *logrus.Logger, metricsClient *telemetry.Client) {
 	log := logger.WithField("component", "autoscaler")
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -523,7 +581,12 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, idleTarget int, log
 			if !mgr.IsDraining() && status.IdleRunners < idleTarget && mgr.CanAddRunner() {
 				log.Debug("Adding runner to maintain idle pool")
 				allocTimer := telemetry.NewStopwatch()
-				_, err := mgr.AllocateRunner(ctx, runner.AllocateRequest{})
+				var err error
+				if chunkedMgr != nil {
+					_, err = chunkedMgr.AllocateRunnerChunked(ctx, runner.AllocateRequest{})
+				} else {
+					_, err = mgr.AllocateRunner(ctx, runner.AllocateRequest{})
+				}
 				if err != nil {
 					log.WithError(err).Warn("Failed to allocate idle runner")
 					if metricsClient != nil {
@@ -561,6 +624,36 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, idleTarget int, log
 					IdleRunners: status.IdleRunners,
 					BusyRunners: status.BusyRunners,
 				})
+
+				// Record chunked snapshot metrics
+				if chunkedMgr != nil {
+					cs := chunkedMgr.GetChunkedStats()
+					metricsClient.RecordChunkedMetrics(ctx, telemetry.ChunkedMetrics{
+						CacheSize:    cs.CacheSize,
+						CacheMaxSize: cs.CacheMaxSize,
+						CacheItems:   cs.CacheItems,
+						PageFaults:   cs.TotalPageFaults,
+						CacheHits:    cs.TotalCacheHits,
+						ChunkFetches: cs.TotalChunkFetches,
+						DiskReads:    cs.TotalDiskReads,
+						DiskWrites:   cs.TotalDiskWrites,
+						DirtyChunks:  cs.TotalDirtyChunks,
+					})
+				}
+
+				// Record runner pool metrics
+				if pool := mgr.GetPool(); pool != nil {
+					ps := pool.Stats()
+					metricsClient.RecordPoolMetrics(ctx, telemetry.PoolMetrics{
+						PooledRunners:   ps.PooledRunners,
+						PoolHits:        ps.PoolHits,
+						PoolMisses:      ps.PoolMisses,
+						Evictions:       ps.Evictions,
+						RecycleFailures: ps.RecycleFailures,
+						MemoryUsedBytes: ps.MemoryUsageBytes,
+						MemoryMaxBytes:  ps.MaxMemoryBytes,
+					})
+				}
 			}
 		}
 	}
@@ -885,4 +978,59 @@ func poolStatsHandler(mgr *runner.Manager, logger *logrus.Logger) http.HandlerFu
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(stats)
 	}
+}
+
+// waitForDataMount blocks until the parent mount point of workspaceDir (e.g.
+// /mnt/data) has a real filesystem mounted on it. This prevents the manager
+// from creating files on the root filesystem that get hidden when the data
+// disk is later mounted over /mnt/data by the startup script.
+func waitForDataMount(log *logrus.Entry, workspaceDir string) {
+	// Walk up from workspaceDir to find the /mnt/data mount point.
+	// workspaceDir is typically /mnt/data/workspaces.
+	mountPoint := filepath.Dir(workspaceDir) // e.g. /mnt/data
+
+	const (
+		pollInterval = 2 * time.Second
+		maxWait      = 120 * time.Second
+	)
+
+	start := time.Now()
+	for {
+		if isMounted(mountPoint) {
+			log.WithFields(logrus.Fields{
+				"mount_point": mountPoint,
+				"waited_ms":   time.Since(start).Milliseconds(),
+			}).Info("Data mount ready")
+			return
+		}
+
+		elapsed := time.Since(start)
+		if elapsed >= maxWait {
+			log.WithFields(logrus.Fields{
+				"mount_point": mountPoint,
+				"waited":      elapsed.String(),
+			}).Fatal("Data mount not ready after timeout — startup script may have failed")
+		}
+
+		log.WithField("mount_point", mountPoint).Warn("Data mount not ready, waiting...")
+		time.Sleep(pollInterval)
+	}
+}
+
+// isMounted checks whether the given path is a mount point by scanning /proc/mounts.
+func isMounted(target string) bool {
+	f, err := os.Open("/proc/mounts")
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) >= 2 && fields[1] == target {
+			return true
+		}
+	}
+	return false
 }

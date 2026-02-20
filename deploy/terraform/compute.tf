@@ -104,6 +104,7 @@ resource "google_compute_instance_template" "firecracker_host" {
     runner-ephemeral      = var.runner_ephemeral ? "true" : "false"
     # Indicates whether data disk was created from snapshot (fast) or empty (needs GCS download)
     use-data-snapshot     = var.use_data_snapshot ? "true" : "false"
+    use-chunked-snapshots = var.use_chunked_snapshots ? "true" : "false"
   }
 
   metadata_startup_script = <<-EOF
@@ -140,8 +141,8 @@ resource "google_compute_instance_template" "firecracker_host" {
       if [ -b "$DATA_DISK" ]; then
         # Disk from snapshot is already formatted, just mount it
         mount "$DATA_DISK" /mnt/data
-        echo "$DATA_DISK /mnt/data ext4 defaults,nofail 0 2" >> /etc/fstab
-        
+        echo "$DATA_DISK /mnt/data xfs defaults,nofail 0 0" >> /etc/fstab
+
         # Verify expected files exist
         if [ -d "/mnt/data/snapshots" ] && [ -f "/mnt/data/git-cache.img" ]; then
           echo "Snapshot data verified OK:"
@@ -168,13 +169,13 @@ resource "google_compute_instance_template" "firecracker_host" {
       
       if [ -b "$DATA_DISK" ]; then
         echo "Formatting data disk..."
-        mkfs.ext4 -F -L RUNNER_DATA "$DATA_DISK"
+        mkfs.xfs -f -L RUNNER_DATA "$DATA_DISK"
         mount "$DATA_DISK" /mnt/data
-        echo "$DATA_DISK /mnt/data ext4 defaults,nofail 0 2" >> /etc/fstab
+        echo "$DATA_DISK /mnt/data xfs defaults,nofail 0 0" >> /etc/fstab
       elif [ -b "/dev/sdb" ]; then
-        mkfs.ext4 -F -L RUNNER_DATA /dev/sdb
+        mkfs.xfs -f -L RUNNER_DATA /dev/sdb
         mount /dev/sdb /mnt/data
-        echo "/dev/sdb /mnt/data ext4 defaults,nofail 0 2" >> /etc/fstab
+        echo "/dev/sdb /mnt/data xfs defaults,nofail 0 0" >> /etc/fstab
       else
         echo "WARNING: No data disk found"
       fi
@@ -200,6 +201,13 @@ resource "google_compute_instance_template" "firecracker_host" {
         else
           echo "No pointer file found, falling back to current/ directory"
           gcloud storage rsync -r "gs://$SNAPSHOT_BUCKET/current/" /mnt/data/snapshots/ || true
+        fi
+
+        # Pre-decompress snapshot.mem.zst so firecracker-manager doesn't re-download it
+        if [ -f "/mnt/data/snapshots/snapshot.mem.zst" ] && [ ! -f "/mnt/data/snapshots/snapshot.mem" ]; then
+          echo "Decompressing snapshot.mem.zst in background..."
+          zstd -d /mnt/data/snapshots/snapshot.mem.zst -o /mnt/data/snapshots/snapshot.mem --no-progress &
+          ZSTD_PID=$!
         fi
 
         # Download git-cache.img if it exists
@@ -307,6 +315,9 @@ resource "google_compute_instance_template" "firecracker_host" {
       fi
     fi
 
+    USE_CHUNKED_SNAPSHOTS=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/use-chunked-snapshots || echo "false")
+
     # Stop firecracker-manager if already running (from Packer image auto-start)
     # This ensures the override is applied before the service runs
     systemctl stop firecracker-manager 2>/dev/null || true
@@ -352,12 +363,24 @@ resource "google_compute_instance_template" "firecracker_host" {
     if [ -n "$CONTROL_PLANE" ]; then
       EXEC_START="$EXEC_START --control-plane=$CONTROL_PLANE"
     fi
-    
+
+    # Add chunked snapshot flag if enabled
+    if [ "$USE_CHUNKED_SNAPSHOTS" = "true" ]; then
+      EXEC_START="$EXEC_START --use-chunked-snapshots"
+      EXEC_START="$EXEC_START --snapshot-bucket=$SNAPSHOT_BUCKET"
+    fi
+
     cat > /etc/systemd/system/firecracker-manager.service.d/override.conf << OVERRIDE
 [Service]
 ExecStart=
 ExecStart=$EXEC_START
 OVERRIDE
+
+    # Wait for background mem decompression before starting firecracker-manager
+    if [ -n "$${ZSTD_PID:-}" ]; then
+      echo "Waiting for snapshot.mem decompression to finish..."
+      wait $ZSTD_PID && echo "snapshot.mem decompressed OK" || echo "WARNING: snapshot.mem decompression failed"
+    fi
 
     # Reload and restart firecracker-manager service with new config
     echo "Starting firecracker-manager with: max-runners=$MAX_RUNNERS, idle-target=$IDLE_TARGET, vcpus=$VCPUS_PER_RUNNER, memory=$MEMORY_PER_RUNNER"

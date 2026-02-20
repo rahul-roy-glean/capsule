@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -28,11 +29,20 @@ const (
 	// ChunksPrefix is the GCS prefix for chunk storage
 	ChunksPrefix = "chunks"
 
+	// ZeroChunkHash is the sentinel value for chunks that are entirely zero.
+	// These chunks are never uploaded or fetched — readers return zero-filled
+	// buffers when they encounter this hash.
+	ZeroChunkHash = ""
+
 	// Eager prefetching constants
-	eagerFetchBufferCapacity = 100  // Max chunks queued for prefetch
-	numChunksToEagerFetch    = 32   // Chunks to queue on each access
-	maxEagerFetchesPerSec    = 1000 // Rate limit for prefetch operations
-	eagerFetchConcurrency    = 32   // Parallel prefetch workers
+	eagerFetchBufferCapacity = 1000  // Max chunks queued for prefetch
+	numChunksToEagerFetch    = 64    // Chunks to queue on each access
+	maxEagerFetchesPerSec    = 5000  // Rate limit for prefetch operations
+	eagerFetchConcurrency    = 64    // Parallel prefetch workers
+
+	// chunkFileUploadConcurrency controls how many chunks are uploaded in
+	// parallel during ChunkFile.
+	chunkFileUploadConcurrency = 16
 )
 
 // ChunkedSnapshotMetadata holds metadata for a chunked snapshot.
@@ -49,8 +59,17 @@ type ChunkedSnapshotMetadata struct {
 	RootfsChunks  []ChunkRef `json:"rootfs_chunks"`
 	TotalMemSize  int64      `json:"total_mem_size"`
 	TotalDiskSize int64      `json:"total_disk_size"`
+	// MemFilePath is the GCS object path of the raw memory file (zstd-compressed).
+	// When set, the memory is downloaded as a single file and restored via
+	// file-backed mem_backend instead of UFFD lazy loading.
+	// MemChunks will be empty/nil for new-style snapshots.
+	MemFilePath string `json:"mem_file_path,omitempty"`
 	// RepoCacheSeedChunks holds chunks for the shared Bazel repo cache seed image
 	RepoCacheSeedChunks []ChunkRef `json:"repo_cache_seed_chunks,omitempty"`
+	// RootfsSourceHash is the SHA-256 hash of the original base rootfs.img used
+	// to build this snapshot. Used by incremental builds to detect rootfs changes
+	// and fall back to cold boot when the base image has been updated.
+	RootfsSourceHash string `json:"rootfs_source_hash,omitempty"`
 }
 
 // ChunkRef references a single chunk by its content hash
@@ -176,7 +195,6 @@ func (cs *ChunkStore) StoreChunk(ctx context.Context, data []byte) (string, int6
 
 	writer := obj.NewWriter(ctx)
 	writer.ContentType = "application/octet-stream"
-	writer.ContentEncoding = "zstd"
 
 	if _, err := writer.Write(compressed); err != nil {
 		writer.Close()
@@ -276,7 +294,24 @@ func (cs *ChunkStore) GetChunkToFile(ctx context.Context, hash string, file *os.
 	return err
 }
 
-// ChunkFile splits a file into chunks and stores them, returning chunk refs
+// IsZeroChunk returns true if the ChunkRef represents a zero chunk (never stored).
+func (r *ChunkRef) IsZeroChunk() bool {
+	return r.Hash == ZeroChunkHash
+}
+
+// zeroRef is a pre-allocated zero buffer used for fast zero-chunk detection.
+// bytes.Equal uses SIMD-accelerated comparison internally.
+var zeroRef = make([]byte, DefaultChunkSize)
+
+// isZeroChunk returns true if data is entirely zeros.
+func isZeroChunk(data []byte) bool {
+	return bytes.Equal(data, zeroRef[:len(data)])
+}
+
+// ChunkFile splits a file into chunks and stores them, returning chunk refs.
+// Zero chunks (all-zero data) are detected and skipped — they are recorded with
+// Hash="" so that readers can serve zero-filled pages without a network fetch.
+// Non-zero chunks are uploaded in parallel for throughput.
 func (cs *ChunkStore) ChunkFile(ctx context.Context, path string, chunkSize int64) ([]ChunkRef, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -291,7 +326,6 @@ func (cs *ChunkStore) ChunkFile(ctx context.Context, path string, chunkSize int6
 
 	totalSize := stat.Size()
 	numChunks := (totalSize + chunkSize - 1) / chunkSize
-	refs := make([]ChunkRef, 0, numChunks)
 
 	cs.logger.WithFields(logrus.Fields{
 		"file":       path,
@@ -300,10 +334,17 @@ func (cs *ChunkStore) ChunkFile(ctx context.Context, path string, chunkSize int6
 		"num_chunks": numChunks,
 	}).Info("Chunking file")
 
-	buf := make([]byte, chunkSize)
-	var offset int64
+	// Pre-allocate the refs slice so goroutines can write by index.
+	refs := make([]ChunkRef, numChunks)
 
-	for offset < totalSize {
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(chunkFileUploadConcurrency)
+
+	var zeroChunks int64
+	buf := make([]byte, chunkSize) // reusable read buffer
+
+	for i := int64(0); i < numChunks; i++ {
+		offset := i * chunkSize
 		readSize := chunkSize
 		if offset+readSize > totalSize {
 			readSize = totalSize - offset
@@ -314,20 +355,48 @@ func (cs *ChunkStore) ChunkFile(ctx context.Context, path string, chunkSize int6
 			return nil, fmt.Errorf("failed to read at offset %d: %w", offset, err)
 		}
 
-		hash, compressedSize, err := cs.StoreChunk(ctx, buf[:n])
-		if err != nil {
-			return nil, fmt.Errorf("failed to store chunk at offset %d: %w", offset, err)
+		// Fast path: zero chunks are recorded with a sentinel hash and never uploaded.
+		if isZeroChunk(buf[:n]) {
+			refs[i] = ChunkRef{
+				Offset: offset,
+				Size:   int64(n),
+				Hash:   ZeroChunkHash,
+			}
+			zeroChunks++
+			continue
 		}
 
-		refs = append(refs, ChunkRef{
-			Offset:         offset,
-			Size:           int64(n),
-			CompressedSize: compressedSize,
-			Hash:           hash,
-		})
+		// Copy the data so the goroutine owns its buffer while we reuse buf.
+		chunkData := make([]byte, n)
+		copy(chunkData, buf[:n])
 
-		offset += int64(n)
+		idx := i
+		chunkOffset := offset
+		g.Go(func() error {
+			hash, compressedSize, err := cs.StoreChunk(gCtx, chunkData)
+			if err != nil {
+				return fmt.Errorf("failed to store chunk at offset %d: %w", chunkOffset, err)
+			}
+			refs[idx] = ChunkRef{
+				Offset:         chunkOffset,
+				Size:           int64(len(chunkData)),
+				CompressedSize: compressedSize,
+				Hash:           hash,
+			}
+			return nil
+		})
 	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	cs.logger.WithFields(logrus.Fields{
+		"file":         path,
+		"total_chunks": numChunks,
+		"zero_chunks":  zeroChunks,
+		"data_chunks":  numChunks - zeroChunks,
+	}).Info("Chunking complete")
 
 	return refs, nil
 }
@@ -353,34 +422,23 @@ func (cs *ChunkStore) ReassembleFile(ctx context.Context, refs []ChunkRef, destP
 	}).Info("Reassembling file from chunks")
 
 	// Fetch chunks in parallel
-	const maxParallel = 8
-	sem := make(chan struct{}, maxParallel)
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(refs))
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(chunkFileUploadConcurrency)
 
 	for _, ref := range refs {
-		wg.Add(1)
-		sem <- struct{}{}
-
-		go func(r ChunkRef) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			if err := cs.GetChunkToFile(ctx, r.Hash, file, r.Offset); err != nil {
-				errCh <- fmt.Errorf("failed to write chunk at offset %d: %w", r.Offset, err)
+		r := ref
+		if r.IsZeroChunk() {
+			continue // file already zeroed by Truncate
+		}
+		g.Go(func() error {
+			if err := cs.GetChunkToFile(gCtx, r.Hash, file, r.Offset); err != nil {
+				return fmt.Errorf("failed to write chunk at offset %d: %w", r.Offset, err)
 			}
-		}(ref)
+			return nil
+		})
 	}
 
-	wg.Wait()
-	close(errCh)
-
-	// Check for errors
-	for err := range errCh {
-		return err
-	}
-
-	return nil
+	return g.Wait()
 }
 
 // chunkPath returns the GCS path for a chunk
@@ -412,6 +470,127 @@ func (cs *ChunkStore) getChunkSize(ctx context.Context, hash string) (int64, err
 		return 0, err
 	}
 	return attrs.Size, nil
+}
+
+// UploadRawFile compresses a local file with zstd and uploads it to GCS as a
+// single object. Returns the GCS object path and compressed size.
+func (cs *ChunkStore) UploadRawFile(ctx context.Context, localPath, gcsObjectPath string) (string, int64, error) {
+	start := time.Now()
+
+	srcFile, err := os.Open(localPath)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to open source file: %w", err)
+	}
+	defer srcFile.Close()
+
+	srcStat, err := srcFile.Stat()
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to stat source file: %w", err)
+	}
+
+	cs.logger.WithFields(logrus.Fields{
+		"src":       localPath,
+		"dst":       gcsObjectPath,
+		"src_size":  srcStat.Size(),
+	}).Info("Uploading raw file to GCS (zstd-compressed)")
+
+	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
+	obj := bucket.Object(gcsObjectPath)
+	writer := obj.NewWriter(ctx)
+	writer.ContentType = "application/zstd"
+
+	// Create a streaming zstd encoder that writes compressed data to GCS
+	zw, err := zstd.NewWriter(writer, zstd.WithEncoderLevel(zstd.SpeedDefault))
+	if err != nil {
+		writer.Close()
+		return "", 0, fmt.Errorf("failed to create zstd writer: %w", err)
+	}
+
+	n, err := io.Copy(zw, srcFile)
+	if err != nil {
+		zw.Close()
+		writer.Close()
+		return "", 0, fmt.Errorf("failed to compress and upload: %w", err)
+	}
+
+	if err := zw.Close(); err != nil {
+		writer.Close()
+		return "", 0, fmt.Errorf("failed to close zstd writer: %w", err)
+	}
+
+	if err := writer.Close(); err != nil {
+		return "", 0, fmt.Errorf("failed to close GCS writer: %w", err)
+	}
+
+	// Get compressed size from GCS object attributes
+	attrs, err := obj.Attrs(ctx)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to get object attrs: %w", err)
+	}
+
+	cs.logger.WithFields(logrus.Fields{
+		"src":             localPath,
+		"dst":             gcsObjectPath,
+		"src_size":        n,
+		"compressed_size": attrs.Size,
+		"ratio":           float64(attrs.Size) / float64(n),
+		"duration":        time.Since(start),
+	}).Info("Raw file uploaded to GCS")
+
+	return gcsObjectPath, attrs.Size, nil
+}
+
+// DownloadRawFile downloads a zstd-compressed file from GCS and decompresses it
+// to localDestPath.
+func (cs *ChunkStore) DownloadRawFile(ctx context.Context, gcsObjectPath, localDestPath string) error {
+	start := time.Now()
+
+	cs.logger.WithFields(logrus.Fields{
+		"src": gcsObjectPath,
+		"dst": localDestPath,
+	}).Info("Downloading raw file from GCS (zstd-compressed)")
+
+	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
+	reader, err := bucket.Object(gcsObjectPath).NewReader(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to open GCS object %s: %w", gcsObjectPath, err)
+	}
+	defer reader.Close()
+
+	downloadSize := reader.Attrs.Size
+
+	// Create destination file
+	if err := os.MkdirAll(filepath.Dir(localDestPath), 0755); err != nil {
+		return fmt.Errorf("failed to create destination directory: %w", err)
+	}
+
+	destFile, err := os.Create(localDestPath)
+	if err != nil {
+		return fmt.Errorf("failed to create destination file: %w", err)
+	}
+	defer destFile.Close()
+
+	// Create streaming zstd decoder
+	zr, err := zstd.NewReader(reader)
+	if err != nil {
+		return fmt.Errorf("failed to create zstd reader: %w", err)
+	}
+	defer zr.Close()
+
+	n, err := io.Copy(destFile, zr)
+	if err != nil {
+		return fmt.Errorf("failed to decompress and write: %w", err)
+	}
+
+	cs.logger.WithFields(logrus.Fields{
+		"src":             gcsObjectPath,
+		"dst":             localDestPath,
+		"download_size":   downloadSize,
+		"decompressed_size": n,
+		"duration":        time.Since(start),
+	}).Info("Raw file downloaded and decompressed")
+
+	return nil
 }
 
 // Close closes the chunk store
@@ -554,14 +733,17 @@ func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths
 		meta.StateHash = stateHash
 	}
 
-	// Chunk memory file
+	// Upload memory file as a single compressed file (not chunked).
+	// This enables file-backed restore instead of UFFD lazy loading,
+	// eliminating the per-page-fault latency that causes 3-14 minute boot times.
 	if paths.Mem != "" {
-		b.logger.Info("Chunking memory file...")
-		memChunks, err := b.store.ChunkFile(ctx, paths.Mem, DefaultChunkSize)
+		b.logger.Info("Uploading raw memory file...")
+		memGCSPath := fmt.Sprintf("%s/snapshot.mem.zst", version)
+		_, _, err := b.store.UploadRawFile(ctx, paths.Mem, memGCSPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to chunk memory: %w", err)
+			return nil, fmt.Errorf("failed to upload raw memory file: %w", err)
 		}
-		meta.MemChunks = memChunks
+		meta.MemFilePath = memGCSPath
 
 		memStat, _ := os.Stat(paths.Mem)
 		meta.TotalMemSize = memStat.Size()
@@ -590,11 +772,11 @@ func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths
 
 	duration := time.Since(start)
 	b.logger.WithFields(logrus.Fields{
-		"version":      version,
-		"duration":     duration,
-		"mem_chunks":   len(meta.MemChunks),
-		"disk_chunks":  len(meta.RootfsChunks),
-		"total_chunks": len(meta.MemChunks) + len(meta.RootfsChunks) + len(meta.RepoCacheSeedChunks) + 2,
+		"version":       version,
+		"duration":      duration,
+		"mem_file_path": meta.MemFilePath,
+		"disk_chunks":   len(meta.RootfsChunks),
+		"total_chunks":  len(meta.RootfsChunks) + len(meta.RepoCacheSeedChunks) + 2,
 	}).Info("Chunked snapshot built successfully")
 
 	return meta, nil

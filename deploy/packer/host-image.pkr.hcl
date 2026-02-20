@@ -91,7 +91,7 @@ build {
       "set -o errexit -o nounset -o xtrace",
       "sudo apt-get update",
       "sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y",
-      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget gnupg2 software-properties-common apt-transport-https ca-certificates jq git"
+      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget gnupg2 software-properties-common apt-transport-https ca-certificates jq git xfsprogs"
     ]
   }
 
@@ -207,8 +207,7 @@ build {
       "[Install]",
       "WantedBy=multi-user.target",
       "EOF",
-      "sudo systemctl daemon-reload",
-      "sudo systemctl enable firecracker-manager"
+      "sudo systemctl daemon-reload"
     ]
   }
 
@@ -225,6 +224,18 @@ build {
   provisioner "shell" {
     inline = [
       "echo 'KERNEL==\"kvm\", GROUP=\"kvm\", MODE=\"0666\"' | sudo tee /etc/udev/rules.d/99-kvm.rules"
+    ]
+  }
+
+  # Disable unnecessary services to speed up boot (~35s savings)
+  provisioner "shell" {
+    inline = [
+      "sudo systemctl disable snap.lxd.activate.service || true",
+      "sudo systemctl disable snapd.service snapd.socket snapd.seeded.service || true",
+      "sudo systemctl disable apport.service || true",
+      "sudo systemctl mask snap.lxd.activate.service snapd.service snapd.socket snapd.seeded.service apport.service || true",
+      "sudo apt-get purge -y snapd lxd-agent-loader apport || true",
+      "sudo apt-get autoremove -y"
     ]
   }
 

@@ -32,8 +32,9 @@ type ChunkedManager struct {
 	chunkedMeta *snapshot.ChunkedSnapshotMetadata
 
 	// Per-runner UFFD handlers and FUSE disks
-	uffdHandlers map[string]*uffd.Handler
-	fuseDisks    map[string]*fuse.ChunkedDisk
+	uffdHandlers      map[string]*uffd.Handler
+	fuseDisks         map[string]*fuse.ChunkedDisk // rootfs FUSE disks per runner
+	fuseSeedDisks     map[string]*fuse.ChunkedDisk // repo-cache-seed FUSE disks per runner
 
 	// Network namespace manager (alternative to slot-based TAPs)
 	netnsNetwork *network.NetNSNetwork
@@ -75,6 +76,7 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 		Manager:       baseManager,
 		uffdHandlers:  make(map[string]*uffd.Handler),
 		fuseDisks:     make(map[string]*fuse.ChunkedDisk),
+		fuseSeedDisks: make(map[string]*fuse.ChunkedDisk),
 		useNetNS:      cfg.UseNetNS,
 		chunkedLogger: logger.WithField("component", "chunked-manager"),
 	}
@@ -84,7 +86,7 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 		// Create chunk store with in-memory LRU cache
 		cacheSize := cfg.ChunkCacheSizeBytes
 		if cacheSize <= 0 {
-			cacheSize = 2 * 1024 * 1024 * 1024 // 2GB default
+			cacheSize = 8 * 1024 * 1024 * 1024 // 8GB default
 		}
 
 		chunkStore, err := snapshot.NewChunkStore(ctx, snapshot.ChunkStoreConfig{
@@ -225,32 +227,117 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	}
 	cm.fuseDisks[runnerID] = fuseDisk
 
-	// Setup UFFD handler for lazy memory loading
-	uffdSocketPath := filepath.Join(cm.config.SocketDir, runnerID+".uffd.sock")
-	uffdHandler, err := uffd.NewHandler(uffd.HandlerConfig{
-		SocketPath: uffdSocketPath,
-		ChunkStore: cm.chunkStore,
-		Metadata:   cm.chunkedMeta,
-		MemStart:   0, // Will be set by Firecracker
-		MemSize:    uint64(cm.chunkedMeta.TotalMemSize),
-		Logger:     cm.logger.Logger,
-	})
-	if err != nil {
-		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
-		return nil, fmt.Errorf("failed to create UFFD handler: %w", err)
+	// Setup FUSE disk for lazy repo-cache-seed loading (if chunks are available).
+	// This avoids downloading the full ~20GB repo cache seed image.
+	var fuseSeedDisk *fuse.ChunkedDisk
+	if len(cm.chunkedMeta.RepoCacheSeedChunks) > 0 {
+		fuseSeedMountDir := filepath.Join(cm.config.WorkspaceDir, runnerID, "fuse-seed")
+		if err := os.MkdirAll(fuseSeedMountDir, 0755); err != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
+			return nil, fmt.Errorf("failed to create FUSE seed mount dir: %w", err)
+		}
+
+		// Compute total repo-cache-seed size from chunks
+		var totalSeedSize int64
+		for _, c := range cm.chunkedMeta.RepoCacheSeedChunks {
+			end := c.Offset + c.Size
+			if end > totalSeedSize {
+				totalSeedSize = end
+			}
+		}
+
+		fuseSeedDisk, err = fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
+			ChunkStore: cm.chunkStore,
+			Chunks:     cm.chunkedMeta.RepoCacheSeedChunks,
+			TotalSize:  totalSeedSize,
+			ChunkSize:  cm.chunkedMeta.ChunkSize,
+			MountPoint: fuseSeedMountDir,
+			Logger:     cm.logger.Logger,
+		})
+		if err != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
+			return nil, fmt.Errorf("failed to create FUSE seed disk: %w", err)
+		}
+
+		if err := fuseSeedDisk.Mount(); err != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
+			return nil, fmt.Errorf("failed to mount FUSE seed disk: %w", err)
+		}
+		cm.fuseSeedDisks[runnerID] = fuseSeedDisk
+		cm.chunkedLogger.WithField("runner_id", runnerID).Info("Mounted FUSE-backed repo-cache-seed")
 	}
 
-	if err := uffdHandler.Start(); err != nil {
-		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
-		return nil, fmt.Errorf("failed to start UFFD handler: %w", err)
-	}
-	cm.uffdHandlers[runnerID] = uffdHandler
+	// Setup memory backend: either file-backed (new) or UFFD lazy loading (legacy).
+	useFileBackedMem := cm.chunkedMeta.MemFilePath != ""
+	var uffdHandler *uffd.Handler
+	var uffdSocketPath string
+	var localMemPath string
 
-	// Get snapshot state path (kernel state, not memory - that's via UFFD)
-	snapshotPaths, err := cm.snapshotCache.GetSnapshotPaths()
-	if err != nil {
+	if useFileBackedMem {
+		// New-style: memory was downloaded as a single file at manager startup.
+		// Use file-backed restore — no UFFD handler needed.
+		localMemPath = filepath.Join(cm.config.SnapshotCachePath, "snapshot.mem")
+		if _, err := os.Stat(localMemPath); err != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
+			return nil, fmt.Errorf("raw memory file not found at %s (should have been downloaded at startup): %w", localMemPath, err)
+		}
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"runner_id": runnerID,
+			"mem_path":  localMemPath,
+		}).Info("Using file-backed memory restore")
+	} else {
+		// Legacy: UFFD lazy memory loading from chunk store.
+		uffdSocketPath = filepath.Join(cm.config.SocketDir, runnerID+".uffd.sock")
+		uffdHandler, err = uffd.NewHandler(uffd.HandlerConfig{
+			SocketPath: uffdSocketPath,
+			ChunkStore: cm.chunkStore,
+			Metadata:   cm.chunkedMeta,
+			Logger:     cm.logger.Logger,
+		})
+		if err != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
+			return nil, fmt.Errorf("failed to create UFFD handler: %w", err)
+		}
+
+		if err := uffdHandler.Start(); err != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
+			return nil, fmt.Errorf("failed to start UFFD handler: %w", err)
+		}
+		cm.uffdHandlers[runnerID] = uffdHandler
+	}
+
+	// Eagerly fetch the VM state (CPU/device state) from the ChunkStore.
+	// This is small (~100KB) and required as a local file for Firecracker restore.
+	snapshotDir := filepath.Join(cm.config.WorkspaceDir, runnerID, "snapshot")
+	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
 		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
-		return nil, fmt.Errorf("failed to get snapshot paths: %w", err)
+		return nil, fmt.Errorf("failed to create snapshot dir: %w", err)
+	}
+
+	localStatePath := filepath.Join(snapshotDir, "snapshot.state")
+	if cm.chunkedMeta.StateHash != "" {
+		stateData, err := cm.chunkStore.GetChunk(ctx, cm.chunkedMeta.StateHash)
+		if err != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+			return nil, fmt.Errorf("failed to fetch vmstate chunk: %w", err)
+		}
+		if err := os.WriteFile(localStatePath, stateData, 0644); err != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+			return nil, fmt.Errorf("failed to write vmstate: %w", err)
+		}
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"runner_id":  runnerID,
+			"state_size": len(stateData),
+		}).Debug("Fetched vmstate from chunk store")
+	}
+
+	// In chunked mode, rootfs and repo-cache-seed are served via FUSE, memory
+	// via UFFD, and state was eagerly fetched above. The only traditional local
+	// file we need is the kernel, which was eagerly fetched at manager startup.
+	kernelPath := filepath.Join(cm.config.SnapshotCachePath, "kernel.bin")
+	if _, err := os.Stat(kernelPath); err != nil {
+		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+		return nil, fmt.Errorf("kernel not found at %s (should have been eagerly fetched at startup): %w", kernelPath, err)
 	}
 
 	// Create runner record
@@ -280,12 +367,34 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	bootArgs := fmt.Sprintf("console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off",
 		guestIP, netCfg.Gateway, netCfg.Netmask)
 
+	// For repo-cache-seed drive: use FUSE-backed path if available,
+	// otherwise fall back to a placeholder (should not happen in chunked mode).
+	var repoCacheSeedPath string
+	if fuseSeedDisk != nil {
+		repoCacheSeedPath = fuseSeedDisk.DiskImagePath()
+	} else {
+		repoCacheSeedPath = filepath.Join(cm.config.SnapshotCachePath, "repo-cache-seed.img")
+	}
+
+	// Build drives to match the snapshot's drive layout.
+	// Create per-runner writable repo cache upper image.
+	repoCacheUpperPath := filepath.Join(cm.config.WorkspaceDir, runnerID, "repo-cache-upper.img")
+	if err := os.MkdirAll(filepath.Dir(repoCacheUpperPath), 0755); err != nil {
+		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+		return nil, fmt.Errorf("failed to create repo-cache-upper directory: %w", err)
+	}
+	if err := createExt4Image(repoCacheUpperPath, cm.config.RepoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
+		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+		return nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
+	}
+	drives := cm.buildDrives(repoCacheSeedPath, repoCacheUpperPath)
+
 	// Create VM configuration
 	vmCfg := firecracker.VMConfig{
 		VMID:           runnerID,
 		SocketDir:      cm.config.SocketDir,
 		FirecrackerBin: cm.config.FirecrackerBin,
-		KernelPath:     snapshotPaths.Kernel,
+		KernelPath:     kernelPath,
 		RootfsPath:     fuseDisk.DiskImagePath(), // FUSE-backed disk
 		BootArgs:       bootArgs,
 		VCPUs:          runner.Resources.VCPUs,
@@ -299,6 +408,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 			Version:           "V1",
 			NetworkInterfaces: []string{"eth0"},
 		},
+		Drives:      drives,
 		LogPath:     runner.LogPath,
 		MetricsPath: runner.MetricsPath,
 	}
@@ -310,43 +420,85 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
-	// Restore from snapshot with UFFD backend for memory
-	cm.chunkedLogger.WithFields(logrus.Fields{
-		"runner_id":   runnerID,
-		"snapshot":    snapshotPaths.State,
-		"uffd_socket": uffdSocketPath,
-	}).Info("Restoring VM with UFFD memory backend")
+	// Use the eagerly-fetched local vmstate for restore.
+	restoreStatePath := localStatePath
 
-	if err := vm.RestoreFromSnapshotWithUFFD(ctx, snapshotPaths.State, uffdSocketPath, true); err != nil {
-		cm.chunkedLogger.WithError(err).Warn("UFFD restore failed, trying traditional restore")
+	// Setup symlinks from the snapshot's baked-in drive paths (/tmp/snapshot/*.img)
+	// to the actual FUSE-backed / local paths. Firecracker opens drives by the paths
+	// recorded in the snapshot state file during LoadSnapshot.
+	symlinkCleanup, err := cm.setupChunkedSymlinks(
+		fuseDisk.DiskImagePath(),
+		repoCacheSeedPath,
+		repoCacheUpperPath,
+	)
+	if err != nil {
+		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+		return nil, fmt.Errorf("failed to setup snapshot symlinks: %w", err)
+	}
+
+	// Setup TAP rename: the snapshot bakes in host_dev_name="tap-slot-0".
+	// If this runner uses a different slot, temporarily rename its TAP.
+	tapRestore, err := cm.setupSnapshotTAPRename(tap.Name)
+	if err != nil {
+		symlinkCleanup()
+		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+		return nil, fmt.Errorf("failed to setup TAP rename: %w", err)
+	}
+
+	// Restore from snapshot.
+	// Load WITHOUT resuming so we can inject MMDS data before the guest
+	// thaw-agent wakes up. Otherwise the agent reads stale MMDS from the
+	// snapshot and skips runner registration.
+	var restoreErr error
+	if useFileBackedMem {
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"runner_id": runnerID,
+			"snapshot":  restoreStatePath,
+			"mem_path":  localMemPath,
+		}).Info("Restoring VM with file-backed memory")
+		restoreErr = vm.RestoreFromSnapshot(ctx, restoreStatePath, localMemPath, false)
+	} else {
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"runner_id":   runnerID,
+			"snapshot":    restoreStatePath,
+			"uffd_socket": uffdSocketPath,
+		}).Info("Restoring VM with UFFD memory backend")
+		restoreErr = vm.RestoreFromSnapshotWithUFFD(ctx, restoreStatePath, uffdSocketPath, false)
+	}
+	tapRestore()
+	symlinkCleanup()
+
+	if restoreErr != nil {
+		cm.chunkedLogger.WithError(restoreErr).Warn("UFFD restore failed, trying cold boot fallback")
 		vm.Stop()
 
-		// Fallback to traditional restore
 		vm, err = firecracker.NewVM(vmCfg, cm.logger.Logger)
 		if err != nil {
 			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
 			return nil, fmt.Errorf("failed to recreate VM: %w", err)
 		}
 
-		if snapshotPaths.Mem != "" && snapshotPaths.State != "" {
-			if err := vm.RestoreFromSnapshot(ctx, snapshotPaths.State, snapshotPaths.Mem, true); err != nil {
-				cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
-				return nil, fmt.Errorf("traditional restore also failed: %w", err)
-			}
-		} else {
-			if err := vm.Start(ctx); err != nil {
-				cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
-				return nil, fmt.Errorf("cold boot failed: %w", err)
-			}
+		if err := vm.Start(ctx); err != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+			return nil, fmt.Errorf("cold boot fallback failed: %w", err)
 		}
 	}
 
-	// Inject MMDS data
+	// Inject MMDS data BEFORE resuming so the thaw-agent sees fresh config
 	mmdsData := cm.buildMMDSData(ctx, runner, tap, req)
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
 		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
 		return nil, fmt.Errorf("failed to set MMDS data: %w", err)
+	}
+
+	// Now resume the VM — thaw-agent will read the fresh MMDS data
+	if restoreErr == nil {
+		if err := vm.Resume(ctx); err != nil {
+			vm.Stop()
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+			return nil, fmt.Errorf("failed to resume VM after MMDS injection: %w", err)
+		}
 	}
 
 	runner.State = StateInitializing
@@ -420,10 +572,14 @@ func (cm *ChunkedManager) ReleaseRunnerChunked(ctx context.Context, runnerID str
 		delete(cm.uffdHandlers, runnerID)
 	}
 
-	// Cleanup FUSE disk
+	// Cleanup FUSE disks
 	if disk, exists := cm.fuseDisks[runnerID]; exists {
 		disk.Unmount()
 		delete(cm.fuseDisks, runnerID)
+	}
+	if disk, exists := cm.fuseSeedDisks[runnerID]; exists {
+		disk.Unmount()
+		delete(cm.fuseSeedDisks, runnerID)
 	}
 
 	// Cleanup network
@@ -466,6 +622,11 @@ func (cm *ChunkedManager) cleanupChunkedRunner(
 	if fuseDisk != nil {
 		fuseDisk.Unmount()
 	}
+	// Also clean up repo-cache-seed FUSE disk if it was mounted
+	if seedDisk, ok := cm.fuseSeedDisks[runnerID]; ok {
+		seedDisk.Unmount()
+		delete(cm.fuseSeedDisks, runnerID)
+	}
 	if cm.useNetNS && cm.netnsNetwork != nil && netns != nil {
 		cm.netnsNetwork.ReleaseNamespace(runnerID)
 	} else if tap != nil {
@@ -477,6 +638,60 @@ func (cm *ChunkedManager) cleanupChunkedRunner(
 	}
 	workspaceDir := filepath.Join(cm.config.WorkspaceDir, runnerID)
 	os.RemoveAll(workspaceDir)
+}
+
+// setupChunkedSymlinks creates symlinks from the snapshot's baked-in drive paths
+// (/tmp/snapshot/*.img) to the actual FUSE-backed or local paths on this host.
+// Firecracker opens drive backing files during LoadSnapshot at the paths recorded
+// in the snapshot state file. Returns a cleanup function to remove the symlinks
+// after restore (Firecracker holds open fds, so symlinks can be removed).
+func (cm *ChunkedManager) setupChunkedSymlinks(rootfsPath, repoCacheSeedPath, repoCacheUpperPath string) (func(), error) {
+	if err := os.MkdirAll(snapshotSymlinkDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create snapshot symlink dir: %w", err)
+	}
+
+	// Resolve git-cache image path
+	gitCacheImg := cm.gitCacheImage
+	if gitCacheImg == "" {
+		gitCacheImg = cm.getOrCreateGitCachePlaceholder()
+	}
+
+	symlinks := []struct {
+		name   string
+		target string
+	}{
+		{"rootfs.img", rootfsPath},
+		{"repo-cache-seed.img", repoCacheSeedPath},
+		{"repo-cache-upper.img", repoCacheUpperPath},
+		{"credentials.img", cm.credentialsImage},
+		{"git-cache.img", gitCacheImg},
+	}
+
+	var created []string
+	for _, s := range symlinks {
+		if s.target == "" {
+			continue
+		}
+		linkPath := filepath.Join(snapshotSymlinkDir, s.name)
+		os.Remove(linkPath)
+		if err := os.Symlink(s.target, linkPath); err != nil {
+			for _, c := range created {
+				os.Remove(c)
+			}
+			return nil, fmt.Errorf("symlink %s -> %s: %w", linkPath, s.target, err)
+		}
+		created = append(created, linkPath)
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"link":   linkPath,
+			"target": s.target,
+		}).Debug("Created snapshot symlink")
+	}
+
+	return func() {
+		for _, c := range created {
+			os.Remove(c)
+		}
+	}, nil
 }
 
 // GetChunkedStats returns statistics for chunked snapshot system
@@ -498,6 +713,12 @@ func (cm *ChunkedManager) GetChunkedStats() ChunkedStats {
 	}
 
 	for _, disk := range cm.fuseDisks {
+		ds := disk.Stats()
+		stats.TotalDiskReads += ds.Reads
+		stats.TotalDiskWrites += ds.Writes
+		stats.TotalDirtyChunks += ds.DirtyChunks
+	}
+	for _, disk := range cm.fuseSeedDisks {
 		ds := disk.Stats()
 		stats.TotalDiskReads += ds.Reads
 		stats.TotalDiskWrites += ds.Writes
@@ -543,6 +764,10 @@ func (cm *ChunkedManager) Close() error {
 		disk.Unmount()
 		delete(cm.fuseDisks, id)
 	}
+	for id, disk := range cm.fuseSeedDisks {
+		disk.Unmount()
+		delete(cm.fuseSeedDisks, id)
+	}
 
 	// Cleanup network namespaces
 	if cm.netnsNetwork != nil {
@@ -556,6 +781,16 @@ func (cm *ChunkedManager) Close() error {
 
 	// Close base manager
 	return cm.Manager.Close()
+}
+
+// GetChunkedMetadata returns the loaded chunked snapshot metadata (may be nil).
+func (cm *ChunkedManager) GetChunkedMetadata() *snapshot.ChunkedSnapshotMetadata {
+	return cm.chunkedMeta
+}
+
+// GetChunkStore returns the underlying chunk store.
+func (cm *ChunkedManager) GetChunkStore() *snapshot.ChunkStore {
+	return cm.chunkStore
 }
 
 // GetSubnet returns the subnet from either netns or nat network

@@ -206,10 +206,16 @@ variable "memory_per_runner_mb" {
   default     = 49152
 }
 
+variable "use_chunked_snapshots" {
+  description = "Enable chunked snapshot restore with UFFD (lazy memory) and FUSE (lazy disk). Requires chunked metadata in the snapshot bucket."
+  type        = bool
+  default     = false
+}
+
 variable "runner_ephemeral" {
   description = "Whether GitHub runners are ephemeral (one job per VM) or persistent (multiple jobs)"
   type        = bool
-  default     = true
+  default     = false
 }
 
 # Container Registry configuration

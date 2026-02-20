@@ -339,8 +339,10 @@ func (c *Client) WaitForSocket(ctx context.Context, timeout time.Duration) error
 	return fmt.Errorf("timeout waiting for socket %s", c.socketPath)
 }
 
-// StartFirecracker starts the Firecracker process
-func (c *Client) StartFirecracker(ctx context.Context, firecrackerBin string) error {
+// StartFirecracker starts the Firecracker process.
+// If consolePath is non-empty, the guest serial console output (stdout/stderr)
+// is captured to that file, which includes kernel messages and thaw-agent logs.
+func (c *Client) StartFirecracker(ctx context.Context, firecrackerBin string, consolePath string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -372,6 +374,22 @@ func (c *Client) StartFirecracker(ctx context.Context, firecrackerBin string) er
 
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid: true,
+	}
+
+	// Capture guest serial console output (kernel + thaw-agent logs via console=ttyS0)
+	if consolePath != "" {
+		if err := os.MkdirAll(filepath.Dir(consolePath), 0755); err != nil {
+			c.logger.WithError(err).Warn("Failed to create console log directory")
+		} else {
+			f, err := os.OpenFile(consolePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+			if err != nil {
+				c.logger.WithError(err).Warn("Failed to open console log file")
+			} else {
+				cmd.Stdout = f
+				cmd.Stderr = f
+				c.logger.WithField("console_log", consolePath).Info("Guest console output captured")
+			}
+		}
 	}
 
 	if err := cmd.Start(); err != nil {

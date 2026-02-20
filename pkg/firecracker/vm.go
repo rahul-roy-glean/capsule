@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
@@ -33,6 +34,17 @@ type VM struct {
 	client *Client
 	config VMConfig
 	logger *logrus.Entry
+}
+
+// consolePath returns the path for guest serial console logs,
+// derived from LogPath by replacing the extension with .console.log.
+// Returns empty string if LogPath is not set.
+func (vm *VM) consolePath() string {
+	if vm.config.LogPath == "" {
+		return ""
+	}
+	ext := filepath.Ext(vm.config.LogPath)
+	return strings.TrimSuffix(vm.config.LogPath, ext) + ".console.log"
 }
 
 // NewVM creates a new VM instance
@@ -77,7 +89,7 @@ func (vm *VM) Start(ctx context.Context) error {
 	vm.logger.Info("Starting microVM (cold boot)")
 
 	// Start Firecracker process
-	if err := vm.client.StartFirecracker(ctx, vm.config.FirecrackerBin); err != nil {
+	if err := vm.client.StartFirecracker(ctx, vm.config.FirecrackerBin, vm.consolePath()); err != nil {
 		return fmt.Errorf("failed to start firecracker: %w", err)
 	}
 
@@ -193,7 +205,7 @@ func (vm *VM) RestoreFromSnapshot(ctx context.Context, snapshotPath, memPath str
 	}
 
 	// Start Firecracker process
-	if err := vm.client.StartFirecracker(ctx, vm.config.FirecrackerBin); err != nil {
+	if err := vm.client.StartFirecracker(ctx, vm.config.FirecrackerBin, vm.consolePath()); err != nil {
 		return fmt.Errorf("failed to start firecracker: %w", err)
 	}
 
@@ -315,7 +327,7 @@ func (vm *VM) RestoreFromSnapshotWithUFFD(ctx context.Context, snapshotPath, uff
 	}
 
 	// Start Firecracker process
-	if err := vm.client.StartFirecracker(ctx, vm.config.FirecrackerBin); err != nil {
+	if err := vm.client.StartFirecracker(ctx, vm.config.FirecrackerBin, vm.consolePath()); err != nil {
 		return fmt.Errorf("failed to start firecracker: %w", err)
 	}
 
