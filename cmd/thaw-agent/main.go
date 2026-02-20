@@ -682,17 +682,17 @@ func main() {
 		}
 	}
 
-	// Start application if configured
+	// Wait for bazel verification to finish before starting application
+	<-bazelDone
+	bootTimer.Phase("ci_runner")
+
+	// Start application if configured (after bazel verify so the environment is ready)
 	if !*skipApplication && mmdsData.Latest.Application.Command != "" {
 		log.WithField("command", mmdsData.Latest.Application.Command).Info("Starting application...")
 		if err := startApplication(mmdsData); err != nil {
 			log.WithError(err).Error("Failed to start application")
 		}
 	}
-
-	// Wait for bazel verification to finish (usually completes before CI registration)
-	<-bazelDone
-	bootTimer.Phase("ci_runner")
 
 	// Signal ready
 	log.Info("Signaling ready...")
