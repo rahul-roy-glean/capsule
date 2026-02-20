@@ -624,6 +624,36 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 					IdleRunners: status.IdleRunners,
 					BusyRunners: status.BusyRunners,
 				})
+
+				// Record chunked snapshot metrics
+				if chunkedMgr != nil {
+					cs := chunkedMgr.GetChunkedStats()
+					metricsClient.RecordChunkedMetrics(ctx, telemetry.ChunkedMetrics{
+						CacheSize:    cs.CacheSize,
+						CacheMaxSize: cs.CacheMaxSize,
+						CacheItems:   cs.CacheItems,
+						PageFaults:   cs.TotalPageFaults,
+						CacheHits:    cs.TotalCacheHits,
+						ChunkFetches: cs.TotalChunkFetches,
+						DiskReads:    cs.TotalDiskReads,
+						DiskWrites:   cs.TotalDiskWrites,
+						DirtyChunks:  cs.TotalDirtyChunks,
+					})
+				}
+
+				// Record runner pool metrics
+				if pool := mgr.GetPool(); pool != nil {
+					ps := pool.Stats()
+					metricsClient.RecordPoolMetrics(ctx, telemetry.PoolMetrics{
+						PooledRunners:   ps.PooledRunners,
+						PoolHits:        ps.PoolHits,
+						PoolMisses:      ps.PoolMisses,
+						Evictions:       ps.Evictions,
+						RecycleFailures: ps.RecycleFailures,
+						MemoryUsedBytes: ps.MemoryUsageBytes,
+						MemoryMaxBytes:  ps.MaxMemoryBytes,
+					})
+				}
 			}
 		}
 	}
