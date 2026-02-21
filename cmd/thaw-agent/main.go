@@ -1719,7 +1719,7 @@ func registerGitHubRunner(data *MMDSData) error {
 
 	// Start runner in background as 'runner' user
 	// Use setsid to create a new session so runner survives if thaw-agent exits
-	runCmd := exec.Command(filepath.Join(runnerPath, "run.sh"))
+	runCmd := exec.Command(filepath.Join(runnerPath, "run.sh"), "--disableupdate")
 	runCmd.Dir = runnerPath
 	runCmd.Stdout = os.Stdout
 	runCmd.Stderr = os.Stderr
@@ -1730,7 +1730,7 @@ func registerGitHubRunner(data *MMDSData) error {
 		},
 		Setsid: true, // Create new session so runner survives parent exit
 	}
-	runCmd.Env = append(os.Environ(), "HOME="+runnerUser.HomeDir, "RUNNER_DISABLEUPDATE=1")
+	runCmd.Env = append(os.Environ(), "HOME="+runnerUser.HomeDir)
 
 	log.Info("Starting GitHub runner (run.sh)...")
 	runStart := time.Now()
@@ -2291,7 +2291,7 @@ func updateGitHubRunner(runnerPath string, cred *syscall.SysProcAttr, homeEnv st
 		return
 	}
 
-	// Save tarball to temp file.
+	// Save tarball to temp file (world-readable so runner user can access it).
 	tmpFile, err := os.CreateTemp("", "runner-*.tar.gz")
 	if err != nil {
 		log.WithError(err).Warn("Failed to create temp file")
@@ -2306,15 +2306,14 @@ func updateGitHubRunner(runnerPath string, cred *syscall.SysProcAttr, homeEnv st
 		return
 	}
 	tmpFile.Close()
+	os.Chmod(tmpPath, 0644)
 
 	log.WithField("duration_ms", time.Since(start).Milliseconds()).Info("Runner tarball downloaded")
 
-	// Extract over existing installation.
-	// The runner tarball extracts into the current directory with bin/, externals/, etc.
+	// Extract as root over existing installation, then chown to runner user.
+	// We extract as root because the temp file is owned by root and the runner
+	// user may not have write access to all directories being overwritten.
 	extractCmd := exec.Command("tar", "-xzf", tmpPath, "-C", runnerPath)
-	if cred != nil {
-		extractCmd.SysProcAttr = cred
-	}
 	if out, err := extractCmd.CombinedOutput(); err != nil {
 		log.WithFields(logrus.Fields{
 			"error":  err,
