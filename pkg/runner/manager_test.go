@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sirupsen/logrus"
 
@@ -511,5 +512,101 @@ func TestSetRunnerState_NotFound(t *testing.T) {
 	err := m.SetRunnerState("nonexistent", StateBusy)
 	if err == nil {
 		t.Error("SetRunnerState(nonexistent) should return error")
+	}
+}
+
+func TestIdempotencyTracking(t *testing.T) {
+	m := newTestManager()
+	m.recentRequests = make(map[string]*recentAllocation)
+
+	// Simulate a recent allocation
+	runner := &Runner{ID: "test-runner-1", State: StateIdle}
+	m.runners["test-runner-1"] = runner
+	m.recentRequests["req-123"] = &recentAllocation{
+		runner:    runner,
+		allocTime: time.Now(),
+	}
+
+	// Verify dedup check finds it
+	m.mu.RLock()
+	recent, ok := m.recentRequests["req-123"]
+	m.mu.RUnlock()
+
+	if !ok {
+		t.Fatal("Expected to find recent request")
+	}
+	if recent.runner.ID != "test-runner-1" {
+		t.Errorf("Expected runner ID test-runner-1, got %s", recent.runner.ID)
+	}
+	if time.Since(recent.allocTime) > 5*time.Minute {
+		t.Error("Recent allocation should not be expired yet")
+	}
+}
+
+func TestIdempotencyCleanup(t *testing.T) {
+	m := newTestManager()
+	m.recentRequests = make(map[string]*recentAllocation)
+
+	// Add an expired entry
+	m.recentRequests["old-req"] = &recentAllocation{
+		runner:    &Runner{ID: "old-runner"},
+		allocTime: time.Now().Add(-10 * time.Minute), // 10 min ago, past 5 min TTL
+	}
+	// Add a fresh entry
+	m.recentRequests["new-req"] = &recentAllocation{
+		runner:    &Runner{ID: "new-runner"},
+		allocTime: time.Now(),
+	}
+
+	m.cleanupRecentRequests()
+
+	if _, ok := m.recentRequests["old-req"]; ok {
+		t.Error("Expired request should have been cleaned up")
+	}
+	if _, ok := m.recentRequests["new-req"]; !ok {
+		t.Error("Fresh request should not have been cleaned up")
+	}
+}
+
+func TestDrainBlocksAllocation(t *testing.T) {
+	m := newTestManager()
+	m.SetDraining(true)
+
+	if !m.IsDraining() {
+		t.Error("Expected manager to be draining")
+	}
+	if m.CanAddRunner() {
+		t.Error("Draining manager should not accept new runners")
+	}
+}
+
+func TestCanAddRunner_AtCapacity(t *testing.T) {
+	m := newTestManager()
+	// Fill to capacity (MaxRunners=4)
+	for i := 0; i < 4; i++ {
+		m.runners[fmt.Sprintf("runner-%d", i)] = &Runner{ID: fmt.Sprintf("runner-%d", i)}
+	}
+
+	if m.CanAddRunner() {
+		t.Error("Manager at capacity should not accept new runners")
+	}
+}
+
+func TestSetDraining_ChangedReport(t *testing.T) {
+	m := newTestManager()
+
+	// First set should report changed
+	if !m.SetDraining(true) {
+		t.Error("First SetDraining(true) should return changed=true")
+	}
+
+	// Same value should report not changed
+	if m.SetDraining(true) {
+		t.Error("Second SetDraining(true) should return changed=false")
+	}
+
+	// Different value should report changed
+	if !m.SetDraining(false) {
+		t.Error("SetDraining(false) after true should return changed=true")
 	}
 }

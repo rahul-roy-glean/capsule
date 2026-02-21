@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sort"
-	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -17,14 +17,15 @@ import (
 // Scheduler handles runner allocation across hosts
 type Scheduler struct {
 	hostRegistry *HostRegistry
-	mu           sync.RWMutex
+	db           *sql.DB
 	logger       *logrus.Entry
 }
 
 // NewScheduler creates a new scheduler
-func NewScheduler(hr *HostRegistry, logger *logrus.Logger) *Scheduler {
+func NewScheduler(hr *HostRegistry, db *sql.DB, logger *logrus.Logger) *Scheduler {
 	return &Scheduler{
 		hostRegistry: hr,
+		db:           db,
 		logger:       logger.WithField("component", "scheduler"),
 	}
 }
@@ -35,6 +36,7 @@ type AllocateRunnerRequest struct {
 	Repo              string
 	Branch            string
 	Commit            string
+	RepoSlug          string
 	Labels            map[string]string
 	GitHubRunnerToken string
 	VCPUs             int
@@ -58,14 +60,32 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		"branch":     req.Branch,
 	}).Info("Allocating runner")
 
+	// Derive repo slug for multi-repo support
+	repoSlug := req.RepoSlug
+
+	// Per-repo fairness: check max_concurrent_runners
+	if repoSlug != "" && s.db != nil {
+		var maxConcurrent int
+		err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners FROM repos WHERE slug = $1`, repoSlug).Scan(&maxConcurrent)
+		if err == nil && maxConcurrent > 0 {
+			var currentCount int
+			_ = s.db.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM runners WHERE repo = $1 AND status IN ('running','busy','initializing')
+			`, req.Repo).Scan(&currentCount)
+			if currentCount >= maxConcurrent {
+				return nil, fmt.Errorf("repo %s at max concurrent runners (%d/%d)", repoSlug, currentCount, maxConcurrent)
+			}
+		}
+	}
+
 	// Get available hosts
 	hosts := s.hostRegistry.GetAvailableHosts()
 	if len(hosts) == 0 {
 		return nil, fmt.Errorf("no available hosts")
 	}
 
-	// Score and select best host
-	host := s.selectBestHost(hosts)
+	// Score and select best host (with repo-aware affinity)
+	host := s.selectBestHostForRepo(hosts, repoSlug)
 	if host == nil {
 		return nil, fmt.Errorf("no suitable host found")
 	}
@@ -137,13 +157,12 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	}, nil
 }
 
-// selectBestHost selects the best host based on scoring
-func (s *Scheduler) selectBestHost(hosts []*Host) *Host {
+// selectBestHostForRepo selects the best host with repo-aware cache affinity.
+func (s *Scheduler) selectBestHostForRepo(hosts []*Host, repoSlug string) *Host {
 	if len(hosts) == 0 {
 		return nil
 	}
 
-	// Score hosts
 	type scoredHost struct {
 		host  *Host
 		score float64
@@ -151,11 +170,10 @@ func (s *Scheduler) selectBestHost(hosts []*Host) *Host {
 
 	var scored []scoredHost
 	for _, h := range hosts {
-		score := s.scoreHost(h)
+		score := s.scoreHostForRepo(h, repoSlug)
 		scored = append(scored, scoredHost{host: h, score: score})
 	}
 
-	// Sort by score (higher is better)
 	sort.Slice(scored, func(i, j int) bool {
 		return scored[i].score > scored[j].score
 	})
@@ -163,7 +181,29 @@ func (s *Scheduler) selectBestHost(hosts []*Host) *Host {
 	return scored[0].host
 }
 
-// scoreHost calculates a score for a host
+// scoreHostForRepo calculates a score for a host with repo-aware cache affinity.
+func (s *Scheduler) scoreHostForRepo(h *Host, repoSlug string) float64 {
+	score := s.scoreHost(h)
+
+	// Repo-aware cache affinity scoring:
+	// If we have loaded manifests info (from heartbeat), prefer hosts with warm caches.
+	if repoSlug != "" && h.LoadedManifests != nil {
+		if version, ok := h.LoadedManifests[repoSlug]; ok {
+			// Host has a manifest loaded for this repo
+			// Check if it's the current version (ideal) or any version (warm-ish)
+			if version != "" {
+				score += 100 // Warm cache: manifest loaded for this repo
+			} else {
+				score += 50 // Manifest loaded but version unknown
+			}
+		}
+		// No manifest for this repo: +0 (cold, but fast in UFFD mode)
+	}
+
+	return score
+}
+
+// scoreHost calculates a base score for a host
 func (s *Scheduler) scoreHost(h *Host) float64 {
 	var score float64
 
@@ -311,8 +351,13 @@ func (s *Scheduler) UnquarantineRunner(ctx context.Context, runnerID string, unb
 
 // GetQueueDepth returns the current queue depth
 func (s *Scheduler) GetQueueDepth() int {
-	// In production, track pending requests
-	return 0
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE status='queued'`).Scan(&count)
+	if err != nil {
+		s.logger.WithError(err).Warn("Failed to query queue depth")
+		return 0
+	}
+	return count
 }
 
 // GetStats returns scheduler statistics

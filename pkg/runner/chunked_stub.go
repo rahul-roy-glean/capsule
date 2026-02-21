@@ -11,6 +11,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/ci"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
 // ChunkedManager is a stub for non-Linux platforms
@@ -75,4 +76,24 @@ func (cm *ChunkedManager) GetSubnet() *net.IPNet {
 		return cm.Manager.network.GetSubnet()
 	}
 	return nil
+}
+
+// GetChunkedMetadata is a stub
+func (cm *ChunkedManager) GetChunkedMetadata() *snapshot.ChunkedSnapshotMetadata {
+	return nil
+}
+
+// GetChunkStore is a stub
+func (cm *ChunkedManager) GetChunkStore() *snapshot.ChunkStore {
+	return nil
+}
+
+// GetLoadedManifests is a stub
+func (cm *ChunkedManager) GetLoadedManifests() map[string]string {
+	return nil
+}
+
+// SyncManifest is a stub
+func (cm *ChunkedManager) SyncManifest(ctx context.Context, repoSlug, version string) error {
+	return fmt.Errorf("chunked snapshots are only supported on Linux")
 }

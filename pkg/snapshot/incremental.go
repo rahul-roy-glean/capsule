@@ -239,17 +239,98 @@ func (u *IncrementalUploader) UpdateSnapshotPointer(ctx context.Context, meta *C
 	return nil
 }
 
-// GarbageCollect removes chunks that are not referenced by any snapshot
-// This should be called periodically to clean up old chunks
+// GarbageCollect removes chunks that are not referenced by any of the keepVersions.
+// It loads all chunk manifests for the versions to keep, builds a set of referenced
+// hashes, lists all chunks in GCS, and deletes unreferenced ones.
 func (u *IncrementalUploader) GarbageCollect(ctx context.Context, keepVersions []string) error {
 	u.logger.WithField("keep_versions", keepVersions).Info("Starting garbage collection")
 
-	// TODO: Implement garbage collection
-	// 1. Load metadata for all versions to keep
-	// 2. Build set of all referenced chunk hashes
-	// 3. List all chunks in storage
-	// 4. Delete chunks not in referenced set
+	if len(keepVersions) == 0 {
+		u.logger.Warn("No versions to keep, skipping GC")
+		return nil
+	}
 
-	u.logger.Warn("Garbage collection not yet implemented")
+	// 1. Load metadata for all versions to keep
+	referencedHashes := make(map[string]bool)
+	for _, version := range keepVersions {
+		meta, err := u.store.LoadChunkedMetadata(ctx, version)
+		if err != nil {
+			u.logger.WithError(err).WithField("version", version).Warn("Failed to load metadata for GC, skipping version")
+			continue
+		}
+
+		// Collect all referenced chunk hashes
+		if meta.KernelHash != "" {
+			referencedHashes[meta.KernelHash] = true
+		}
+		if meta.StateHash != "" {
+			referencedHashes[meta.StateHash] = true
+		}
+		for _, chunk := range meta.MemChunks {
+			if chunk.Hash != "" && chunk.Hash != ZeroChunkHash {
+				referencedHashes[chunk.Hash] = true
+			}
+		}
+		for _, chunk := range meta.RootfsChunks {
+			if chunk.Hash != "" && chunk.Hash != ZeroChunkHash {
+				referencedHashes[chunk.Hash] = true
+			}
+		}
+		for _, chunk := range meta.RepoCacheSeedChunks {
+			if chunk.Hash != "" && chunk.Hash != ZeroChunkHash {
+				referencedHashes[chunk.Hash] = true
+			}
+		}
+
+		u.logger.WithFields(logrus.Fields{
+			"version":           version,
+			"referenced_chunks": len(referencedHashes),
+		}).Debug("Loaded chunk references for version")
+	}
+
+	u.logger.WithField("total_referenced", len(referencedHashes)).Info("Built referenced chunk set")
+
+	// 2. List all chunks in GCS
+	allChunks, err := u.store.ListChunks(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list chunks: %w", err)
+	}
+
+	u.logger.WithField("total_chunks", len(allChunks)).Info("Listed all chunks in storage")
+
+	// 3. Find unreferenced chunks
+	var toDelete []string
+	for _, hash := range allChunks {
+		if !referencedHashes[hash] {
+			toDelete = append(toDelete, hash)
+		}
+	}
+
+	if len(toDelete) == 0 {
+		u.logger.Info("No unreferenced chunks to delete")
+		return nil
+	}
+
+	u.logger.WithFields(logrus.Fields{
+		"unreferenced": len(toDelete),
+		"referenced":   len(referencedHashes),
+		"total":        len(allChunks),
+	}).Info("Deleting unreferenced chunks")
+
+	// 4. Delete unreferenced chunks
+	deleted := 0
+	for _, hash := range toDelete {
+		if err := u.store.DeleteChunk(ctx, hash); err != nil {
+			u.logger.WithError(err).WithField("hash", hash).Warn("Failed to delete chunk")
+			continue
+		}
+		deleted++
+	}
+
+	u.logger.WithFields(logrus.Fields{
+		"deleted": deleted,
+		"failed":  len(toDelete) - deleted,
+	}).Info("Garbage collection complete")
+
 	return nil
 }

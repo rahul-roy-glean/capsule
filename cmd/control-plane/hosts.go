@@ -26,6 +26,10 @@ type Host struct {
 	GRPCAddress      string
 	HTTPAddress      string
 	CreatedAt        time.Time
+	// LoadedManifests tracks which chunked snapshot manifests are loaded per repo (repo_slug → version)
+	LoadedManifests map[string]string
+	// DiskUsage is the reported disk usage percentage (0.0-1.0)
+	DiskUsage float64
 }
 
 // Runner represents a runner instance
@@ -292,9 +296,9 @@ func (hr *HostRegistry) AddRunner(ctx context.Context, runner *Runner) error {
 	defer hr.mu.Unlock()
 
 	_, err := hr.db.ExecContext(ctx, `
-		INSERT INTO runners (id, host_id, status, internal_ip, repo, branch)
-		VALUES ($1, $2, $3, $4, $5, $6)
-	`, runner.ID, runner.HostID, runner.Status, runner.InternalIP, runner.Repo, runner.Branch)
+		INSERT INTO runners (id, host_id, status, internal_ip, job_id, repo, branch)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+	`, runner.ID, runner.HostID, runner.Status, runner.InternalIP, runner.JobID, runner.Repo, runner.Branch)
 
 	if err != nil {
 		return err

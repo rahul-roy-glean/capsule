@@ -114,10 +114,10 @@ func TestParallelUploadErrorCollection(t *testing.T) {
 		{
 			name: "all_succeed",
 			fileErrors: map[string]error{
-				"kernel.bin":         nil,
-				"rootfs.img":        nil,
-				"snapshot.mem":      nil,
-				"snapshot.state":    nil,
+				"kernel.bin":          nil,
+				"rootfs.img":          nil,
+				"snapshot.mem":        nil,
+				"snapshot.state":      nil,
 				"repo-cache-seed.img": nil,
 			},
 			wantErr: false,
@@ -125,10 +125,10 @@ func TestParallelUploadErrorCollection(t *testing.T) {
 		{
 			name: "one_failure",
 			fileErrors: map[string]error{
-				"kernel.bin":         nil,
-				"rootfs.img":        fmt.Errorf("upload failed"),
-				"snapshot.mem":      nil,
-				"snapshot.state":    nil,
+				"kernel.bin":          nil,
+				"rootfs.img":          fmt.Errorf("upload failed"),
+				"snapshot.mem":        nil,
+				"snapshot.state":      nil,
 				"repo-cache-seed.img": nil,
 			},
 			wantErr:   true,
@@ -137,10 +137,10 @@ func TestParallelUploadErrorCollection(t *testing.T) {
 		{
 			name: "all_fail",
 			fileErrors: map[string]error{
-				"kernel.bin":         fmt.Errorf("fail1"),
-				"rootfs.img":        fmt.Errorf("fail2"),
-				"snapshot.mem":      fmt.Errorf("fail3"),
-				"snapshot.state":    fmt.Errorf("fail4"),
+				"kernel.bin":          fmt.Errorf("fail1"),
+				"rootfs.img":          fmt.Errorf("fail2"),
+				"snapshot.mem":        fmt.Errorf("fail3"),
+				"snapshot.state":      fmt.Errorf("fail4"),
 				"repo-cache-seed.img": fmt.Errorf("fail5"),
 			},
 			wantErr:   true,
@@ -203,10 +203,10 @@ func TestUploadSnapshotSizeCalculation(t *testing.T) {
 
 	// Create test files of known sizes
 	testFiles := map[string]int{
-		"kernel.bin":         1024,
-		"rootfs.img":        2048,
-		"snapshot.mem":      4096,
-		"snapshot.state":    512,
+		"kernel.bin":          1024,
+		"rootfs.img":          2048,
+		"snapshot.mem":        4096,
+		"snapshot.state":      512,
 		"repo-cache-seed.img": 8192,
 	}
 

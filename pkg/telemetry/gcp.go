@@ -354,15 +354,15 @@ func (c *Client) RecordHostMetrics(ctx context.Context, m HostMetrics) {
 
 // ChunkedMetrics holds chunked snapshot system metrics.
 type ChunkedMetrics struct {
-	CacheSize       int64
-	CacheMaxSize    int64
-	CacheItems      int
-	PageFaults      uint64
-	CacheHits       uint64
-	ChunkFetches    uint64
-	DiskReads       uint64
-	DiskWrites      uint64
-	DirtyChunks     int
+	CacheSize    int64
+	CacheMaxSize int64
+	CacheItems   int
+	PageFaults   uint64
+	CacheHits    uint64
+	ChunkFetches uint64
+	DiskReads    uint64
+	DiskWrites   uint64
+	DirtyChunks  int
 }
 
 // RecordChunkedMetrics records chunked snapshot system metrics.
@@ -387,13 +387,13 @@ func (c *Client) RecordChunkedMetrics(ctx context.Context, m ChunkedMetrics) {
 
 // PoolMetrics holds runner pool metrics.
 type PoolMetrics struct {
-	PooledRunners    int
-	PoolHits         int64
-	PoolMisses       int64
-	Evictions        int64
-	RecycleFailures  int64
-	MemoryUsedBytes  int64
-	MemoryMaxBytes   int64
+	PooledRunners   int
+	PoolHits        int64
+	PoolMisses      int64
+	Evictions       int64
+	RecycleFailures int64
+	MemoryUsedBytes int64
+	MemoryMaxBytes  int64
 }
 
 // RecordPoolMetrics records runner pool metrics.

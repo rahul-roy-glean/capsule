@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -19,15 +18,17 @@ import (
 type GitHubWebhookHandler struct {
 	scheduler     *Scheduler
 	hostRegistry  *HostRegistry
+	jobQueue      *JobQueue
 	webhookSecret string
 	logger        *logrus.Entry
 }
 
 // NewGitHubWebhookHandler creates a new webhook handler
-func NewGitHubWebhookHandler(s *Scheduler, hr *HostRegistry, logger *logrus.Logger) *GitHubWebhookHandler {
+func NewGitHubWebhookHandler(s *Scheduler, hr *HostRegistry, jq *JobQueue, logger *logrus.Logger) *GitHubWebhookHandler {
 	return &GitHubWebhookHandler{
 		scheduler:     s,
 		hostRegistry:  hr,
+		jobQueue:      jq,
 		webhookSecret: os.Getenv("GITHUB_WEBHOOK_SECRET"),
 		logger:        logger.WithField("component", "github-webhook"),
 	}
@@ -166,30 +167,16 @@ func (h *GitHubWebhookHandler) handleJobQueued(ctx context.Context, event *Workf
 	h.logger.WithFields(logrus.Fields{
 		"job_id": event.WorkflowJob.ID,
 		"repo":   event.Repository.FullName,
-	}).Info("Allocating runner for queued job")
+	}).Info("Enqueuing job for allocation")
 
-	// Request runner allocation
-	req := AllocateRunnerRequest{
-		RequestID: fmt.Sprintf("gh-%d", event.WorkflowJob.ID),
-		Repo:      event.Repository.FullName,
-		Branch:    event.WorkflowJob.HeadBranch,
-		Commit:    event.WorkflowJob.HeadSHA,
-		Labels:    labelsToMap(event.WorkflowJob.Labels),
-	}
-
-	resp, err := h.scheduler.AllocateRunner(ctx, req)
+	jobID, err := h.jobQueue.EnqueueJob(ctx, event)
 	if err != nil {
-		h.logger.WithError(err).Error("Failed to allocate runner")
-		// Don't return error to GitHub - they'll retry
-		w.WriteHeader(http.StatusOK)
-		return
+		h.logger.WithError(err).Error("Failed to enqueue job")
+	} else {
+		h.logger.WithField("job_id", jobID).Info("Job enqueued successfully")
 	}
 
-	h.logger.WithFields(logrus.Fields{
-		"runner_id": resp.RunnerID,
-		"host_id":   resp.HostID,
-	}).Info("Runner allocated successfully")
-
+	// Always return 200 to GitHub
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -200,15 +187,8 @@ func (h *GitHubWebhookHandler) handleJobInProgress(ctx context.Context, event *W
 		"runner_name": event.WorkflowJob.RunnerName,
 	}).Info("Job started running")
 
-	// Update runner status in registry
-	// The runner name should match our runner ID
-	if event.WorkflowJob.RunnerName != "" {
-		// Find runner by name and update status
-		// runner, _ := h.hostRegistry.GetRunnerByName(event.WorkflowJob.RunnerName)
-		// if runner != nil {
-		//     runner.Status = "busy"
-		//     runner.JobID = fmt.Sprintf("%d", event.WorkflowJob.ID)
-		// }
+	if err := h.jobQueue.UpdateJobInProgress(ctx, event.WorkflowJob.ID, event.WorkflowJob.RunnerName); err != nil {
+		h.logger.WithError(err).Warn("Failed to update job to in_progress")
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -222,11 +202,18 @@ func (h *GitHubWebhookHandler) handleJobCompleted(ctx context.Context, event *Wo
 		"runner_name": event.WorkflowJob.RunnerName,
 	}).Info("Job completed")
 
-	// Release the runner
+	if err := h.jobQueue.CompleteJob(ctx, event.WorkflowJob.ID, event.WorkflowJob.RunnerName); err != nil {
+		h.logger.WithError(err).Warn("Failed to complete job")
+	}
+
+	// Release the runner associated with this job
 	if event.WorkflowJob.RunnerName != "" {
-		// Find and release runner
-		// Since we use ephemeral runners, the runner will self-terminate
-		// But we should clean up our records
+		runner, err := h.hostRegistry.GetRunner(event.WorkflowJob.RunnerName)
+		if err == nil && runner != nil {
+			if releaseErr := h.scheduler.ReleaseRunner(ctx, runner.ID, true); releaseErr != nil {
+				h.logger.WithError(releaseErr).WithField("runner_id", runner.ID).Warn("Failed to release runner")
+			}
+		}
 	}
 
 	w.WriteHeader(http.StatusOK)

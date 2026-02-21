@@ -32,6 +32,7 @@ type Runner struct {
 	SnapshotVersion         string
 	GitHubRunnerID          string
 	GitHubRepo              string // Repository for pool key matching
+	RepoSlug                string // Deterministic repo slug for multi-repo support
 	CISystem                string // CI system used for this runner (e.g., "github-actions")
 	JobID                   string
 	Resources               Resources
@@ -72,6 +73,7 @@ type AllocateRequest struct {
 	Repo              string
 	Branch            string
 	Commit            string
+	RepoSlug          string // Deterministic repo identifier for multi-repo support
 	Resources         Resources
 	Labels            map[string]string
 	GitHubRunnerToken string
@@ -86,6 +88,7 @@ type MMDSData struct {
 			HostID       string `json:"host_id"`
 			InstanceName string `json:"instance_name,omitempty"`
 			Environment  string `json:"environment"`
+			JobID        string `json:"job_id,omitempty"`
 			CurrentTime  string `json:"current_time,omitempty"` // RFC3339 timestamp from host for clock sync
 		} `json:"meta"`
 		Buildbarn struct {

@@ -615,3 +615,151 @@ func TestTryRecycle(t *testing.T) {
 		t.Errorf("Expected 1 pooled runner, got %d", pool.Len())
 	}
 }
+
+func TestFlushOlderThan_EvictsStaleVersions(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.DebugLevel)
+
+	cfg := DefaultPoolConfig()
+	cfg.Enabled = true
+	cfg.MaxPooledRunners = 10
+
+	pool := NewPool(cfg, logger)
+
+	removedRunners := make(map[string]bool)
+	var removeMu sync.Mutex
+	pool.SetCallbacks(
+		func(ctx context.Context, runnerID string) error { return nil },
+		func(ctx context.Context, runnerID string) error { return nil },
+		nil,
+		func(ctx context.Context, runnerID string) error {
+			removeMu.Lock()
+			removedRunners[runnerID] = true
+			removeMu.Unlock()
+			return nil
+		},
+	)
+
+	// Manually add runners with different versions (bypass pause)
+	pool.mu.Lock()
+	pool.runners = append(pool.runners, &pooledRunner{
+		Runner: &Runner{ID: "old-1", State: StatePaused, SnapshotVersion: "v1"},
+		key:    &RunnerKey{SnapshotVersion: "v1"},
+	})
+	pool.runners = append(pool.runners, &pooledRunner{
+		Runner: &Runner{ID: "old-2", State: StatePaused, SnapshotVersion: "v1"},
+		key:    &RunnerKey{SnapshotVersion: "v1"},
+	})
+	pool.runners = append(pool.runners, &pooledRunner{
+		Runner: &Runner{ID: "current", State: StatePaused, SnapshotVersion: "v2"},
+		key:    &RunnerKey{SnapshotVersion: "v2"},
+	})
+	pool.mu.Unlock()
+
+	ctx := context.Background()
+	evicted := pool.FlushOlderThan(ctx, "v2")
+
+	if evicted != 2 {
+		t.Errorf("FlushOlderThan evicted %d runners, want 2", evicted)
+	}
+
+	if pool.Len() != 1 {
+		t.Errorf("Pool has %d runners after flush, want 1", pool.Len())
+	}
+
+	// Wait for async removals
+	time.Sleep(100 * time.Millisecond)
+
+	removeMu.Lock()
+	if !removedRunners["old-1"] || !removedRunners["old-2"] {
+		t.Error("Expected old runners to be removed")
+	}
+	if removedRunners["current"] {
+		t.Error("Current version runner should not be removed")
+	}
+	removeMu.Unlock()
+}
+
+func TestFlushOlderThan_EmptyVersion(t *testing.T) {
+	logger := logrus.New()
+	pool := NewPool(DefaultPoolConfig(), logger)
+
+	evicted := pool.FlushOlderThan(context.Background(), "")
+	if evicted != 0 {
+		t.Errorf("FlushOlderThan with empty version should return 0, got %d", evicted)
+	}
+}
+
+func TestFlushOlderThan_NoMatches(t *testing.T) {
+	logger := logrus.New()
+	cfg := DefaultPoolConfig()
+	cfg.Enabled = true
+	pool := NewPool(cfg, logger)
+
+	pool.mu.Lock()
+	pool.runners = append(pool.runners, &pooledRunner{
+		Runner: &Runner{ID: "r1", State: StatePaused, SnapshotVersion: "v2"},
+		key:    &RunnerKey{SnapshotVersion: "v2"},
+	})
+	pool.mu.Unlock()
+
+	evicted := pool.FlushOlderThan(context.Background(), "v2")
+	if evicted != 0 {
+		t.Errorf("FlushOlderThan should evict 0 when all match, got %d", evicted)
+	}
+	if pool.Len() != 1 {
+		t.Errorf("Pool should still have 1 runner, got %d", pool.Len())
+	}
+}
+
+func TestFlushByDesiredVersions(t *testing.T) {
+	logger := logrus.New()
+	cfg := DefaultPoolConfig()
+	cfg.Enabled = true
+	cfg.MaxPooledRunners = 10
+	pool := NewPool(cfg, logger)
+
+	pool.SetCallbacks(nil, nil, nil,
+		func(ctx context.Context, runnerID string) error { return nil },
+	)
+
+	pool.mu.Lock()
+	pool.runners = append(pool.runners,
+		&pooledRunner{
+			Runner: &Runner{ID: "r1", State: StatePaused, SnapshotVersion: "v1", GitHubRepo: "org/repo-a"},
+			key:    &RunnerKey{SnapshotVersion: "v1"},
+		},
+		&pooledRunner{
+			Runner: &Runner{ID: "r2", State: StatePaused, SnapshotVersion: "v2", GitHubRepo: "org/repo-a"},
+			key:    &RunnerKey{SnapshotVersion: "v2"},
+		},
+		&pooledRunner{
+			Runner: &Runner{ID: "r3", State: StatePaused, SnapshotVersion: "v1", GitHubRepo: "org/repo-b"},
+			key:    &RunnerKey{SnapshotVersion: "v1"},
+		},
+	)
+	pool.mu.Unlock()
+
+	desired := map[string]string{
+		"org/repo-a": "v2", // r1 is stale for repo-a
+		"org/repo-b": "v1", // r3 is current for repo-b
+	}
+
+	evicted := pool.FlushByDesiredVersions(context.Background(), desired)
+	if evicted != 1 {
+		t.Errorf("FlushByDesiredVersions evicted %d, want 1 (only r1)", evicted)
+	}
+	if pool.Len() != 2 {
+		t.Errorf("Pool has %d runners, want 2", pool.Len())
+	}
+}
+
+func TestFlushByDesiredVersions_EmptyMap(t *testing.T) {
+	logger := logrus.New()
+	pool := NewPool(DefaultPoolConfig(), logger)
+
+	evicted := pool.FlushByDesiredVersions(context.Background(), nil)
+	if evicted != 0 {
+		t.Errorf("FlushByDesiredVersions with nil map should return 0, got %d", evicted)
+	}
+}

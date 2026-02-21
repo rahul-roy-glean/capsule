@@ -22,6 +22,8 @@ type SnapshotMetadata struct {
 	Version      string    `json:"version"`
 	BazelVersion string    `json:"bazel_version"`
 	RepoCommit   string    `json:"repo_commit"`
+	Repo         string    `json:"repo,omitempty"`
+	RepoSlug     string    `json:"repo_slug,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	SizeBytes    int64     `json:"size_bytes"`
 	KernelPath   string    `json:"kernel_path"`
@@ -140,8 +142,17 @@ func (c *Cache) SyncFromGCS(ctx context.Context, version string) error {
 // resolveCurrentPointer reads the current-pointer.json file from GCS to find
 // the versioned directory. Returns empty string if pointer file doesn't exist.
 func (c *Cache) resolveCurrentPointer(ctx context.Context) (string, error) {
+	return c.resolveCurrentPointerForRepo(ctx, "")
+}
+
+// resolveCurrentPointerForRepo reads the repo-scoped current-pointer.json from GCS.
+func (c *Cache) resolveCurrentPointerForRepo(ctx context.Context, repoSlug string) (string, error) {
+	pointerPath := "current-pointer.json"
+	if repoSlug != "" {
+		pointerPath = repoSlug + "/current-pointer.json"
+	}
 	bucket := c.gcsClient.Bucket(c.gcsBucket)
-	obj := bucket.Object("current-pointer.json")
+	obj := bucket.Object(pointerPath)
 
 	reader, err := obj.NewReader(ctx)
 	if err != nil {

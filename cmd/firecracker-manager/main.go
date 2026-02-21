@@ -390,6 +390,9 @@ func main() {
 		defer mgr.Close()
 	}
 
+	// Reconcile orphaned resources from previous incarnation
+	go mgr.ReconcileOrphans(ctx)
+
 	// Initialize telemetry
 	telemetryCfg := telemetry.Config{
 		Enabled:      *telemetryEnabled,
@@ -466,6 +469,15 @@ func main() {
 	httpMux.HandleFunc("/api/v1/gc", gcHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/pool/flush", poolFlushHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/pool/stats", poolStatsHandler(mgr, logger))
+	httpMux.HandleFunc("/api/v1/runners/", func(w http.ResponseWriter, r *http.Request) {
+		// Route /api/v1/runners/{id}/token/gcp
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/runners/"), "/")
+		if len(parts) >= 3 && parts[1] == "token" && parts[2] == "gcp" {
+			gcpTokenHandler(w, r, logger)
+			return
+		}
+		http.Error(w, "Not found", http.StatusNotFound)
+	})
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *httpPort),
@@ -484,7 +496,7 @@ func main() {
 
 	// Start heartbeat loop if control plane is configured
 	if *controlPlane != "" {
-		go heartbeatLoop(ctx, mgr, *controlPlane, instanceName, zone, *grpcPort, *httpPort, logger, metricsClient)
+		go heartbeatLoop(ctx, mgr, chunkedMgr, *controlPlane, instanceName, zone, *grpcPort, *httpPort, logger, metricsClient)
 	}
 
 	// Wait for shutdown signal
@@ -578,7 +590,9 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			status := mgr.GetStatus()
 
 			// Maintain idle target
-			if !mgr.IsDraining() && status.IdleRunners < idleTarget && mgr.CanAddRunner() {
+			if mgr.DiskUsage() > 0.85 {
+				log.Warn("Disk usage exceeds 85%, skipping runner allocation")
+			} else if !mgr.IsDraining() && status.IdleRunners < idleTarget && mgr.CanAddRunner() {
 				log.Debug("Adding runner to maintain idle pool")
 				allocTimer := telemetry.NewStopwatch()
 				var err error
@@ -660,25 +674,31 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 }
 
 type hostHeartbeatRequest struct {
-	InstanceName    string `json:"instance_name"`
-	Zone            string `json:"zone"`
-	GRPCAddress     string `json:"grpc_address"`
-	HTTPAddress     string `json:"http_address"`
-	TotalSlots      int    `json:"total_slots"`
-	UsedSlots       int    `json:"used_slots"`
-	IdleRunners     int    `json:"idle_runners"`
-	BusyRunners     int    `json:"busy_runners"`
-	SnapshotVersion string `json:"snapshot_version"`
-	Draining        bool   `json:"draining"`
+	InstanceName    string            `json:"instance_name"`
+	Zone            string            `json:"zone"`
+	GRPCAddress     string            `json:"grpc_address"`
+	HTTPAddress     string            `json:"http_address"`
+	TotalSlots      int               `json:"total_slots"`
+	UsedSlots       int               `json:"used_slots"`
+	IdleRunners     int               `json:"idle_runners"`
+	BusyRunners     int               `json:"busy_runners"`
+	SnapshotVersion string            `json:"snapshot_version"`
+	Draining        bool              `json:"draining"`
+	DiskUsage       float64           `json:"disk_usage"`
+	LoadedManifests map[string]string `json:"loaded_manifests,omitempty"`
 }
 
 type hostHeartbeatResponse struct {
-	Acknowledged bool   `json:"acknowledged"`
-	ShouldDrain  bool   `json:"should_drain"`
-	Error        string `json:"error,omitempty"`
+	Acknowledged       bool              `json:"acknowledged"`
+	ShouldDrain        bool              `json:"should_drain"`
+	ShouldSyncSnapshot bool              `json:"should_sync_snapshot,omitempty"`
+	SnapshotVersion    string            `json:"snapshot_version,omitempty"`
+	DesiredVersions    map[string]string `json:"desired_versions,omitempty"`
+	SyncVersions       map[string]string `json:"sync_versions,omitempty"`
+	Error              string            `json:"error,omitempty"`
 }
 
-func heartbeatLoop(ctx context.Context, mgr *runner.Manager, controlPlane, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger, metricsClient *telemetry.Client) {
+func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, controlPlane, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger, metricsClient *telemetry.Client) {
 	log := logger.WithField("component", "heartbeat")
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -715,6 +735,10 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, controlPlane, insta
 				BusyRunners:     status.BusyRunners,
 				SnapshotVersion: status.SnapshotVersion,
 				Draining:        status.Draining,
+				DiskUsage:       mgr.DiskUsage(),
+			}
+			if chunkedMgr != nil {
+				reqBody.LoadedManifests = chunkedMgr.GetLoadedManifests()
 			}
 
 			b, _ := json.Marshal(reqBody)
@@ -783,6 +807,36 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, controlPlane, insta
 				wasDraining = true
 				_, _ = mgr.RemoveRunnerLabels(ctx)
 				_, _ = mgr.DrainIdleRunners(ctx)
+			}
+
+			// Handle snapshot sync directive from control plane
+			if hbResp.ShouldSyncSnapshot && hbResp.SnapshotVersion != "" {
+				log.WithField("snapshot_version", hbResp.SnapshotVersion).Info("Control plane requested snapshot sync")
+				go func(version string) {
+					syncCtx, syncCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+					defer syncCancel()
+					if err := mgr.SyncSnapshot(syncCtx, version); err != nil {
+						log.WithError(err).WithField("snapshot_version", version).Error("Failed to sync snapshot")
+					} else {
+						log.WithField("snapshot_version", version).Info("Snapshot sync completed")
+					}
+				}(hbResp.SnapshotVersion)
+			}
+
+			// Handle per-repo manifest sync directives
+			if len(hbResp.SyncVersions) > 0 && chunkedMgr != nil {
+				for repoSlug, version := range hbResp.SyncVersions {
+					go func(slug, ver string) {
+						syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+						defer cancel()
+						if err := chunkedMgr.SyncManifest(syncCtx, slug, ver); err != nil {
+							log.WithError(err).WithFields(logrus.Fields{
+								"repo_slug": slug,
+								"version":   ver,
+							}).Warn("Failed to sync manifest for repo")
+						}
+					}(repoSlug, version)
+				}
 			}
 		}
 	}
@@ -930,6 +984,30 @@ func getLocalIPFallback() string {
 		}
 	}
 	return ""
+}
+
+func gcpTokenHandler(w http.ResponseWriter, r *http.Request, logger *logrus.Logger) {
+	// Fetch a fresh GCP access token from the metadata server
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest("GET",
+		"http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+		nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Metadata-Flavor", "Google")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "Failed to fetch GCP token: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(body)
 }
 
 func gcHandler(mgr *runner.Manager, logger *logrus.Logger) http.HandlerFunc {

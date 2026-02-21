@@ -20,9 +20,11 @@ type hostHeartbeatRequest struct {
 }
 
 type hostHeartbeatResponse struct {
-	Acknowledged bool   `json:"acknowledged"`
-	ShouldDrain  bool   `json:"should_drain"`
-	Error        string `json:"error,omitempty"`
+	Acknowledged       bool   `json:"acknowledged"`
+	ShouldDrain        bool   `json:"should_drain"`
+	ShouldSyncSnapshot bool   `json:"should_sync_snapshot,omitempty"`
+	SnapshotVersion    string `json:"snapshot_version,omitempty"`
+	Error              string `json:"error,omitempty"`
 }
 
 func (s *ControlPlaneServer) HandleHostHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -66,9 +68,15 @@ func (s *ControlPlaneServer) HandleHostHeartbeat(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// Check if host needs a snapshot sync
+	currentSnapshot := s.snapshotManager.GetCurrentVersion()
+	shouldSync := currentSnapshot != "" && currentSnapshot != req.SnapshotVersion
+
 	writeJSON(w, http.StatusOK, hostHeartbeatResponse{
-		Acknowledged: true,
-		ShouldDrain:  shouldDrain,
+		Acknowledged:       true,
+		ShouldDrain:        shouldDrain,
+		ShouldSyncSnapshot: shouldSync,
+		SnapshotVersion:    currentSnapshot,
 	})
 }
 

@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
@@ -163,7 +164,7 @@ func (dir *diskDir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	if name == "disk.img" {
 		return &diskFile{disk: dir.disk}, nil
 	}
-	return nil, fuse.ENOENT
+	return nil, syscall.ENOENT
 }
 
 // ReadDirAll implements fs.HandleReadDirAller
