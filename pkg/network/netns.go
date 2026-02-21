@@ -27,14 +27,6 @@ import (
 // This provides complete VM isolation by construction — no shared L2 domain,
 // no path between namespaces, no VM-to-VM or VM-to-host connectivity.
 //
-// Architecture per VM:
-//
-//	netns fc-{shortID}:
-//	  tap-slot-0 (172.16.0.2) --> br-vm (172.16.0.1) --> veth-{shortID}-v (10.200.{slot}.2/30)
-//	                                                        |
-//	host namespace:                                    veth-{shortID}-h (10.200.{slot}.1/30)
-//	                                                        |
-//	                                                   routing + MASQUERADE --> eth0
 type NetNSNetwork struct {
 	subnet        *net.IPNet
 	gateway       net.IP
