@@ -10,6 +10,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"path"
@@ -29,6 +31,7 @@ import (
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/ci"
 	cigithub "github.com/rahul-roy-glean/bazel-firecracker/pkg/ci/github"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/metrics"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
 )
@@ -310,7 +313,7 @@ func main() {
 	var mgr *runner.Manager
 	var chunkedMgr *runner.ChunkedManager
 
-	if *useChunkedSnapshots || *useNetNS {
+	if *useChunkedSnapshots {
 		log.WithFields(logrus.Fields{
 			"chunked_snapshots": *useChunkedSnapshots,
 			"use_netns":         *useNetNS,
@@ -388,6 +391,26 @@ func main() {
 			log.WithError(err).Fatal("Failed to create runner manager")
 		}
 		defer mgr.Close()
+
+		// Wire --use-netns to the base manager for per-VM namespace isolation.
+		// When --use-netns is set without --use-chunked-snapshots, the base
+		// manager creates per-VM namespaces instead of using the shared bridge.
+		if *useNetNS {
+			netnsNet, err := network.NewNetNSNetwork(network.NetNSConfig{
+				BridgeName:    *bridgeName,
+				Subnet:        *microVMSubnet,
+				ExternalIface: *extInterface,
+				Logger:        logger,
+			})
+			if err != nil {
+				log.WithError(err).Fatal("Failed to create netns network for base manager")
+			}
+			if err := netnsNet.Setup(); err != nil {
+				log.WithError(err).Fatal("Failed to setup netns network for base manager")
+			}
+			mgr.SetNetNSNetwork(netnsNet)
+			log.Info("Network namespace mode enabled for base manager")
+		}
 	}
 
 	// Initialize telemetry
@@ -466,6 +489,7 @@ func main() {
 	httpMux.HandleFunc("/api/v1/gc", gcHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/pool/flush", poolFlushHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/pool/stats", poolStatsHandler(mgr, logger))
+	httpMux.HandleFunc("/api/v1/runners/", runnerProxyHandler(mgr, logger))
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *httpPort),
@@ -977,6 +1001,86 @@ func poolStatsHandler(mgr *runner.Manager, logger *logrus.Logger) http.HandlerFu
 		stats := pool.Stats()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(stats)
+	}
+}
+
+// runnerProxyHandler reverse-proxies HTTP requests to a specific microVM's service.
+//
+// URL pattern: /api/v1/runners/{runnerID}/proxy/{path...}
+//
+// The handler looks up the runner by ID, gets its InternalIP (which is the
+// host-reachable veth IP in netns mode), and proxies the request to
+// http://{InternalIP}:8080/{path}.
+//
+// This allows external clients to reach services running inside microVMs
+// (e.g., claude_sandbox_service) without knowing about network namespaces,
+// veth IPs, or DNAT. The client just needs the host address and runner ID.
+func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.HandlerFunc {
+	log := logger.WithField("handler", "runner-proxy")
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Parse URL: /api/v1/runners/{runnerID}/proxy/{path...}
+		// Strip the prefix to get {runnerID}/proxy/{path...}
+		suffix := strings.TrimPrefix(r.URL.Path, "/api/v1/runners/")
+
+		// Don't proxy quarantine/unquarantine endpoints (they're registered separately)
+		if strings.HasPrefix(suffix, "quarantine") || strings.HasPrefix(suffix, "unquarantine") {
+			http.NotFound(w, r)
+			return
+		}
+
+		// Split into runnerID and the rest
+		parts := strings.SplitN(suffix, "/proxy/", 2)
+		if len(parts) != 2 {
+			http.Error(w, "Invalid URL: expected /api/v1/runners/{id}/proxy/{path}", http.StatusBadRequest)
+			return
+		}
+
+		runnerID := parts[0]
+		proxyPath := "/" + parts[1]
+
+		// Look up runner
+		rn, err := mgr.GetRunner(runnerID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Runner not found: %s", runnerID), http.StatusNotFound)
+			return
+		}
+
+		if rn.InternalIP == nil {
+			http.Error(w, "Runner has no internal IP", http.StatusServiceUnavailable)
+			return
+		}
+
+		// Build target URL
+		target, err := url.Parse(fmt.Sprintf("http://%s:8080", rn.InternalIP.String()))
+		if err != nil {
+			http.Error(w, "Invalid target URL", http.StatusInternalServerError)
+			return
+		}
+
+		log.WithFields(logrus.Fields{
+			"runner_id": runnerID,
+			"target":    target.String(),
+			"path":      proxyPath,
+			"method":    r.Method,
+		}).Debug("Proxying request to microVM")
+
+		// Create reverse proxy
+		proxy := httputil.NewSingleHostReverseProxy(target)
+
+		// Rewrite the request path to the proxied path
+		r.URL.Path = proxyPath
+		r.Host = target.Host
+
+		// For streaming responses (SSE), disable buffering
+		proxy.FlushInterval = -1 // Flush immediately
+
+		proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+			log.WithError(err).WithField("runner_id", runnerID).Warn("Proxy error")
+			rw.WriteHeader(http.StatusBadGateway)
+			fmt.Fprintf(rw, "Proxy error: %v", err)
+		}
+
+		proxy.ServeHTTP(w, r)
 	}
 }
 

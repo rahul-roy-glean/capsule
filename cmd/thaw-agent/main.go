@@ -1140,6 +1140,22 @@ func configureNetwork(data *MMDSData) error {
 		}
 	}
 
+	// Set MTU to avoid fragmentation on GCP (ens4 MTU=1460).
+	// The guest eth0 defaults to 1500 but the host TAP/bridge/veth path
+	// is clamped to the external interface MTU. Read the current MTU from
+	// sysfs and only adjust if it's already lower (set by the TAP).
+	mtuBytes, mtuErr := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/mtu", iface))
+	if mtuErr == nil {
+		currentMTU := strings.TrimSpace(string(mtuBytes))
+		if currentMTU == "1500" {
+			// Try setting to 1460 (GCP standard). If the TAP supports it, great.
+			// If not, the command will fail silently and we keep 1500.
+			if err := exec.Command("ip", "link", "set", iface, "mtu", "1460").Run(); err == nil {
+				log.Info("Guest interface MTU set to 1460")
+			}
+		}
+	}
+
 	// Check if kernel already configured the network (via ip= boot parameter)
 	// If so, skip IP reconfiguration but still ensure DNS is configured
 	out, _ := exec.Command("ip", "addr", "show", "dev", iface).Output()
@@ -1714,7 +1730,7 @@ func registerGitHubRunner(data *MMDSData) error {
 		},
 		Setsid: true, // Create new session so runner survives parent exit
 	}
-	runCmd.Env = append(os.Environ(), "HOME="+runnerUser.HomeDir)
+	runCmd.Env = append(os.Environ(), "HOME="+runnerUser.HomeDir, "RUNNER_DISABLEUPDATE=1")
 
 	log.Info("Starting GitHub runner (run.sh)...")
 	runStart := time.Now()
@@ -2120,7 +2136,14 @@ esac
 		globalWarmupLogs.Add("[done] bazel info completed")
 	}
 
-	// Phase 6: Pre-warm .NET Runner.Listener pages into memory.
+	// Phase 6a: Update GitHub Actions runner to latest version.
+	// The runner self-updates on startup if a newer version exists, which takes
+	// ~3-4 minutes. By updating during warmup, the snapshot has the latest
+	// version baked in, avoiding the self-update delay after restore.
+	updateWarmupState("runner_update", "Updating GitHub Actions runner...")
+	updateGitHubRunner(*runnerDir, runnerCred, runnerHome)
+
+	// Phase 6b: Pre-warm .NET Runner.Listener pages into memory.
 	// The GitHub Actions runner is a .NET application. After snapshot restore,
 	// its pages need to be demand-faulted from UFFD, which takes ~2+ minutes.
 	// By briefly starting Runner.Listener during warmup, the .NET runtime,
@@ -2176,6 +2199,164 @@ func preWarmRunnerPages(runnerPath string, cred *syscall.SysProcAttr, homeEnv st
 		"output":      strings.TrimSpace(string(out)),
 	}).Info("Runner.Listener pre-warm completed")
 	globalWarmupLogs.Add(fmt.Sprintf("[done] runner pre-warm completed in %dms", elapsed.Milliseconds()))
+}
+
+// updateGitHubRunner downloads the latest GitHub Actions runner release and
+// replaces the existing installation. This avoids a ~3-4 minute self-update
+// delay after snapshot restore. The runner is downloaded directly from GitHub
+// releases API rather than relying on run.sh's self-update mechanism (which
+// requires the runner to be configured and connected first).
+func updateGitHubRunner(runnerPath string, cred *syscall.SysProcAttr, homeEnv string) {
+	start := time.Now()
+	log.WithField("runner_path", runnerPath).Info("Checking for GitHub Actions runner updates...")
+	globalWarmupLogs.Add("[phase] runner update check")
+
+	binDir := filepath.Join(runnerPath, "bin")
+	if _, err := os.Stat(binDir); err != nil {
+		log.WithError(err).Warn("Runner bin dir not found, skipping update")
+		globalWarmupLogs.Add("[warn] runner bin dir not found, skipping update")
+		return
+	}
+
+	// Read current version from Runner.Listener.deps.json filename pattern or
+	// by running Runner.Listener --version.
+	currentVersion := getRunnerVersion(runnerPath, cred, homeEnv)
+	log.WithField("current_version", currentVersion).Info("Current runner version")
+
+	// Query GitHub API for latest runner release.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET",
+		"https://api.github.com/repos/actions/runner/releases/latest", nil)
+	if err != nil {
+		log.WithError(err).Warn("Failed to create GitHub API request")
+		return
+	}
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.WithError(err).Warn("Failed to query GitHub releases API")
+		globalWarmupLogs.Add("[warn] failed to query GitHub releases: " + err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	var release struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		log.WithError(err).Warn("Failed to parse GitHub releases response")
+		return
+	}
+
+	latestVersion := strings.TrimPrefix(release.TagName, "v")
+	log.WithFields(logrus.Fields{
+		"current": currentVersion,
+		"latest":  latestVersion,
+	}).Info("Runner version check")
+
+	if currentVersion == latestVersion {
+		log.Info("Runner is already at latest version, no update needed")
+		globalWarmupLogs.Add("[done] runner already at latest version " + latestVersion)
+		return
+	}
+
+	// Download the latest runner tarball.
+	tarballURL := fmt.Sprintf(
+		"https://github.com/actions/runner/releases/download/v%s/actions-runner-linux-x64-%s.tar.gz",
+		latestVersion, latestVersion)
+	log.WithField("url", tarballURL).Info("Downloading latest runner...")
+	globalWarmupLogs.Add("[info] downloading runner " + latestVersion)
+
+	dlCtx, dlCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer dlCancel()
+
+	dlReq, err := http.NewRequestWithContext(dlCtx, "GET", tarballURL, nil)
+	if err != nil {
+		log.WithError(err).Warn("Failed to create download request")
+		return
+	}
+	dlResp, err := http.DefaultClient.Do(dlReq)
+	if err != nil {
+		log.WithError(err).Warn("Failed to download runner tarball")
+		globalWarmupLogs.Add("[warn] failed to download runner: " + err.Error())
+		return
+	}
+	defer dlResp.Body.Close()
+
+	if dlResp.StatusCode != 200 {
+		log.WithField("status", dlResp.StatusCode).Warn("Runner download returned non-200")
+		return
+	}
+
+	// Save tarball to temp file.
+	tmpFile, err := os.CreateTemp("", "runner-*.tar.gz")
+	if err != nil {
+		log.WithError(err).Warn("Failed to create temp file")
+		return
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := io.Copy(tmpFile, dlResp.Body); err != nil {
+		tmpFile.Close()
+		log.WithError(err).Warn("Failed to save runner tarball")
+		return
+	}
+	tmpFile.Close()
+
+	log.WithField("duration_ms", time.Since(start).Milliseconds()).Info("Runner tarball downloaded")
+
+	// Extract over existing installation.
+	// The runner tarball extracts into the current directory with bin/, externals/, etc.
+	extractCmd := exec.Command("tar", "-xzf", tmpPath, "-C", runnerPath)
+	if cred != nil {
+		extractCmd.SysProcAttr = cred
+	}
+	if out, err := extractCmd.CombinedOutput(); err != nil {
+		log.WithFields(logrus.Fields{
+			"error":  err,
+			"output": string(out),
+		}).Warn("Failed to extract runner tarball")
+		return
+	}
+
+	// Fix ownership — tar may extract as root, but runner needs to run as the runner user.
+	if cred != nil && cred.Credential != nil {
+		chownCmd := exec.Command("chown", "-R",
+			fmt.Sprintf("%d:%d", cred.Credential.Uid, cred.Credential.Gid), runnerPath)
+		chownCmd.Run()
+	}
+
+	elapsed := time.Since(start)
+	newVersion := getRunnerVersion(runnerPath, cred, homeEnv)
+	log.WithFields(logrus.Fields{
+		"old_version": currentVersion,
+		"new_version": newVersion,
+		"duration_ms": elapsed.Milliseconds(),
+	}).Info("Runner updated successfully")
+	globalWarmupLogs.Add(fmt.Sprintf("[done] runner updated %s -> %s in %dms", currentVersion, newVersion, elapsed.Milliseconds()))
+}
+
+// getRunnerVersion returns the installed runner version by running Runner.Listener --version.
+func getRunnerVersion(runnerPath string, cred *syscall.SysProcAttr, homeEnv string) string {
+	listenerBin := filepath.Join(runnerPath, "bin", "Runner.Listener")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, listenerBin, "--version")
+	cmd.Dir = runnerPath
+	cmd.Env = append(os.Environ(), homeEnv, "DOTNET_EnableDiagnostics=0")
+	if cred != nil {
+		cmd.SysProcAttr = cred
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // runStreamedCommand runs a command, capturing stdout/stderr line by line

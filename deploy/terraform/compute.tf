@@ -105,6 +105,7 @@ resource "google_compute_instance_template" "firecracker_host" {
     # Indicates whether data disk was created from snapshot (fast) or empty (needs GCS download)
     use-data-snapshot     = var.use_data_snapshot ? "true" : "false"
     use-chunked-snapshots = var.use_chunked_snapshots ? "true" : "false"
+    use-netns             = var.use_netns ? "true" : "false"
   }
 
   metadata_startup_script = <<-EOF
@@ -187,23 +188,36 @@ resource "google_compute_instance_template" "firecracker_host" {
       if [ -n "$SNAPSHOT_BUCKET" ]; then
         echo "Downloading Firecracker snapshot artifacts from GCS..."
 
-        # Try to resolve versioned directory via pointer file
+        # Resolve versioned directory via pointer file (use curl + metadata API for speed)
         SNAPSHOT_VERSION=""
-        POINTER_FILE=$(mktemp)
-        if gcloud storage cp "gs://$SNAPSHOT_BUCKET/current-pointer.json" "$POINTER_FILE" 2>/dev/null; then
-          SNAPSHOT_VERSION=$(python3 -c "import json; print(json.load(open('$POINTER_FILE'))['version'])" 2>/dev/null || true)
+        TOKEN=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])" 2>/dev/null || true)
+        if [ -n "$TOKEN" ]; then
+          SNAPSHOT_VERSION=$(curl -s -H "Authorization: Bearer $TOKEN" \
+            "https://storage.googleapis.com/$SNAPSHOT_BUCKET/current-pointer.json" | \
+            python3 -c "import sys,json; print(json.load(sys.stdin)['version'])" 2>/dev/null || true)
         fi
-        rm -f "$POINTER_FILE"
+        if [ -z "$SNAPSHOT_VERSION" ]; then
+          # Fallback to gcloud CLI
+          POINTER_FILE=$(mktemp)
+          if gcloud storage cp "gs://$SNAPSHOT_BUCKET/current-pointer.json" "$POINTER_FILE" 2>/dev/null; then
+            SNAPSHOT_VERSION=$(python3 -c "import json; print(json.load(open('$POINTER_FILE'))['version'])" 2>/dev/null || true)
+          fi
+          rm -f "$POINTER_FILE"
+        fi
 
+        SNAPSHOT_DIR=""
         if [ -n "$SNAPSHOT_VERSION" ]; then
           echo "Resolved current pointer to version: $SNAPSHOT_VERSION"
-          gcloud storage rsync -r "gs://$SNAPSHOT_BUCKET/$SNAPSHOT_VERSION/" /mnt/data/snapshots/ || true
+          SNAPSHOT_DIR="gs://$SNAPSHOT_BUCKET/$SNAPSHOT_VERSION"
         else
           echo "No pointer file found, falling back to current/ directory"
-          gcloud storage rsync -r "gs://$SNAPSHOT_BUCKET/current/" /mnt/data/snapshots/ || true
+          SNAPSHOT_DIR="gs://$SNAPSHOT_BUCKET/current"
         fi
 
-        # Pre-decompress snapshot.mem.zst so firecracker-manager doesn't re-download it
+        # Download snapshot artifacts (parallel composite download is faster than streaming)
+        gcloud storage rsync -r "$SNAPSHOT_DIR/" /mnt/data/snapshots/ || true
+
+        # Decompress snapshot.mem.zst in background while other setup continues
         if [ -f "/mnt/data/snapshots/snapshot.mem.zst" ] && [ ! -f "/mnt/data/snapshots/snapshot.mem" ]; then
           echo "Decompressing snapshot.mem.zst in background..."
           zstd -d /mnt/data/snapshots/snapshot.mem.zst -o /mnt/data/snapshots/snapshot.mem --no-progress &
@@ -317,6 +331,8 @@ resource "google_compute_instance_template" "firecracker_host" {
 
     USE_CHUNKED_SNAPSHOTS=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/use-chunked-snapshots || echo "false")
+    USE_NETNS=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/use-netns || echo "false")
 
     # Stop firecracker-manager if already running (from Packer image auto-start)
     # This ensures the override is applied before the service runs
@@ -370,16 +386,21 @@ resource "google_compute_instance_template" "firecracker_host" {
       EXEC_START="$EXEC_START --snapshot-bucket=$SNAPSHOT_BUCKET"
     fi
 
+    # Add network namespace flag if enabled
+    if [ "$USE_NETNS" = "true" ]; then
+      EXEC_START="$EXEC_START --use-netns"
+    fi
+
     cat > /etc/systemd/system/firecracker-manager.service.d/override.conf << OVERRIDE
 [Service]
 ExecStart=
 ExecStart=$EXEC_START
 OVERRIDE
 
-    # Wait for background mem decompression before starting firecracker-manager
+    # Wait for background decompression before starting firecracker-manager
     if [ -n "$${ZSTD_PID:-}" ]; then
       echo "Waiting for snapshot.mem decompression to finish..."
-      wait $ZSTD_PID && echo "snapshot.mem decompressed OK" || echo "WARNING: snapshot.mem decompression failed"
+      wait $ZSTD_PID && echo "snapshot.mem ready" || echo "WARNING: snapshot.mem decompression failed"
     fi
 
     # Reload and restart firecracker-manager service with new config
