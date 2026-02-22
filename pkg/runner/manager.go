@@ -43,6 +43,10 @@ type Manager struct {
 	gitCacheImage string
 	// ciAdapter provides CI system integration (runner registration, drain, etc.)
 	ciAdapter ci.Adapter
+	// netnsNetwork manages per-VM network namespaces (nil if using legacy bridge mode).
+	// When set, each VM gets its own namespace with point-to-point veth routing
+	// instead of sharing the fcbr0 bridge.
+	netnsNetwork *network.NetNSNetwork
 	// slotToRunner tracks which runner is using each TAP slot (for snapshot restore).
 	// Key is slot number (0, 1, 2, ...), value is runner ID.
 	slotToRunner map[int]string
@@ -192,6 +196,19 @@ func (m *Manager) cleanupRecentRequests() {
 	}
 }
 
+// SetNetNSNetwork configures the manager to use per-VM network namespaces
+// instead of the shared bridge. When set, AllocateRunner creates a namespace
+// per VM with point-to-point veth routing, and Firecracker is launched inside
+// the namespace.
+func (m *Manager) SetNetNSNetwork(netnsNet *network.NetNSNetwork) {
+	m.netnsNetwork = netnsNet
+}
+
+// GetNetNSNetwork returns the netns network manager (may be nil).
+func (m *Manager) GetNetNSNetwork() *network.NetNSNetwork {
+	return m.netnsNetwork
+}
+
 func (m *Manager) IsDraining() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -299,14 +316,36 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	// Determine if snapshot restore is available
 	useSnapshotRestore := snapshotPaths.Mem != "" && snapshotPaths.State != ""
 
-	// Allocate TAP device
-	// For snapshot restore, we MUST use slot-based allocation because Firecracker
-	// does not support changing host_dev_name after snapshot load. The snapshot was
-	// created with tap-slot-0, so we need to use matching slot names.
+	// Allocate network resources.
+	// When using per-VM namespaces, each VM gets its own namespace with
+	// tap-slot-0 inside it — no TAP rename needed, no shared bridge.
+	// Otherwise, use the legacy slot-based TAP allocation on the shared bridge.
 	var tap *network.TapDevice
-	var slot int = -1 //nolint:ineffassign // sentinel used when useSnapshotRestore is false
-	if useSnapshotRestore {
-		// Find an available slot
+	var nsInfo *network.VMNamespace
+	var slot int = -1
+	useNetNS := m.netnsNetwork != nil
+
+	if useNetNS {
+		// Per-VM namespace mode: create isolated namespace with inner bridge + TAP
+		slot = m.findAvailableSlot()
+		if slot < 0 {
+			return nil, fmt.Errorf("no slots available (all %d slots in use)", m.config.MaxRunners)
+		}
+		nsInfo, err = m.netnsNetwork.CreateNamespaceForVM(runnerID, slot)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create network namespace: %w", err)
+		}
+		tap = nsInfo.GetTapDevice(m.netnsNetwork.GetSubnet())
+		m.slotToRunner[slot] = runnerID
+		m.runnerToSlot[runnerID] = slot
+		m.logger.WithFields(logrus.Fields{
+			"runner_id": runnerID,
+			"slot":      slot,
+			"namespace": nsInfo.Name,
+			"tap":       tap.Name,
+		}).Debug("Using per-VM namespace with inner bridge")
+	} else if useSnapshotRestore {
+		// Legacy: slot-based TAP on shared bridge for snapshot restore
 		slot = m.findAvailableSlot()
 		if slot < 0 {
 			return nil, fmt.Errorf("no TAP slots available (all %d slots in use)", m.config.MaxRunners)
@@ -323,7 +362,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 			"tap":       tap.Name,
 		}).Debug("Using slot-based TAP for snapshot restore")
 	} else {
-		// Cold boot path - use dynamic TAP allocation
+		// Legacy: dynamic TAP allocation for cold boot
 		tap, err = m.network.CreateTapForVM(runnerID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create TAP device: %w", err)
@@ -356,12 +395,19 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	}
 	repoCacheDur := time.Since(repoCacheStart)
 
-	// Create runner record
+	// Create runner record.
+	// When using per-VM namespaces, InternalIP is set to the host-reachable
+	// veth IP (10.0.{slot}.2) so the host proxy can reach the VM's services.
+	// The guest still uses 172.16.0.2 internally (configured via boot args).
+	internalIP := tap.IP
+	if useNetNS && nsInfo != nil {
+		internalIP = nsInfo.HostReachableIP
+	}
 	runner := &Runner{
 		ID:              runnerID,
 		HostID:          m.config.HostID,
 		State:           StateBooting,
-		InternalIP:      tap.IP,
+		InternalIP:      internalIP,
 		TapDevice:       tap.Name,
 		MAC:             tap.MAC,
 		SnapshotVersion: snapshotPaths.Version,
@@ -419,6 +465,12 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		MetricsPath: runner.MetricsPath,
 	}
 
+	// When using per-VM namespaces, Firecracker must be launched inside the
+	// namespace so it can open tap-slot-0 (which exists only in that namespace).
+	if useNetNS && nsInfo != nil {
+		vmCfg.NetNSPath = nsInfo.GetFirecrackerNetNSPath()
+	}
+
 	// Create VM instance
 	vm, err := firecracker.NewVM(vmCfg, m.logger.Logger)
 	if err != nil {
@@ -449,6 +501,16 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		cleanup, symlinkErr := m.setupSnapshotSymlinks(overlayPath, repoCacheUpperPath, snapshotPaths)
 		if symlinkErr != nil {
 			m.logger.WithError(symlinkErr).Warn("Failed to setup snapshot symlinks, falling back to cold boot")
+		} else if useNetNS {
+			// With per-VM namespaces, tap-slot-0 already exists in the namespace
+			// with the right name — no TAP rename dance needed.
+			restoreErr := vm.RestoreFromSnapshot(ctx, snapshotPaths.State, snapshotPaths.Mem, true)
+			cleanup()
+			if restoreErr != nil {
+				m.logger.WithError(restoreErr).Warn("Snapshot restore failed, falling back to cold boot")
+			} else {
+				restoreOK = true
+			}
 		} else {
 			tapRestore, tapErr := m.setupSnapshotTAPRename(tap.Name)
 			if tapErr != nil {
@@ -495,6 +557,15 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		vm.Stop()
 		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
 		return nil, fmt.Errorf("failed to set MMDS data: %w", err)
+	}
+
+	// When using per-VM namespaces, set up port forwarding (DNAT) so the host
+	// can reach services inside the VM via the host-reachable veth IP.
+	// Port 8080 is the standard service port (e.g., claude_sandbox_service).
+	if useNetNS && m.netnsNetwork != nil {
+		if err := m.netnsNetwork.ForwardPort(runnerID, 8080); err != nil {
+			m.logger.WithError(err).Warn("Failed to forward port 8080 into namespace")
+		}
 	}
 
 	runner.State = StateInitializing
@@ -710,8 +781,16 @@ func (m *Manager) QuarantineRunner(ctx context.Context, runnerID string, opts Qu
 	var errs []error
 	egressBlocked := false
 	if blockEgress {
-		if err := m.network.BlockEgress(net.IP(ip)); err != nil {
-			errs = append(errs, fmt.Errorf("block egress: %w", err))
+		var blockErr error
+		if m.netnsNetwork != nil {
+			// Per-VM namespace mode: block by veth interface name
+			blockErr = m.netnsNetwork.BlockEgress(runnerID)
+		} else {
+			// Legacy bridge mode: block by VM IP
+			blockErr = m.network.BlockEgress(net.IP(ip))
+		}
+		if blockErr != nil {
+			errs = append(errs, fmt.Errorf("block egress: %w", blockErr))
 		} else {
 			egressBlocked = true
 		}
@@ -793,8 +872,14 @@ func (m *Manager) UnquarantineRunner(ctx context.Context, runnerID string, opts 
 	var errs []error
 	unblocked := false
 	if unblockEgress && egressWasBlocked {
-		if err := m.network.UnblockEgress(net.IP(ip)); err != nil {
-			errs = append(errs, fmt.Errorf("unblock egress: %w", err))
+		var unblockErr error
+		if m.netnsNetwork != nil {
+			unblockErr = m.netnsNetwork.UnblockEgress(runnerID)
+		} else {
+			unblockErr = m.network.UnblockEgress(net.IP(ip))
+		}
+		if unblockErr != nil {
+			errs = append(errs, fmt.Errorf("unblock egress: %w", unblockErr))
 		} else {
 			unblocked = true
 		}
@@ -876,13 +961,20 @@ func errorsToStrings(errs []error) []string {
 
 // cleanupRunner cleans up runner resources
 func (m *Manager) cleanupRunner(runnerID, tapDevice, overlayPath, repoCacheUpperPath string) {
-	// Release TAP slot if using slot-based allocation
-	if slot, ok := m.runnerToSlot[runnerID]; ok {
+	if m.netnsNetwork != nil {
+		// Per-VM namespace mode: release the entire namespace
+		m.netnsNetwork.ReleaseNamespace(runnerID)
+		if slot, ok := m.runnerToSlot[runnerID]; ok {
+			delete(m.slotToRunner, slot)
+			delete(m.runnerToSlot, runnerID)
+		}
+	} else if slot, ok := m.runnerToSlot[runnerID]; ok {
+		// Legacy: release TAP slot
 		m.network.ReleaseTapSlot(slot, runnerID)
 		delete(m.slotToRunner, slot)
 		delete(m.runnerToSlot, runnerID)
 	} else {
-		// Release dynamic TAP device (cold boot path)
+		// Legacy: release dynamic TAP device (cold boot path)
 		m.network.ReleaseTap(runnerID)
 	}
 

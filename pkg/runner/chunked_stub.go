@@ -70,6 +70,16 @@ func (cm *ChunkedManager) Close() error {
 	return nil
 }
 
+// GetChunkedMetadata is a stub
+func (cm *ChunkedManager) GetChunkedMetadata() *snapshot.ChunkedSnapshotMetadata {
+	return nil
+}
+
+// GetChunkStore is a stub
+func (cm *ChunkedManager) GetChunkStore() *snapshot.ChunkStore {
+	return nil
+}
+
 // GetSubnet is a stub
 func (cm *ChunkedManager) GetSubnet() *net.IPNet {
 	if cm.Manager != nil {
