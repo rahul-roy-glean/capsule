@@ -1097,6 +1097,12 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 			return
 		}
 
+		// Handle /api/v1/runners/{id}/token/gcp (GCP token refresh for long jobs)
+		if tokenParts := strings.SplitN(suffix, "/token/gcp", 2); len(tokenParts) == 2 && tokenParts[1] == "" {
+			gcpTokenHandler(w, r, logger)
+			return
+		}
+
 		// Split into runnerID and the rest
 		parts := strings.SplitN(suffix, "/proxy/", 2)
 		if len(parts) != 2 {

@@ -88,16 +88,6 @@ func (cm *ChunkedManager) GetSubnet() *net.IPNet {
 	return nil
 }
 
-// GetChunkedMetadata is a stub
-func (cm *ChunkedManager) GetChunkedMetadata() *snapshot.ChunkedSnapshotMetadata {
-	return nil
-}
-
-// GetChunkStore is a stub
-func (cm *ChunkedManager) GetChunkStore() *snapshot.ChunkStore {
-	return nil
-}
-
 // GetLoadedManifests is a stub
 func (cm *ChunkedManager) GetLoadedManifests() map[string]string {
 	return nil
