@@ -242,6 +242,12 @@ func (u *IncrementalUploader) UpdateSnapshotPointer(ctx context.Context, meta *C
 // GarbageCollect removes chunks that are not referenced by any of the keepVersions.
 // It loads all chunk manifests for the versions to keep, builds a set of referenced
 // hashes, lists all chunks in GCS, and deletes unreferenced ones.
+//
+// IMPORTANT: keepVersions must include versions from ALL repos that share this
+// chunk store. Chunks are content-addressed and shared globally — a chunk
+// referenced by repo B must not be deleted just because repo A deprecated its
+// snapshot. The caller is responsible for collecting versions across all repos.
+// Use GarbageCollectAllRepos for the safe multi-repo variant.
 func (u *IncrementalUploader) GarbageCollect(ctx context.Context, keepVersions []string) error {
 	u.logger.WithField("keep_versions", keepVersions).Info("Starting garbage collection")
 
@@ -259,28 +265,7 @@ func (u *IncrementalUploader) GarbageCollect(ctx context.Context, keepVersions [
 			continue
 		}
 
-		// Collect all referenced chunk hashes
-		if meta.KernelHash != "" {
-			referencedHashes[meta.KernelHash] = true
-		}
-		if meta.StateHash != "" {
-			referencedHashes[meta.StateHash] = true
-		}
-		for _, chunk := range meta.MemChunks {
-			if chunk.Hash != "" && chunk.Hash != ZeroChunkHash {
-				referencedHashes[chunk.Hash] = true
-			}
-		}
-		for _, chunk := range meta.RootfsChunks {
-			if chunk.Hash != "" && chunk.Hash != ZeroChunkHash {
-				referencedHashes[chunk.Hash] = true
-			}
-		}
-		for _, chunk := range meta.RepoCacheSeedChunks {
-			if chunk.Hash != "" && chunk.Hash != ZeroChunkHash {
-				referencedHashes[chunk.Hash] = true
-			}
-		}
+		collectReferencedHashes(meta, referencedHashes)
 
 		u.logger.WithFields(logrus.Fields{
 			"version":           version,
@@ -288,9 +273,74 @@ func (u *IncrementalUploader) GarbageCollect(ctx context.Context, keepVersions [
 		}).Debug("Loaded chunk references for version")
 	}
 
+	return u.deleteUnreferencedChunks(ctx, referencedHashes)
+}
+
+// GarbageCollectAllRepos is the safe multi-repo variant of GarbageCollect.
+// It accepts a map of repo_slug → []version_paths (GCS metadata paths) and
+// builds the referenced set across ALL repos before deleting anything.
+// This prevents repo A's GC from deleting chunks still referenced by repo B.
+func (u *IncrementalUploader) GarbageCollectAllRepos(ctx context.Context, repoVersions map[string][]string) error {
+	u.logger.WithField("repos", len(repoVersions)).Info("Starting multi-repo garbage collection")
+
+	referencedHashes := make(map[string]bool)
+	totalVersions := 0
+
+	for repoSlug, versions := range repoVersions {
+		for _, version := range versions {
+			meta, err := u.store.LoadChunkedMetadata(ctx, version)
+			if err != nil {
+				u.logger.WithError(err).WithFields(logrus.Fields{
+					"repo_slug": repoSlug,
+					"version":   version,
+				}).Warn("Failed to load metadata for GC, skipping version")
+				continue
+			}
+
+			collectReferencedHashes(meta, referencedHashes)
+			totalVersions++
+		}
+	}
+
+	u.logger.WithFields(logrus.Fields{
+		"repos":            len(repoVersions),
+		"versions_scanned": totalVersions,
+		"total_referenced": len(referencedHashes),
+	}).Info("Built referenced chunk set across all repos")
+
+	return u.deleteUnreferencedChunks(ctx, referencedHashes)
+}
+
+// collectReferencedHashes adds all chunk hashes from a metadata to the set.
+func collectReferencedHashes(meta *ChunkedSnapshotMetadata, hashes map[string]bool) {
+	if meta.KernelHash != "" {
+		hashes[meta.KernelHash] = true
+	}
+	if meta.StateHash != "" {
+		hashes[meta.StateHash] = true
+	}
+	for _, chunk := range meta.MemChunks {
+		if chunk.Hash != "" && chunk.Hash != ZeroChunkHash {
+			hashes[chunk.Hash] = true
+		}
+	}
+	for _, chunk := range meta.RootfsChunks {
+		if chunk.Hash != "" && chunk.Hash != ZeroChunkHash {
+			hashes[chunk.Hash] = true
+		}
+	}
+	for _, chunk := range meta.RepoCacheSeedChunks {
+		if chunk.Hash != "" && chunk.Hash != ZeroChunkHash {
+			hashes[chunk.Hash] = true
+		}
+	}
+}
+
+// deleteUnreferencedChunks lists all chunks in storage and deletes those
+// not in the referenced set.
+func (u *IncrementalUploader) deleteUnreferencedChunks(ctx context.Context, referencedHashes map[string]bool) error {
 	u.logger.WithField("total_referenced", len(referencedHashes)).Info("Built referenced chunk set")
 
-	// 2. List all chunks in GCS
 	allChunks, err := u.store.ListChunks(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to list chunks: %w", err)
@@ -298,7 +348,6 @@ func (u *IncrementalUploader) GarbageCollect(ctx context.Context, keepVersions [
 
 	u.logger.WithField("total_chunks", len(allChunks)).Info("Listed all chunks in storage")
 
-	// 3. Find unreferenced chunks
 	var toDelete []string
 	for _, hash := range allChunks {
 		if !referencedHashes[hash] {
@@ -317,7 +366,6 @@ func (u *IncrementalUploader) GarbageCollect(ctx context.Context, keepVersions [
 		"total":        len(allChunks),
 	}).Info("Deleting unreferenced chunks")
 
-	// 4. Delete unreferenced chunks
 	deleted := 0
 	for _, hash := range toDelete {
 		if err := u.store.DeleteChunk(ctx, hash); err != nil {
