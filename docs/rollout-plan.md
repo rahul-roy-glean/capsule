@@ -289,10 +289,35 @@ psql -c "SELECT status, COUNT(*) FROM jobs GROUP BY status;"
 
 This is the point where you register your repositories and start managing them through the system. Start with your primary repo, then add more.
 
-### 6a. Register Primary Repo
+### GCS path compatibility
+
+Understanding what changes and what doesn't:
+
+```
+BEFORE (single-repo):                    AFTER (multi-repo):
+gs://bucket/                              gs://bucket/
+├── chunks/ab/ab1234.zst    ← shared      ├── chunks/ab/ab1234.zst    ← SAME, shared
+├── v20260220-.../           ← old snap    ├── v20260220-.../           ← stays, still works
+│   ├── kernel.bin                         │   └── ...
+│   ├── chunked-metadata.json              ├── org-repo/               ← NEW prefix
+│   └── ...                                │   ├── current-pointer.json
+├── current/                               │   └── v20260221-.../
+│   └── chunked-metadata.json              │       ├── kernel.bin
+└── current-pointer.json                   │       ├── chunked-metadata.json
+                                           │       └── ...
+                                           └── current-pointer.json    ← old, still works
+```
+
+Key points:
+- **Chunks never move.** They're at `gs://bucket/chunks/<hash>` regardless of repo. All versions of all repos share the same chunk pool.
+- **Old snapshots stay where they are.** Nothing is moved or deleted. Hosts that booted with the old `current/chunked-metadata.json` keep working.
+- **New repo-scoped snapshots go to `gs://bucket/<slug>/<version>/`.** The chunked metadata, kernel, and pointer file are under the slug prefix. Hosts load them via the heartbeat sync protocol.
+- **The `getOrLoadManifest` path is `<slug>/<version>/chunked-metadata.json`**, matching where `UploadChunkedMetadata` puts them.
+
+### 6a. Register Primary Repo and Adopt Existing Snapshot
 
 ```bash
-# Register your existing repo (this doesn't change anything operationally yet)
+# Register your existing repo
 curl -X POST http://${CP_URL}:8080/api/v1/repos \
   -H 'Content-Type: application/json' \
   -d '{
@@ -308,20 +333,55 @@ curl -X POST http://${CP_URL}:8080/api/v1/repos \
 curl http://${CP_URL}:8080/api/v1/repos | jq .
 ```
 
-### 6b. Build First Repo-Scoped Snapshot
+Now adopt the existing active snapshot so the repo has a current version without
+needing to build a new one. This tags the DB record — the GCS files stay at
+their original path (`gs://bucket/<version>/`).
 
 ```bash
-# Trigger a snapshot build for the registered repo
-# This will upload to gs://bucket/org-primary-repo/<version>/ instead of gs://bucket/<version>/
+# Find the current active snapshot version
+CURRENT_VERSION=$(psql -t -c "SELECT version FROM snapshots WHERE status='active' ORDER BY created_at DESC LIMIT 1;" | xargs)
+echo "Current active: ${CURRENT_VERSION}"
+
+# Adopt it for the registered repo
+# This sets repo_slug on the snapshot record and current_version on the repo
+psql -c "UPDATE snapshots SET repo_slug='org-primary-repo' WHERE version='${CURRENT_VERSION}';"
+psql -c "UPDATE repos SET current_version='${CURRENT_VERSION}' WHERE slug='org-primary-repo';"
+
+# Verify
+psql -c "SELECT version, status, repo_slug, gcs_path FROM snapshots WHERE version='${CURRENT_VERSION}';"
+curl http://${CP_URL}:8080/api/v1/repos/org-primary-repo | jq .
+```
+
+The adopted snapshot's `gcs_path` still points to `gs://bucket/<version>/` (no
+slug prefix). This is fine — `checkSnapshotComplete` reads the `gcs_path` from
+the DB to find files, and `getOrLoadManifest` with an empty repo slug falls back
+to the old path. Hosts continue using the old chunked metadata at
+`current/chunked-metadata.json`.
+
+### 6b. Build First Repo-Scoped Snapshot
+
+When you're ready, build a new snapshot that goes to the repo-scoped path:
+
+```bash
+# Trigger a repo-scoped snapshot build
+# Files will go to gs://bucket/org-primary-repo/<version>/
 curl -X POST http://${CP_URL}:8080/api/v1/snapshots \
   -d '{"repo":"https://github.com/org/primary-repo","branch":"main","bazel_version":"7.5"}'
 
 # Watch the build
-psql -c "SELECT version, status, repo_slug, created_at FROM snapshots ORDER BY created_at DESC LIMIT 5;"
+watch -n10 'psql -c "SELECT version, status, repo_slug, gcs_path FROM snapshots WHERE repo_slug='\''org-primary-repo'\'' ORDER BY created_at DESC LIMIT 5;"'
 
 # Verify GCS path is repo-scoped
 gcloud storage ls gs://${BUCKET}/org-primary-repo/
+
+# The chunks are still shared
+gcloud storage ls gs://${BUCKET}/chunks/ | head -5
 ```
+
+When this build completes and activates, the heartbeat protocol will tell hosts
+to load the new manifest from `gs://bucket/org-primary-repo/<version>/chunked-metadata.json`.
+Hosts fetch the ~100KB manifest and start using it for new allocations. Existing
+running VMs are unaffected.
 
 ### 6c. Register Second Repo
 
@@ -354,9 +414,12 @@ curl "http://${CP_URL}:8080/api/v1/versions/fleet?repo_slug=org-second-repo" | j
 
 # Verify scheduler prefers warm hosts
 kubectl -n firecracker-runner logs deployment/control-plane | grep "cache_affinity\|warm\|Selected host"
+
+# Verify chunks are shared (not duplicated per repo)
+gcloud storage ls gs://${BUCKET}/chunks/ | wc -l
 ```
 
-**Checkpoint:** Multiple repos registered, snapshots built in repo-scoped GCS paths, jobs for different repos are allocated correctly. Proceed to Stage 7.
+**Checkpoint:** Multiple repos registered, existing snapshot adopted, new repo-scoped snapshots built, chunks shared, jobs allocated correctly. Proceed to Stage 7.
 
 ---
 

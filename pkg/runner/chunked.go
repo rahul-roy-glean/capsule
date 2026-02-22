@@ -159,10 +159,15 @@ func (cm *ChunkedManager) getOrLoadManifest(ctx context.Context, repoSlug, versi
 	}
 	cm.mu.RUnlock()
 
-	// Load from GCS
+	// Load from GCS.
+	// The chunked metadata lives at <prefix>/chunked-metadata.json where prefix is:
+	//   - "<repoSlug>/<version>" for a repo-scoped versioned snapshot
+	//   - "<repoSlug>/current"   for the repo-scoped current pointer
+	//   - "<version>"            for a legacy non-repo-scoped snapshot
+	//   - "current"              for the legacy current pointer
 	path := version
 	if repoSlug != "" && version != "" {
-		path = repoSlug + "/chunked-meta/" + version
+		path = repoSlug + "/" + version
 	} else if repoSlug != "" {
 		path = repoSlug + "/current"
 	}

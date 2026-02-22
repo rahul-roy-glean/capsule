@@ -180,6 +180,28 @@ func (rr *RepoRegistry) UpdateRepo(ctx context.Context, slug string, updates map
 	return nil
 }
 
+// AdoptSnapshot tags an existing snapshot (built without a repo slug) so it
+// belongs to this repo. This is used during migration from single-repo to
+// multi-repo: the old snapshot at gs://bucket/<version>/ stays where it is,
+// but its DB record gets repo and repo_slug set so the system can find it.
+// The GCS files are NOT moved — hosts can still load from the old path.
+func (rr *RepoRegistry) AdoptSnapshot(ctx context.Context, slug, version string) error {
+	result, err := rr.db.ExecContext(ctx, `
+		UPDATE snapshots SET repo_slug = $1 WHERE version = $2 AND (repo_slug = '' OR repo_slug IS NULL)
+	`, slug, version)
+	if err != nil {
+		return err
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("snapshot %s not found or already owned by a repo", version)
+	}
+
+	// Also set it as current_version on the repo
+	_, err = rr.db.ExecContext(ctx, `UPDATE repos SET current_version = $2 WHERE slug = $1`, slug, version)
+	return err
+}
+
 // GetCurrentVersion returns the current active version for a repo
 func (rr *RepoRegistry) GetCurrentVersion(ctx context.Context, repoSlug string) (string, error) {
 	var version sql.NullString

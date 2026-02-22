@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -538,14 +539,28 @@ func (sm *SnapshotManager) monitorSnapshotBuild(ctx context.Context, version, in
 	}
 }
 
-// checkSnapshotComplete checks if snapshot files exist in GCS
+// checkSnapshotComplete checks if snapshot files exist in GCS.
+// It uses the gcs_path stored in the DB record to find the files.
 func (sm *SnapshotManager) checkSnapshotComplete(ctx context.Context, version string) (bool, error) {
 	bucket := sm.gcsClient.Bucket(sm.gcsBucket)
 
+	// Look up the GCS prefix from the snapshot record — it may be repo-scoped
+	// (e.g. "org-repo/v20260221-..." instead of "v20260221-...")
+	gcsPrefix := version
+	var gcsPath sql.NullString
+	if err := sm.db.QueryRow(`SELECT gcs_path FROM snapshots WHERE version = $1`, version).Scan(&gcsPath); err == nil && gcsPath.Valid {
+		// gcs_path is "gs://bucket/org-repo/v20260221-.../", extract the prefix after bucket
+		prefix := strings.TrimPrefix(gcsPath.String, fmt.Sprintf("gs://%s/", sm.gcsBucket))
+		prefix = strings.TrimSuffix(prefix, "/")
+		if prefix != "" {
+			gcsPrefix = prefix
+		}
+	}
+
 	requiredFiles := []string{
-		fmt.Sprintf("%s/kernel.bin", version),
-		fmt.Sprintf("%s/rootfs.img", version),
-		fmt.Sprintf("%s/metadata.json", version),
+		fmt.Sprintf("%s/kernel.bin", gcsPrefix),
+		fmt.Sprintf("%s/rootfs.img", gcsPrefix),
+		fmt.Sprintf("%s/metadata.json", gcsPrefix),
 	}
 
 	for _, file := range requiredFiles {
