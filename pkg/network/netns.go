@@ -17,29 +17,22 @@ import (
 	"github.com/vishvananda/netns"
 )
 
-// NetNSNetwork manages network namespaces for microVMs.
+// NetNSNetwork manages per-VM network namespaces with point-to-point veth routing.
 //
-// This approach allows ALL VMs to use the same IP address (e.g., 172.16.0.2) because
-// each VM runs in its own network namespace with isolated routing tables and interfaces.
-// This is the approach BuildBuddy uses and simplifies snapshot restore significantly:
-// - No slot-based TAP allocation needed
-// - Snapshot can be created with a fixed IP
-// - All clones use the same IP without conflict
+// Each VM gets its own network namespace containing:
+//   - An inner bridge (br-vm) with the snapshot-expected gateway (172.16.0.1/24)
+//   - A TAP device (tap-slot-0) attached to br-vm
+//   - A veth pair connecting the namespace to the host with 10.200.{slot}.0/30 addressing
 //
-// Architecture:
+// This provides complete VM isolation by construction — no shared L2 domain,
+// no path between namespaces, no VM-to-VM or VM-to-host connectivity.
 //
-//	Host namespace:
-//	  - veth-{vmid}-host (connected to bridge)
-//	VM namespace (netns-{vmid}):
-//	  - veth-{vmid}-vm (same IP for all VMs, e.g., 172.16.0.2)
-//	  - TAP device for Firecracker (tap0)
-//	  - NAT masquerade from VM subnet to veth
 type NetNSNetwork struct {
-	bridgeName    string
 	subnet        *net.IPNet
 	gateway       net.IP
-	vmIP          net.IP // Same IP for all VMs
+	vmIP          net.IP // Same IP for all VMs (172.16.0.2)
 	externalIface string
+	extMTU        int // MTU of external interface (e.g., 1460 on GCP)
 	namespaces    map[string]*VMNamespace // vmID -> namespace info
 	mu            sync.Mutex
 	logger        *logrus.Entry
@@ -47,24 +40,36 @@ type NetNSNetwork struct {
 
 // VMNamespace holds info about a VM's network namespace
 type VMNamespace struct {
-	Name     string // Namespace name
-	Path     string // Path to namespace file
-	VethHost string // Host-side veth name
-	VethVM   string // VM-side veth name (inside namespace)
-	TapName  string // TAP device name inside namespace
-	IP       net.IP // IP address (same for all VMs)
-	Gateway  net.IP // Gateway IP
-	MAC      string // MAC address for TAP
-	Handle   netns.NsHandle
+	Name           string // Namespace name (fc-{shortID})
+	Path           string // Path to namespace file (/var/run/netns/fc-{shortID})
+	VethHost       string // Host-side veth name
+	VethVM         string // VM-side veth name (inside namespace)
+	TapName        string // TAP device name inside namespace (always tap-slot-0)
+	IP             net.IP // Guest IP address (same for all VMs: 172.16.0.2)
+	Gateway        net.IP // Gateway IP (172.16.0.1)
+	MAC            string // MAC address for TAP
+	Slot           int    // Slot number (determines veth addressing: 10.200.{slot}.0/30)
+	HostReachableIP net.IP // IP reachable from host namespace (10.200.{slot}.2)
+	Handle         netns.NsHandle
 }
 
 // NetNSConfig holds configuration for network namespace setup
 type NetNSConfig struct {
-	BridgeName    string
-	Subnet        string // CIDR notation, e.g., "172.16.0.0/24"
+	BridgeName    string // Unused in per-VM namespace mode; kept for config compatibility
+	Subnet        string // CIDR notation for guest subnet, e.g., "172.16.0.0/24"
 	ExternalIface string
 	Logger        *logrus.Logger
 }
+
+// vethSupernet is the supernet covering all per-VM veth /30 subnets.
+const vethSupernet = "10.200.0.0/16"
+
+// innerBridgeName is the bridge created inside each namespace.
+const innerBridgeName = "br-vm"
+
+// snapshotTAPNameNetNS is the TAP device name inside each namespace,
+// matching the name baked into the snapshot state file.
+const snapshotTAPNameNetNS = "tap-slot-0"
 
 // NewNetNSNetwork creates a new network namespace manager
 func NewNetNSNetwork(cfg NetNSConfig) (*NetNSNetwork, error) {
@@ -81,147 +86,117 @@ func NewNetNSNetwork(cfg NetNSConfig) (*NetNSNetwork, error) {
 		logger = logrus.New()
 	}
 
+	extIface := cfg.ExternalIface
+	// Auto-detect the external interface from the default route if the
+	// configured one doesn't exist (e.g., "eth0" on hosts that use "ens4").
+	if _, err := net.InterfaceByName(extIface); err != nil {
+		if detected := detectDefaultRouteIface(); detected != "" {
+			logger.WithField("component", "netns-network").WithFields(logrus.Fields{
+				"configured": extIface,
+				"detected":   detected,
+			}).Info("Configured external interface not found, using detected default route interface")
+			extIface = detected
+		}
+	}
+
+	// Detect MTU from external interface to avoid fragmentation.
+	// GCP uses 1460, AWS uses 9001, default is 1500.
+	extMTU := 1500
+	if iface, err := net.InterfaceByName(extIface); err == nil {
+		extMTU = iface.MTU
+	}
+
 	return &NetNSNetwork{
-		bridgeName:    cfg.BridgeName,
 		subnet:        subnet,
 		gateway:       gateway,
 		vmIP:          vmIP,
-		externalIface: cfg.ExternalIface,
+		externalIface: extIface,
+		extMTU:        extMTU,
 		namespaces:    make(map[string]*VMNamespace),
 		logger:        logger.WithField("component", "netns-network"),
 	}, nil
 }
 
-// Setup initializes the bridge (namespaces are created per-VM)
+// Setup enables IP forwarding and configures host-level MASQUERADE for the
+// veth supernet (10.200.0.0/16). No shared bridge is created — each VM gets
+// its own namespace with an inner bridge.
 func (n *NetNSNetwork) Setup() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	n.logger.WithFields(logrus.Fields{
-		"bridge":  n.bridgeName,
 		"subnet":  n.subnet.String(),
 		"gateway": n.gateway.String(),
 		"vm_ip":   n.vmIP.String(),
-	}).Info("Setting up network namespace infrastructure")
-
-	// Create bridge
-	if err := n.createBridge(); err != nil {
-		return fmt.Errorf("failed to create bridge: %w", err)
-	}
+	}).Info("Setting up per-VM network namespace infrastructure")
 
 	// Enable IP forwarding
 	if err := exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run(); err != nil {
 		n.logger.WithError(err).Warn("Failed to enable IP forwarding")
 	}
 
-	// Setup NAT for bridge traffic to external interface
-	if err := n.setupBridgeNAT(); err != nil {
-		return fmt.Errorf("failed to setup bridge NAT: %w", err)
-	}
+	// Host-level MASQUERADE for veth supernet so traffic from namespaces can reach the internet.
+	// Each namespace's veth-h is in 10.200.{slot}.0/30; we cover them all with 10.200.0.0/16.
+	addIPTablesRuleIfMissing("iptables",
+		[]string{"-t", "nat", "-C", "POSTROUTING", "-s", vethSupernet, "-o", n.externalIface, "-j", "MASQUERADE"},
+		[]string{"-t", "nat", "-A", "POSTROUTING", "-s", vethSupernet, "-o", n.externalIface, "-j", "MASQUERADE"},
+	)
 
+	// FORWARD rules for veth traffic to/from external interface
+	addIPTablesRuleIfMissing("iptables",
+		[]string{"-C", "FORWARD", "-s", vethSupernet, "-o", n.externalIface, "-j", "ACCEPT"},
+		[]string{"-A", "FORWARD", "-s", vethSupernet, "-o", n.externalIface, "-j", "ACCEPT"},
+	)
+	addIPTablesRuleIfMissing("iptables",
+		[]string{"-C", "FORWARD", "-d", vethSupernet, "-i", n.externalIface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"},
+		[]string{"-A", "FORWARD", "-d", vethSupernet, "-i", n.externalIface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"},
+	)
+
+	// Clamp TCP MSS to path MTU
+	addIPTablesRuleIfMissing("iptables",
+		[]string{"-t", "mangle", "-C", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"},
+		[]string{"-t", "mangle", "-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"},
+	)
+
+	n.logger.Info("Host-level NAT rules configured for per-VM namespaces")
 	return nil
 }
 
-// createBridge creates the bridge interface (same as NAT approach)
-func (n *NetNSNetwork) createBridge() error {
-	link, err := netlink.LinkByName(n.bridgeName)
-	if err == nil {
-		n.logger.WithField("bridge", n.bridgeName).Debug("Bridge already exists")
-		return netlink.LinkSetUp(link)
-	}
-
-	bridge := &netlink.Bridge{
-		LinkAttrs: netlink.LinkAttrs{
-			Name: n.bridgeName,
-		},
-	}
-
-	if err := netlink.LinkAdd(bridge); err != nil {
-		return fmt.Errorf("failed to add bridge: %w", err)
-	}
-
-	link, err = netlink.LinkByName(n.bridgeName)
+// addIPTablesRuleIfMissing checks if a rule exists (checkArgs) and adds it (addArgs) if missing.
+// detectDefaultRouteIface returns the network interface used by the default route.
+func detectDefaultRouteIface() string {
+	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
 	if err != nil {
-		return fmt.Errorf("failed to get bridge link: %w", err)
+		return ""
 	}
-
-	// Add gateway IP to bridge
-	ones, _ := n.subnet.Mask.Size()
-	addr := &netlink.Addr{
-		IPNet: &net.IPNet{
-			IP:   n.gateway,
-			Mask: net.CIDRMask(ones, 32),
-		},
-	}
-	if err := netlink.AddrAdd(link, addr); err != nil {
-		if err.Error() != "file exists" {
-			return fmt.Errorf("failed to add address to bridge: %w", err)
+	for _, r := range routes {
+		if r.Dst == nil { // default route
+			link, err := netlink.LinkByIndex(r.LinkIndex)
+			if err != nil {
+				continue
+			}
+			return link.Attrs().Name
 		}
 	}
+	return ""
+}
 
-	if err := netlink.LinkSetUp(link); err != nil {
-		return fmt.Errorf("failed to bring up bridge: %w", err)
+func addIPTablesRuleIfMissing(binary string, checkArgs, addArgs []string) error {
+	if err := exec.Command(binary, checkArgs...).Run(); err != nil {
+		if err := exec.Command(binary, addArgs...).Run(); err != nil {
+			return fmt.Errorf("failed to add iptables rule: %w", err)
+		}
 	}
-
-	n.logger.WithField("bridge", n.bridgeName).Info("Bridge created successfully")
 	return nil
 }
 
-// setupBridgeNAT configures NAT for traffic from bridge to external
-func (n *NetNSNetwork) setupBridgeNAT() error {
-	subnetCIDR := n.subnet.String()
-
-	// MASQUERADE for outbound traffic
-	masqueradeRule := []string{
-		"-t", "nat", "-C", "POSTROUTING",
-		"-s", subnetCIDR,
-		"-o", n.externalIface,
-		"-j", "MASQUERADE",
-	}
-	if err := exec.Command("iptables", masqueradeRule...).Run(); err != nil {
-		addRule := []string{
-			"-t", "nat", "-A", "POSTROUTING",
-			"-s", subnetCIDR,
-			"-o", n.externalIface,
-			"-j", "MASQUERADE",
-		}
-		if err := exec.Command("iptables", addRule...).Run(); err != nil {
-			return fmt.Errorf("failed to add MASQUERADE rule: %w", err)
-		}
-	}
-
-	// FORWARD rules
-	forwardOut := []string{"-C", "FORWARD", "-i", n.bridgeName, "-o", n.externalIface, "-j", "ACCEPT"}
-	if err := exec.Command("iptables", forwardOut...).Run(); err != nil {
-		addRule := []string{"-A", "FORWARD", "-i", n.bridgeName, "-o", n.externalIface, "-j", "ACCEPT"}
-		if err := exec.Command("iptables", addRule...).Run(); err != nil {
-			return fmt.Errorf("failed to add forward out rule: %w", err)
-		}
-	}
-
-	forwardIn := []string{"-C", "FORWARD", "-i", n.externalIface, "-o", n.bridgeName, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"}
-	if err := exec.Command("iptables", forwardIn...).Run(); err != nil {
-		addRule := []string{"-A", "FORWARD", "-i", n.externalIface, "-o", n.bridgeName, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"}
-		if err := exec.Command("iptables", addRule...).Run(); err != nil {
-			return fmt.Errorf("failed to add forward in rule: %w", err)
-		}
-	}
-
-	// Clamp TCP MSS to path MTU (see nat.go setupNAT for explanation)
-	mssClampRule := []string{"-t", "mangle", "-C", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"}
-	if err := exec.Command("iptables", mssClampRule...).Run(); err != nil {
-		addRule := []string{"-t", "mangle", "-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"}
-		if err := exec.Command("iptables", addRule...).Run(); err != nil {
-			n.logger.WithError(err).Warn("Failed to add MSS clamping rule")
-		}
-	}
-
-	n.logger.Info("Bridge NAT rules configured successfully")
-	return nil
-}
-
-// CreateNamespaceForVM creates a network namespace and devices for a VM
-func (n *NetNSNetwork) CreateNamespaceForVM(vmID string) (*VMNamespace, error) {
+// CreateNamespaceForVM creates an isolated network namespace for a VM.
+//
+// The slot parameter determines the veth /30 subnet (10.200.{slot}.0/30).
+// Inside the namespace, an inner bridge (br-vm) with gateway 172.16.0.1/24
+// and TAP device (tap-slot-0) are created, replicating the topology the
+// snapshot expects.
+func (n *NetNSNetwork) CreateNamespaceForVM(vmID string, slot int) (*VMNamespace, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -233,46 +208,49 @@ func (n *NetNSNetwork) CreateNamespaceForVM(vmID string) (*VMNamespace, error) {
 	nsName := fmt.Sprintf("fc-%s", shortID)
 	vethHost := fmt.Sprintf("veth-%s-h", shortID)
 	vethVM := fmt.Sprintf("veth-%s-v", shortID)
-	tapName := "tap0" // Standard name inside namespace
+
+	// Veth addressing: 10.200.{slot}.0/30
+	// Host side: 10.200.{slot}.1, Namespace side: 10.200.{slot}.2
+	vethHostIP := net.IPv4(10, 200, byte(slot), 1)
+	vethVMIP := net.IPv4(10, 200, byte(slot), 2)
+	vethMask := net.CIDRMask(30, 32)
 
 	n.logger.WithFields(logrus.Fields{
-		"vm_id":     vmID,
-		"namespace": nsName,
-		"veth_host": vethHost,
-		"veth_vm":   vethVM,
-		"tap":       tapName,
-		"ip":        n.vmIP.String(),
-	}).Info("Creating network namespace for VM")
+		"vm_id":        vmID,
+		"namespace":    nsName,
+		"slot":         slot,
+		"veth_host":    vethHost,
+		"veth_vm":      vethVM,
+		"veth_host_ip": vethHostIP.String(),
+		"veth_vm_ip":   vethVMIP.String(),
+	}).Info("Creating per-VM network namespace")
 
-	// Lock OS thread for namespace operations
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	// Save current namespace
+	// Save current (host) namespace
 	origNS, err := netns.Get()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get current namespace: %w", err)
 	}
 	defer origNS.Close()
 
-	// Create new namespace
+	// 1. Create namespace
 	newNS, err := netns.NewNamed(nsName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create namespace: %w", err)
 	}
 
-	// Switch back to original namespace for veth creation
+	// Switch back to host namespace for veth creation
 	if err := netns.Set(origNS); err != nil {
 		newNS.Close()
 		return nil, fmt.Errorf("failed to switch back to original namespace: %w", err)
 	}
 
-	// Create veth pair in host namespace
+	// 2. Create veth pair in host namespace (MTU matches external interface to avoid fragmentation)
 	veth := &netlink.Veth{
-		LinkAttrs: netlink.LinkAttrs{
-			Name: vethHost,
-		},
-		PeerName: vethVM,
+		LinkAttrs: netlink.LinkAttrs{Name: vethHost, MTU: n.extMTU},
+		PeerName:  vethVM,
 	}
 	if err := netlink.LinkAdd(veth); err != nil {
 		netns.DeleteNamed(nsName)
@@ -280,7 +258,7 @@ func (n *NetNSNetwork) CreateNamespaceForVM(vmID string) (*VMNamespace, error) {
 		return nil, fmt.Errorf("failed to create veth pair: %w", err)
 	}
 
-	// Get veth peer (vm side)
+	// 3. Move veth-v into namespace
 	vethVMLink, err := netlink.LinkByName(vethVM)
 	if err != nil {
 		netlink.LinkDel(veth)
@@ -288,8 +266,6 @@ func (n *NetNSNetwork) CreateNamespaceForVM(vmID string) (*VMNamespace, error) {
 		newNS.Close()
 		return nil, fmt.Errorf("failed to get veth vm link: %w", err)
 	}
-
-	// Move veth VM side to new namespace
 	if err := netlink.LinkSetNsFd(vethVMLink, int(newNS)); err != nil {
 		netlink.LinkDel(veth)
 		netns.DeleteNamed(nsName)
@@ -297,30 +273,23 @@ func (n *NetNSNetwork) CreateNamespaceForVM(vmID string) (*VMNamespace, error) {
 		return nil, fmt.Errorf("failed to move veth to namespace: %w", err)
 	}
 
-	// Attach veth host side to bridge
+	// 4. Host side: assign 10.200.{slot}.1/30, bring up
 	vethHostLink, err := netlink.LinkByName(vethHost)
 	if err != nil {
 		netns.DeleteNamed(nsName)
 		newNS.Close()
 		return nil, fmt.Errorf("failed to get veth host link: %w", err)
 	}
-
-	bridge, err := netlink.LinkByName(n.bridgeName)
-	if err != nil {
-		netlink.LinkDel(vethHostLink)
-		netns.DeleteNamed(nsName)
-		newNS.Close()
-		return nil, fmt.Errorf("failed to get bridge: %w", err)
+	if err := netlink.AddrAdd(vethHostLink, &netlink.Addr{
+		IPNet: &net.IPNet{IP: vethHostIP, Mask: vethMask},
+	}); err != nil {
+		if err.Error() != "file exists" {
+			netlink.LinkDel(vethHostLink)
+			netns.DeleteNamed(nsName)
+			newNS.Close()
+			return nil, fmt.Errorf("failed to add IP to veth host: %w", err)
+		}
 	}
-
-	if err := netlink.LinkSetMaster(vethHostLink, bridge); err != nil {
-		netlink.LinkDel(vethHostLink)
-		netns.DeleteNamed(nsName)
-		newNS.Close()
-		return nil, fmt.Errorf("failed to attach veth to bridge: %w", err)
-	}
-
-	// Bring up veth host side
 	if err := netlink.LinkSetUp(vethHostLink); err != nil {
 		netlink.LinkDel(vethHostLink)
 		netns.DeleteNamed(nsName)
@@ -328,7 +297,7 @@ func (n *NetNSNetwork) CreateNamespaceForVM(vmID string) (*VMNamespace, error) {
 		return nil, fmt.Errorf("failed to bring up veth host: %w", err)
 	}
 
-	// Configure inside the namespace
+	// 6. Configure inside the namespace (netlink operations respect thread namespace)
 	if err := netns.Set(newNS); err != nil {
 		netlink.LinkDel(vethHostLink)
 		netns.DeleteNamed(nsName)
@@ -336,7 +305,12 @@ func (n *NetNSNetwork) CreateNamespaceForVM(vmID string) (*VMNamespace, error) {
 		return nil, fmt.Errorf("failed to switch to new namespace: %w", err)
 	}
 
-	// Configure veth VM side
+	// 6h. Bring up loopback
+	if lo, err := netlink.LinkByName("lo"); err == nil {
+		netlink.LinkSetUp(lo)
+	}
+
+	// 6a. Assign 10.200.{slot}.2/30 to veth-v, bring up
 	vethVMLink, err = netlink.LinkByName(vethVM)
 	if err != nil {
 		netns.Set(origNS)
@@ -345,24 +319,18 @@ func (n *NetNSNetwork) CreateNamespaceForVM(vmID string) (*VMNamespace, error) {
 		newNS.Close()
 		return nil, fmt.Errorf("failed to get veth vm link in namespace: %w", err)
 	}
-
-	// Add IP address to veth VM side
-	ones, _ := n.subnet.Mask.Size()
-	addr := &netlink.Addr{
-		IPNet: &net.IPNet{
-			IP:   n.vmIP,
-			Mask: net.CIDRMask(ones, 32),
-		},
-	}
-	if err := netlink.AddrAdd(vethVMLink, addr); err != nil {
+	if err := netlink.AddrAdd(vethVMLink, &netlink.Addr{
+		IPNet: &net.IPNet{IP: vethVMIP, Mask: vethMask},
+	}); err != nil {
 		netns.Set(origNS)
 		netlink.LinkDel(vethHostLink)
 		netns.DeleteNamed(nsName)
 		newNS.Close()
-		return nil, fmt.Errorf("failed to add IP to veth: %w", err)
+		return nil, fmt.Errorf("failed to add IP to veth vm: %w", err)
 	}
-
-	// Bring up veth VM side
+	if err := netlink.LinkSetMTU(vethVMLink, n.extMTU); err != nil {
+		n.logger.WithError(err).Warn("Failed to set MTU on veth vm")
+	}
 	if err := netlink.LinkSetUp(vethVMLink); err != nil {
 		netns.Set(origNS)
 		netlink.LinkDel(vethHostLink)
@@ -371,27 +339,53 @@ func (n *NetNSNetwork) CreateNamespaceForVM(vmID string) (*VMNamespace, error) {
 		return nil, fmt.Errorf("failed to bring up veth vm: %w", err)
 	}
 
-	// Bring up loopback
-	lo, err := netlink.LinkByName("lo")
-	if err == nil {
-		netlink.LinkSetUp(lo)
+	// 6b. Create inner bridge br-vm with gateway IP 172.16.0.1/24
+	bridge := &netlink.Bridge{
+		LinkAttrs: netlink.LinkAttrs{Name: innerBridgeName, MTU: n.extMTU},
+	}
+	if err := netlink.LinkAdd(bridge); err != nil {
+		netns.Set(origNS)
+		netlink.LinkDel(vethHostLink)
+		netns.DeleteNamed(nsName)
+		newNS.Close()
+		return nil, fmt.Errorf("failed to create inner bridge: %w", err)
+	}
+	brLink, err := netlink.LinkByName(innerBridgeName)
+	if err != nil {
+		netns.Set(origNS)
+		netlink.LinkDel(vethHostLink)
+		netns.DeleteNamed(nsName)
+		newNS.Close()
+		return nil, fmt.Errorf("failed to get inner bridge link: %w", err)
+	}
+	ones, _ := n.subnet.Mask.Size()
+	if err := netlink.AddrAdd(brLink, &netlink.Addr{
+		IPNet: &net.IPNet{IP: n.gateway, Mask: net.CIDRMask(ones, 32)},
+	}); err != nil {
+		if err.Error() != "file exists" {
+			netns.Set(origNS)
+			netlink.LinkDel(vethHostLink)
+			netns.DeleteNamed(nsName)
+			newNS.Close()
+			return nil, fmt.Errorf("failed to add IP to inner bridge: %w", err)
+		}
+	}
+	if err := netlink.LinkSetMTU(brLink, n.extMTU); err != nil {
+		n.logger.WithError(err).Warn("Failed to set MTU on inner bridge")
+	}
+	if err := netlink.LinkSetUp(brLink); err != nil {
+		netns.Set(origNS)
+		netlink.LinkDel(vethHostLink)
+		netns.DeleteNamed(nsName)
+		newNS.Close()
+		return nil, fmt.Errorf("failed to bring up inner bridge: %w", err)
 	}
 
-	// Add default route via gateway
-	route := &netlink.Route{
-		Gw: n.gateway,
-	}
-	if err := netlink.RouteAdd(route); err != nil {
-		n.logger.WithError(err).Warn("Failed to add default route (may already exist)")
-	}
-
-	// Create TAP device inside namespace
+	// 6c. Create TAP device tap-slot-0, attach to br-vm, bring up
 	tap := &netlink.Tuntap{
-		LinkAttrs: netlink.LinkAttrs{
-			Name: tapName,
-		},
-		Mode:  netlink.TUNTAP_MODE_TAP,
-		Flags: netlink.TUNTAP_DEFAULTS,
+		LinkAttrs: netlink.LinkAttrs{Name: snapshotTAPNameNetNS, MTU: n.extMTU},
+		Mode:      netlink.TUNTAP_MODE_TAP,
+		Flags:     netlink.TUNTAP_DEFAULTS,
 	}
 	if err := netlink.LinkAdd(tap); err != nil {
 		netns.Set(origNS)
@@ -400,15 +394,23 @@ func (n *NetNSNetwork) CreateNamespaceForVM(vmID string) (*VMNamespace, error) {
 		newNS.Close()
 		return nil, fmt.Errorf("failed to create TAP in namespace: %w", err)
 	}
-
-	// Bring up TAP
-	tapLink, err := netlink.LinkByName(tapName)
+	tapLink, err := netlink.LinkByName(snapshotTAPNameNetNS)
 	if err != nil {
 		netns.Set(origNS)
 		netlink.LinkDel(vethHostLink)
 		netns.DeleteNamed(nsName)
 		newNS.Close()
 		return nil, fmt.Errorf("failed to get TAP link: %w", err)
+	}
+	if err := netlink.LinkSetMTU(tapLink, n.extMTU); err != nil {
+		n.logger.WithError(err).Warn("Failed to set MTU on TAP")
+	}
+	if err := netlink.LinkSetMaster(tapLink, brLink); err != nil {
+		netns.Set(origNS)
+		netlink.LinkDel(vethHostLink)
+		netns.DeleteNamed(nsName)
+		newNS.Close()
+		return nil, fmt.Errorf("failed to attach TAP to inner bridge: %w", err)
 	}
 	if err := netlink.LinkSetUp(tapLink); err != nil {
 		netns.Set(origNS)
@@ -418,21 +420,45 @@ func (n *NetNSNetwork) CreateNamespaceForVM(vmID string) (*VMNamespace, error) {
 		return nil, fmt.Errorf("failed to bring up TAP: %w", err)
 	}
 
-	// Switch back to original namespace
+	// 6d. Add default route via host-side veth IP (10.200.{slot}.1)
+	if err := netlink.RouteAdd(&netlink.Route{Gw: vethHostIP}); err != nil {
+		n.logger.WithError(err).Warn("Failed to add default route in namespace (may already exist)")
+	}
+
+	// Switch back to host namespace before running iptables via ip-netns-exec
 	if err := netns.Set(origNS); err != nil {
 		return nil, fmt.Errorf("failed to switch back to original namespace: %w", err)
 	}
 
+	// 6e. MASQUERADE inside namespace: translate 172.16.0.0/24 -> veth-v for outbound
+	subnetCIDR := n.subnet.String()
+	exec.Command("ip", "netns", "exec", nsName,
+		"iptables", "-t", "nat", "-A", "POSTROUTING",
+		"-s", subnetCIDR, "-o", vethVM, "-j", "MASQUERADE").Run()
+
+	// 6f. FORWARD: allow bridge -> veth outbound
+	exec.Command("ip", "netns", "exec", nsName,
+		"iptables", "-A", "FORWARD",
+		"-i", innerBridgeName, "-o", vethVM, "-j", "ACCEPT").Run()
+
+	// 6g. FORWARD: allow veth -> bridge for established connections
+	exec.Command("ip", "netns", "exec", nsName,
+		"iptables", "-A", "FORWARD",
+		"-i", vethVM, "-o", innerBridgeName,
+		"-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT").Run()
+
 	nsInfo := &VMNamespace{
-		Name:     nsName,
-		Path:     filepath.Join("/var/run/netns", nsName),
-		VethHost: vethHost,
-		VethVM:   vethVM,
-		TapName:  tapName,
-		IP:       n.vmIP,
-		Gateway:  n.gateway,
-		MAC:      generateMAC(n.vmIP),
-		Handle:   newNS,
+		Name:            nsName,
+		Path:            filepath.Join("/var/run/netns", nsName),
+		VethHost:        vethHost,
+		VethVM:          vethVM,
+		TapName:         snapshotTAPNameNetNS,
+		IP:              n.vmIP,
+		Gateway:         n.gateway,
+		MAC:             generateMAC(n.vmIP),
+		Slot:            slot,
+		HostReachableIP: vethVMIP, // 10.200.{slot}.2 — reachable from host via veth pair
+		Handle:          newNS,
 	}
 
 	n.namespaces[vmID] = nsInfo
@@ -440,13 +466,14 @@ func (n *NetNSNetwork) CreateNamespaceForVM(vmID string) (*VMNamespace, error) {
 	n.logger.WithFields(logrus.Fields{
 		"vm_id":     vmID,
 		"namespace": nsName,
+		"slot":      slot,
 		"ip":        n.vmIP.String(),
-	}).Info("Network namespace created successfully")
+	}).Info("Per-VM network namespace created successfully")
 
 	return nsInfo, nil
 }
 
-// ReleaseNamespace removes a VM's network namespace
+// ReleaseNamespace removes a VM's network namespace and all associated resources.
 func (n *NetNSNetwork) ReleaseNamespace(vmID string) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -461,7 +488,11 @@ func (n *NetNSNetwork) ReleaseNamespace(vmID string) error {
 		"namespace": nsInfo.Name,
 	}).Info("Releasing network namespace")
 
-	// Delete veth host side (automatically removes peer)
+	// Remove any egress block rules on the host (best-effort)
+	exec.Command("iptables", "-D", "FORWARD", "-i", nsInfo.VethHost, "-j", "DROP").Run()
+	exec.Command("iptables", "-D", "FORWARD", "-o", nsInfo.VethHost, "-j", "DROP").Run()
+
+	// Delete veth host side (automatically removes peer in namespace)
 	if link, err := netlink.LinkByName(nsInfo.VethHost); err == nil {
 		netlink.LinkDel(link)
 	}
@@ -489,7 +520,9 @@ func (n *NetNSNetwork) GetNamespace(vmID string) (*VMNamespace, error) {
 	return nsInfo, nil
 }
 
-// GetTapDevice returns a TapDevice-compatible struct for integration
+// GetTapDevice returns a TapDevice-compatible struct for integration with
+// the rest of the runner system. The tap device is always tap-slot-0 with
+// IP 172.16.0.2 and gateway 172.16.0.1 (matching snapshot constants).
 func (ns *VMNamespace) GetTapDevice(subnet *net.IPNet) *TapDevice {
 	return &TapDevice{
 		Name:       ns.TapName,
@@ -497,7 +530,7 @@ func (ns *VMNamespace) GetTapDevice(subnet *net.IPNet) *TapDevice {
 		Gateway:    ns.Gateway,
 		Subnet:     subnet,
 		MAC:        ns.MAC,
-		BridgeName: "", // Not directly on bridge
+		BridgeName: innerBridgeName,
 	}
 }
 
@@ -528,13 +561,120 @@ func (n *NetNSNetwork) RunInNamespace(vmID string, fn func() error) error {
 	return fn()
 }
 
-// GetFirecrackerNetNSPath returns the path to the namespace file for Firecracker
-// Firecracker can be launched with --network-namespace flag
+// GetFirecrackerNetNSPath returns the path to the namespace file for Firecracker.
+// Firecracker is launched via "ip netns exec {nsName}" to inherit this namespace.
 func (ns *VMNamespace) GetFirecrackerNetNSPath() string {
 	return ns.Path
 }
 
-// Cleanup removes all namespaces and the bridge
+// ForwardPort sets up DNAT inside the VM's namespace so that traffic arriving
+// on the namespace-side veth (10.200.{slot}.2) at the given port is forwarded
+// to the guest (172.16.0.2) at the same port. This allows the host to reach
+// services running inside the VM via the host-reachable IP.
+//
+// Example: ForwardPort("vm-id", 8080) makes 10.200.{slot}.2:8080 → 172.16.0.2:8080
+func (n *NetNSNetwork) ForwardPort(vmID string, port int) error {
+	n.mu.Lock()
+	nsInfo, exists := n.namespaces[vmID]
+	n.mu.Unlock()
+
+	if !exists {
+		return fmt.Errorf("namespace not found for VM: %s", vmID)
+	}
+
+	guestIP := n.vmIP.String()
+	portStr := fmt.Sprintf("%d", port)
+	dest := fmt.Sprintf("%s:%d", guestIP, port)
+
+	n.logger.WithFields(logrus.Fields{
+		"vm_id":     vmID,
+		"namespace": nsInfo.Name,
+		"port":      port,
+		"dest":      dest,
+	}).Info("Forwarding port into VM namespace")
+
+	// DNAT: traffic arriving on veth-v at this port → guest IP
+	if err := exec.Command("ip", "netns", "exec", nsInfo.Name,
+		"iptables", "-t", "nat", "-A", "PREROUTING",
+		"-i", nsInfo.VethVM, "-p", "tcp", "--dport", portStr,
+		"-j", "DNAT", "--to-destination", dest).Run(); err != nil {
+		return fmt.Errorf("failed to add DNAT rule for port %d: %w", port, err)
+	}
+
+	// FORWARD: allow inbound traffic on this port from veth to bridge
+	if err := exec.Command("ip", "netns", "exec", nsInfo.Name,
+		"iptables", "-A", "FORWARD",
+		"-i", nsInfo.VethVM, "-o", innerBridgeName,
+		"-p", "tcp", "--dport", portStr,
+		"-j", "ACCEPT").Run(); err != nil {
+		return fmt.Errorf("failed to add FORWARD rule for port %d: %w", port, err)
+	}
+
+	return nil
+}
+
+// ForwardPorts is a convenience method that forwards multiple ports.
+func (n *NetNSNetwork) ForwardPorts(vmID string, ports []int) error {
+	for _, port := range ports {
+		if err := n.ForwardPort(vmID, port); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// BlockEgress blocks all network egress for a VM by inserting DROP rules on
+// the host FORWARD chain matching the VM's veth interface. This is used for
+// quarantine and works regardless of the VM's internal IP address.
+func (n *NetNSNetwork) BlockEgress(vmID string) error {
+	n.mu.Lock()
+	nsInfo, exists := n.namespaces[vmID]
+	n.mu.Unlock()
+
+	if !exists {
+		return fmt.Errorf("namespace not found for VM: %s", vmID)
+	}
+
+	n.logger.WithFields(logrus.Fields{
+		"vm_id":     vmID,
+		"veth_host": nsInfo.VethHost,
+	}).Info("Blocking VM egress via veth interface")
+
+	// Block all forwarding through this VM's veth (both directions)
+	if err := exec.Command("iptables", "-I", "FORWARD", "1",
+		"-i", nsInfo.VethHost, "-j", "DROP").Run(); err != nil {
+		return fmt.Errorf("failed to insert inbound egress drop rule: %w", err)
+	}
+	if err := exec.Command("iptables", "-I", "FORWARD", "1",
+		"-o", nsInfo.VethHost, "-j", "DROP").Run(); err != nil {
+		return fmt.Errorf("failed to insert outbound egress drop rule: %w", err)
+	}
+
+	return nil
+}
+
+// UnblockEgress removes the egress block rules for a VM.
+func (n *NetNSNetwork) UnblockEgress(vmID string) error {
+	n.mu.Lock()
+	nsInfo, exists := n.namespaces[vmID]
+	n.mu.Unlock()
+
+	if !exists {
+		return fmt.Errorf("namespace not found for VM: %s", vmID)
+	}
+
+	n.logger.WithFields(logrus.Fields{
+		"vm_id":     vmID,
+		"veth_host": nsInfo.VethHost,
+	}).Info("Unblocking VM egress")
+
+	exec.Command("iptables", "-D", "FORWARD", "-i", nsInfo.VethHost, "-j", "DROP").Run()
+	exec.Command("iptables", "-D", "FORWARD", "-o", nsInfo.VethHost, "-j", "DROP").Run()
+
+	return nil
+}
+
+// Cleanup removes all namespaces and host-level NAT rules.
 func (n *NetNSNetwork) Cleanup() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -543,6 +683,10 @@ func (n *NetNSNetwork) Cleanup() error {
 
 	// Release all namespaces
 	for vmID, nsInfo := range n.namespaces {
+		// Remove egress block rules (best-effort)
+		exec.Command("iptables", "-D", "FORWARD", "-i", nsInfo.VethHost, "-j", "DROP").Run()
+		exec.Command("iptables", "-D", "FORWARD", "-o", nsInfo.VethHost, "-j", "DROP").Run()
+
 		if link, err := netlink.LinkByName(nsInfo.VethHost); err == nil {
 			netlink.LinkDel(link)
 		}
@@ -551,30 +695,24 @@ func (n *NetNSNetwork) Cleanup() error {
 		delete(n.namespaces, vmID)
 	}
 
-	// Remove bridge
-	if link, err := netlink.LinkByName(n.bridgeName); err == nil {
-		netlink.LinkDel(link)
-	}
-
-	// Remove NAT rules
-	subnetCIDR := n.subnet.String()
+	// Remove host-level NAT rules
 	exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING",
-		"-s", subnetCIDR, "-o", n.externalIface, "-j", "MASQUERADE").Run()
+		"-s", vethSupernet, "-o", n.externalIface, "-j", "MASQUERADE").Run()
 	exec.Command("iptables", "-D", "FORWARD",
-		"-i", n.bridgeName, "-o", n.externalIface, "-j", "ACCEPT").Run()
+		"-s", vethSupernet, "-o", n.externalIface, "-j", "ACCEPT").Run()
 	exec.Command("iptables", "-D", "FORWARD",
-		"-i", n.externalIface, "-o", n.bridgeName,
+		"-d", vethSupernet, "-i", n.externalIface,
 		"-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT").Run()
 
 	return nil
 }
 
-// GetVMIP returns the IP address used by all VMs
+// GetVMIP returns the IP address used by all VMs (172.16.0.2)
 func (n *NetNSNetwork) GetVMIP() net.IP {
 	return n.vmIP
 }
 
-// GetSubnet returns the subnet used by the network
+// GetSubnet returns the guest subnet used by the network (172.16.0.0/24)
 func (n *NetNSNetwork) GetSubnet() *net.IPNet {
 	return n.subnet
 }

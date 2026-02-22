@@ -11,6 +11,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/ci"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
 // ChunkedManager is a stub for non-Linux platforms
@@ -66,6 +67,16 @@ func (cm *ChunkedManager) Close() error {
 	if cm.Manager != nil {
 		return cm.Manager.Close()
 	}
+	return nil
+}
+
+// GetChunkedMetadata is a stub
+func (cm *ChunkedManager) GetChunkedMetadata() *snapshot.ChunkedSnapshotMetadata {
+	return nil
+}
+
+// GetChunkStore is a stub
+func (cm *ChunkedManager) GetChunkStore() *snapshot.ChunkStore {
 	return nil
 }
 

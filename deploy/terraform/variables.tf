@@ -209,7 +209,13 @@ variable "memory_per_runner_mb" {
 variable "use_chunked_snapshots" {
   description = "Enable chunked snapshot restore with UFFD (lazy memory) and FUSE (lazy disk). Requires chunked metadata in the snapshot bucket."
   type        = bool
-  default     = false
+  default     = true
+}
+
+variable "use_netns" {
+  description = "Use per-VM network namespaces instead of a shared bridge. Provides VM-to-VM isolation by construction — each VM gets its own namespace with point-to-point veth routing."
+  type        = bool
+  default     = true
 }
 
 variable "runner_ephemeral" {

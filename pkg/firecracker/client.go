@@ -23,6 +23,7 @@ type Client struct {
 	socketPath string
 	httpClient *http.Client
 	vmID       string
+	netNSPath  string // Network namespace path; if set, Firecracker runs inside this namespace
 	process    *exec.Cmd
 	mu         sync.Mutex
 	logger     *logrus.Entry
@@ -35,6 +36,7 @@ type Config struct {
 	FirecrackerBin string
 	JailerBin      string
 	UseJailer      bool
+	NetNSPath      string // Network namespace path (e.g., /var/run/netns/fc-xxxx)
 	Logger         *logrus.Logger
 }
 
@@ -54,6 +56,7 @@ func NewClient(cfg Config) *Client {
 	return &Client{
 		socketPath: cfg.SocketPath,
 		vmID:       cfg.VMID,
+		netNSPath:  cfg.NetNSPath,
 		httpClient: &http.Client{
 			Transport: transport,
 			Timeout:   10 * time.Minute, // Snapshot creation can take minutes for large memory VMs on standard disks
@@ -367,10 +370,20 @@ func (c *Client) StartFirecracker(ctx context.Context, firecrackerBin string, co
 	// IMPORTANT: Use context.Background() instead of the passed context.
 	// The Firecracker process should outlive the gRPC request that started it.
 	// Using the request context would kill the VM when the gRPC response is sent.
-	cmd := exec.Command(firecrackerBin,
-		"--api-sock", c.socketPath,
-		"--id", c.vmID,
-	)
+	var cmd *exec.Cmd
+	if c.netNSPath != "" {
+		// Launch Firecracker inside the VM's network namespace so it can
+		// open the TAP device (tap-slot-0) that exists only in that namespace.
+		nsName := filepath.Base(c.netNSPath)
+		cmd = exec.Command("ip", "netns", "exec", nsName,
+			firecrackerBin, "--api-sock", c.socketPath, "--id", c.vmID)
+		c.logger.WithField("netns", nsName).Info("Launching Firecracker inside network namespace")
+	} else {
+		cmd = exec.Command(firecrackerBin,
+			"--api-sock", c.socketPath,
+			"--id", c.vmID,
+		)
+	}
 
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid: true,

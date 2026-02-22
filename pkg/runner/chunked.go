@@ -182,11 +182,17 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	var err error
 
 	if cm.useNetNS && cm.netnsNetwork != nil {
-		netns, err = cm.netnsNetwork.CreateNamespaceForVM(runnerID)
+		slot := cm.findAvailableSlot()
+		if slot < 0 {
+			return nil, fmt.Errorf("no slots available")
+		}
+		netns, err = cm.netnsNetwork.CreateNamespaceForVM(runnerID, slot)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create network namespace: %w", err)
 		}
 		tap = netns.GetTapDevice(cm.netnsNetwork.GetSubnet())
+		cm.slotToRunner[slot] = runnerID
+		cm.runnerToSlot[runnerID] = slot
 	} else {
 		// Use slot-based allocation from base manager
 		slot := cm.findAvailableSlot()
@@ -340,12 +346,18 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		return nil, fmt.Errorf("kernel not found at %s (should have been eagerly fetched at startup): %w", kernelPath, err)
 	}
 
-	// Create runner record
+	// Create runner record.
+	// When using per-VM namespaces, InternalIP is set to the host-reachable
+	// veth IP (10.0.{slot}.2) so the host proxy can reach the VM's services.
+	internalIP := tap.IP
+	if netns != nil {
+		internalIP = netns.HostReachableIP
+	}
 	runner := &Runner{
 		ID:              runnerID,
 		HostID:          cm.config.HostID,
 		State:           StateBooting,
-		InternalIP:      tap.IP,
+		InternalIP:      internalIP,
 		TapDevice:       tap.Name,
 		MAC:             tap.MAC,
 		SnapshotVersion: cm.chunkedMeta.Version,
@@ -413,6 +425,11 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		MetricsPath: runner.MetricsPath,
 	}
 
+	// When using per-VM namespaces, Firecracker runs inside the namespace
+	if netns != nil {
+		vmCfg.NetNSPath = netns.GetFirecrackerNetNSPath()
+	}
+
 	// Create VM instance
 	vm, err := firecracker.NewVM(vmCfg, cm.logger.Logger)
 	if err != nil {
@@ -437,12 +454,16 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	}
 
 	// Setup TAP rename: the snapshot bakes in host_dev_name="tap-slot-0".
-	// If this runner uses a different slot, temporarily rename its TAP.
-	tapRestore, err := cm.setupSnapshotTAPRename(tap.Name)
-	if err != nil {
-		symlinkCleanup()
-		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
-		return nil, fmt.Errorf("failed to setup TAP rename: %w", err)
+	// With per-VM namespaces, tap-slot-0 already exists in the namespace — no rename needed.
+	var tapRestore func()
+	if netns == nil {
+		var tapErr error
+		tapRestore, tapErr = cm.setupSnapshotTAPRename(tap.Name)
+		if tapErr != nil {
+			symlinkCleanup()
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+			return nil, fmt.Errorf("failed to setup TAP rename: %w", tapErr)
+		}
 	}
 
 	// Restore from snapshot.
@@ -465,7 +486,9 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		}).Info("Restoring VM with UFFD memory backend")
 		restoreErr = vm.RestoreFromSnapshotWithUFFD(ctx, restoreStatePath, uffdSocketPath, false)
 	}
-	tapRestore()
+	if tapRestore != nil {
+		tapRestore()
+	}
 	symlinkCleanup()
 
 	if restoreErr != nil {
@@ -498,6 +521,14 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 			vm.Stop()
 			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
 			return nil, fmt.Errorf("failed to resume VM after MMDS injection: %w", err)
+		}
+	}
+
+	// When using per-VM namespaces, set up port forwarding (DNAT) so the host
+	// can reach services inside the VM via the host-reachable veth IP.
+	if netns != nil && cm.netnsNetwork != nil {
+		if err := cm.netnsNetwork.ForwardPort(runnerID, 8080); err != nil {
+			cm.chunkedLogger.WithError(err).Warn("Failed to forward port 8080 into namespace")
 		}
 	}
 

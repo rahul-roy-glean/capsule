@@ -27,6 +27,9 @@ type VMConfig struct {
 	Drives         []Drive
 	LogPath        string
 	MetricsPath    string
+	// NetNSPath is the path to a network namespace file (e.g., /var/run/netns/fc-xxxx).
+	// When set, Firecracker is launched inside this namespace via "ip netns exec".
+	NetNSPath string
 }
 
 // VM represents a running Firecracker microVM
@@ -74,6 +77,7 @@ func NewVM(cfg VMConfig, logger *logrus.Logger) (*VM, error) {
 	client := NewClient(Config{
 		SocketPath: socketPath,
 		VMID:       cfg.VMID,
+		NetNSPath:  cfg.NetNSPath,
 		Logger:     logger,
 	})
 
