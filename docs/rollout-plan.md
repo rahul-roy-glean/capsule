@@ -105,19 +105,18 @@ SELECT COUNT(*) FROM jobs;
 ## Stage 2: Deploy Control Plane
 
 Build and push the new control plane image, then do a rolling update on GKE.
+All builds use existing Makefile targets — no manual docker commands needed.
 
 ```bash
-# Build the new binary
-make build
+# Build all linux/amd64 binaries + Docker images (--platform linux/amd64 is in the Makefile)
+make docker-build PROJECT_ID=${PROJECT_ID}
 
-# Build and push Docker image
-docker build -t us-central1-docker.pkg.dev/${PROJECT_ID}/firecracker/control-plane:v2 \
-  -f deploy/docker/Dockerfile.control-plane .
-docker push us-central1-docker.pkg.dev/${PROJECT_ID}/firecracker/control-plane:v2
+# Push to Artifact Registry
+make docker-push PROJECT_ID=${PROJECT_ID}
 
 # Update the deployment image (rolling restart, zero downtime with 2 replicas)
 kubectl -n firecracker-runner set image deployment/control-plane \
-  control-plane=us-central1-docker.pkg.dev/${PROJECT_ID}/firecracker/control-plane:v2
+  control-plane=$(REGION)-docker.pkg.dev/${PROJECT_ID}/firecracker/firecracker-control-plane:$(git describe --tags --always --dirty)
 
 # Watch rollout
 kubectl -n firecracker-runner rollout status deployment/control-plane
@@ -195,42 +194,23 @@ Build a new host image with the updated `firecracker-manager` binary and roll it
 ### 4a. Build New Host Image
 
 ```bash
-# Build linux binary
-GOOS=linux GOARCH=amd64 go build -o bin/firecracker-manager-linux ./cmd/firecracker-manager
-
-# Upload to GCS (for Packer or startup script)
-gcloud storage cp bin/firecracker-manager-linux \
-  gs://${PROJECT_ID}-firecracker-snapshots/bin/firecracker-manager
-
-# Option A: Bake new image with Packer
-cd deploy/packer
-packer build -var project_id=${PROJECT_ID} firecracker-host.pkr.hcl
-
-# Option B: Just update the binary via startup script (no image rebuild)
-# The startup script already downloads from GCS on boot
+# Build linux/amd64 binary + bake Packer image (single command)
+make release-host-image PROJECT_ID=${PROJECT_ID} ENV=${ENV}
 ```
+
+This runs `make firecracker-manager-linux` (cross-compile to linux/amd64 via
+`CGO_ENABLED=0 GOOS=linux GOARCH=amd64`), then `packer build` to bake the
+binary into a GCE image in the `firecracker-host` image family.
 
 ### 4b. Rolling MIG Update
 
 ```bash
-# If using a new image:
-gcloud compute instance-groups managed rolling-action start-update \
-  firecracker-hosts-${ENVIRONMENT} \
-  --version=template=firecracker-host-template-v2 \
-  --zone=${ZONE} \
-  --max-unavailable=1 \
-  --max-surge=1
+# Rolling update to the latest image (max-surge=3, max-unavailable=0)
+make mig-rolling-update PROJECT_ID=${PROJECT_ID} ENV=${ENV}
 
 # Watch the rollout
-watch -n5 'gcloud compute instance-groups managed list-instances \
-  firecracker-hosts-${ENVIRONMENT} --zone=${ZONE} \
-  --format="table(instance,status,currentAction)"'
-```
-
-If using startup script binary download, just restart hosts one at a time:
-```bash
-# Drain a host, wait for jobs to finish, restart
-gcloud compute instances reset <instance-name> --zone=${ZONE}
+gcloud compute instance-groups managed list-instances \
+  fc-runner-${ENV}-hosts --region=${REGION} --project=${PROJECT_ID}
 ```
 
 ### 4c. Validate Host Changes
