@@ -17,9 +17,8 @@ import (
 
 var (
 	// Source: GCS bucket or GCP snapshot
-	gcsBucket      = flag.String("gcs-bucket", "", "GCS bucket containing git-cache metadata (legacy mode)")
-	gcpProject     = flag.String("gcp-project", "", "GCP project for snapshot/Cloud Build")
-	snapshotPrefix = flag.String("snapshot-prefix", "runner-data", "Prefix for snapshot names")
+	gcsBucket  = flag.String("gcs-bucket", "", "GCS bucket containing git-cache metadata (legacy mode)")
+	gcpProject = flag.String("gcp-project", "", "GCP project for snapshot/Cloud Build")
 
 	// Freshness thresholds
 	maxAgeHours    = flag.Int("max-age-hours", 24, "Maximum age before rebuild (hours)")

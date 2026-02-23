@@ -27,6 +27,7 @@ type ChunkedManagerConfig struct {
 	UseChunkedSnapshots bool
 	UseNetNS            bool
 	ChunkCacheSizeBytes int64
+	MemBackend          string
 }
 
 // NewChunkedManager returns an error on non-Linux platforms
@@ -86,4 +87,14 @@ func (cm *ChunkedManager) GetSubnet() *net.IPNet {
 		return cm.Manager.network.GetSubnet()
 	}
 	return nil
+}
+
+// GetLoadedManifests is a stub
+func (cm *ChunkedManager) GetLoadedManifests() map[string]string {
+	return nil
+}
+
+// SyncManifest is a stub
+func (cm *ChunkedManager) SyncManifest(ctx context.Context, repoSlug, version string) error {
+	return fmt.Errorf("chunked snapshots are only supported on Linux")
 }

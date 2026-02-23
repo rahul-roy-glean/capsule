@@ -22,33 +22,37 @@ import (
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/fuse"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/github"
+	repomod "github.com/rahul-roy-glean/bazel-firecracker/pkg/repo"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
 var (
-	repoURL             = flag.String("repo-url", "", "Repository URL to clone")
-	repoBranch          = flag.String("repo-branch", "main", "Branch to checkout")
-	bazelVersion        = flag.String("bazel-version", "7.x", "Bazel version")
-	gcsBucket           = flag.String("gcs-bucket", "", "GCS bucket for snapshots")
-	outputDir           = flag.String("output-dir", "/tmp/snapshot", "Output directory for snapshot files")
-	kernelPath          = flag.String("kernel-path", "/opt/firecracker/kernel.bin", "Path to kernel")
-	rootfsPath          = flag.String("rootfs-path", "/opt/firecracker/rootfs.img", "Path to base rootfs")
-	firecrackerBin      = flag.String("firecracker-bin", "/usr/local/bin/firecracker", "Path to firecracker binary")
-	vcpus               = flag.Int("vcpus", 4, "vCPUs for warmup VM")
-	memoryMB            = flag.Int("memory-mb", 8192, "Memory MB for warmup VM")
-	warmupTimeout       = flag.Duration("warmup-timeout", 30*time.Minute, "Timeout for warmup phase")
-	rootfsSizeGB        = flag.Int("rootfs-size-gb", 0, "Expand rootfs to this size in GB (0 = keep original size). Increase if bazel fetch runs out of space.")
+	repoURL              = flag.String("repo-url", "", "Repository URL to clone")
+	repoBranch           = flag.String("repo-branch", "main", "Branch to checkout")
+	bazelVersion         = flag.String("bazel-version", "7.x", "Bazel version")
+	gcsBucket            = flag.String("gcs-bucket", "", "GCS bucket for snapshots")
+	outputDir            = flag.String("output-dir", "/tmp/snapshot", "Output directory for snapshot files")
+	kernelPath           = flag.String("kernel-path", "/opt/firecracker/kernel.bin", "Path to kernel")
+	rootfsPath           = flag.String("rootfs-path", "/opt/firecracker/rootfs.img", "Path to base rootfs")
+	firecrackerBin       = flag.String("firecracker-bin", "/usr/local/bin/firecracker", "Path to firecracker binary")
+	vcpus                = flag.Int("vcpus", 4, "vCPUs for warmup VM")
+	memoryMB             = flag.Int("memory-mb", 8192, "Memory MB for warmup VM")
+	warmupTimeout        = flag.Duration("warmup-timeout", 30*time.Minute, "Timeout for warmup phase")
+	rootfsSizeGB         = flag.Int("rootfs-size-gb", 0, "Expand rootfs to this size in GB (0 = keep original size). Increase if bazel fetch runs out of space.")
 	repoCacheUpperSizeGB = flag.Int("repo-cache-upper-size-gb", 10, "Size in GB of repo-cache-upper.img (writable overlay for Bazel repository cache)")
 	repoCacheSeedSizeGB  = flag.Int("repo-cache-seed-size-gb", 20, "Size in GB of repo-cache-seed.img (shared Bazel repository cache seed)")
-	repoCacheSeedDir    = flag.String("repo-cache-seed-dir", "", "Optional directory to seed into repo-cache-seed.img (copied into image root)")
-	gitCachePath        = flag.String("git-cache-path", "", "Path to pre-populated git-cache.img (from git-cache-builder). If set, uses this instead of cloning during warmup.")
-	fetchTargets        = flag.String("fetch-targets", "//...", "Bazel target pattern for fetch (e.g., '//... -- -//terraform/...' to exclude terraform)")
-	bazelrc             = flag.String("bazelrc", "", "Path to .bazelrc file relative to repo root. If empty, uses repo's .bazelrc if it exists.")
-	logLevel            = flag.String("log-level", "info", "Log level")
-	enableChunked       = flag.Bool("enable-chunked", true, "Also build a chunked snapshot for lazy loading")
-	chunkSize           = flag.Int64("chunk-size", 4194304, "Chunk size in bytes for chunked snapshots (default 4MB)")
+	repoCacheSeedDir     = flag.String("repo-cache-seed-dir", "", "Optional directory to seed into repo-cache-seed.img (copied into image root)")
+	gitCachePath         = flag.String("git-cache-path", "", "Path to pre-populated git-cache.img (from git-cache-builder). If set, uses this instead of cloning during warmup.")
+	fetchTargets         = flag.String("fetch-targets", "//...", "Bazel target pattern for fetch (e.g., '//... -- -//terraform/...' to exclude terraform)")
+	bazelrc              = flag.String("bazelrc", "", "Path to .bazelrc file relative to repo root. If empty, uses repo's .bazelrc if it exists.")
+	logLevel             = flag.String("log-level", "info", "Log level")
+	enableChunked        = flag.Bool("enable-chunked", true, "Also build a chunked snapshot for lazy loading")
+	memBackend           = flag.String("mem-backend", "file", "Memory backend for chunked snapshots: 'file' (upload snapshot.mem as single blob, default) or 'chunked' (UFFD lazy loading via MemChunks)")
 
 	incremental = flag.Bool("incremental", false, "Restore from previous snapshot for incremental rebuild")
+
+	// Multi-repo support
+	repoSlug = flag.String("repo-slug", "", "Deterministic repo slug (derived from repo-url if empty). Used to namespace GCS paths.")
 
 	// GitHub App authentication for private repos (used when git-cache is not available)
 	githubAppID     = flag.String("github-app-id", "", "GitHub App ID for private repo access")
@@ -409,11 +413,19 @@ func main() {
 		}
 	}
 
+	// Derive repo slug (use flag, or derive from repo URL)
+	effectiveRepoSlug := *repoSlug
+	if effectiveRepoSlug == "" && *repoURL != "" {
+		effectiveRepoSlug = repomod.Slug(*repoURL)
+	}
+
 	// Create metadata
 	metadata := snapshot.SnapshotMetadata{
 		Version:           version,
 		BazelVersion:      *bazelVersion,
 		RepoCommit:        getGitCommit(*outputDir),
+		Repo:              *repoURL,
+		RepoSlug:          effectiveRepoSlug,
 		CreatedAt:         time.Now(),
 		SizeBytes:         totalSize,
 		KernelPath:        "kernel.bin",
@@ -443,9 +455,9 @@ func main() {
 		}
 	}
 
-	// Update current pointer
+	// Update current pointer (repo-scoped if repo slug is set)
 	log.Info("Updating current pointer...")
-	if err := uploader.UpdateCurrentPointer(ctx, version); err != nil {
+	if err := uploader.UpdateCurrentPointerForRepo(ctx, version, effectiveRepoSlug); err != nil {
 		log.WithError(err).Fatal("Failed to update current pointer")
 	}
 
@@ -464,6 +476,7 @@ func main() {
 		defer chunkStore.Close()
 
 		builder := snapshot.NewChunkedSnapshotBuilder(chunkStore, logger)
+		builder.MemBackend = *memBackend
 
 		// Compute rootfs source hash for storing in metadata (enables incremental change detection).
 		// Only needed at upload time — the incremental path hashes independently for comparison.
@@ -510,18 +523,25 @@ func main() {
 			}
 			chunkedMeta.StateHash = stateHash
 
-			// Upload memory as compressed raw file
-			memGCSPath := fmt.Sprintf("%s/snapshot.mem.zst", version)
-			_, _, err = chunkStore.UploadRawFile(ctx, memPath, memGCSPath)
-			if err != nil {
-				log.WithError(err).Fatal("Failed to upload raw memory file")
+			// Store memory according to --mem-backend flag.
+			if *memBackend == "file" {
+				memGCSPath := fmt.Sprintf("%s/snapshot.mem.zst", version)
+				_, _, err = chunkStore.UploadRawFile(ctx, memPath, memGCSPath)
+				if err != nil {
+					log.WithError(err).Fatal("Failed to upload raw memory file")
+				}
+				chunkedMeta.MemFilePath = memGCSPath
+			} else {
+				memChunks, err := chunkStore.ChunkFile(ctx, memPath, snapshot.DefaultChunkSize)
+				if err != nil {
+					log.WithError(err).Fatal("Failed to chunk memory file")
+				}
+				chunkedMeta.MemChunks = memChunks
 			}
-			chunkedMeta.MemFilePath = memGCSPath
 			memStat, _ := os.Stat(memPath)
 			if memStat != nil {
 				chunkedMeta.TotalMemSize = memStat.Size()
 			}
-
 			// Use rootfs chunks from FUSE (original + dirty writes already uploaded)
 			chunkedMeta.RootfsChunks = incrementalRootfsChunks
 			chunkedMeta.TotalDiskSize = int64(len(incrementalRootfsChunks)) * chunkedMeta.ChunkSize

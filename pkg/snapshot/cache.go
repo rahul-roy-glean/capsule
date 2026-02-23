@@ -22,6 +22,8 @@ type SnapshotMetadata struct {
 	Version      string    `json:"version"`
 	BazelVersion string    `json:"bazel_version"`
 	RepoCommit   string    `json:"repo_commit"`
+	Repo         string    `json:"repo,omitempty"`
+	RepoSlug     string    `json:"repo_slug,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	SizeBytes    int64     `json:"size_bytes"`
 	KernelPath   string    `json:"kernel_path"`
@@ -47,6 +49,7 @@ type SnapshotPaths struct {
 type Cache struct {
 	localPath  string
 	gcsBucket  string
+	repoSlug   string
 	gcsClient  *storage.Client
 	currentVer string
 	metadata   *SnapshotMetadata
@@ -58,6 +61,7 @@ type Cache struct {
 type CacheConfig struct {
 	LocalPath string
 	GCSBucket string
+	RepoSlug  string
 	Logger    *logrus.Logger
 }
 
@@ -76,6 +80,7 @@ func NewCache(ctx context.Context, cfg CacheConfig) (*Cache, error) {
 	cache := &Cache{
 		localPath: cfg.LocalPath,
 		gcsBucket: cfg.GCSBucket,
+		repoSlug:  cfg.RepoSlug,
 		gcsClient: client,
 		logger:    logger.WithField("component", "snapshot-cache"),
 	}
@@ -102,7 +107,7 @@ func (c *Cache) SyncFromGCS(ctx context.Context, version string) error {
 
 	// If version is "current", try to resolve via pointer file first
 	if version == "current" {
-		if resolved, err := c.resolveCurrentPointer(ctx); err == nil && resolved != "" {
+		if resolved, err := c.resolveCurrentPointerForRepo(ctx, c.repoSlug); err == nil && resolved != "" {
 			c.logger.WithField("resolved_version", resolved).Info("Resolved current pointer to versioned directory")
 			version = resolved
 		} else {
@@ -137,11 +142,11 @@ func (c *Cache) SyncFromGCS(ctx context.Context, version string) error {
 	return nil
 }
 
-// resolveCurrentPointer reads the current-pointer.json file from GCS to find
-// the versioned directory. Returns empty string if pointer file doesn't exist.
-func (c *Cache) resolveCurrentPointer(ctx context.Context) (string, error) {
+// resolveCurrentPointerForRepo reads the repo-scoped current-pointer.json from GCS.
+func (c *Cache) resolveCurrentPointerForRepo(ctx context.Context, repoSlug string) (string, error) {
+	pointerPath := repoSlug + "/current-pointer.json"
 	bucket := c.gcsClient.Bucket(c.gcsBucket)
-	obj := bucket.Object("current-pointer.json")
+	obj := bucket.Object(pointerPath)
 
 	reader, err := obj.NewReader(ctx)
 	if err != nil {
@@ -300,7 +305,7 @@ func (c *Cache) IsStale(ctx context.Context) (bool, error) {
 	c.mu.RUnlock()
 
 	// Try to resolve the current version via pointer file first
-	remoteVer, err := c.resolveCurrentPointer(ctx)
+	remoteVer, err := c.resolveCurrentPointerForRepo(ctx, c.repoSlug)
 	if err == nil && remoteVer != "" {
 		return localVer != remoteVer, nil
 	}

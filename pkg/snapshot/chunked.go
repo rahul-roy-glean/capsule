@@ -1,8 +1,8 @@
 package snapshot
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,10 +36,10 @@ const (
 	ZeroChunkHash = ""
 
 	// Eager prefetching constants
-	eagerFetchBufferCapacity = 1000  // Max chunks queued for prefetch
-	numChunksToEagerFetch    = 64    // Chunks to queue on each access
-	maxEagerFetchesPerSec    = 5000  // Rate limit for prefetch operations
-	eagerFetchConcurrency    = 64    // Parallel prefetch workers
+	eagerFetchBufferCapacity = 1000 // Max chunks queued for prefetch
+	numChunksToEagerFetch    = 64   // Chunks to queue on each access
+	maxEagerFetchesPerSec    = 5000 // Rate limit for prefetch operations
+	eagerFetchConcurrency    = 64   // Parallel prefetch workers
 
 	// chunkFileUploadConcurrency controls how many chunks are uploaded in
 	// parallel during ChunkFile.
@@ -51,6 +52,8 @@ type ChunkedSnapshotMetadata struct {
 	Version       string     `json:"version"`
 	BazelVersion  string     `json:"bazel_version,omitempty"`
 	RepoCommit    string     `json:"repo_commit,omitempty"`
+	Repo          string     `json:"repo,omitempty"`
+	RepoSlug      string     `json:"repo_slug,omitempty"`
 	CreatedAt     time.Time  `json:"created_at"`
 	ChunkSize     int64      `json:"chunk_size"`
 	KernelHash    string     `json:"kernel_hash"`
@@ -85,7 +88,6 @@ type ChunkStore struct {
 	gcsBucket  string
 	gcsClient  *storage.Client
 	localCache string
-	cacheMu    sync.RWMutex
 	encoder    *zstd.Encoder
 	decoder    *zstd.Decoder
 	logger     *logrus.Entry
@@ -489,9 +491,9 @@ func (cs *ChunkStore) UploadRawFile(ctx context.Context, localPath, gcsObjectPat
 	}
 
 	cs.logger.WithFields(logrus.Fields{
-		"src":       localPath,
-		"dst":       gcsObjectPath,
-		"src_size":  srcStat.Size(),
+		"src":      localPath,
+		"dst":      gcsObjectPath,
+		"src_size": srcStat.Size(),
 	}).Info("Uploading raw file to GCS (zstd-compressed)")
 
 	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
@@ -583,14 +585,45 @@ func (cs *ChunkStore) DownloadRawFile(ctx context.Context, gcsObjectPath, localD
 	}
 
 	cs.logger.WithFields(logrus.Fields{
-		"src":             gcsObjectPath,
-		"dst":             localDestPath,
-		"download_size":   downloadSize,
+		"src":               gcsObjectPath,
+		"dst":               localDestPath,
+		"download_size":     downloadSize,
 		"decompressed_size": n,
-		"duration":        time.Since(start),
+		"duration":          time.Since(start),
 	}).Info("Raw file downloaded and decompressed")
 
 	return nil
+}
+
+// ListChunks lists all chunk hashes stored in GCS under the chunks/ prefix.
+func (cs *ChunkStore) ListChunks(ctx context.Context) ([]string, error) {
+	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
+	prefix := ChunksPrefix + "/"
+
+	it := bucket.Objects(ctx, &storage.Query{Prefix: prefix})
+	var hashes []string
+	for {
+		attrs, err := it.Next()
+		if err != nil {
+			break // done or error
+		}
+		// Extract hash from path: chunks/<hash>.zst → <hash>
+		name := attrs.Name
+		name = name[len(prefix):]
+		name = strings.TrimSuffix(name, ".zst")
+		if name != "" {
+			hashes = append(hashes, name)
+		}
+	}
+
+	return hashes, nil
+}
+
+// DeleteChunk deletes a chunk from GCS by its hash.
+func (cs *ChunkStore) DeleteChunk(ctx context.Context, hash string) error {
+	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
+	obj := bucket.Object(cs.chunkPath(hash))
+	return obj.Delete(ctx)
 }
 
 // Close closes the chunk store
@@ -684,15 +717,19 @@ func (cs *ChunkStore) eagerFetchLoop(limiter *rate.Limiter, eg *errgroup.Group) 
 
 // ChunkedSnapshotBuilder creates chunked snapshots from existing snapshot files
 type ChunkedSnapshotBuilder struct {
-	store  *ChunkStore
-	logger *logrus.Entry
+	store      *ChunkStore
+	logger     *logrus.Entry
+	// MemBackend controls how memory is stored: "chunked" (UFFD lazy via MemChunks,
+	// default) or "file" (single compressed blob via MemFilePath for file-backed restore).
+	MemBackend string
 }
 
 // NewChunkedSnapshotBuilder creates a new chunked snapshot builder
 func NewChunkedSnapshotBuilder(store *ChunkStore, logger *logrus.Logger) *ChunkedSnapshotBuilder {
 	return &ChunkedSnapshotBuilder{
-		store:  store,
-		logger: logger.WithField("component", "chunked-snapshot-builder"),
+		store:      store,
+		logger:     logger.WithField("component", "chunked-snapshot-builder"),
+		MemBackend: "chunked",
 	}
 }
 
@@ -733,20 +770,34 @@ func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths
 		meta.StateHash = stateHash
 	}
 
-	// Upload memory file as a single compressed file (not chunked).
-	// This enables file-backed restore instead of UFFD lazy loading,
-	// eliminating the per-page-fault latency that causes 3-14 minute boot times.
+	// Chunk memory file into MemChunks for UFFD lazy loading.
+	// Previously this was uploaded as a single compressed file (MemFilePath) to
+	// avoid per-page-fault GCS latency, but that required downloading the full
+	// 8GB snapshot.mem per repo per host before any VM could start. With the
+	// chunk LRU cache and eager prefetcher, UFFD lazy loading is fast enough and
+	// avoids the upfront download cost entirely.
 	if paths.Mem != "" {
-		b.logger.Info("Uploading raw memory file...")
-		memGCSPath := fmt.Sprintf("%s/snapshot.mem.zst", version)
-		_, _, err := b.store.UploadRawFile(ctx, paths.Mem, memGCSPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to upload raw memory file: %w", err)
+		if b.MemBackend == "file" {
+			b.logger.Info("Uploading raw memory file (file-backed restore)...")
+			memGCSPath := fmt.Sprintf("%s/snapshot.mem.zst", version)
+			_, _, err := b.store.UploadRawFile(ctx, paths.Mem, memGCSPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to upload raw memory file: %w", err)
+			}
+			meta.MemFilePath = memGCSPath
+		} else {
+			b.logger.Info("Chunking memory file for UFFD lazy loading...")
+			memChunks, err := b.store.ChunkFile(ctx, paths.Mem, DefaultChunkSize)
+			if err != nil {
+				return nil, fmt.Errorf("failed to chunk memory file: %w", err)
+			}
+			meta.MemChunks = memChunks
 		}
-		meta.MemFilePath = memGCSPath
 
 		memStat, _ := os.Stat(paths.Mem)
-		meta.TotalMemSize = memStat.Size()
+		if memStat != nil {
+			meta.TotalMemSize = memStat.Size()
+		}
 	}
 
 	// Chunk rootfs

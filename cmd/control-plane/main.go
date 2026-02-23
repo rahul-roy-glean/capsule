@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/repo"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
 )
 
@@ -148,8 +149,10 @@ func main() {
 
 	// Create services
 	hostRegistry := NewHostRegistry(db, logger)
-	scheduler := NewScheduler(hostRegistry, logger)
+	scheduler := NewScheduler(hostRegistry, db, logger)
 	snapshotManager := NewSnapshotManager(ctx, db, *gcsBucket, logger)
+	jobQueue := NewJobQueue(db, scheduler, hostRegistry, logger)
+	repoRegistry := NewRepoRegistry(db, logger)
 
 	// Load existing state from DB (best-effort)
 	if err := hostRegistry.LoadFromDB(ctx); err != nil {
@@ -160,7 +163,7 @@ func main() {
 	grpcServer := grpc.NewServer()
 
 	// Register services
-	controlPlaneServer := NewControlPlaneServer(scheduler, hostRegistry, snapshotManager, metricsClient, logger)
+	controlPlaneServer := NewControlPlaneServer(scheduler, hostRegistry, snapshotManager, jobQueue, metricsClient, logger)
 	pb.RegisterControlPlaneServer(grpcServer, controlPlaneServer)
 
 	// Register health service
@@ -191,11 +194,20 @@ func main() {
 	})
 	httpMux.Handle("/metrics", promhttp.Handler())
 	httpMux.HandleFunc("/api/v1/runners", controlPlaneServer.HandleGetRunners)
+	httpMux.HandleFunc("/api/v1/runners/allocate", controlPlaneServer.HandleAllocateRunner)
 	httpMux.HandleFunc("/api/v1/runners/quarantine", controlPlaneServer.HandleQuarantineRunner)
 	httpMux.HandleFunc("/api/v1/runners/unquarantine", controlPlaneServer.HandleUnquarantineRunner)
 	httpMux.HandleFunc("/api/v1/hosts", controlPlaneServer.HandleGetHosts)
 	httpMux.HandleFunc("/api/v1/hosts/heartbeat", controlPlaneServer.HandleHostHeartbeat)
 	httpMux.HandleFunc("/api/v1/snapshots", controlPlaneServer.HandleGetSnapshots)
+	// Repo registry endpoints (Phase 1)
+	httpMux.HandleFunc("/api/v1/repos/", repoRegistry.HandleRepos)
+	httpMux.HandleFunc("/api/v1/repos", repoRegistry.HandleRepos)
+	// Version/rollout endpoints (Phase 4)
+	httpMux.HandleFunc("/api/v1/versions/desired", controlPlaneServer.HandleGetDesiredVersions)
+	httpMux.HandleFunc("/api/v1/versions/fleet", controlPlaneServer.HandleGetFleetConvergence)
+	// Canary report endpoint (Phase 6)
+	httpMux.HandleFunc("/api/v1/canary/report", controlPlaneServer.HandleCanaryReport)
 	// Register webhook handler conditionally based on CI system config
 	ciSystemEnv := os.Getenv("CI_SYSTEM")
 	if ciSystemEnv == "" || ciSystemEnv == "github-actions" {
@@ -216,8 +228,9 @@ func main() {
 
 	// Start background workers
 	go hostRegistry.HealthCheckLoop(ctx)
-	go snapshotManager.FreshnessCheckLoop(ctx)
+	go snapshotFreshnessLoop(ctx, snapshotManager, repoRegistry, logger)
 	go startDownscaler(ctx, db, hostRegistry, logger)
+	go jobQueue.jobRetryLoop(ctx)
 	if metricsClient != nil {
 		go controlPlaneMetricsLoop(ctx, hostRegistry, scheduler, snapshotManager, metricsClient, logger)
 	}
@@ -283,10 +296,26 @@ func initSchema(db *sql.DB) error {
 		metrics JSONB
 	);
 
+	CREATE TABLE IF NOT EXISTS jobs (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		github_workflow_run_id BIGINT,
+		github_job_id BIGINT,
+		repo VARCHAR(255),
+		branch VARCHAR(255),
+		commit_sha VARCHAR(40),
+		status VARCHAR(20) NOT NULL DEFAULT 'queued',
+		runner_id UUID REFERENCES runners(id),
+		labels JSONB,
+		queued_at TIMESTAMP DEFAULT NOW(),
+		started_at TIMESTAMP,
+		completed_at TIMESTAMP
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_hosts_status ON hosts(status);
 	CREATE INDEX IF NOT EXISTS idx_runners_status ON runners(status);
 	CREATE INDEX IF NOT EXISTS idx_runners_host_id ON runners(host_id);
 	CREATE INDEX IF NOT EXISTS idx_snapshots_status ON snapshots(status);
+	CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 	`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -298,6 +327,36 @@ func initSchema(db *sql.DB) error {
 		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS idle_runners INT NOT NULL DEFAULT 0`,
 		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS busy_runners INT NOT NULL DEFAULT 0`,
 		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS http_address VARCHAR(255)`,
+		// Phase 1: Multi-repo support
+		`ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS repo VARCHAR(255) DEFAULT ''`,
+		`ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS repo_slug VARCHAR(255) DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_snapshots_repo_slug ON snapshots(repo_slug)`,
+		// Repos table
+		`CREATE TABLE IF NOT EXISTS repos (
+			slug VARCHAR(255) PRIMARY KEY,
+			url VARCHAR(512) NOT NULL,
+			branch VARCHAR(255) DEFAULT 'main',
+			bazel_version VARCHAR(32) DEFAULT '',
+			warmup_targets VARCHAR(1024) DEFAULT '//...',
+			build_schedule VARCHAR(64) DEFAULT '',
+			max_concurrent_runners INT DEFAULT 0,
+			current_version VARCHAR(255),
+			auto_rollout BOOLEAN DEFAULT true,
+			created_at TIMESTAMP DEFAULT NOW()
+		)`,
+		// Version assignments table
+		`CREATE TABLE IF NOT EXISTS version_assignments (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			repo_slug VARCHAR(255) NOT NULL,
+			host_id UUID REFERENCES hosts(id),
+			version VARCHAR(255) NOT NULL,
+			status VARCHAR(32) DEFAULT 'assigned',
+			assigned_at TIMESTAMP DEFAULT NOW(),
+			synced_at TIMESTAMP,
+			UNIQUE(repo_slug, host_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_version_assignments_repo ON version_assignments(repo_slug)`,
+		`CREATE INDEX IF NOT EXISTS idx_version_assignments_host ON version_assignments(host_id)`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil {
@@ -313,15 +372,17 @@ type ControlPlaneServer struct {
 	scheduler       *Scheduler
 	hostRegistry    *HostRegistry
 	snapshotManager *SnapshotManager
+	jobQueue        *JobQueue
 	metricsClient   *telemetry.Client
 	logger          *logrus.Entry
 }
 
-func NewControlPlaneServer(s *Scheduler, h *HostRegistry, sm *SnapshotManager, mc *telemetry.Client, l *logrus.Logger) *ControlPlaneServer {
+func NewControlPlaneServer(s *Scheduler, h *HostRegistry, sm *SnapshotManager, jq *JobQueue, mc *telemetry.Client, l *logrus.Logger) *ControlPlaneServer {
 	return &ControlPlaneServer{
 		scheduler:       s,
 		hostRegistry:    h,
 		snapshotManager: sm,
+		jobQueue:        jq,
 		metricsClient:   mc,
 		logger:          l.WithField("service", "control-plane"),
 	}
@@ -429,6 +490,71 @@ func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// HandleAllocateRunner handles manual runner allocation requests.
+// POST /api/v1/runners/allocate
+// Body: {"repo": "org/repo", "branch": "main", "commit": "abc123", "labels": {"firecracker": "true"}}
+func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Repo      string            `json:"repo"`
+		Branch    string            `json:"branch"`
+		Commit    string            `json:"commit"`
+		Labels    map[string]string `json:"labels"`
+		RequestID string            `json:"request_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.Repo == "" {
+		http.Error(w, "repo is required", http.StatusBadRequest)
+		return
+	}
+	if req.RequestID == "" {
+		req.RequestID = fmt.Sprintf("manual-%d", time.Now().UnixNano())
+	}
+
+	repoSlug := repo.Slug(req.Repo)
+
+	s.logger.WithFields(logrus.Fields{
+		"request_id": req.RequestID,
+		"repo":       req.Repo,
+		"repo_slug":  repoSlug,
+		"branch":     req.Branch,
+	}).Info("Manual runner allocation request")
+
+	resp, err := s.scheduler.AllocateRunner(r.Context(), AllocateRunnerRequest{
+		RequestID: req.RequestID,
+		Repo:      req.Repo,
+		Branch:    req.Branch,
+		Commit:    req.Commit,
+		RepoSlug:  repoSlug,
+		Labels:    req.Labels,
+	})
+	if err != nil {
+		s.logger.WithError(err).Error("Manual allocation failed")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"runner_id":    resp.RunnerID,
+		"host_id":      resp.HostID,
+		"host_address": resp.HostAddress,
+		"internal_ip":  resp.InternalIP,
+	})
+}
+
 func (s *ControlPlaneServer) HandleGetHosts(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -474,8 +600,95 @@ func (s *ControlPlaneServer) HandleGetSnapshots(w http.ResponseWriter, r *http.R
 }
 
 func (s *ControlPlaneServer) HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
-	handler := NewGitHubWebhookHandler(s.scheduler, s.hostRegistry, s.logger.Logger)
+	handler := NewGitHubWebhookHandler(s.scheduler, s.hostRegistry, s.jobQueue, s.logger.Logger)
 	handler.HandleWebhook(w, r)
+}
+
+// HandleGetDesiredVersions returns the desired snapshot versions for a host.
+// GET /api/v1/versions/desired?instance_name={name}
+func (s *ControlPlaneServer) HandleGetDesiredVersions(w http.ResponseWriter, r *http.Request) {
+	instanceName := r.URL.Query().Get("instance_name")
+	if instanceName == "" {
+		http.Error(w, "instance_name is required", http.StatusBadRequest)
+		return
+	}
+
+	host, ok := s.hostRegistry.GetHostByInstanceName(instanceName)
+	if !ok {
+		http.Error(w, "host not found", http.StatusNotFound)
+		return
+	}
+
+	versions, err := s.snapshotManager.GetDesiredVersions(r.Context(), host.ID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"host_id":          host.ID,
+		"instance_name":    instanceName,
+		"desired_versions": versions,
+	})
+}
+
+// HandleGetFleetConvergence returns the fleet convergence state.
+// GET /api/v1/versions/fleet?repo_slug={slug}
+func (s *ControlPlaneServer) HandleGetFleetConvergence(w http.ResponseWriter, r *http.Request) {
+	repoSlug := r.URL.Query().Get("repo_slug")
+	if repoSlug == "" {
+		http.Error(w, "repo_slug is required", http.StatusBadRequest)
+		return
+	}
+
+	statuses, err := s.snapshotManager.GetFleetConvergence(r.Context(), repoSlug)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"repo_slug": repoSlug,
+		"hosts":     statuses,
+		"count":     len(statuses),
+	})
+}
+
+// HandleCanaryReport receives E2E canary health check results.
+// POST /api/v1/canary/report
+func (s *ControlPlaneServer) HandleCanaryReport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var report struct {
+		Status    string `json:"status"`
+		Runner    string `json:"runner"`
+		Timestamp string `json:"timestamp"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	s.logger.WithFields(logrus.Fields{
+		"status": report.Status,
+		"runner": report.Runner,
+	}).Info("Received canary report")
+
+	if s.metricsClient != nil {
+		if report.Status == "success" {
+			s.metricsClient.IncrementCounter(r.Context(), telemetry.MetricE2ECanarySuccess, nil)
+		} else {
+			s.metricsClient.IncrementCounter(r.Context(), telemetry.MetricE2ECanaryFailure, nil)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 // controlPlaneMetricsLoop periodically records control plane metrics to GCP Cloud Monitoring

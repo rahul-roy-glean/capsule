@@ -1216,6 +1216,35 @@ resource "google_monitoring_alert_policy" "chunk_cache_low_hit_ratio" {
   }
 }
 
+# E2E Canary Alert
+resource "google_monitoring_alert_policy" "e2e_canary_failures" {
+  count        = var.enable_monitoring ? 1 : 0
+  display_name = "E2E Canary Consecutive Failures"
+  project      = var.project_id
+  combiner     = "OR"
+
+  conditions {
+    display_name = "E2E canary failures > 3 in 1h"
+    condition_threshold {
+      filter          = "metric.type=\"${local.metric_prefix}/e2e/canary_failure_total\" AND resource.type=\"global\""
+      duration        = "3600s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 3
+      aggregations {
+        alignment_period   = "900s"
+        per_series_aligner = "ALIGN_DELTA"
+      }
+    }
+  }
+
+  notification_channels = var.monitoring_notification_channels
+
+  documentation {
+    content   = "E2E canary health check has failed more than 3 times in the last hour. Check the self-hosted runner infrastructure."
+    mime_type = "text/markdown"
+  }
+}
+
 # Log-based metric for thaw-agent boot phases (runs inside VM)
 # Using DISTRIBUTION type to extract numeric values
 resource "google_logging_metric" "vm_boot_phase_from_logs" {

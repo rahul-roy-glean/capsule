@@ -480,10 +480,104 @@ func (p *Pool) Remove(runnerID string) bool {
 	return false
 }
 
-// FlushOlderThan evicts all pooled runners older than the given version.
+// FlushOlderThan evicts all pooled runners whose snapshot version doesn't
+// match any of the desired versions. desiredVersions maps repo_slug to the
+// target version. Runners whose repo/version combo is not in the map are evicted.
+// If called with a simple version string, it evicts runners not matching that version.
 func (p *Pool) FlushOlderThan(ctx context.Context, version string) int {
-	// TODO: implement version-based flush
-	return 0
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if version == "" {
+		return 0
+	}
+
+	var toEvict []*pooledRunner
+	var remaining []*pooledRunner
+
+	for _, r := range p.runners {
+		if r.key != nil && r.key.SnapshotVersion != version {
+			toEvict = append(toEvict, r)
+		} else {
+			remaining = append(remaining, r)
+		}
+	}
+
+	p.runners = remaining
+
+	for _, r := range toEvict {
+		atomic.AddInt64(&p.evictions, 1)
+		if p.removeVM != nil {
+			p.pendingRemovals.Add(1)
+			go func(runnerID string) {
+				defer p.pendingRemovals.Done()
+				removeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if err := p.removeVM(removeCtx, runnerID); err != nil {
+					p.logger.WithError(err).WithField("runner_id", runnerID).Warn("Failed to remove evicted runner")
+				}
+			}(r.Runner.ID)
+		}
+	}
+
+	if len(toEvict) > 0 {
+		p.logger.WithFields(logrus.Fields{
+			"evicted":         len(toEvict),
+			"desired_version": version,
+		}).Info("Flushed pooled runners with stale versions")
+	}
+
+	return len(toEvict)
+}
+
+// FlushByDesiredVersions evicts pooled runners whose snapshot version doesn't
+// match the desired version for their repo. desiredVersions maps repo_slug → version.
+func (p *Pool) FlushByDesiredVersions(ctx context.Context, desiredVersions map[string]string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(desiredVersions) == 0 {
+		return 0
+	}
+
+	var toEvict []*pooledRunner
+	var remaining []*pooledRunner
+
+	for _, r := range p.runners {
+		if r.key == nil {
+			remaining = append(remaining, r)
+			continue
+		}
+		desired, exists := desiredVersions[r.Runner.GitHubRepo]
+		if exists && r.key.SnapshotVersion != desired {
+			toEvict = append(toEvict, r)
+		} else {
+			remaining = append(remaining, r)
+		}
+	}
+
+	p.runners = remaining
+
+	for _, r := range toEvict {
+		atomic.AddInt64(&p.evictions, 1)
+		if p.removeVM != nil {
+			p.pendingRemovals.Add(1)
+			go func(runnerID string) {
+				defer p.pendingRemovals.Done()
+				removeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if err := p.removeVM(removeCtx, runnerID); err != nil {
+					p.logger.WithError(err).WithField("runner_id", runnerID).Warn("Failed to remove evicted runner")
+				}
+			}(r.Runner.ID)
+		}
+	}
+
+	if len(toEvict) > 0 {
+		p.logger.WithField("evicted", len(toEvict)).Info("Flushed pooled runners with stale versions")
+	}
+
+	return len(toEvict)
 }
 
 // GetRunner returns a pooled runner by ID, or nil if not found

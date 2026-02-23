@@ -101,13 +101,6 @@ type uffdMsgPagefault struct {
 	Feat    uint64
 }
 
-// uffdioApi is the UFFDIO_API ioctl structure
-type uffdioApi struct {
-	Api      uint64
-	Features uint64
-	Ioctls   uint64
-}
-
 // ufffdioCopy is the UFFDIO_COPY ioctl structure
 type uffdioCopy struct {
 	Dst  uint64
@@ -115,16 +108,6 @@ type uffdioCopy struct {
 	Len  uint64
 	Mode uint64
 	Copy int64
-}
-
-// uffdioZeropage is the UFFDIO_ZEROPAGE ioctl structure.
-// This is faster than UFFDIO_COPY with zero data because the kernel
-// maps a shared zero page without copying any bytes.
-type uffdioZeropage struct {
-	Start    uint64 // range start
-	Len      uint64 // range length
-	Mode     uint64
-	Zeropage int64 // output: number of bytes zeroed
 }
 
 // Handler handles UFFD page faults by fetching memory chunks on demand
@@ -351,7 +334,7 @@ func (h *Handler) handleConnection(conn net.Conn) {
 // - Out-of-band (SCM_RIGHTS): the UFFD file descriptor
 func (h *Handler) receiveUffdAndMappings(conn *net.UnixConn) (int, []GuestRegionUFFDMapping, error) {
 	// Read using the higher-level UnixConn API which handles SCM_RIGHTS parsing.
-	mappingsBuf := make([]byte, 4096) // enough for JSON mappings
+	mappingsBuf := make([]byte, 4096)         // enough for JSON mappings
 	oobBuf := make([]byte, unix.CmsgSpace(4)) // space for one fd
 
 	n, oobn, _, _, err := conn.ReadMsgUnix(mappingsBuf, oobBuf)

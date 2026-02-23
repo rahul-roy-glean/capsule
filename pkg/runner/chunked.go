@@ -27,18 +27,22 @@ type ChunkedManager struct {
 	*Manager
 
 	// Chunked snapshot infrastructure
-	chunkStore  *snapshot.ChunkStore
-	chunkCache  *snapshot.LRUCache
-	chunkedMeta *snapshot.ChunkedSnapshotMetadata
+	chunkStore   *snapshot.ChunkStore
+	chunkCache   *snapshot.LRUCache
+	chunkedMetas map[string]*snapshot.ChunkedSnapshotMetadata // keyed by repoSlug
 
 	// Per-runner UFFD handlers and FUSE disks
-	uffdHandlers      map[string]*uffd.Handler
-	fuseDisks         map[string]*fuse.ChunkedDisk // rootfs FUSE disks per runner
-	fuseSeedDisks     map[string]*fuse.ChunkedDisk // repo-cache-seed FUSE disks per runner
+	uffdHandlers  map[string]*uffd.Handler
+	fuseDisks     map[string]*fuse.ChunkedDisk // rootfs FUSE disks per runner
+	fuseSeedDisks map[string]*fuse.ChunkedDisk // repo-cache-seed FUSE disks per runner
 
 	// Network namespace manager (alternative to slot-based TAPs)
 	netnsNetwork *network.NetNSNetwork
 	useNetNS     bool
+
+	// memBackend overrides metadata-based backend detection:
+	// "chunked" forces UFFD, "file" forces file-backed, "" uses metadata.
+	memBackend string
 
 	chunkedLogger *logrus.Entry
 }
@@ -58,6 +62,11 @@ type ChunkedManagerConfig struct {
 
 	// ChunkCacheSizeBytes is the max size of the local chunk LRU cache
 	ChunkCacheSizeBytes int64
+
+	// MemBackend controls memory restore: "chunked" (UFFD lazy, default) or
+	// "file" (download full snapshot.mem at startup). Overrides what the
+	// snapshot metadata says, allowing rollback without rebuilding snapshots.
+	MemBackend string
 }
 
 // NewChunkedManager creates a new manager with chunked snapshot support
@@ -74,10 +83,12 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 
 	cm := &ChunkedManager{
 		Manager:       baseManager,
+		chunkedMetas:  make(map[string]*snapshot.ChunkedSnapshotMetadata),
 		uffdHandlers:  make(map[string]*uffd.Handler),
 		fuseDisks:     make(map[string]*fuse.ChunkedDisk),
 		fuseSeedDisks: make(map[string]*fuse.ChunkedDisk),
 		useNetNS:      cfg.UseNetNS,
+		memBackend:    cfg.MemBackend,
 		chunkedLogger: logger.WithField("component", "chunked-manager"),
 	}
 
@@ -113,7 +124,7 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 		if err != nil {
 			cm.chunkedLogger.WithError(err).Warn("No chunked snapshot metadata found, will use traditional restore")
 		} else {
-			cm.chunkedMeta = meta
+			cm.chunkedMetas[""] = meta
 			cm.chunkedLogger.WithFields(logrus.Fields{
 				"version":     meta.Version,
 				"mem_chunks":  len(meta.MemChunks),
@@ -149,6 +160,42 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 	return cm, nil
 }
 
+// getOrLoadManifest returns the chunked metadata for a repo, loading it from GCS if needed.
+func (cm *ChunkedManager) getOrLoadManifest(ctx context.Context, repoSlug, version string) (*snapshot.ChunkedSnapshotMetadata, error) {
+	cm.mu.RLock()
+	if meta, ok := cm.chunkedMetas[repoSlug]; ok && (version == "" || meta.Version == version) {
+		cm.mu.RUnlock()
+		return meta, nil
+	}
+	cm.mu.RUnlock()
+
+	// Load from GCS.
+	// The chunked metadata lives at <repoSlug>/<version>/chunked-metadata.json
+	// or <repoSlug>/current/chunked-metadata.json for the current pointer.
+	var path string
+	if version != "" {
+		path = repoSlug + "/" + version
+	} else {
+		path = repoSlug + "/current"
+	}
+
+	meta, err := cm.chunkStore.LoadChunkedMetadata(ctx, path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load chunked metadata for %s/%s: %w", repoSlug, version, err)
+	}
+
+	cm.mu.Lock()
+	cm.chunkedMetas[repoSlug] = meta
+	cm.mu.Unlock()
+
+	cm.chunkedLogger.WithFields(logrus.Fields{
+		"repo_slug": repoSlug,
+		"version":   meta.Version,
+	}).Info("Loaded chunked manifest for repo")
+
+	return meta, nil
+}
+
 // AllocateRunnerChunked allocates a runner using chunked snapshots
 func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req AllocateRequest) (*Runner, error) {
 	cm.mu.Lock()
@@ -162,8 +209,23 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		return nil, fmt.Errorf("host at capacity: %d/%d runners", len(cm.runners), cm.config.MaxRunners)
 	}
 
+	// Derive repo slug — the request must always carry one (resolved upstream).
+	repoSlug := req.RepoSlug
+
+	// Get the appropriate manifest for this repo
+	var meta *snapshot.ChunkedSnapshotMetadata
+	if cm.chunkStore != nil {
+		cm.mu.Unlock()
+		var err error
+		meta, err = cm.getOrLoadManifest(ctx, repoSlug, "")
+		cm.mu.Lock()
+		if err != nil {
+			return nil, fmt.Errorf("failed to load manifest for repo %q: %w", repoSlug, err)
+		}
+	}
+
 	// Check if we can use chunked restore
-	if cm.chunkedMeta == nil || cm.chunkStore == nil {
+	if meta == nil || cm.chunkStore == nil {
 		cm.chunkedLogger.Warn("Chunked snapshots not available, falling back to traditional restore")
 		cm.mu.Unlock()
 		runner, err := cm.Manager.AllocateRunner(ctx, req)
@@ -216,9 +278,9 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 
 	fuseDisk, err := fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
 		ChunkStore: cm.chunkStore,
-		Chunks:     cm.chunkedMeta.RootfsChunks,
-		TotalSize:  cm.chunkedMeta.TotalDiskSize,
-		ChunkSize:  cm.chunkedMeta.ChunkSize,
+		Chunks:     meta.RootfsChunks,
+		TotalSize:  meta.TotalDiskSize,
+		ChunkSize:  meta.ChunkSize,
 		MountPoint: fuseMountDir,
 		Logger:     cm.logger.Logger,
 	})
@@ -236,7 +298,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	// Setup FUSE disk for lazy repo-cache-seed loading (if chunks are available).
 	// This avoids downloading the full ~20GB repo cache seed image.
 	var fuseSeedDisk *fuse.ChunkedDisk
-	if len(cm.chunkedMeta.RepoCacheSeedChunks) > 0 {
+	if len(meta.RepoCacheSeedChunks) > 0 {
 		fuseSeedMountDir := filepath.Join(cm.config.WorkspaceDir, runnerID, "fuse-seed")
 		if err := os.MkdirAll(fuseSeedMountDir, 0755); err != nil {
 			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
@@ -245,7 +307,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 
 		// Compute total repo-cache-seed size from chunks
 		var totalSeedSize int64
-		for _, c := range cm.chunkedMeta.RepoCacheSeedChunks {
+		for _, c := range meta.RepoCacheSeedChunks {
 			end := c.Offset + c.Size
 			if end > totalSeedSize {
 				totalSeedSize = end
@@ -254,9 +316,9 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 
 		fuseSeedDisk, err = fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
 			ChunkStore: cm.chunkStore,
-			Chunks:     cm.chunkedMeta.RepoCacheSeedChunks,
+			Chunks:     meta.RepoCacheSeedChunks,
 			TotalSize:  totalSeedSize,
-			ChunkSize:  cm.chunkedMeta.ChunkSize,
+			ChunkSize:  meta.ChunkSize,
 			MountPoint: fuseSeedMountDir,
 			Logger:     cm.logger.Logger,
 		})
@@ -273,19 +335,41 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		cm.chunkedLogger.WithField("runner_id", runnerID).Info("Mounted FUSE-backed repo-cache-seed")
 	}
 
-	// Setup memory backend: either file-backed (new) or UFFD lazy loading (legacy).
-	useFileBackedMem := cm.chunkedMeta.MemFilePath != ""
+	// Setup memory backend: flag overrides metadata when set, otherwise fall
+	// back to metadata-based detection (MemFilePath set → file, else chunked).
+	useFileBackedMem := meta.MemFilePath != ""
+	if cm.memBackend == "file" {
+		useFileBackedMem = true
+	} else if cm.memBackend == "chunked" {
+		useFileBackedMem = false
+	}
 	var uffdHandler *uffd.Handler
 	var uffdSocketPath string
 	var localMemPath string
 
 	if useFileBackedMem {
-		// New-style: memory was downloaded as a single file at manager startup.
-		// Use file-backed restore — no UFFD handler needed.
-		localMemPath = filepath.Join(cm.config.SnapshotCachePath, "snapshot.mem")
-		if _, err := os.Stat(localMemPath); err != nil {
+		// Per-repo path so multiple repos don't share a single snapshot.mem.
+		localMemPath = filepath.Join(cm.config.SnapshotCachePath, repoSlug, "snapshot.mem")
+		if _, err := os.Stat(localMemPath); err != nil && meta.MemFilePath != "" {
+			// snapshot.mem not cached locally yet — download on demand from GCS.
+			cm.chunkedLogger.WithFields(logrus.Fields{
+				"runner_id":  runnerID,
+				"gcs_path":   meta.MemFilePath,
+				"local_path": localMemPath,
+			}).Info("Downloading snapshot.mem on demand for repo")
+			if dlErr := cm.chunkStore.DownloadRawFile(ctx, meta.MemFilePath, localMemPath); dlErr != nil {
+				cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
+				return nil, fmt.Errorf("failed to download snapshot.mem from %s: %w", meta.MemFilePath, dlErr)
+			}
+			fi, _ := os.Stat(localMemPath)
+			cm.chunkedLogger.WithFields(logrus.Fields{
+				"runner_id":  runnerID,
+				"local_path": localMemPath,
+				"size_bytes": fi.Size(),
+			}).Info("snapshot.mem downloaded on demand")
+		} else if err != nil {
 			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
-			return nil, fmt.Errorf("raw memory file not found at %s (should have been downloaded at startup): %w", localMemPath, err)
+			return nil, fmt.Errorf("raw memory file not found at %s and no MemFilePath in metadata: %w", localMemPath, err)
 		}
 		cm.chunkedLogger.WithFields(logrus.Fields{
 			"runner_id": runnerID,
@@ -297,7 +381,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		uffdHandler, err = uffd.NewHandler(uffd.HandlerConfig{
 			SocketPath: uffdSocketPath,
 			ChunkStore: cm.chunkStore,
-			Metadata:   cm.chunkedMeta,
+			Metadata:   meta,
 			Logger:     cm.logger.Logger,
 		})
 		if err != nil {
@@ -312,6 +396,49 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		cm.uffdHandlers[runnerID] = uffdHandler
 	}
 
+	// Pre-warm critical disk chunks before VM resume to prevent guest kernel
+	// soft lockups. On restore, jbd2 (ext4 journal) and the filesystem mount
+	// immediately read the superblock, block group descriptors, and journal.
+	// With FUSE-backed disks these reads block on GCS fetches; if 4 VMs all
+	// resume simultaneously the chunk store is overwhelmed and the guest vCPU
+	// stalls for >20s triggering a soft lockup watchdog before thaw-agent
+	// can register with GitHub Actions.
+	//
+	// Prefetching the first 16 chunks (64MB @ 4MB/chunk) covers:
+	//   - ext4 superblock (offset 1024)
+	//   - block group descriptor table
+	//   - entire jbd2 journal (usually within first 64MB on a 50GB volume)
+	// Repo-cache-seed only needs the superblock (first 2 chunks = 8MB).
+	// These fetches run in parallel and populate the chunk store LRU cache
+	// so FUSE Read() returns immediately from cache on the actual mount.
+	{
+		prefetchCtx, prefetchCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer prefetchCancel()
+
+		prefetchDone := make(chan error, 2)
+		go func() {
+			err := fuseDisk.PrefetchHead(prefetchCtx, 16)
+			if err != nil {
+				cm.chunkedLogger.WithError(err).WithField("runner_id", runnerID).Warn("Rootfs prefetch incomplete (non-fatal)")
+			}
+			prefetchDone <- err
+		}()
+		go func() {
+			if fuseSeedDisk != nil {
+				err := fuseSeedDisk.PrefetchHead(prefetchCtx, 2)
+				if err != nil {
+					cm.chunkedLogger.WithError(err).WithField("runner_id", runnerID).Warn("Seed disk prefetch incomplete (non-fatal)")
+				}
+				prefetchDone <- err
+			} else {
+				prefetchDone <- nil
+			}
+		}()
+		<-prefetchDone
+		<-prefetchDone
+		cm.chunkedLogger.WithField("runner_id", runnerID).Debug("Pre-resume disk prefetch complete")
+	}
+
 	// Eagerly fetch the VM state (CPU/device state) from the ChunkStore.
 	// This is small (~100KB) and required as a local file for Firecracker restore.
 	snapshotDir := filepath.Join(cm.config.WorkspaceDir, runnerID, "snapshot")
@@ -321,8 +448,8 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	}
 
 	localStatePath := filepath.Join(snapshotDir, "snapshot.state")
-	if cm.chunkedMeta.StateHash != "" {
-		stateData, err := cm.chunkStore.GetChunk(ctx, cm.chunkedMeta.StateHash)
+	if meta.StateHash != "" {
+		stateData, err := cm.chunkStore.GetChunk(ctx, meta.StateHash)
 		if err != nil {
 			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
 			return nil, fmt.Errorf("failed to fetch vmstate chunk: %w", err)
@@ -340,6 +467,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	// In chunked mode, rootfs and repo-cache-seed are served via FUSE, memory
 	// via UFFD, and state was eagerly fetched above. The only traditional local
 	// file we need is the kernel, which was eagerly fetched at manager startup.
+	// The kernel is the same across all repos, so always use the root path.
 	kernelPath := filepath.Join(cm.config.SnapshotCachePath, "kernel.bin")
 	if _, err := os.Stat(kernelPath); err != nil {
 		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
@@ -360,7 +488,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		InternalIP:      internalIP,
 		TapDevice:       tap.Name,
 		MAC:             tap.MAC,
-		SnapshotVersion: cm.chunkedMeta.Version,
+		SnapshotVersion: meta.Version,
 		Resources: Resources{
 			VCPUs:    cm.config.VCPUsPerRunner,
 			MemoryMB: cm.config.MemoryMBPerRunner,
@@ -577,8 +705,9 @@ func (cm *ChunkedManager) ReleaseRunnerChunked(ctx context.Context, runnerID str
 				dirtyChunks := fuseDisk.GetDirtyChunks()
 				uploader := snapshot.NewIncrementalUploader(cm.chunkStore, cm.logger.Logger)
 
-				newVersion := fmt.Sprintf("%s-%s", cm.chunkedMeta.Version, runnerID[:8])
-				newMeta, err := uploader.UploadIncrementalSnapshot(ctx, cm.chunkedMeta, dirtyChunks, nil, newVersion)
+				defaultMeta := cm.chunkedMetas[""]
+				newVersion := fmt.Sprintf("%s-%s", defaultMeta.Version, runnerID[:8])
+				newMeta, err := uploader.UploadIncrementalSnapshot(ctx, defaultMeta, dirtyChunks, nil, newVersion)
 				if err != nil {
 					cm.chunkedLogger.WithError(err).Warn("Failed to save incremental snapshot")
 				} else {
@@ -816,7 +945,71 @@ func (cm *ChunkedManager) Close() error {
 
 // GetChunkedMetadata returns the loaded chunked snapshot metadata (may be nil).
 func (cm *ChunkedManager) GetChunkedMetadata() *snapshot.ChunkedSnapshotMetadata {
-	return cm.chunkedMeta
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.chunkedMetas[""]
+}
+
+// GetManifest returns the loaded chunked metadata for a specific repo slug (may be nil).
+func (cm *ChunkedManager) GetManifest(repoSlug string) (*snapshot.ChunkedSnapshotMetadata, error) {
+	cm.mu.RLock()
+	meta, ok := cm.chunkedMetas[repoSlug]
+	cm.mu.RUnlock()
+	if ok {
+		return meta, nil
+	}
+	return nil, fmt.Errorf("manifest not loaded for repo %q", repoSlug)
+}
+
+// GetLoadedManifests returns a map of repo_slug -> version for loaded manifests.
+func (cm *ChunkedManager) GetLoadedManifests() map[string]string {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	result := make(map[string]string)
+	for slug, meta := range cm.chunkedMetas {
+		if meta != nil {
+			result[slug] = meta.Version
+		}
+	}
+	return result
+}
+
+// SyncManifest loads (or refreshes) the chunked manifest for a given repo and version.
+// When using file-backed memory, it also downloads snapshot.mem to the per-repo path.
+func (cm *ChunkedManager) SyncManifest(ctx context.Context, repoSlug, version string) error {
+	meta, err := cm.getOrLoadManifest(ctx, repoSlug, version)
+	if err != nil {
+		return err
+	}
+
+	// Download snapshot.mem for file-backed memory mode.
+	useFileMem := meta.MemFilePath != ""
+	if cm.memBackend == "file" {
+		useFileMem = true
+	} else if cm.memBackend == "chunked" {
+		useFileMem = false
+	}
+
+	if useFileMem && meta.MemFilePath != "" && cm.chunkStore != nil {
+		memPath := filepath.Join(cm.config.SnapshotCachePath, repoSlug, "snapshot.mem")
+
+		if _, statErr := os.Stat(memPath); statErr != nil {
+			// Ensure parent directory exists.
+			if err := os.MkdirAll(filepath.Dir(memPath), 0755); err != nil {
+				return fmt.Errorf("failed to create directory for snapshot.mem: %w", err)
+			}
+			cm.chunkedLogger.WithFields(logrus.Fields{
+				"repo_slug": repoSlug,
+				"gcs_path":  meta.MemFilePath,
+				"local_path": memPath,
+			}).Info("Downloading snapshot.mem for repo")
+			if err := cm.chunkStore.DownloadRawFile(ctx, meta.MemFilePath, memPath); err != nil {
+				return fmt.Errorf("failed to download snapshot.mem for %s: %w", repoSlug, err)
+			}
+		}
+	}
+
+	return nil
 }
 
 // GetChunkStore returns the underlying chunk store.

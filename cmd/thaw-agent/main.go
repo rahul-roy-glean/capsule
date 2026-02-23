@@ -109,7 +109,8 @@ var globalWarmupLogs = &WarmupLogBuffer{}
 
 // globalLogBuffer captures all logrus log entries for the /logs HTTP endpoint.
 // This allows debugging thaw-agent behavior from the host via:
-//   curl http://<vm-ip>:8081/logs
+//
+//	curl http://<vm-ip>:8081/logs
 var globalLogBuffer = &WarmupLogBuffer{}
 
 // logCaptureHook is a logrus hook that captures log entries into globalLogBuffer.
@@ -166,6 +167,7 @@ type MMDSData struct {
 			HostID       string `json:"host_id"`
 			InstanceName string `json:"instance_name,omitempty"`
 			Environment  string `json:"environment"`
+			JobID        string `json:"job_id,omitempty"`
 			Mode         string `json:"mode,omitempty"`         // "warmup" for snapshot building, empty for normal runner
 			CurrentTime  string `json:"current_time,omitempty"` // RFC3339 timestamp from host for clock sync
 		} `json:"meta"`
@@ -309,6 +311,7 @@ func main() {
 	log.WithFields(logrus.Fields{
 		"runner_id": mmdsData.Latest.Meta.RunnerID,
 		"host_id":   mmdsData.Latest.Meta.HostID,
+		"job_id":    mmdsData.Latest.Meta.JobID,
 		"repo":      mmdsData.Latest.Job.Repo,
 		"branch":    mmdsData.Latest.Job.Branch,
 	}).Info("MMDS data received")
@@ -978,6 +981,7 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					HostID       string `json:"host_id"`
 					InstanceName string `json:"instance_name,omitempty"`
 					Environment  string `json:"environment"`
+					JobID        string `json:"job_id,omitempty"`
 					Mode         string `json:"mode,omitempty"`
 					CurrentTime  string `json:"current_time,omitempty"`
 				} `json:"meta"`
@@ -1880,9 +1884,9 @@ func runWarmupMode(data *MMDSData) error {
 			// Build clone URL with auth token if available (for private repos)
 			cloneURL := warmup.RepoURL
 			log.WithFields(logrus.Fields{
-				"warmup_repo_url":  warmup.RepoURL,
-				"job_repo":         data.Latest.Job.Repo,
-				"job_git_token":    fmt.Sprintf("len=%d, empty=%v, first5=%s", len(data.Latest.Job.GitToken), data.Latest.Job.GitToken == "", safePrefix(data.Latest.Job.GitToken, 5)),
+				"warmup_repo_url":   warmup.RepoURL,
+				"job_repo":          data.Latest.Job.Repo,
+				"job_git_token":     fmt.Sprintf("len=%d, empty=%v, first5=%s", len(data.Latest.Job.GitToken), data.Latest.Job.GitToken == "", safePrefix(data.Latest.Job.GitToken, 5)),
 				"git_cache_enabled": data.Latest.GitCache.Enabled,
 			}).Debug("Clone decision - checking token")
 
@@ -2560,8 +2564,6 @@ func verifyBazelServer(repoDir string) {
 		}).Info("Bazel server alive after restore")
 	}
 }
-
-
 
 // startHealthServer starts a simple HTTP server for health checks and testing
 func startHealthServer(mmdsData *MMDSData) {

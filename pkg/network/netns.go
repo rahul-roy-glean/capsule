@@ -26,13 +26,12 @@ import (
 //
 // This provides complete VM isolation by construction — no shared L2 domain,
 // no path between namespaces, no VM-to-VM or VM-to-host connectivity.
-//
 type NetNSNetwork struct {
 	subnet        *net.IPNet
 	gateway       net.IP
 	vmIP          net.IP // Same IP for all VMs (172.16.0.2)
 	externalIface string
-	extMTU        int // MTU of external interface (e.g., 1460 on GCP)
+	extMTU        int                     // MTU of external interface (e.g., 1460 on GCP)
 	namespaces    map[string]*VMNamespace // vmID -> namespace info
 	mu            sync.Mutex
 	logger        *logrus.Entry
@@ -40,17 +39,17 @@ type NetNSNetwork struct {
 
 // VMNamespace holds info about a VM's network namespace
 type VMNamespace struct {
-	Name           string // Namespace name (fc-{shortID})
-	Path           string // Path to namespace file (/var/run/netns/fc-{shortID})
-	VethHost       string // Host-side veth name
-	VethVM         string // VM-side veth name (inside namespace)
-	TapName        string // TAP device name inside namespace (always tap-slot-0)
-	IP             net.IP // Guest IP address (same for all VMs: 172.16.0.2)
-	Gateway        net.IP // Gateway IP (172.16.0.1)
-	MAC            string // MAC address for TAP
-	Slot           int    // Slot number (determines veth addressing: 10.200.{slot}.0/30)
+	Name            string // Namespace name (fc-{shortID})
+	Path            string // Path to namespace file (/var/run/netns/fc-{shortID})
+	VethHost        string // Host-side veth name
+	VethVM          string // VM-side veth name (inside namespace)
+	TapName         string // TAP device name inside namespace (always tap-slot-0)
+	IP              net.IP // Guest IP address (same for all VMs: 172.16.0.2)
+	Gateway         net.IP // Gateway IP (172.16.0.1)
+	MAC             string // MAC address for TAP
+	Slot            int    // Slot number (determines veth addressing: 10.200.{slot}.0/30)
 	HostReachableIP net.IP // IP reachable from host namespace (10.200.{slot}.2)
-	Handle         netns.NsHandle
+	Handle          netns.NsHandle
 }
 
 // NetNSConfig holds configuration for network namespace setup

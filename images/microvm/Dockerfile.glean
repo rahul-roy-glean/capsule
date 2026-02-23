@@ -70,12 +70,8 @@ RUN useradd -m -s /bin/bash -G sudo gleanuser \
     && echo 'export PATH=$PATH:/home/gleanuser/.local/bin' >> /home/gleanuser/.bashrc
 
 # Install GitHub Actions Runner
-ARG RUNNER_VERSION=2.314.1
 WORKDIR /home/gleanuser
-RUN curl -fsSL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" \
-    | tar xzf - \
-    && ./bin/installdependencies.sh \
-    && chown -R gleanuser:gleanuser /home/gleanuser
+RUN RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name' | cut -c 2-) && curl -fsSL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" | tar xzf - && ./bin/installdependencies.sh && chown -R gleanuser:gleanuser /home/gleanuser
 
 # Create workspace and cache directories
 RUN mkdir -p /workspace /var/run/thaw-agent /var/log/thaw-agent \

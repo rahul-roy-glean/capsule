@@ -87,6 +87,7 @@ var (
 	// Chunked snapshot flags (BuildBuddy-style lazy loading)
 	useChunkedSnapshots = flag.Bool("use-chunked-snapshots", false, "Enable chunked snapshot restore with UFFD (lazy memory) and FUSE (lazy disk)")
 	chunkCacheSizeGB    = flag.Int("chunk-cache-size-gb", 2, "Size in GB of local LRU chunk cache")
+	memBackend          = flag.String("mem-backend", "file", "Memory restore backend: 'chunked' (UFFD lazy loading) or 'file' (download full snapshot.mem at startup, default). Overrides the backend recorded in snapshot metadata.")
 
 	// Network namespace mode (alternative to slot-based TAPs)
 	useNetNS = flag.Bool("use-netns", false, "Use network namespaces instead of slot-based TAP devices (simplifies snapshot restore)")
@@ -326,6 +327,7 @@ func main() {
 			UseChunkedSnapshots: *useChunkedSnapshots,
 			UseNetNS:            *useNetNS,
 			ChunkCacheSizeBytes: int64(*chunkCacheSizeGB) * 1024 * 1024 * 1024,
+			MemBackend:          *memBackend,
 		}
 
 		var err error
@@ -357,24 +359,24 @@ func main() {
 					"path":        kernelPath,
 				}).Info("Kernel fetched from chunk store")
 
-				// If a raw memory file path is set, download and decompress it
-				// to local disk so VMs can use file-backed restore instead of UFFD.
-				if meta.MemFilePath != "" {
+				// When using file-backed memory, also download snapshot.mem now
+				// so AllocateRunnerChunked can find it at restore time.
+				// At 8GB this takes ~30s on a fresh host but is only done once;
+				// all 4 runners share the same file via read-only mmap.
+				if *memBackend == "file" && meta.MemFilePath != "" {
 					memPath := filepath.Join(*snapshotCache, "snapshot.mem")
-					if info, err := os.Stat(memPath); err == nil && info.Size() > 0 {
-						log.WithFields(logrus.Fields{
-							"path": memPath,
-							"size": info.Size(),
-						}).Info("snapshot.mem already exists locally, skipping download")
-					} else {
-						log.WithFields(logrus.Fields{
-							"gcs_path":   meta.MemFilePath,
-							"local_path": memPath,
-						}).Info("Downloading raw memory file from GCS...")
+					if _, err := os.Stat(memPath); err != nil {
+						log.WithField("gcs_path", meta.MemFilePath).Info("Downloading snapshot.mem (file-backed memory mode)...")
 						if err := chunkedMgr.GetChunkStore().DownloadRawFile(ctx, meta.MemFilePath, memPath); err != nil {
-							log.WithError(err).Fatal("Failed to download raw memory file")
+							log.WithError(err).Fatal("Failed to download snapshot.mem")
 						}
-						log.WithField("path", memPath).Info("Raw memory file downloaded and decompressed")
+						fi, _ := os.Stat(memPath)
+						log.WithFields(logrus.Fields{
+							"path":      memPath,
+							"size_bytes": fi.Size(),
+						}).Info("snapshot.mem downloaded")
+					} else {
+						log.WithField("path", memPath).Info("snapshot.mem already cached, skipping download")
 					}
 				}
 			} else {
@@ -412,6 +414,9 @@ func main() {
 			log.Info("Network namespace mode enabled for base manager")
 		}
 	}
+
+	// Reconcile orphaned resources from previous incarnation
+	go mgr.ReconcileOrphans(ctx)
 
 	// Initialize telemetry
 	telemetryCfg := telemetry.Config{
@@ -508,7 +513,7 @@ func main() {
 
 	// Start heartbeat loop if control plane is configured
 	if *controlPlane != "" {
-		go heartbeatLoop(ctx, mgr, *controlPlane, instanceName, zone, *grpcPort, *httpPort, logger, metricsClient)
+		go heartbeatLoop(ctx, mgr, chunkedMgr, *controlPlane, instanceName, zone, *grpcPort, *httpPort, logger, metricsClient)
 	}
 
 	// Wait for shutdown signal
@@ -601,16 +606,21 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 		case <-ticker.C:
 			status := mgr.GetStatus()
 
-			// Maintain idle target
-			if !mgr.IsDraining() && status.IdleRunners < idleTarget && mgr.CanAddRunner() {
+			// Maintain idle target.
+			// In chunked mode, skip pre-allocation: each repo needs a different
+			// snapshot, so generic warm VMs would load the wrong data and be
+			// useless when an actual job arrives. The control plane drives
+			// allocation on-demand via gRPC AllocateRunner with the correct
+			// RepoSlug. In single-repo (non-chunked) mode, warm pool is fine
+			// because there is only one snapshot.
+			if chunkedMgr != nil {
+				// Chunked mode: no local pre-allocation; control plane drives it.
+			} else if mgr.DiskUsage() > 0.85 {
+				log.Warn("Disk usage exceeds 85%, skipping runner allocation")
+			} else if !mgr.IsDraining() && status.IdleRunners < idleTarget && mgr.CanAddRunner() {
 				log.Debug("Adding runner to maintain idle pool")
 				allocTimer := telemetry.NewStopwatch()
-				var err error
-				if chunkedMgr != nil {
-					_, err = chunkedMgr.AllocateRunnerChunked(ctx, runner.AllocateRequest{})
-				} else {
-					_, err = mgr.AllocateRunner(ctx, runner.AllocateRequest{})
-				}
+				_, err := mgr.AllocateRunner(ctx, runner.AllocateRequest{})
 				if err != nil {
 					log.WithError(err).Warn("Failed to allocate idle runner")
 					if metricsClient != nil {
@@ -684,25 +694,31 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 }
 
 type hostHeartbeatRequest struct {
-	InstanceName    string `json:"instance_name"`
-	Zone            string `json:"zone"`
-	GRPCAddress     string `json:"grpc_address"`
-	HTTPAddress     string `json:"http_address"`
-	TotalSlots      int    `json:"total_slots"`
-	UsedSlots       int    `json:"used_slots"`
-	IdleRunners     int    `json:"idle_runners"`
-	BusyRunners     int    `json:"busy_runners"`
-	SnapshotVersion string `json:"snapshot_version"`
-	Draining        bool   `json:"draining"`
+	InstanceName    string            `json:"instance_name"`
+	Zone            string            `json:"zone"`
+	GRPCAddress     string            `json:"grpc_address"`
+	HTTPAddress     string            `json:"http_address"`
+	TotalSlots      int               `json:"total_slots"`
+	UsedSlots       int               `json:"used_slots"`
+	IdleRunners     int               `json:"idle_runners"`
+	BusyRunners     int               `json:"busy_runners"`
+	SnapshotVersion string            `json:"snapshot_version"`
+	Draining        bool              `json:"draining"`
+	DiskUsage       float64           `json:"disk_usage"`
+	LoadedManifests map[string]string `json:"loaded_manifests,omitempty"`
 }
 
 type hostHeartbeatResponse struct {
-	Acknowledged bool   `json:"acknowledged"`
-	ShouldDrain  bool   `json:"should_drain"`
-	Error        string `json:"error,omitempty"`
+	Acknowledged       bool              `json:"acknowledged"`
+	ShouldDrain        bool              `json:"should_drain"`
+	ShouldSyncSnapshot bool              `json:"should_sync_snapshot,omitempty"`
+	SnapshotVersion    string            `json:"snapshot_version,omitempty"`
+	DesiredVersions    map[string]string `json:"desired_versions,omitempty"`
+	SyncVersions       map[string]string `json:"sync_versions,omitempty"`
+	Error              string            `json:"error,omitempty"`
 }
 
-func heartbeatLoop(ctx context.Context, mgr *runner.Manager, controlPlane, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger, metricsClient *telemetry.Client) {
+func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, controlPlane, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger, metricsClient *telemetry.Client) {
 	log := logger.WithField("component", "heartbeat")
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -739,6 +755,10 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, controlPlane, insta
 				BusyRunners:     status.BusyRunners,
 				SnapshotVersion: status.SnapshotVersion,
 				Draining:        status.Draining,
+				DiskUsage:       mgr.DiskUsage(),
+			}
+			if chunkedMgr != nil {
+				reqBody.LoadedManifests = chunkedMgr.GetLoadedManifests()
 			}
 
 			b, _ := json.Marshal(reqBody)
@@ -807,6 +827,36 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, controlPlane, insta
 				wasDraining = true
 				_, _ = mgr.RemoveRunnerLabels(ctx)
 				_, _ = mgr.DrainIdleRunners(ctx)
+			}
+
+			// Handle snapshot sync directive from control plane
+			if hbResp.ShouldSyncSnapshot && hbResp.SnapshotVersion != "" {
+				log.WithField("snapshot_version", hbResp.SnapshotVersion).Info("Control plane requested snapshot sync")
+				go func(version string) {
+					syncCtx, syncCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+					defer syncCancel()
+					if err := mgr.SyncSnapshot(syncCtx, version); err != nil {
+						log.WithError(err).WithField("snapshot_version", version).Error("Failed to sync snapshot")
+					} else {
+						log.WithField("snapshot_version", version).Info("Snapshot sync completed")
+					}
+				}(hbResp.SnapshotVersion)
+			}
+
+				// Handle per-repo manifest sync directives
+			if len(hbResp.SyncVersions) > 0 && chunkedMgr != nil {
+				for repoSlug, version := range hbResp.SyncVersions {
+					go func(slug, ver string) {
+						syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+						defer cancel()
+						if err := chunkedMgr.SyncManifest(syncCtx, slug, ver); err != nil {
+							log.WithError(err).WithFields(logrus.Fields{
+								"repo_slug": slug,
+								"version":   ver,
+							}).Warn("Failed to sync manifest for repo")
+						}
+					}(repoSlug, version)
+				}
 			}
 		}
 	}
@@ -956,6 +1006,30 @@ func getLocalIPFallback() string {
 	return ""
 }
 
+func gcpTokenHandler(w http.ResponseWriter, r *http.Request, logger *logrus.Logger) {
+	// Fetch a fresh GCP access token from the metadata server
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest("GET",
+		"http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+		nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Metadata-Flavor", "Google")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "Failed to fetch GCP token: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(body)
+}
+
 func gcHandler(mgr *runner.Manager, logger *logrus.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -1025,6 +1099,12 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 		// Don't proxy quarantine/unquarantine endpoints (they're registered separately)
 		if strings.HasPrefix(suffix, "quarantine") || strings.HasPrefix(suffix, "unquarantine") {
 			http.NotFound(w, r)
+			return
+		}
+
+		// Handle /api/v1/runners/{id}/token/gcp (GCP token refresh for long jobs)
+		if tokenParts := strings.SplitN(suffix, "/token/gcp", 2); len(tokenParts) == 2 && tokenParts[1] == "" {
+			gcpTokenHandler(w, r, logger)
 			return
 		}
 

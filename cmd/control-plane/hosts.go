@@ -26,6 +26,10 @@ type Host struct {
 	GRPCAddress      string
 	HTTPAddress      string
 	CreatedAt        time.Time
+	// LoadedManifests tracks which chunked snapshot manifests are loaded per repo (repo_slug → version)
+	LoadedManifests map[string]string
+	// DiskUsage is the reported disk usage percentage (0.0-1.0)
+	DiskUsage float64
 }
 
 // Runner represents a runner instance
@@ -146,6 +150,7 @@ type HostHeartbeat struct {
 	IdleRunners     int
 	BusyRunners     int
 	SnapshotVersion string
+	LoadedManifests map[string]string
 }
 
 // UpsertHeartbeat upserts the host record and updates heartbeat fields. It preserves
@@ -204,6 +209,9 @@ func (hr *HostRegistry) UpsertHeartbeat(ctx context.Context, hb HostHeartbeat) (
 	host.GRPCAddress = hb.GRPCAddress
 	host.HTTPAddress = hb.HTTPAddress
 	host.LastHeartbeat = time.Now()
+	if hb.LoadedManifests != nil {
+		host.LoadedManifests = hb.LoadedManifests
+	}
 
 	return host, status == "draining", nil
 }
@@ -292,9 +300,9 @@ func (hr *HostRegistry) AddRunner(ctx context.Context, runner *Runner) error {
 	defer hr.mu.Unlock()
 
 	_, err := hr.db.ExecContext(ctx, `
-		INSERT INTO runners (id, host_id, status, internal_ip, repo, branch)
-		VALUES ($1, $2, $3, $4, $5, $6)
-	`, runner.ID, runner.HostID, runner.Status, runner.InternalIP, runner.Repo, runner.Branch)
+		INSERT INTO runners (id, host_id, status, internal_ip, job_id, repo, branch)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+	`, runner.ID, runner.HostID, runner.Status, runner.InternalIP, runner.JobID, runner.Repo, runner.Branch)
 
 	if err != nil {
 		return err

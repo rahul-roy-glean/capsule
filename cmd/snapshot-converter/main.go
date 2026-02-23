@@ -28,15 +28,15 @@ import (
 )
 
 var (
-	sourceDir  = flag.String("source-dir", "", "Directory containing traditional snapshot files")
-	gcsBucket  = flag.String("gcs-bucket", "", "GCS bucket for chunk storage")
+	sourceDir       = flag.String("source-dir", "", "Directory containing traditional snapshot files")
+	gcsBucket       = flag.String("gcs-bucket", "", "GCS bucket for chunk storage")
 	snapshotVersion = flag.String("version", "", "Snapshot version (e.g., v20240101-abc123)")
-	chunkSize  = flag.Int64("chunk-size", snapshot.DefaultChunkSize, "Chunk size in bytes (default 4MB)")
-	setCurrent = flag.Bool("set-current", false, "Set this version as current after conversion")
-	logLevel   = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
-	localCache = flag.String("local-cache", "/tmp/chunk-cache", "Local chunk cache directory")
-	bazelVer   = flag.String("bazel-version", "", "Bazel version in the snapshot")
-	repoCommit = flag.String("repo-commit", "", "Repository commit hash in the snapshot")
+	chunkSize       = flag.Int64("chunk-size", snapshot.DefaultChunkSize, "Chunk size in bytes (default 4MB)")
+	setCurrent      = flag.Bool("set-current", false, "Set this version as current after conversion")
+	logLevel        = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+	localCache      = flag.String("local-cache", "/tmp/chunk-cache", "Local chunk cache directory")
+	bazelVer        = flag.String("bazel-version", "", "Bazel version in the snapshot")
+	repoCommit      = flag.String("repo-commit", "", "Repository commit hash in the snapshot")
 )
 
 func main() {

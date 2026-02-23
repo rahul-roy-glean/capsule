@@ -278,6 +278,19 @@ resource "google_compute_instance_template" "firecracker_host" {
       exit 1
     fi
 
+    # Setup logrotate for Firecracker logs
+    cat > /etc/logrotate.d/firecracker <<'LOGROTATE'
+/var/log/firecracker/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+LOGROTATE
+
     # Get microVM configuration from metadata
     MAX_RUNNERS=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/max-runners || echo "16")

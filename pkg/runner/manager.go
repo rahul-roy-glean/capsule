@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,16 +19,23 @@ import (
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/ci"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
+	repomod "github.com/rahul-roy-glean/bazel-firecracker/pkg/repo"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
+type recentAllocation struct {
+	runner    *Runner
+	allocTime time.Time
+}
+
 // Manager manages the lifecycle of runners on a host
 type Manager struct {
-	config        HostConfig
-	runners       map[string]*Runner
-	vms           map[string]*firecracker.VM
-	snapshotCache *snapshot.Cache
-	network       *network.NATNetwork
+	config         HostConfig
+	runners        map[string]*Runner
+	recentRequests map[string]*recentAllocation // keyed by RequestID, TTL 5min
+	vms            map[string]*firecracker.VM
+	snapshotCache  *snapshot.Cache
+	network        *network.NATNetwork
 	// credentialsImage is an ext4 image containing credentials (e.g. Buildbarn certs),
 	// attached read-only to each microVM for Bazel remote cache/execution TLS config.
 	credentialsImage string
@@ -74,6 +82,7 @@ func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logge
 	cache, err := snapshot.NewCache(ctx, snapshot.CacheConfig{
 		LocalPath: cfg.SnapshotCachePath,
 		GCSBucket: cfg.SnapshotBucket,
+		RepoSlug:  repomod.Slug(cfg.GitHubRepo),
 		Logger:    logger,
 	})
 	if err != nil {
@@ -122,6 +131,7 @@ func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logge
 	m := &Manager{
 		config:           cfg,
 		runners:          make(map[string]*Runner),
+		recentRequests:   make(map[string]*recentAllocation),
 		vms:              make(map[string]*firecracker.VM),
 		snapshotCache:    cache,
 		network:          natNet,
@@ -165,7 +175,27 @@ func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logge
 		}).Info("Runner pooling enabled")
 	}
 
+	// Start idempotency cleanup loop
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			m.cleanupRecentRequests()
+		}
+	}()
+
 	return m, nil
+}
+
+// cleanupRecentRequests removes expired idempotency entries (>5 min old).
+func (m *Manager) cleanupRecentRequests() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for reqID, alloc := range m.recentRequests {
+		if time.Since(alloc.allocTime) > 5*time.Minute {
+			delete(m.recentRequests, reqID)
+		}
+	}
 }
 
 // SetNetNSNetwork configures the manager to use per-VM network namespaces
@@ -199,6 +229,24 @@ func (m *Manager) SetDraining(draining bool) (changed bool) {
 
 // AllocateRunner allocates a new runner
 func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Runner, error) {
+	// Idempotency check: if we've already allocated for this RequestID, return existing runner
+	if req.RequestID != "" {
+		m.mu.RLock()
+		if recent, ok := m.recentRequests[req.RequestID]; ok {
+			if time.Since(recent.allocTime) < 5*time.Minute {
+				if existingRunner, exists := m.runners[recent.runner.ID]; exists {
+					m.mu.RUnlock()
+					m.logger.WithFields(logrus.Fields{
+						"runner_id":  existingRunner.ID,
+						"request_id": req.RequestID,
+					}).Info("Returning existing runner for duplicate request")
+					return existingRunner, nil
+				}
+			}
+		}
+		m.mu.RUnlock()
+	}
+
 	// Build pool key from request (before locking, as pool.Get needs the key)
 	var poolKey *RunnerKey
 	if m.pool != nil {
@@ -528,6 +576,14 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	m.runners[runnerID] = runner
 	m.vms[runnerID] = vm
 
+	// Track for idempotency
+	if req.RequestID != "" {
+		m.recentRequests[req.RequestID] = &recentAllocation{
+			runner:    runner,
+			allocTime: time.Now(),
+		}
+	}
+
 	m.logger.WithFields(logrus.Fields{
 		"runner_id":         runnerID,
 		"ip":                runner.InternalIP.String(),
@@ -549,6 +605,7 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 	data.Latest.Meta.HostID = m.config.HostID
 	data.Latest.Meta.InstanceName = m.config.InstanceName
 	data.Latest.Meta.Environment = m.config.Environment
+	data.Latest.Meta.JobID = req.RequestID
 	data.Latest.Meta.CurrentTime = time.Now().UTC().Format(time.RFC3339)
 	data.Latest.Buildbarn.CertsMountPath = m.config.BuildbarnCertsMountPath
 	data.Latest.Network.IP = netCfg.IP
@@ -1453,6 +1510,61 @@ func (m *Manager) Close() error {
 	return nil
 }
 
+// DiskUsage returns the disk usage percentage of the data directory (0.0 to 1.0).
+func (m *Manager) DiskUsage() float64 {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(m.config.WorkspaceDir, &stat); err != nil {
+		m.logger.WithError(err).Warn("Failed to get disk usage")
+		return 0
+	}
+	total := stat.Blocks * uint64(stat.Bsize)
+	free := stat.Bfree * uint64(stat.Bsize)
+	if total == 0 {
+		return 0
+	}
+	return float64(total-free) / float64(total)
+}
+
+// CleanupOrphanedWorkspaces removes workspace directories that don't belong to any active runner.
+func (m *Manager) CleanupOrphanedWorkspaces() {
+	entries, err := os.ReadDir(m.config.WorkspaceDir)
+	if err != nil {
+		m.logger.WithError(err).Warn("Failed to read workspace directory")
+		return
+	}
+
+	m.mu.RLock()
+	activeRunners := make(map[string]bool)
+	for id := range m.runners {
+		activeRunners[id] = true
+	}
+	m.mu.RUnlock()
+
+	cleaned := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		// Skip special directories
+		if name == "_shared" || name == "." || name == ".." {
+			continue
+		}
+		if !activeRunners[name] {
+			dirPath := filepath.Join(m.config.WorkspaceDir, name)
+			m.logger.WithField("dir", dirPath).Info("Cleaning up orphaned workspace")
+			if err := os.RemoveAll(dirPath); err != nil {
+				m.logger.WithError(err).WithField("dir", dirPath).Warn("Failed to remove orphaned workspace")
+			} else {
+				cleaned++
+			}
+		}
+	}
+	if cleaned > 0 {
+		m.logger.WithField("cleaned", cleaned).Info("Cleaned up orphaned workspaces")
+	}
+}
+
 // pauseRunnerVM pauses a runner's VM (pool callback)
 func (m *Manager) pauseRunnerVM(ctx context.Context, runnerID string) error {
 	m.mu.RLock()
@@ -1502,6 +1614,75 @@ func (m *Manager) getRunnerVMStats(ctx context.Context, runnerID string) (*VMSta
 // removeRunnerVM removes a runner completely (pool callback)
 func (m *Manager) removeRunnerVM(ctx context.Context, runnerID string) error {
 	return m.ReleaseRunner(runnerID, true)
+}
+
+// ReconcileOrphans cleans up resources left behind by a previous manager incarnation.
+// This includes:
+// 1. Orphaned Firecracker sockets (from crashed VMs)
+// 2. Orphaned workspace directories
+// 3. Orphaned TAP/veth network devices
+func (m *Manager) ReconcileOrphans(ctx context.Context) {
+	m.logger.Info("Reconciling orphaned resources from previous incarnation")
+
+	orphaned := 0
+
+	// 1. Find orphaned Firecracker sockets
+	sockEntries, err := os.ReadDir(m.config.SocketDir)
+	if err != nil {
+		m.logger.WithError(err).Warn("Failed to read socket directory")
+	} else {
+		m.mu.RLock()
+		for _, entry := range sockEntries {
+			if !strings.HasSuffix(entry.Name(), ".sock") {
+				continue
+			}
+			runnerID := strings.TrimSuffix(entry.Name(), ".sock")
+			if _, exists := m.runners[runnerID]; !exists {
+				sockPath := filepath.Join(m.config.SocketDir, entry.Name())
+				m.logger.WithField("socket", sockPath).Info("Removing orphaned socket")
+				os.Remove(sockPath)
+				orphaned++
+			}
+		}
+		m.mu.RUnlock()
+	}
+
+	// 2. Clean up orphaned workspaces
+	m.CleanupOrphanedWorkspaces()
+
+	// 3. Clean up orphaned TAP devices
+	netEntries, err := os.ReadDir("/sys/class/net")
+	if err != nil {
+		m.logger.WithError(err).Debug("Failed to read /sys/class/net")
+	} else {
+		for _, entry := range netEntries {
+			name := entry.Name()
+			if strings.HasPrefix(name, "veth-") || (strings.HasPrefix(name, "tap-") && name != "tap-slot-0") {
+				// Check if this TAP belongs to an active runner
+				m.mu.RLock()
+				inUse := false
+				for _, r := range m.runners {
+					if r.TapDevice == name {
+						inUse = true
+						break
+					}
+				}
+				m.mu.RUnlock()
+
+				if !inUse {
+					m.logger.WithField("device", name).Info("Removing orphaned network device")
+					exec.Command("ip", "link", "delete", name).Run()
+					orphaned++
+				}
+			}
+		}
+	}
+
+	if orphaned > 0 {
+		m.logger.WithField("orphaned_cleaned", orphaned).Info("Orphan reconciliation complete")
+	} else {
+		m.logger.Info("No orphaned resources found")
+	}
 }
 
 // GetPool returns the runner pool (may be nil if pooling disabled)

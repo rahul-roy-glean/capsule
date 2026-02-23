@@ -45,23 +45,28 @@ func NewUploader(ctx context.Context, cfg UploaderConfig) (*Uploader, error) {
 	}, nil
 }
 
-// UploadSnapshot uploads a snapshot to GCS using parallel gcloud storage cp calls
+// UploadSnapshot uploads a snapshot to GCS using parallel gcloud storage cp calls.
+// Paths are namespaced under the repo slug from metadata.RepoSlug.
 func (u *Uploader) UploadSnapshot(ctx context.Context, localDir string, metadata SnapshotMetadata) error {
 	version := metadata.Version
-	u.logger.WithField("version", version).Info("Uploading snapshot to GCS")
+	prefix := metadata.RepoSlug + "/" + version
+	u.logger.WithFields(logrus.Fields{
+		"version":    version,
+		"gcs_prefix": prefix,
+	}).Info("Uploading snapshot to GCS")
 
 	start := time.Now()
 
-	// Files to upload
+	// Files to upload (namespaced under repo slug if set)
 	files := []struct {
 		local  string
 		remote string
 	}{
-		{filepath.Join(localDir, "kernel.bin"), fmt.Sprintf("%s/kernel.bin", version)},
-		{filepath.Join(localDir, "rootfs.img"), fmt.Sprintf("%s/rootfs.img", version)},
-		{filepath.Join(localDir, "snapshot.mem"), fmt.Sprintf("%s/snapshot.mem", version)},
-		{filepath.Join(localDir, "snapshot.state"), fmt.Sprintf("%s/snapshot.state", version)},
-		{filepath.Join(localDir, "repo-cache-seed.img"), fmt.Sprintf("%s/repo-cache-seed.img", version)},
+		{filepath.Join(localDir, "kernel.bin"), fmt.Sprintf("%s/kernel.bin", prefix)},
+		{filepath.Join(localDir, "rootfs.img"), fmt.Sprintf("%s/rootfs.img", prefix)},
+		{filepath.Join(localDir, "snapshot.mem"), fmt.Sprintf("%s/snapshot.mem", prefix)},
+		{filepath.Join(localDir, "snapshot.state"), fmt.Sprintf("%s/snapshot.state", prefix)},
+		{filepath.Join(localDir, "repo-cache-seed.img"), fmt.Sprintf("%s/repo-cache-seed.img", prefix)},
 	}
 
 	// Calculate total size
@@ -105,7 +110,7 @@ func (u *Uploader) UploadSnapshot(ctx context.Context, localDir string, metadata
 	}
 
 	bucket := u.gcsClient.Bucket(u.gcsBucket)
-	metadataObj := bucket.Object(fmt.Sprintf("%s/metadata.json", version))
+	metadataObj := bucket.Object(fmt.Sprintf("%s/metadata.json", prefix))
 	writer := metadataObj.NewWriter(ctx)
 	writer.ContentType = "application/json"
 	if _, err := writer.Write(metadataJSON); err != nil {
@@ -156,10 +161,12 @@ func (u *Uploader) uploadFile(ctx context.Context, localPath, remotePath string)
 	return nil
 }
 
-// UpdateCurrentPointer updates the "current" pointer to a new version by writing
-// a small JSON pointer file instead of copying all snapshot objects (~58GB).
-func (u *Uploader) UpdateCurrentPointer(ctx context.Context, version string) error {
-	u.logger.WithField("version", version).Info("Updating current pointer")
+// UpdateCurrentPointerForRepo updates the "current" pointer for a specific repo.
+func (u *Uploader) UpdateCurrentPointerForRepo(ctx context.Context, version, repoSlug string) error {
+	u.logger.WithFields(logrus.Fields{
+		"version":   version,
+		"repo_slug": repoSlug,
+	}).Info("Updating current pointer")
 
 	pointer := struct {
 		Version string `json:"version"`
@@ -170,8 +177,10 @@ func (u *Uploader) UpdateCurrentPointer(ctx context.Context, version string) err
 		return fmt.Errorf("failed to marshal pointer: %w", err)
 	}
 
+	pointerPath := repoSlug + "/current-pointer.json"
+
 	bucket := u.gcsClient.Bucket(u.gcsBucket)
-	obj := bucket.Object("current-pointer.json")
+	obj := bucket.Object(pointerPath)
 	writer := obj.NewWriter(ctx)
 	writer.ContentType = "application/json"
 	if _, err := writer.Write(pointerJSON); err != nil {

@@ -40,13 +40,41 @@ CREATE TABLE IF NOT EXISTS runners (
 -- Snapshots table: tracks snapshot versions
 CREATE TABLE IF NOT EXISTS snapshots (
     version VARCHAR(255) PRIMARY KEY,
-    status VARCHAR(32) DEFAULT 'building' CHECK (status IN ('building', 'ready', 'active', 'deprecated', 'failed')),
+    status VARCHAR(32) DEFAULT 'building' CHECK (status IN ('building', 'ready', 'validating', 'canary', 'active', 'deprecated', 'failed', 'rolled_back')),
     gcs_path VARCHAR(512),
     bazel_version VARCHAR(32),
     repo_commit VARCHAR(64),
+    repo VARCHAR(255) DEFAULT '',
+    repo_slug VARCHAR(255) DEFAULT '',
     size_bytes BIGINT DEFAULT 0,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     metrics JSONB DEFAULT '{}'::jsonb
+);
+
+-- Repos table: registered repositories managed by the system
+CREATE TABLE IF NOT EXISTS repos (
+    slug VARCHAR(255) PRIMARY KEY,
+    url VARCHAR(512) NOT NULL,
+    branch VARCHAR(255) DEFAULT 'main',
+    bazel_version VARCHAR(32) DEFAULT '',
+    warmup_targets VARCHAR(1024) DEFAULT '//...',
+    build_schedule VARCHAR(64) DEFAULT '',
+    max_concurrent_runners INT DEFAULT 0,
+    current_version VARCHAR(255),
+    auto_rollout BOOLEAN DEFAULT true,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Version assignments: tracks which snapshot version each host should run per repo
+CREATE TABLE IF NOT EXISTS version_assignments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    repo_slug VARCHAR(255) NOT NULL,
+    host_id UUID REFERENCES hosts(id),
+    version VARCHAR(255) NOT NULL,
+    status VARCHAR(32) DEFAULT 'assigned',
+    assigned_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    synced_at TIMESTAMP WITH TIME ZONE,
+    UNIQUE(repo_slug, host_id)
 );
 
 -- Jobs table: tracks CI job requests (optional, for queue-based allocation)
@@ -76,6 +104,10 @@ CREATE INDEX IF NOT EXISTS idx_runners_job ON runners(job_id);
 
 CREATE INDEX IF NOT EXISTS idx_snapshots_status ON snapshots(status);
 CREATE INDEX IF NOT EXISTS idx_snapshots_created ON snapshots(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_snapshots_repo_slug ON snapshots(repo_slug);
+
+CREATE INDEX IF NOT EXISTS idx_version_assignments_repo ON version_assignments(repo_slug);
+CREATE INDEX IF NOT EXISTS idx_version_assignments_host ON version_assignments(host_id);
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_queued ON jobs(queued_at) WHERE status = 'queued';
