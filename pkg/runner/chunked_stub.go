@@ -95,6 +95,6 @@ func (cm *ChunkedManager) GetLoadedManifests() map[string]string {
 }
 
 // SyncManifest is a stub
-func (cm *ChunkedManager) SyncManifest(ctx context.Context, repoSlug, version string) error {
+func (cm *ChunkedManager) SyncManifest(ctx context.Context, chunkKey, version string) error {
 	return fmt.Errorf("chunked snapshots are only supported on Linux")
 }

@@ -17,8 +17,8 @@ type hostHeartbeatRequest struct {
 	BusyRunners     int               `json:"busy_runners"`
 	SnapshotVersion string            `json:"snapshot_version"`
 	Draining        bool              `json:"draining"`
-	// LoadedManifests reports which repo manifests are already loaded on this host
-	// (repo_slug → version). Used by the control plane for cache-affinity scheduling.
+	// LoadedManifests reports which chunk manifests are already loaded on this host
+	// (chunk_key → version). Used by the control plane for cache-affinity scheduling.
 	LoadedManifests map[string]string `json:"loaded_manifests,omitempty"`
 }
 
@@ -89,13 +89,13 @@ func (s *ControlPlaneServer) HandleHostHeartbeat(w http.ResponseWriter, r *http.
 		if err != nil {
 			s.logger.WithError(err).Warn("Failed to get desired versions for heartbeat")
 		} else {
-			for slug, ver := range desired {
-				loaded, hasLoaded := req.LoadedManifests[slug]
+			for chunkKey, ver := range desired {
+				loaded, hasLoaded := req.LoadedManifests[chunkKey]
 				if !hasLoaded || loaded != ver {
 					if syncVersions == nil {
 						syncVersions = make(map[string]string)
 					}
-					syncVersions[slug] = ver
+					syncVersions[chunkKey] = ver
 				}
 			}
 		}

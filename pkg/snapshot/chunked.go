@@ -53,7 +53,8 @@ type ChunkedSnapshotMetadata struct {
 	BazelVersion  string     `json:"bazel_version,omitempty"`
 	RepoCommit    string     `json:"repo_commit,omitempty"`
 	Repo          string     `json:"repo,omitempty"`
-	RepoSlug      string     `json:"repo_slug,omitempty"`
+	ChunkKey      string     `json:"chunk_key,omitempty"`
+	Commands      []SnapshotCommand `json:"commands,omitempty"`
 	CreatedAt     time.Time  `json:"created_at"`
 	ChunkSize     int64      `json:"chunk_size"`
 	KernelHash    string     `json:"kernel_hash"`

@@ -22,14 +22,10 @@ import (
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/fuse"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/github"
-	repomod "github.com/rahul-roy-glean/bazel-firecracker/pkg/repo"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
 var (
-	repoURL              = flag.String("repo-url", "", "Repository URL to clone")
-	repoBranch           = flag.String("repo-branch", "main", "Branch to checkout")
-	bazelVersion         = flag.String("bazel-version", "7.x", "Bazel version")
 	gcsBucket            = flag.String("gcs-bucket", "", "GCS bucket for snapshots")
 	outputDir            = flag.String("output-dir", "/tmp/snapshot", "Output directory for snapshot files")
 	kernelPath           = flag.String("kernel-path", "/opt/firecracker/kernel.bin", "Path to kernel")
@@ -43,16 +39,14 @@ var (
 	repoCacheSeedSizeGB  = flag.Int("repo-cache-seed-size-gb", 20, "Size in GB of repo-cache-seed.img (shared Bazel repository cache seed)")
 	repoCacheSeedDir     = flag.String("repo-cache-seed-dir", "", "Optional directory to seed into repo-cache-seed.img (copied into image root)")
 	gitCachePath         = flag.String("git-cache-path", "", "Path to pre-populated git-cache.img (from git-cache-builder). If set, uses this instead of cloning during warmup.")
-	fetchTargets         = flag.String("fetch-targets", "//...", "Bazel target pattern for fetch (e.g., '//... -- -//terraform/...' to exclude terraform)")
-	bazelrc              = flag.String("bazelrc", "", "Path to .bazelrc file relative to repo root. If empty, uses repo's .bazelrc if it exists.")
 	logLevel             = flag.String("log-level", "info", "Log level")
 	enableChunked        = flag.Bool("enable-chunked", true, "Also build a chunked snapshot for lazy loading")
 	memBackend           = flag.String("mem-backend", "file", "Memory backend for chunked snapshots: 'file' (upload snapshot.mem as single blob, default) or 'chunked' (UFFD lazy loading via MemChunks)")
 
 	incremental = flag.Bool("incremental", false, "Restore from previous snapshot for incremental rebuild")
 
-	// Multi-repo support
-	repoSlug = flag.String("repo-slug", "", "Deterministic repo slug (derived from repo-url if empty). Used to namespace GCS paths.")
+	// Snapshot commands (replaces --repo-slug/--repo-url/--repo-branch/--bazel-version)
+	snapshotCommands = flag.String("snapshot-commands", "", "JSON array of SnapshotCommand describing what to bake into the snapshot (required)")
 
 	// GitHub App authentication for private repos (used when git-cache is not available)
 	githubAppID     = flag.String("github-app-id", "", "GitHub App ID for private repo access")
@@ -75,8 +69,8 @@ func main() {
 	log := logger.WithField("component", "snapshot-builder")
 	log.Info("Starting snapshot builder")
 
-	if *repoURL == "" {
-		log.Fatal("--repo-url is required")
+	if *snapshotCommands == "" {
+		log.Fatal("--snapshot-commands is required")
 	}
 	if *gcsBucket == "" {
 		log.Fatal("--gcs-bucket is required")
@@ -142,12 +136,19 @@ func main() {
 		log.WithError(err).Warn("Failed to get GCP access token (Artifact Registry auth won't work in warmup VM)")
 	}
 
-	// Generate version string
-	branchSuffix := *repoBranch
-	if len(branchSuffix) > 8 {
-		branchSuffix = branchSuffix[:8]
+	// Parse snapshot commands early — needed for chunk key and version.
+	var commands []snapshot.SnapshotCommand
+	if err := json.Unmarshal([]byte(*snapshotCommands), &commands); err != nil {
+		log.WithError(err).Fatal("invalid --snapshot-commands")
 	}
-	version := fmt.Sprintf("v%s-%s", time.Now().Format("20060102-150405"), branchSuffix)
+	if len(commands) == 0 {
+		log.Fatal("--snapshot-commands must be non-empty")
+	}
+	chunkKey := snapshot.ComputeChunkKey(commands)
+	log.WithField("chunk_key", chunkKey).Info("Computed chunk key from snapshot commands")
+
+	// Generate version string
+	version := fmt.Sprintf("v%s-%s", time.Now().Format("20060102-150405"), chunkKey)
 	log.WithField("version", version).Info("Building snapshot")
 
 	// Create output directory
@@ -189,7 +190,7 @@ func main() {
 	if *incremental {
 		log.Info("Attempting incremental restore from previous snapshot...")
 		var incrementalErr error
-		vm, fuseDisk, fuseSeedDisk, incrementalErr = restoreFromPreviousSnapshot(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken)
+		vm, fuseDisk, fuseSeedDisk, incrementalErr = restoreFromPreviousSnapshot(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken, commands)
 		if incrementalErr != nil {
 			log.WithError(incrementalErr).Warn("Incremental restore failed, falling back to cold boot")
 			vm = nil
@@ -327,7 +328,7 @@ func main() {
 			log.WithError(err).Fatal("Failed to start VM")
 		}
 
-		mmdsData := buildWarmupMMDS(*repoURL, *repoBranch, *bazelVersion, *fetchTargets, *bazelrc, gitToken, gcpAccessToken, gitCacheEnabled)
+		mmdsData := buildWarmupMMDS(commands, gitToken, gcpAccessToken, gitCacheEnabled)
 		if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 			vm.Stop()
 			log.WithError(err).Fatal("Failed to set MMDS data")
@@ -413,19 +414,22 @@ func main() {
 		}
 	}
 
-	// Derive repo slug (use flag, or derive from repo URL)
-	effectiveRepoSlug := *repoSlug
-	if effectiveRepoSlug == "" && *repoURL != "" {
-		effectiveRepoSlug = repomod.Slug(*repoURL)
+	// Derive informational repo URL from git-clone command (best-effort, for metadata only).
+	metaRepoURL := ""
+	for _, cmd := range commands {
+		if cmd.Type == "git-clone" && len(cmd.Args) > 0 {
+			metaRepoURL = cmd.Args[0]
+			break
+		}
 	}
 
 	// Create metadata
 	metadata := snapshot.SnapshotMetadata{
 		Version:           version,
-		BazelVersion:      *bazelVersion,
 		RepoCommit:        getGitCommit(*outputDir),
-		Repo:              *repoURL,
-		RepoSlug:          effectiveRepoSlug,
+		Repo:              metaRepoURL,
+		ChunkKey:          chunkKey,
+		Commands:          commands,
 		CreatedAt:         time.Now(),
 		SizeBytes:         totalSize,
 		KernelPath:        "kernel.bin",
@@ -455,9 +459,9 @@ func main() {
 		}
 	}
 
-	// Update current pointer (repo-scoped if repo slug is set)
+	// Update current pointer (chunk-key-scoped)
 	log.Info("Updating current pointer...")
-	if err := uploader.UpdateCurrentPointerForRepo(ctx, version, effectiveRepoSlug); err != nil {
+	if err := uploader.UpdateCurrentPointerForRepo(ctx, version, chunkKey); err != nil {
 		log.WithError(err).Fatal("Failed to update current pointer")
 	}
 
@@ -1010,6 +1014,7 @@ func restoreFromPreviousSnapshot(
 	log *logrus.Entry,
 	vmID, tapName, guestMAC, bootArgs string,
 	gitToken, gcpAccessToken string,
+	commands []snapshot.SnapshotCommand,
 ) (*firecracker.VM, *fuse.ChunkedDisk, *fuse.ChunkedDisk, error) {
 	// Use a subdirectory for incremental working files to avoid colliding
 	// with the symlinks in /tmp/snapshot/ that Firecracker expects.
@@ -1300,10 +1305,10 @@ func restoreFromPreviousSnapshot(
 		os.Remove(c)
 	}
 
-	// 11. Set MMDS with mode=warmup, fresh bazelrc, and new runner_id
+	// 11. Set MMDS with mode=warmup and new runner_id
 	newRunnerID := fmt.Sprintf("snapshot-builder-incr-%s", uuid.New().String()[:8])
 	gitCacheEnabled := false
-	mmdsData := buildWarmupMMDS(*repoURL, *repoBranch, *bazelVersion, *fetchTargets, *bazelrc, gitToken, gcpAccessToken, gitCacheEnabled)
+	mmdsData := buildWarmupMMDS(commands, gitToken, gcpAccessToken, gitCacheEnabled)
 	// Override runner_id so thaw-agent detects the change and re-runs warmup
 	mmdsData["latest"].(map[string]interface{})["meta"].(map[string]interface{})["runner_id"] = newRunnerID
 
@@ -1333,10 +1338,23 @@ func restoreFromPreviousSnapshot(
 	return vm, fuseDisk, fuseSeedDisk, nil
 }
 
-// buildWarmupMMDS creates the MMDS data for warmup mode
-func buildWarmupMMDS(repoURL, repoBranch, bazelVersion, fetchTargets, bazelrc, gitToken, gcpAccessToken string, gitCacheEnabled bool) map[string]interface{} {
-	// Extract repo name for git-cache lookup (e.g., "askscio/scio" -> "scio")
+// buildWarmupMMDS creates the MMDS data for warmup mode.
+// commands are passed through to thaw-agent as warmup.commands.
+func buildWarmupMMDS(commands []snapshot.SnapshotCommand, gitToken, gcpAccessToken string, gitCacheEnabled bool) map[string]interface{} {
+	// Extract repo URL from git-clone command for git_cache mapping (best-effort).
+	repoURL := ""
+	for _, cmd := range commands {
+		if cmd.Type == "git-clone" && len(cmd.Args) > 0 {
+			repoURL = cmd.Args[0]
+			break
+		}
+	}
 	repoName := filepath.Base(strings.TrimSuffix(repoURL, ".git"))
+
+	repoMappings := map[string]string{}
+	if repoURL != "" {
+		repoMappings[repoURL] = repoName
+	}
 
 	return map[string]interface{}{
 		"latest": map[string]interface{}{
@@ -1346,11 +1364,7 @@ func buildWarmupMMDS(repoURL, repoBranch, bazelVersion, fetchTargets, bazelrc, g
 				"environment": "snapshot-build",
 			},
 			"warmup": map[string]interface{}{
-				"repo_url":       repoURL,
-				"repo_branch":    repoBranch,
-				"bazel_version":  bazelVersion,
-				"warmup_targets": fetchTargets,
-				"bazelrc":        bazelrc,
+				"commands": commands,
 			},
 			"network": map[string]interface{}{
 				"ip":        "172.16.0.2/24",
@@ -1361,7 +1375,6 @@ func buildWarmupMMDS(repoURL, repoBranch, bazelVersion, fetchTargets, bazelrc, g
 			},
 			"job": map[string]interface{}{
 				"repo":             repoURL,
-				"branch":           repoBranch,
 				"git_token":        gitToken,
 				"gcp_access_token": gcpAccessToken,
 			},
@@ -1369,10 +1382,7 @@ func buildWarmupMMDS(repoURL, repoBranch, bazelVersion, fetchTargets, bazelrc, g
 				"enabled":       gitCacheEnabled,
 				"mount_path":    "/mnt/git-cache",
 				"workspace_dir": "/mnt/ephemeral/workdir",
-				// Map the repo URL to its cache directory name
-				"repo_mappings": map[string]string{
-					repoURL: repoName,
-				},
+				"repo_mappings": repoMappings,
 			},
 		},
 	}

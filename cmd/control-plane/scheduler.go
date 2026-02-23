@@ -36,7 +36,7 @@ type AllocateRunnerRequest struct {
 	Repo              string
 	Branch            string
 	Commit            string
-	RepoSlug          string
+	ChunkKey          string
 	Labels            map[string]string
 	GitHubRunnerToken string
 	VCPUs             int
@@ -61,19 +61,19 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	}).Info("Allocating runner")
 
 	// Derive repo slug for multi-repo support
-	repoSlug := req.RepoSlug
+	chunkKey := req.ChunkKey
 
 	// Per-repo fairness: check max_concurrent_runners
-	if repoSlug != "" && s.db != nil {
+	if chunkKey != "" && s.db != nil {
 		var maxConcurrent int
-		err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners FROM repos WHERE slug = $1`, repoSlug).Scan(&maxConcurrent)
+		err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners FROM snapshot_configs WHERE chunk_key = $1`, chunkKey).Scan(&maxConcurrent)
 		if err == nil && maxConcurrent > 0 {
 			var currentCount int
 			_ = s.db.QueryRowContext(ctx, `
 				SELECT COUNT(*) FROM runners WHERE repo = $1 AND status IN ('running','busy','initializing')
 			`, req.Repo).Scan(&currentCount)
 			if currentCount >= maxConcurrent {
-				return nil, fmt.Errorf("repo %s at max concurrent runners (%d/%d)", repoSlug, currentCount, maxConcurrent)
+				return nil, fmt.Errorf("chunk_key %s at max concurrent runners (%d/%d)", chunkKey, currentCount, maxConcurrent)
 			}
 		}
 	}
@@ -84,8 +84,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		return nil, fmt.Errorf("no available hosts")
 	}
 
-	// Score and select best host (with repo-aware affinity)
-	host := s.selectBestHostForRepo(hosts, repoSlug)
+	// Score and select best host (with chunk-key cache affinity)
+	host := s.selectBestHostForChunkKey(hosts, chunkKey)
 	if host == nil {
 		return nil, fmt.Errorf("no suitable host found")
 	}
@@ -114,7 +114,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		Commit:            req.Commit,
 		Labels:            req.Labels,
 		GithubRunnerToken: req.GitHubRunnerToken,
-		RepoSlug:          repoSlug,
+		ChunkKey:          chunkKey,
 	}
 	if req.VCPUs > 0 || req.MemoryMB > 0 {
 		protoReq.Resources = &pb.Resources{
@@ -158,8 +158,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	}, nil
 }
 
-// selectBestHostForRepo selects the best host with repo-aware cache affinity.
-func (s *Scheduler) selectBestHostForRepo(hosts []*Host, repoSlug string) *Host {
+// selectBestHostForChunkKey selects the best host with chunk-key cache affinity.
+func (s *Scheduler) selectBestHostForChunkKey(hosts []*Host, chunkKey string) *Host {
 	if len(hosts) == 0 {
 		return nil
 	}
@@ -171,7 +171,7 @@ func (s *Scheduler) selectBestHostForRepo(hosts []*Host, repoSlug string) *Host 
 
 	var scored []scoredHost
 	for _, h := range hosts {
-		score := s.scoreHostForRepo(h, repoSlug)
+		score := s.scoreHostForChunkKey(h, chunkKey)
 		scored = append(scored, scoredHost{host: h, score: score})
 	}
 
@@ -182,14 +182,14 @@ func (s *Scheduler) selectBestHostForRepo(hosts []*Host, repoSlug string) *Host 
 	return scored[0].host
 }
 
-// scoreHostForRepo calculates a score for a host with repo-aware cache affinity.
-func (s *Scheduler) scoreHostForRepo(h *Host, repoSlug string) float64 {
+// scoreHostForChunkKey calculates a score for a host with chunk-key cache affinity.
+func (s *Scheduler) scoreHostForChunkKey(h *Host, chunkKey string) float64 {
 	score := s.scoreHost(h)
 
 	// Repo-aware cache affinity scoring:
 	// If we have loaded manifests info (from heartbeat), prefer hosts with warm caches.
-	if repoSlug != "" && h.LoadedManifests != nil {
-		if version, ok := h.LoadedManifests[repoSlug]; ok {
+	if chunkKey != "" && h.LoadedManifests != nil {
+		if version, ok := h.LoadedManifests[chunkKey]; ok {
 			// Host has a manifest loaded for this repo
 			// Check if it's the current version (ideal) or any version (warm-ish)
 			if version != "" {

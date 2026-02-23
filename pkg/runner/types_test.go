@@ -46,16 +46,16 @@ func TestMMDSData_BackwardsCompatible(t *testing.T) {
 	}
 }
 
-func TestAllocateRequest_RepoSlug(t *testing.T) {
+func TestAllocateRequest_ChunkKey(t *testing.T) {
 	req := AllocateRequest{
 		RequestID: "req-1",
 		Repo:      "https://github.com/org/repo",
-		RepoSlug:  "org-repo",
+		ChunkKey:  "abc1234567890abc",
 		Branch:    "main",
 	}
 
-	if req.RepoSlug != "org-repo" {
-		t.Errorf("RepoSlug = %q, want %q", req.RepoSlug, "org-repo")
+	if req.ChunkKey != "abc1234567890abc" {
+		t.Errorf("ChunkKey = %q, want %q", req.ChunkKey, "abc1234567890abc")
 	}
 }
 

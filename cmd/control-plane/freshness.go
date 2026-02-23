@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
 // checkCommitDrift uses the GitHub API to count commits between a known commit
@@ -46,7 +48,6 @@ func checkCommitDrift(ctx context.Context, repoURL, branch, lastCommit, githubTo
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		// The commit might have been force-pushed away
 		return -1, fmt.Errorf("commit %s not found (may have been force-pushed)", lastCommit)
 	}
 
@@ -91,10 +92,9 @@ func parseGitHubRepo(repoURL string) (owner, repoName string, err error) {
 	return parts[0], parts[1], nil
 }
 
-// snapshotFreshnessLoop replaces the old FreshnessCheckLoop with a repo-aware version.
-// For each registered repo with a build_schedule, it checks if the current snapshot
-// is stale (by age or commit drift) and triggers a rebuild if needed.
-func snapshotFreshnessLoop(ctx context.Context, sm *SnapshotManager, repoRegistry *RepoRegistry, logger *logrus.Logger) {
+// snapshotFreshnessLoop iterates over all snapshot_configs and triggers rebuilds
+// when a build_schedule fires or the snapshot is stale.
+func snapshotFreshnessLoop(ctx context.Context, sm *SnapshotManager, configRegistry *SnapshotConfigRegistry, logger *logrus.Logger) {
 	log := logger.WithField("component", "freshness-loop")
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -104,40 +104,38 @@ func snapshotFreshnessLoop(ctx context.Context, sm *SnapshotManager, repoRegistr
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			checkRepoFreshness(ctx, sm, repoRegistry, log)
+			checkConfigFreshness(ctx, sm, configRegistry, log)
 		}
 	}
 }
 
-func checkRepoFreshness(ctx context.Context, sm *SnapshotManager, repoRegistry *RepoRegistry, log *logrus.Entry) {
-	repos, err := repoRegistry.ListRepos(ctx)
+func checkConfigFreshness(ctx context.Context, sm *SnapshotManager, configRegistry *SnapshotConfigRegistry, log *logrus.Entry) {
+	configs, err := configRegistry.ListSnapshotConfigs(ctx)
 	if err != nil {
-		log.WithError(err).Warn("Failed to list repos for freshness check")
+		log.WithError(err).Warn("Failed to list snapshot configs for freshness check")
 		return
 	}
 
-	for _, r := range repos {
-		if r.BuildSchedule == "" {
-			continue // No scheduled builds for this repo
+	for _, cfg := range configs {
+		if cfg.BuildSchedule == "" {
+			continue // No scheduled builds for this config
 		}
 
-		// Check if current time matches the cron schedule
-		if !shouldBuildNow(r.BuildSchedule) {
+		if !shouldBuildNow(cfg.BuildSchedule) {
 			continue
 		}
 
 		log := log.WithFields(logrus.Fields{
-			"repo_slug": r.Slug,
-			"repo_url":  r.URL,
+			"chunk_key":    cfg.ChunkKey,
+			"display_name": cfg.DisplayName,
 		})
 
 		// Check snapshot age
-		currentSnapshot, err := sm.GetCurrentSnapshotForRepo(ctx, r.Slug)
+		currentSnapshot, err := sm.GetCurrentSnapshotForKey(ctx, cfg.ChunkKey)
 		if err != nil {
-			log.WithError(err).Debug("No current snapshot for repo")
-			// No snapshot exists — trigger build
-			log.Info("No snapshot exists for repo, triggering build")
-			if _, err := sm.TriggerSnapshotBuildForRepo(ctx, r.Slug, r.URL, r.Branch, r.BazelVersion); err != nil {
+			log.WithError(err).Debug("No current snapshot for chunk_key")
+			log.Info("No snapshot exists for chunk_key, triggering build")
+			if _, err := sm.TriggerSnapshotBuildForKey(ctx, cfg.ChunkKey, cfg.Commands); err != nil {
 				log.WithError(err).Error("Failed to trigger snapshot build")
 			}
 			continue
@@ -149,14 +147,19 @@ func checkRepoFreshness(ctx context.Context, sm *SnapshotManager, repoRegistry *
 				"version": currentSnapshot.Version,
 				"age":     age,
 			}).Info("Snapshot is stale (>24h), triggering rebuild")
-			if _, err := sm.TriggerSnapshotBuildForRepo(ctx, r.Slug, r.URL, r.Branch, r.BazelVersion); err != nil {
+			if _, err := sm.TriggerSnapshotBuildForKey(ctx, cfg.ChunkKey, cfg.Commands); err != nil {
 				log.WithError(err).Error("Failed to trigger snapshot build")
 			}
 			continue
 		}
 
-		// Check commit drift
-		drift, err := checkCommitDrift(ctx, r.URL, r.Branch, currentSnapshot.RepoCommit, "")
+		// Check commit drift — only if commands contain a git-clone
+		repoURL, branch := extractGitCloneArgs(cfg.Commands)
+		if repoURL == "" {
+			continue // No git-clone command, skip drift check
+		}
+
+		drift, err := checkCommitDrift(ctx, repoURL, branch, currentSnapshot.RepoCommit, "")
 		if err != nil {
 			log.WithError(err).Debug("Failed to check commit drift")
 			continue
@@ -167,11 +170,32 @@ func checkRepoFreshness(ctx context.Context, sm *SnapshotManager, repoRegistry *
 				"version":      currentSnapshot.Version,
 				"commit_drift": drift,
 			}).Info("Commit drift detected, triggering rebuild")
-			if _, err := sm.TriggerSnapshotBuildForRepo(ctx, r.Slug, r.URL, r.Branch, r.BazelVersion); err != nil {
+			if _, err := sm.TriggerSnapshotBuildForKey(ctx, cfg.ChunkKey, cfg.Commands); err != nil {
 				log.WithError(err).Error("Failed to trigger snapshot build")
 			}
 		}
 	}
+}
+
+// extractGitCloneArgs returns the repo URL and branch from a git-clone command,
+// or empty strings if no git-clone command is found.
+func extractGitCloneArgs(commands []snapshot.SnapshotCommand) (repoURL, branch string) {
+	for _, cmd := range commands {
+		if cmd.Type == "git-clone" {
+			// Args convention: ["<repo-url>", "<branch>"] or just ["<repo-url>"]
+			if len(cmd.Args) >= 1 {
+				repoURL = cmd.Args[0]
+			}
+			if len(cmd.Args) >= 2 {
+				branch = cmd.Args[1]
+			}
+			if branch == "" {
+				branch = "main"
+			}
+			return repoURL, branch
+		}
+	}
+	return "", ""
 }
 
 // shouldBuildNow is a simplified cron check. It supports:

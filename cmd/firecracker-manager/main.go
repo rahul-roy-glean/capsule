@@ -607,11 +607,11 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			status := mgr.GetStatus()
 
 			// Maintain idle target.
-			// In chunked mode, skip pre-allocation: each repo needs a different
+			// In chunked mode, skip pre-allocation: each chunk key needs a different
 			// snapshot, so generic warm VMs would load the wrong data and be
 			// useless when an actual job arrives. The control plane drives
 			// allocation on-demand via gRPC AllocateRunner with the correct
-			// RepoSlug. In single-repo (non-chunked) mode, warm pool is fine
+			// ChunkKey. In single-snapshot (non-chunked) mode, warm pool is fine
 			// because there is only one snapshot.
 			if chunkedMgr != nil {
 				// Chunked mode: no local pre-allocation; control plane drives it.
@@ -843,19 +843,19 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				}(hbResp.SnapshotVersion)
 			}
 
-				// Handle per-repo manifest sync directives
+				// Handle per-chunk-key manifest sync directives
 			if len(hbResp.SyncVersions) > 0 && chunkedMgr != nil {
-				for repoSlug, version := range hbResp.SyncVersions {
-					go func(slug, ver string) {
+				for chunkKey, version := range hbResp.SyncVersions {
+					go func(key, ver string) {
 						syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 						defer cancel()
-						if err := chunkedMgr.SyncManifest(syncCtx, slug, ver); err != nil {
+						if err := chunkedMgr.SyncManifest(syncCtx, key, ver); err != nil {
 							log.WithError(err).WithFields(logrus.Fields{
-								"repo_slug": slug,
+								"chunk_key": key,
 								"version":   ver,
-							}).Warn("Failed to sync manifest for repo")
+							}).Warn("Failed to sync manifest for chunk key")
 						}
-					}(repoSlug, version)
+					}(chunkKey, version)
 				}
 			}
 		}

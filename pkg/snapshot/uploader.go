@@ -46,10 +46,10 @@ func NewUploader(ctx context.Context, cfg UploaderConfig) (*Uploader, error) {
 }
 
 // UploadSnapshot uploads a snapshot to GCS using parallel gcloud storage cp calls.
-// Paths are namespaced under the repo slug from metadata.RepoSlug.
+// Paths are namespaced under the chunk key from metadata.ChunkKey.
 func (u *Uploader) UploadSnapshot(ctx context.Context, localDir string, metadata SnapshotMetadata) error {
 	version := metadata.Version
-	prefix := metadata.RepoSlug + "/" + version
+	prefix := metadata.ChunkKey + "/" + version
 	u.logger.WithFields(logrus.Fields{
 		"version":    version,
 		"gcs_prefix": prefix,
@@ -161,11 +161,11 @@ func (u *Uploader) uploadFile(ctx context.Context, localPath, remotePath string)
 	return nil
 }
 
-// UpdateCurrentPointerForRepo updates the "current" pointer for a specific repo.
-func (u *Uploader) UpdateCurrentPointerForRepo(ctx context.Context, version, repoSlug string) error {
+// UpdateCurrentPointerForRepo updates the "current" pointer for a specific chunk key.
+func (u *Uploader) UpdateCurrentPointerForRepo(ctx context.Context, version, chunkKey string) error {
 	u.logger.WithFields(logrus.Fields{
 		"version":   version,
-		"repo_slug": repoSlug,
+		"chunk_key": chunkKey,
 	}).Info("Updating current pointer")
 
 	pointer := struct {
@@ -177,7 +177,7 @@ func (u *Uploader) UpdateCurrentPointerForRepo(ctx context.Context, version, rep
 		return fmt.Errorf("failed to marshal pointer: %w", err)
 	}
 
-	pointerPath := repoSlug + "/current-pointer.json"
+	pointerPath := chunkKey + "/current-pointer.json"
 
 	bucket := u.gcsClient.Bucket(u.gcsBucket)
 	obj := bucket.Object(pointerPath)

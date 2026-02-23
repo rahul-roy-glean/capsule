@@ -61,7 +61,7 @@ func TestScoreHost_PrefersRecentHeartbeat(t *testing.T) {
 	}
 }
 
-func TestScoreHostForRepo_WarmCacheAffinity(t *testing.T) {
+func TestScoreHostForChunkKey_WarmCacheAffinity(t *testing.T) {
 	s := &Scheduler{}
 
 	hostWarm := &Host{
@@ -76,15 +76,15 @@ func TestScoreHostForRepo_WarmCacheAffinity(t *testing.T) {
 		LastHeartbeat: time.Now(),
 	}
 
-	scoreWarm := s.scoreHostForRepo(hostWarm, "org-repo")
-	scoreCold := s.scoreHostForRepo(hostCold, "org-repo")
+	scoreWarm := s.scoreHostForChunkKey(hostWarm, "org-repo")
+	scoreCold := s.scoreHostForChunkKey(hostCold, "org-repo")
 
 	if scoreWarm <= scoreCold {
 		t.Errorf("Host with warm cache should score higher: warm=%f, cold=%f", scoreWarm, scoreCold)
 	}
 }
 
-func TestScoreHostForRepo_NoRepoSlug(t *testing.T) {
+func TestScoreHostForChunkKey_Empty(t *testing.T) {
 	s := &Scheduler{}
 
 	host := &Host{
@@ -94,10 +94,10 @@ func TestScoreHostForRepo_NoRepoSlug(t *testing.T) {
 		LoadedManifests: map[string]string{"org-repo": "v1"},
 	}
 
-	scoreWithRepo := s.scoreHostForRepo(host, "org-repo")
-	scoreNoRepo := s.scoreHostForRepo(host, "")
+	scoreWithRepo := s.scoreHostForChunkKey(host, "org-repo")
+	scoreNoRepo := s.scoreHostForChunkKey(host, "")
 
-	// With empty repo slug, no cache affinity bonus should be applied
+	// With empty chunk key, no cache affinity bonus should be applied
 	if scoreNoRepo >= scoreWithRepo {
 		t.Errorf("Empty repo slug should not get cache bonus: with=%f, without=%f", scoreWithRepo, scoreNoRepo)
 	}
@@ -111,7 +111,7 @@ func TestSelectBestHostForRepo(t *testing.T) {
 		{ID: "warm", TotalSlots: 10, UsedSlots: 5, LastHeartbeat: time.Now(), LoadedManifests: map[string]string{"org-repo": "v1"}},
 	}
 
-	best := s.selectBestHostForRepo(hosts, "org-repo")
+	best := s.selectBestHostForChunkKey(hosts, "org-repo")
 	if best == nil {
 		t.Fatal("selectBestHostForRepo returned nil")
 	}
@@ -122,7 +122,7 @@ func TestSelectBestHostForRepo(t *testing.T) {
 
 func TestSelectBestHostForRepo_Empty(t *testing.T) {
 	s := &Scheduler{}
-	best := s.selectBestHostForRepo(nil, "org-repo")
+	best := s.selectBestHostForChunkKey(nil, "org-repo")
 	if best != nil {
 		t.Error("Expected nil for empty host list")
 	}

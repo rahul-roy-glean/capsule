@@ -26,7 +26,7 @@ type Host struct {
 	GRPCAddress      string
 	HTTPAddress      string
 	CreatedAt        time.Time
-	// LoadedManifests tracks which chunked snapshot manifests are loaded per repo (repo_slug → version)
+	// LoadedManifests tracks which chunked snapshot manifests are loaded per chunk key (chunk_key → version)
 	LoadedManifests map[string]string
 	// DiskUsage is the reported disk usage percentage (0.0-1.0)
 	DiskUsage float64

@@ -277,7 +277,7 @@ func (u *IncrementalUploader) GarbageCollect(ctx context.Context, keepVersions [
 }
 
 // GarbageCollectAllRepos is the safe multi-repo variant of GarbageCollect.
-// It accepts a map of repo_slug → []version_paths (GCS metadata paths) and
+// It accepts a map of chunk_key → []version_paths (GCS metadata paths) and
 // builds the referenced set across ALL repos before deleting anything.
 // This prevents repo A's GC from deleting chunks still referenced by repo B.
 func (u *IncrementalUploader) GarbageCollectAllRepos(ctx context.Context, repoVersions map[string][]string) error {
@@ -286,12 +286,12 @@ func (u *IncrementalUploader) GarbageCollectAllRepos(ctx context.Context, repoVe
 	referencedHashes := make(map[string]bool)
 	totalVersions := 0
 
-	for repoSlug, versions := range repoVersions {
+	for chunkKey, versions := range repoVersions {
 		for _, version := range versions {
 			meta, err := u.store.LoadChunkedMetadata(ctx, version)
 			if err != nil {
 				u.logger.WithError(err).WithFields(logrus.Fields{
-					"repo_slug": repoSlug,
+					"chunk_key": chunkKey,
 					"version":   version,
 				}).Warn("Failed to load metadata for GC, skipping version")
 				continue

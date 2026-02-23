@@ -18,6 +18,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
 // Snapshot represents a snapshot version
@@ -473,6 +474,112 @@ shutdown -h now
 	}
 
 	// Wait for operation to complete
+	if err := op.Wait(ctx); err != nil {
+		return fmt.Errorf("instance creation failed: %w", err)
+	}
+
+	sm.logger.WithField("instance", instanceName).Info("Snapshot builder VM created")
+	return nil
+}
+
+// launchSnapshotBuilderVMForKey creates a GCE instance to build a snapshot from commands JSON.
+func (sm *SnapshotManager) launchSnapshotBuilderVMForKey(ctx context.Context, instanceName, chunkKey, commandsJSON, version string) error {
+	if sm.gcpProject == "" {
+		sm.logger.Warn("GCP project not configured, skipping VM launch")
+		return nil
+	}
+
+	sm.logger.WithFields(logrus.Fields{
+		"instance":  instanceName,
+		"chunk_key": chunkKey,
+		"version":   version,
+	}).Info("Launching snapshot builder VM")
+
+	instancesClient, err := compute.NewInstancesRESTClient(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create compute client: %w", err)
+	}
+	defer instancesClient.Close()
+
+	startupScript := fmt.Sprintf(`#!/bin/bash
+set -e
+exec > >(tee /var/log/snapshot-builder.log) 2>&1
+echo "Starting snapshot builder..."
+if [ ! -f /usr/local/bin/snapshot-builder ]; then
+    gcloud storage cp gs://%s/bin/snapshot-builder /usr/local/bin/snapshot-builder
+    chmod +x /usr/local/bin/snapshot-builder
+fi
+/usr/local/bin/snapshot-builder \
+    --snapshot-commands='%s' \
+    --gcs-bucket="%s" \
+    --output-dir=/tmp/snapshot \
+    --log-level=info
+echo "Snapshot build complete, shutting down..."
+shutdown -h now
+`, sm.gcsBucket, commandsJSON, sm.gcsBucket)
+
+	machineType := fmt.Sprintf("zones/%s/machineTypes/n2-standard-8", sm.gcpZone)
+	sourceImage := fmt.Sprintf("projects/%s/global/images/family/%s", sm.gcpProject, "firecracker-host")
+	if sm.builderImage != "" {
+		sourceImage = sm.builderImage
+	}
+	network := sm.builderNetwork
+	if network == "" {
+		network = "default"
+	}
+	networkURL := fmt.Sprintf("projects/%s/global/networks/%s", sm.gcpProject, network)
+
+	req := &computepb.InsertInstanceRequest{
+		Project: sm.gcpProject,
+		Zone:    sm.gcpZone,
+		InstanceResource: &computepb.Instance{
+			Name:        proto.String(instanceName),
+			MachineType: proto.String(machineType),
+			Disks: []*computepb.AttachedDisk{
+				{
+					InitializeParams: &computepb.AttachedDiskInitializeParams{
+						DiskSizeGb:  proto.Int64(100),
+						SourceImage: proto.String(sourceImage),
+					},
+					AutoDelete: proto.Bool(true),
+					Boot:       proto.Bool(true),
+				},
+			},
+			NetworkInterfaces: []*computepb.NetworkInterface{
+				{
+					Network: proto.String(networkURL),
+					AccessConfigs: []*computepb.AccessConfig{
+						{
+							Name: proto.String("External NAT"),
+							Type: proto.String("ONE_TO_ONE_NAT"),
+						},
+					},
+				},
+			},
+			Metadata: &computepb.Metadata{
+				Items: []*computepb.Items{
+					{Key: proto.String("startup-script"), Value: proto.String(startupScript)},
+					{Key: proto.String("snapshot-version"), Value: proto.String(version)},
+				},
+			},
+			Labels: map[string]string{
+				"purpose":          "snapshot-builder",
+				"snapshot-version": version,
+			},
+			ServiceAccounts: []*computepb.ServiceAccount{
+				{
+					Email:  proto.String("default"),
+					Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"},
+				},
+			},
+			Scheduling: &computepb.Scheduling{Preemptible: proto.Bool(true)},
+		},
+	}
+
+	op, err := instancesClient.Insert(ctx, req)
+	if err != nil {
+		return fmt.Errorf("failed to create instance: %w", err)
+	}
 	if err := op.Wait(ctx); err != nil {
 		return fmt.Errorf("instance creation failed: %w", err)
 	}
@@ -949,22 +1056,22 @@ func (sm *SnapshotManager) updateGCSCurrentPointer(ctx context.Context, version 
 
 // --- Repo-scoped methods (Phase 1.6) ---
 
-// GetCurrentSnapshotForRepo returns the current active snapshot for a specific repo.
-func (sm *SnapshotManager) GetCurrentSnapshotForRepo(ctx context.Context, repoSlug string) (*Snapshot, error) {
+// GetCurrentSnapshotForKey returns the current active snapshot for a specific repo.
+func (sm *SnapshotManager) GetCurrentSnapshotForKey(ctx context.Context, chunkKey string) (*Snapshot, error) {
 	var s Snapshot
 	var metricsJSON sql.NullString
 
 	err := sm.db.QueryRowContext(ctx, `
 		SELECT version, status, gcs_path, bazel_version, repo_commit, size_bytes, created_at, metrics
 		FROM snapshots
-		WHERE repo_slug = $1 AND status = 'active'
+		WHERE chunk_key = $1 AND status = 'active'
 		ORDER BY created_at DESC
 		LIMIT 1
-	`, repoSlug).Scan(&s.Version, &s.Status, &s.GCSPath, &s.BazelVersion, &s.RepoCommit,
+	`, chunkKey).Scan(&s.Version, &s.Status, &s.GCSPath, &s.BazelVersion, &s.RepoCommit,
 		&s.SizeBytes, &s.CreatedAt, &metricsJSON)
 
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("no active snapshot for repo %s", repoSlug)
+		return nil, fmt.Errorf("no active snapshot for repo %s", chunkKey)
 	}
 	if err != nil {
 		return nil, err
@@ -977,35 +1084,35 @@ func (sm *SnapshotManager) GetCurrentSnapshotForRepo(ctx context.Context, repoSl
 	return &s, nil
 }
 
-// GetCurrentVersionForRepo returns the current active version for a specific repo.
-func (sm *SnapshotManager) GetCurrentVersionForRepo(repoSlug string) string {
+// GetCurrentVersionForKey returns the current active version for a specific repo.
+func (sm *SnapshotManager) GetCurrentVersionForKey(chunkKey string) string {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	// For single-repo backwards compat, fall back to the global version
-	if repoSlug == "" {
+	// Fall back to the global version if no chunk key given
+	if chunkKey == "" {
 		return sm.currentVersion
 	}
 	// Query DB for repo-specific current version
 	var version sql.NullString
 	err := sm.db.QueryRow(`
 		SELECT version FROM snapshots
-		WHERE repo_slug = $1 AND status = 'active'
+		WHERE chunk_key = $1 AND status = 'active'
 		ORDER BY created_at DESC LIMIT 1
-	`, repoSlug).Scan(&version)
+	`, chunkKey).Scan(&version)
 	if err != nil || !version.Valid {
 		return ""
 	}
 	return version.String
 }
 
-// ListSnapshotsForRepo returns snapshots filtered by repo slug.
-func (sm *SnapshotManager) ListSnapshotsForRepo(ctx context.Context, repoSlug string) ([]*Snapshot, error) {
+// ListSnapshotsForKey returns snapshots filtered by repo slug.
+func (sm *SnapshotManager) ListSnapshotsForKey(ctx context.Context, chunkKey string) ([]*Snapshot, error) {
 	rows, err := sm.db.QueryContext(ctx, `
 		SELECT version, status, gcs_path, bazel_version, repo_commit, size_bytes, created_at, metrics
 		FROM snapshots
-		WHERE repo_slug = $1
+		WHERE chunk_key = $1
 		ORDER BY created_at DESC
-	`, repoSlug)
+	`, chunkKey)
 	if err != nil {
 		return nil, err
 	}
@@ -1032,8 +1139,8 @@ func (sm *SnapshotManager) ListSnapshotsForRepo(ctx context.Context, repoSlug st
 	return snapshots, nil
 }
 
-// SetActiveSnapshotForRepo sets a snapshot as active for a repo, deprecating the previous one.
-func (sm *SnapshotManager) SetActiveSnapshotForRepo(ctx context.Context, repoSlug, version string) error {
+// SetActiveSnapshotForKey sets a snapshot as active for a repo, deprecating the previous one.
+func (sm *SnapshotManager) SetActiveSnapshotForKey(ctx context.Context, chunkKey, version string) error {
 	tx, err := sm.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1043,8 +1150,8 @@ func (sm *SnapshotManager) SetActiveSnapshotForRepo(ctx context.Context, repoSlu
 	// Deprecate current active for this repo
 	_, err = tx.ExecContext(ctx, `
 		UPDATE snapshots SET status = 'deprecated'
-		WHERE repo_slug = $1 AND status = 'active'
-	`, repoSlug)
+		WHERE chunk_key = $1 AND status = 'active'
+	`, chunkKey)
 	if err != nil {
 		return err
 	}
@@ -1052,16 +1159,8 @@ func (sm *SnapshotManager) SetActiveSnapshotForRepo(ctx context.Context, repoSlu
 	// Set new active
 	_, err = tx.ExecContext(ctx, `
 		UPDATE snapshots SET status = 'active'
-		WHERE version = $1 AND repo_slug = $2
-	`, version, repoSlug)
-	if err != nil {
-		return err
-	}
-
-	// Update repos table current_version
-	_, err = tx.ExecContext(ctx, `
-		UPDATE repos SET current_version = $2 WHERE slug = $1
-	`, repoSlug, version)
+		WHERE version = $1 AND chunk_key = $2
+	`, version, chunkKey)
 	if err != nil {
 		return err
 	}
@@ -1069,60 +1168,48 @@ func (sm *SnapshotManager) SetActiveSnapshotForRepo(ctx context.Context, repoSlu
 	return tx.Commit()
 }
 
-// TriggerSnapshotBuildForRepo triggers a snapshot build for a specific repo.
-func (sm *SnapshotManager) TriggerSnapshotBuildForRepo(ctx context.Context, repoSlug, repoURL, branch, bazelVersion string) (string, error) {
-	branchShort := branch
-	if len(branchShort) > 8 {
-		branchShort = branch[:8]
-	}
-	version := fmt.Sprintf("v%s-%s-%s", time.Now().Format("20060102-150405"), repoSlug, branchShort)
+// TriggerSnapshotBuildForKey triggers a snapshot build for a specific chunk key.
+func (sm *SnapshotManager) TriggerSnapshotBuildForKey(ctx context.Context, chunkKey string, commands []snapshot.SnapshotCommand) (string, error) {
+	version := fmt.Sprintf("v%s-%s", time.Now().Format("20060102-150405"), chunkKey)
 
 	sm.logger.WithFields(logrus.Fields{
 		"version":   version,
-		"repo_slug": repoSlug,
-		"repo":      repoURL,
-		"branch":    branch,
-	}).Info("Triggering snapshot build for repo")
+		"chunk_key": chunkKey,
+	}).Info("Triggering snapshot build for key")
 
-	// Create snapshot record with repo info
+	// Create snapshot record
 	metricsJSON, _ := json.Marshal(SnapshotMetrics{})
 
+	commandsJSON, _ := json.Marshal(commands)
 	_, err := sm.db.ExecContext(ctx, `
-		INSERT INTO snapshots (version, status, gcs_path, bazel_version, repo_commit, size_bytes, metrics, repo, repo_slug)
-		VALUES ($1, 'building', $2, $3, '', 0, $4, $5, $6)
-	`, version, fmt.Sprintf("gs://%s/%s/%s/", sm.gcsBucket, repoSlug, version),
-		bazelVersion, string(metricsJSON), repoURL, repoSlug)
+		INSERT INTO snapshots (version, status, gcs_path, bazel_version, repo_commit, size_bytes, metrics, chunk_key)
+		VALUES ($1, 'building', $2, '', '', 0, $3, $4)
+	`, version, fmt.Sprintf("gs://%s/%s/%s/", sm.gcsBucket, chunkKey, version),
+		string(metricsJSON), chunkKey)
 	if err != nil {
 		return "", err
 	}
 
-	// Query warmup_targets for this repo
-	var warmupTargets string
-	_ = sm.db.QueryRowContext(ctx, `SELECT warmup_targets FROM repos WHERE slug = $1`, repoSlug).Scan(&warmupTargets)
-	if warmupTargets == "" {
-		warmupTargets = "//..."
-	}
-
 	// Launch snapshot builder VM
 	instanceName := fmt.Sprintf("snapshot-builder-%s", version)
-	if err := sm.launchSnapshotBuilderVM(ctx, instanceName, repoURL, branch, bazelVersion, version, warmupTargets); err != nil {
+	if err := sm.launchSnapshotBuilderVMForKey(ctx, instanceName, chunkKey, string(commandsJSON), version); err != nil {
 		sm.UpdateSnapshotStatus(ctx, version, "failed")
 		return "", fmt.Errorf("failed to launch snapshot builder: %w", err)
 	}
 
 	// Monitor build in background
-	go sm.monitorSnapshotBuildForRepo(context.Background(), version, instanceName, repoSlug)
+	go sm.monitorSnapshotBuildForKey(context.Background(), version, instanceName, chunkKey)
 
 	return version, nil
 }
 
-// monitorSnapshotBuildForRepo monitors a repo-scoped snapshot build.
+// monitorSnapshotBuildForKey monitors a repo-scoped snapshot build.
 // After build completes, it auto-validates and optionally auto-rolls out.
-func (sm *SnapshotManager) monitorSnapshotBuildForRepo(ctx context.Context, version, instanceName, repoSlug string) {
+func (sm *SnapshotManager) monitorSnapshotBuildForKey(ctx context.Context, version, instanceName, chunkKey string) {
 	sm.logger.WithFields(logrus.Fields{
 		"version":   version,
 		"instance":  instanceName,
-		"repo_slug": repoSlug,
+		"chunk_key": chunkKey,
 	}).Info("Monitoring repo snapshot build")
 
 	ticker := time.NewTicker(30 * time.Second)
@@ -1159,9 +1246,9 @@ func (sm *SnapshotManager) monitorSnapshotBuildForRepo(ctx context.Context, vers
 				}
 				sm.UpdateSnapshotStatus(ctx, version, "validating")
 
-				// Check if auto-rollout is enabled for this repo
+				// Check if auto-rollout is enabled for this chunk key
 				var autoRollout bool
-				err := sm.db.QueryRowContext(ctx, `SELECT auto_rollout FROM repos WHERE slug = $1`, repoSlug).Scan(&autoRollout)
+				err := sm.db.QueryRowContext(ctx, `SELECT auto_rollout FROM snapshot_configs WHERE chunk_key = $1`, chunkKey).Scan(&autoRollout)
 				if err != nil {
 					sm.logger.WithError(err).Warn("Failed to check auto_rollout setting")
 					return
@@ -1200,30 +1287,30 @@ func (sm *SnapshotManager) monitorSnapshotBuildForRepo(ctx context.Context, vers
 // --- Version Assignment Methods (Phase 4.3) ---
 
 // AssignVersion upserts a version assignment for a repo on a host (or fleet-wide if hostID is nil).
-func (sm *SnapshotManager) AssignVersion(ctx context.Context, repoSlug string, hostID *string, version string) error {
+func (sm *SnapshotManager) AssignVersion(ctx context.Context, chunkKey string, hostID *string, version string) error {
 	if hostID == nil {
 		// Fleet-wide assignment (host_id IS NULL)
 		_, err := sm.db.ExecContext(ctx, `
-			INSERT INTO version_assignments (repo_slug, host_id, version, status)
+			INSERT INTO version_assignments (chunk_key, host_id, version, status)
 			VALUES ($1, NULL, $2, 'assigned')
-			ON CONFLICT (repo_slug, host_id) DO UPDATE SET
+			ON CONFLICT (chunk_key, host_id) DO UPDATE SET
 				version = EXCLUDED.version,
 				status = 'assigned',
 				assigned_at = NOW(),
 				synced_at = NULL
-		`, repoSlug, version)
+		`, chunkKey, version)
 		return err
 	}
 
 	_, err := sm.db.ExecContext(ctx, `
-		INSERT INTO version_assignments (repo_slug, host_id, version, status)
+		INSERT INTO version_assignments (chunk_key, host_id, version, status)
 		VALUES ($1, $2, $3, 'assigned')
-		ON CONFLICT (repo_slug, host_id) DO UPDATE SET
+		ON CONFLICT (chunk_key, host_id) DO UPDATE SET
 			version = EXCLUDED.version,
 			status = 'assigned',
 			assigned_at = NOW(),
 			synced_at = NULL
-	`, repoSlug, *hostID, version)
+	`, chunkKey, *hostID, version)
 	return err
 }
 
@@ -1234,7 +1321,7 @@ func (sm *SnapshotManager) GetDesiredVersions(ctx context.Context, hostID string
 
 	// First get fleet-wide defaults (host_id IS NULL)
 	rows, err := sm.db.QueryContext(ctx, `
-		SELECT repo_slug, version FROM version_assignments
+		SELECT chunk_key, version FROM version_assignments
 		WHERE host_id IS NULL
 	`)
 	if err != nil {
@@ -1243,16 +1330,16 @@ func (sm *SnapshotManager) GetDesiredVersions(ctx context.Context, hostID string
 	defer rows.Close()
 
 	for rows.Next() {
-		var repoSlug, version string
-		if err := rows.Scan(&repoSlug, &version); err != nil {
+		var chunkKey, version string
+		if err := rows.Scan(&chunkKey, &version); err != nil {
 			return nil, err
 		}
-		result[repoSlug] = version
+		result[chunkKey] = version
 	}
 
 	// Then apply per-host overrides
 	rows, err = sm.db.QueryContext(ctx, `
-		SELECT repo_slug, version FROM version_assignments
+		SELECT chunk_key, version FROM version_assignments
 		WHERE host_id = $1
 	`, hostID)
 	if err != nil {
@@ -1261,11 +1348,11 @@ func (sm *SnapshotManager) GetDesiredVersions(ctx context.Context, hostID string
 	defer rows.Close()
 
 	for rows.Next() {
-		var repoSlug, version string
-		if err := rows.Scan(&repoSlug, &version); err != nil {
+		var chunkKey, version string
+		if err := rows.Scan(&chunkKey, &version); err != nil {
 			return nil, err
 		}
-		result[repoSlug] = version // Override fleet-wide default
+		result[chunkKey] = version // Override fleet-wide default
 	}
 
 	return result, nil
@@ -1280,18 +1367,18 @@ type HostVersionStatus struct {
 	Converged      bool   `json:"converged"`
 }
 
-func (sm *SnapshotManager) GetFleetConvergence(ctx context.Context, repoSlug string) ([]HostVersionStatus, error) {
+func (sm *SnapshotManager) GetFleetConvergence(ctx context.Context, chunkKey string) ([]HostVersionStatus, error) {
 	rows, err := sm.db.QueryContext(ctx, `
 		SELECT h.id, h.instance_name, h.snapshot_version,
 		       COALESCE(
-		           (SELECT va.version FROM version_assignments va WHERE va.repo_slug = $1 AND va.host_id = h.id),
-		           (SELECT va.version FROM version_assignments va WHERE va.repo_slug = $1 AND va.host_id IS NULL),
+		           (SELECT va.version FROM version_assignments va WHERE va.chunk_key = $1 AND va.host_id = h.id),
+		           (SELECT va.version FROM version_assignments va WHERE va.chunk_key = $1 AND va.host_id IS NULL),
 		           ''
 		       ) as desired_version
 		FROM hosts h
 		WHERE h.status IN ('ready', 'draining')
 		ORDER BY h.instance_name
-	`, repoSlug)
+	`, chunkKey)
 	if err != nil {
 		return nil, err
 	}
@@ -1315,51 +1402,51 @@ func (sm *SnapshotManager) GetFleetConvergence(ctx context.Context, repoSlug str
 }
 
 // RollbackSnapshot reverts a repo to its previous active version.
-func (sm *SnapshotManager) RollbackSnapshot(ctx context.Context, repoSlug string) error {
+func (sm *SnapshotManager) RollbackSnapshot(ctx context.Context, chunkKey string) error {
 	// Find the previous active version (now deprecated)
 	var prevVersion string
 	err := sm.db.QueryRowContext(ctx, `
 		SELECT version FROM snapshots
-		WHERE repo_slug = $1 AND status = 'deprecated'
+		WHERE chunk_key = $1 AND status = 'deprecated'
 		ORDER BY created_at DESC
 		LIMIT 1
-	`, repoSlug).Scan(&prevVersion)
+	`, chunkKey).Scan(&prevVersion)
 	if err == sql.ErrNoRows {
-		return fmt.Errorf("no previous version to rollback to for repo %s", repoSlug)
+		return fmt.Errorf("no previous version to rollback to for repo %s", chunkKey)
 	}
 	if err != nil {
 		return err
 	}
 
 	sm.logger.WithFields(logrus.Fields{
-		"repo_slug":    repoSlug,
+		"chunk_key":    chunkKey,
 		"prev_version": prevVersion,
 	}).Info("Rolling back to previous version")
 
 	// Mark current active as rolled_back
 	_, err = sm.db.ExecContext(ctx, `
 		UPDATE snapshots SET status = 'rolled_back'
-		WHERE repo_slug = $1 AND status = 'active'
-	`, repoSlug)
+		WHERE chunk_key = $1 AND status = 'active'
+	`, chunkKey)
 	if err != nil {
 		return err
 	}
 
 	// Set previous version as active
-	if err := sm.SetActiveSnapshotForRepo(ctx, repoSlug, prevVersion); err != nil {
+	if err := sm.SetActiveSnapshotForKey(ctx, chunkKey, prevVersion); err != nil {
 		return err
 	}
 
 	// Update fleet-wide assignment
-	if err := sm.AssignVersion(ctx, repoSlug, nil, prevVersion); err != nil {
+	if err := sm.AssignVersion(ctx, chunkKey, nil, prevVersion); err != nil {
 		return err
 	}
 
 	// Clear per-host overrides
 	_, err = sm.db.ExecContext(ctx, `
 		DELETE FROM version_assignments
-		WHERE repo_slug = $1 AND host_id IS NOT NULL
-	`, repoSlug)
+		WHERE chunk_key = $1 AND host_id IS NOT NULL
+	`, chunkKey)
 
 	return err
 }

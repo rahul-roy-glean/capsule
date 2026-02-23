@@ -8,8 +8,6 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-
-	repopkg "github.com/rahul-roy-glean/bazel-firecracker/pkg/repo"
 )
 
 // JobQueue manages job lifecycle from queued through completion with retry.
@@ -106,13 +104,16 @@ func (jq *JobQueue) processQueuedJobs(ctx context.Context) {
 			continue
 		}
 
+		// Look up chunk_key from snapshot_configs by matching a git-clone command for this repo
+		chunkKey := lookupChunkKeyForRepo(jq.db, repo)
+
 		// Attempt allocation
 		req := AllocateRunnerRequest{
 			RequestID: fmt.Sprintf("gh-%d", githubJobID),
 			Repo:      repo,
 			Branch:    branch,
 			Commit:    commitSHA,
-			RepoSlug:  repopkg.Slug(repo),
+			ChunkKey:  chunkKey,
 			Labels:    labelsToMap(parseLabels(labelsJSON)),
 		}
 
@@ -183,4 +184,47 @@ func parseLabels(labelsJSON []byte) []string {
 	var labels []string
 	_ = json.Unmarshal(labelsJSON, &labels)
 	return labels
+}
+
+// lookupChunkKeyForRepo finds the chunk_key in snapshot_configs whose commands
+// contain a git-clone arg matching the given repo name. Returns "" if not found.
+func lookupChunkKeyForRepo(db *sql.DB, repoFullName string) string {
+	if db == nil {
+		return ""
+	}
+	rows, err := db.Query(`SELECT chunk_key, commands FROM snapshot_configs`)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var chunkKey, commandsJSON string
+		if err := rows.Scan(&chunkKey, &commandsJSON); err != nil {
+			continue
+		}
+		// If any command arg contains the repo name, use this chunk_key
+		if commandsJSON != "" && containsRepo(commandsJSON, repoFullName) {
+			return chunkKey
+		}
+	}
+	return ""
+}
+
+func containsRepo(commandsJSON, repoFullName string) bool {
+	return len(repoFullName) > 0 && len(commandsJSON) > 0 &&
+		(containsString(commandsJSON, repoFullName) ||
+			containsString(commandsJSON, repoFullName+".git"))
+}
+
+func containsString(s, substr string) bool {
+	return len(substr) > 0 && len(s) >= len(substr) &&
+		func() bool {
+			for i := 0; i <= len(s)-len(substr); i++ {
+				if s[i:i+len(substr)] == substr {
+					return true
+				}
+			}
+			return false
+		}()
 }
