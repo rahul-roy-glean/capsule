@@ -18,10 +18,11 @@ import (
 
 // Client is a GCP Cloud Monitoring client for recording custom metrics.
 type Client struct {
-	config   Config
-	client   *monitoring.MetricClient
-	logger   *logrus.Entry
-	resource *monitoredres.MonitoredResource
+	config    Config
+	client    *monitoring.MetricClient
+	logger    *logrus.Entry
+	resource  *monitoredres.MonitoredResource
+	startTime time.Time // fixed process start time for cumulative metrics
 
 	mu          sync.Mutex
 	buffer      []*monitoringpb.TimeSeries
@@ -54,17 +55,25 @@ func NewClient(ctx context.Context, config Config, logger *logrus.Logger) (*Clie
 		"project_id": config.ProjectID,
 	}
 
-	// Use gce_instance for host-level metrics
+	// Use gce_instance for host-level metrics.
+	// instance_id must be the numeric GCE instance ID (from instance/id metadata),
+	// not the instance name. Fall back to InstanceName for local dev where the
+	// numeric ID is unavailable.
 	if config.InstanceName != "" && config.Zone != "" {
 		resourceType = "gce_instance"
-		resourceLabels["instance_id"] = config.InstanceName
+		instanceID := config.InstanceID
+		if instanceID == "" {
+			instanceID = config.InstanceName
+		}
+		resourceLabels["instance_id"] = instanceID
 		resourceLabels["zone"] = config.Zone
 	}
 
 	c := &Client{
-		config: config,
-		client: client,
-		logger: log,
+		config:    config,
+		client:    client,
+		logger:    log,
+		startTime: time.Now(),
 		resource: &monitoredres.MonitoredResource{
 			Type:   resourceType,
 			Labels: resourceLabels,
@@ -282,7 +291,7 @@ func (c *Client) AddToCounter(ctx context.Context, metric string, value int64, l
 		MetricKind: metricpb.MetricDescriptor_CUMULATIVE,
 		Points: []*monitoringpb.Point{{
 			Interval: &monitoringpb.TimeInterval{
-				StartTime: timestamppb.New(now.Add(-1 * time.Minute)), // Required for cumulative
+				StartTime: timestamppb.New(c.startTime),
 				EndTime:   timestamppb.New(now),
 			},
 			Value: &monitoringpb.TypedValue{

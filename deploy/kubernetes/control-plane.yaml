@@ -96,6 +96,12 @@ spec:
             configMapKeyRef:
               name: control-plane-config
               key: gcs_bucket
+        - name: GCP_PROJECT_ID
+          value: ${PROJECT_ID}
+        - name: TELEMETRY_ENABLED
+          value: "true"
+        - name: ENVIRONMENT
+          value: ${ENVIRONMENT}
         - name: GITHUB_WEBHOOK_SECRET
           valueFrom:
             secretKeyRef:
