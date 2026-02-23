@@ -114,6 +114,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		Commit:            req.Commit,
 		Labels:            req.Labels,
 		GithubRunnerToken: req.GitHubRunnerToken,
+		RepoSlug:          repoSlug,
 	}
 	if req.VCPUs > 0 || req.MemoryMB > 0 {
 		protoReq.Resources = &pb.Resources{

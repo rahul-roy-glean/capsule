@@ -518,15 +518,15 @@ func TestUploadSnapshotE2E(t *testing.T) {
 	}
 
 	version := "test-upload-e2e"
-	metadata := SnapshotMetadata{Version: version}
+	metadata := SnapshotMetadata{Version: version, RepoSlug: "test-org-repo"}
 
 	if err := uploader.UploadSnapshot(ctx, dir, metadata); err != nil {
 		t.Fatalf("UploadSnapshot failed: %v", err)
 	}
 
 	// Verify pointer update
-	if err := uploader.UpdateCurrentPointer(ctx, version); err != nil {
-		t.Fatalf("UpdateCurrentPointer failed: %v", err)
+	if err := uploader.UpdateCurrentPointerForRepo(ctx, version, "test-org-repo"); err != nil {
+		t.Fatalf("UpdateCurrentPointerForRepo failed: %v", err)
 	}
 
 	// Clean up

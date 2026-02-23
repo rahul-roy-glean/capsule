@@ -27,6 +27,7 @@ type ChunkedManagerConfig struct {
 	UseChunkedSnapshots bool
 	UseNetNS            bool
 	ChunkCacheSizeBytes int64
+	MemBackend          string
 }
 
 // NewChunkedManager returns an error on non-Linux platforms

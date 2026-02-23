@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/repo"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
 )
 
@@ -193,6 +194,7 @@ func main() {
 	})
 	httpMux.Handle("/metrics", promhttp.Handler())
 	httpMux.HandleFunc("/api/v1/runners", controlPlaneServer.HandleGetRunners)
+	httpMux.HandleFunc("/api/v1/runners/allocate", controlPlaneServer.HandleAllocateRunner)
 	httpMux.HandleFunc("/api/v1/runners/quarantine", controlPlaneServer.HandleQuarantineRunner)
 	httpMux.HandleFunc("/api/v1/runners/unquarantine", controlPlaneServer.HandleUnquarantineRunner)
 	httpMux.HandleFunc("/api/v1/hosts", controlPlaneServer.HandleGetHosts)
@@ -485,6 +487,71 @@ func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Req
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"runners": allRunners,
 		"count":   len(allRunners),
+	})
+}
+
+// HandleAllocateRunner handles manual runner allocation requests.
+// POST /api/v1/runners/allocate
+// Body: {"repo": "org/repo", "branch": "main", "commit": "abc123", "labels": {"firecracker": "true"}}
+func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Repo      string            `json:"repo"`
+		Branch    string            `json:"branch"`
+		Commit    string            `json:"commit"`
+		Labels    map[string]string `json:"labels"`
+		RequestID string            `json:"request_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.Repo == "" {
+		http.Error(w, "repo is required", http.StatusBadRequest)
+		return
+	}
+	if req.RequestID == "" {
+		req.RequestID = fmt.Sprintf("manual-%d", time.Now().UnixNano())
+	}
+
+	repoSlug := repo.Slug(req.Repo)
+
+	s.logger.WithFields(logrus.Fields{
+		"request_id": req.RequestID,
+		"repo":       req.Repo,
+		"repo_slug":  repoSlug,
+		"branch":     req.Branch,
+	}).Info("Manual runner allocation request")
+
+	resp, err := s.scheduler.AllocateRunner(r.Context(), AllocateRunnerRequest{
+		RequestID: req.RequestID,
+		Repo:      req.Repo,
+		Branch:    req.Branch,
+		Commit:    req.Commit,
+		RepoSlug:  repoSlug,
+		Labels:    req.Labels,
+	})
+	if err != nil {
+		s.logger.WithError(err).Error("Manual allocation failed")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"runner_id":    resp.RunnerID,
+		"host_id":      resp.HostID,
+		"host_address": resp.HostAddress,
+		"internal_ip":  resp.InternalIP,
 	})
 }
 

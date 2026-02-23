@@ -328,7 +328,7 @@ func (sm *SnapshotManager) TriggerSnapshotBuild(ctx context.Context, repo, branc
 
 	// Launch snapshot builder VM
 	instanceName := fmt.Sprintf("snapshot-builder-%s", version)
-	if err := sm.launchSnapshotBuilderVM(ctx, instanceName, repo, branch, bazelVersion, version); err != nil {
+	if err := sm.launchSnapshotBuilderVM(ctx, instanceName, repo, branch, bazelVersion, version, "//..."); err != nil {
 		sm.UpdateSnapshotStatus(ctx, version, "failed")
 		return "", fmt.Errorf("failed to launch snapshot builder: %w", err)
 	}
@@ -340,7 +340,7 @@ func (sm *SnapshotManager) TriggerSnapshotBuild(ctx context.Context, repo, branc
 }
 
 // launchSnapshotBuilderVM creates a GCE instance to build a snapshot
-func (sm *SnapshotManager) launchSnapshotBuilderVM(ctx context.Context, instanceName, repo, branch, bazelVersion, version string) error {
+func (sm *SnapshotManager) launchSnapshotBuilderVM(ctx context.Context, instanceName, repo, branch, bazelVersion, version, fetchTargets string) error {
 	if sm.gcpProject == "" {
 		sm.logger.Warn("GCP project not configured, skipping VM launch")
 		return nil
@@ -388,13 +388,14 @@ fi
     --repo-branch="%s" \
     --bazel-version="%s" \
     --gcs-bucket="%s" \
+    --fetch-targets="%s" \
     --output-dir=/tmp/snapshot \
     --log-level=info
 
 # Signal completion
 echo "Snapshot build complete, shutting down..."
 shutdown -h now
-`, repo, branch, version, sm.gcsBucket, repo, branch, bazelVersion, sm.gcsBucket)
+`, repo, branch, version, sm.gcsBucket, repo, branch, bazelVersion, sm.gcsBucket, fetchTargets)
 
 	// Configure the instance
 	machineType := fmt.Sprintf("zones/%s/machineTypes/n2-standard-8", sm.gcpZone)
@@ -1095,9 +1096,16 @@ func (sm *SnapshotManager) TriggerSnapshotBuildForRepo(ctx context.Context, repo
 		return "", err
 	}
 
+	// Query warmup_targets for this repo
+	var warmupTargets string
+	_ = sm.db.QueryRowContext(ctx, `SELECT warmup_targets FROM repos WHERE slug = $1`, repoSlug).Scan(&warmupTargets)
+	if warmupTargets == "" {
+		warmupTargets = "//..."
+	}
+
 	// Launch snapshot builder VM
 	instanceName := fmt.Sprintf("snapshot-builder-%s", version)
-	if err := sm.launchSnapshotBuilderVM(ctx, instanceName, repoURL, branch, bazelVersion, version); err != nil {
+	if err := sm.launchSnapshotBuilderVM(ctx, instanceName, repoURL, branch, bazelVersion, version, warmupTargets); err != nil {
 		sm.UpdateSnapshotStatus(ctx, version, "failed")
 		return "", fmt.Errorf("failed to launch snapshot builder: %w", err)
 	}

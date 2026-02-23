@@ -150,6 +150,7 @@ type HostHeartbeat struct {
 	IdleRunners     int
 	BusyRunners     int
 	SnapshotVersion string
+	LoadedManifests map[string]string
 }
 
 // UpsertHeartbeat upserts the host record and updates heartbeat fields. It preserves
@@ -208,6 +209,9 @@ func (hr *HostRegistry) UpsertHeartbeat(ctx context.Context, hb HostHeartbeat) (
 	host.GRPCAddress = hb.GRPCAddress
 	host.HTTPAddress = hb.HTTPAddress
 	host.LastHeartbeat = time.Now()
+	if hb.LoadedManifests != nil {
+		host.LoadedManifests = hb.LoadedManifests
+	}
 
 	return host, status == "draining", nil
 }

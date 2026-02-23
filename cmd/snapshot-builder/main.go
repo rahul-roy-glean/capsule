@@ -47,6 +47,7 @@ var (
 	bazelrc              = flag.String("bazelrc", "", "Path to .bazelrc file relative to repo root. If empty, uses repo's .bazelrc if it exists.")
 	logLevel             = flag.String("log-level", "info", "Log level")
 	enableChunked        = flag.Bool("enable-chunked", true, "Also build a chunked snapshot for lazy loading")
+	memBackend           = flag.String("mem-backend", "file", "Memory backend for chunked snapshots: 'file' (upload snapshot.mem as single blob, default) or 'chunked' (UFFD lazy loading via MemChunks)")
 
 	incremental = flag.Bool("incremental", false, "Restore from previous snapshot for incremental rebuild")
 
@@ -475,6 +476,7 @@ func main() {
 		defer chunkStore.Close()
 
 		builder := snapshot.NewChunkedSnapshotBuilder(chunkStore, logger)
+		builder.MemBackend = *memBackend
 
 		// Compute rootfs source hash for storing in metadata (enables incremental change detection).
 		// Only needed at upload time — the incremental path hashes independently for comparison.
@@ -521,18 +523,25 @@ func main() {
 			}
 			chunkedMeta.StateHash = stateHash
 
-			// Upload memory as compressed raw file
-			memGCSPath := fmt.Sprintf("%s/snapshot.mem.zst", version)
-			_, _, err = chunkStore.UploadRawFile(ctx, memPath, memGCSPath)
-			if err != nil {
-				log.WithError(err).Fatal("Failed to upload raw memory file")
+			// Store memory according to --mem-backend flag.
+			if *memBackend == "file" {
+				memGCSPath := fmt.Sprintf("%s/snapshot.mem.zst", version)
+				_, _, err = chunkStore.UploadRawFile(ctx, memPath, memGCSPath)
+				if err != nil {
+					log.WithError(err).Fatal("Failed to upload raw memory file")
+				}
+				chunkedMeta.MemFilePath = memGCSPath
+			} else {
+				memChunks, err := chunkStore.ChunkFile(ctx, memPath, snapshot.DefaultChunkSize)
+				if err != nil {
+					log.WithError(err).Fatal("Failed to chunk memory file")
+				}
+				chunkedMeta.MemChunks = memChunks
 			}
-			chunkedMeta.MemFilePath = memGCSPath
 			memStat, _ := os.Stat(memPath)
 			if memStat != nil {
 				chunkedMeta.TotalMemSize = memStat.Size()
 			}
-
 			// Use rootfs chunks from FUSE (original + dirty writes already uploaded)
 			chunkedMeta.RootfsChunks = incrementalRootfsChunks
 			chunkedMeta.TotalDiskSize = int64(len(incrementalRootfsChunks)) * chunkedMeta.ChunkSize
