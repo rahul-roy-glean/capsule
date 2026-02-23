@@ -87,6 +87,7 @@ var (
 	// Chunked snapshot flags (BuildBuddy-style lazy loading)
 	useChunkedSnapshots = flag.Bool("use-chunked-snapshots", false, "Enable chunked snapshot restore with UFFD (lazy memory) and FUSE (lazy disk)")
 	chunkCacheSizeGB    = flag.Int("chunk-cache-size-gb", 2, "Size in GB of local LRU chunk cache")
+	memBackend          = flag.String("mem-backend", "file", "Memory restore backend: 'chunked' (UFFD lazy loading) or 'file' (download full snapshot.mem at startup, default). Overrides the backend recorded in snapshot metadata.")
 
 	// Network namespace mode (alternative to slot-based TAPs)
 	useNetNS = flag.Bool("use-netns", false, "Use network namespaces instead of slot-based TAP devices (simplifies snapshot restore)")
@@ -326,6 +327,7 @@ func main() {
 			UseChunkedSnapshots: *useChunkedSnapshots,
 			UseNetNS:            *useNetNS,
 			ChunkCacheSizeBytes: int64(*chunkCacheSizeGB) * 1024 * 1024 * 1024,
+			MemBackend:          *memBackend,
 		}
 
 		var err error
@@ -357,24 +359,24 @@ func main() {
 					"path":        kernelPath,
 				}).Info("Kernel fetched from chunk store")
 
-				// If a raw memory file path is set, download and decompress it
-				// to local disk so VMs can use file-backed restore instead of UFFD.
-				if meta.MemFilePath != "" {
+				// When using file-backed memory, also download snapshot.mem now
+				// so AllocateRunnerChunked can find it at restore time.
+				// At 8GB this takes ~30s on a fresh host but is only done once;
+				// all 4 runners share the same file via read-only mmap.
+				if *memBackend == "file" && meta.MemFilePath != "" {
 					memPath := filepath.Join(*snapshotCache, "snapshot.mem")
-					if info, err := os.Stat(memPath); err == nil && info.Size() > 0 {
-						log.WithFields(logrus.Fields{
-							"path": memPath,
-							"size": info.Size(),
-						}).Info("snapshot.mem already exists locally, skipping download")
-					} else {
-						log.WithFields(logrus.Fields{
-							"gcs_path":   meta.MemFilePath,
-							"local_path": memPath,
-						}).Info("Downloading raw memory file from GCS...")
+					if _, err := os.Stat(memPath); err != nil {
+						log.WithField("gcs_path", meta.MemFilePath).Info("Downloading snapshot.mem (file-backed memory mode)...")
 						if err := chunkedMgr.GetChunkStore().DownloadRawFile(ctx, meta.MemFilePath, memPath); err != nil {
-							log.WithError(err).Fatal("Failed to download raw memory file")
+							log.WithError(err).Fatal("Failed to download snapshot.mem")
 						}
-						log.WithField("path", memPath).Info("Raw memory file downloaded and decompressed")
+						fi, _ := os.Stat(memPath)
+						log.WithFields(logrus.Fields{
+							"path":      memPath,
+							"size_bytes": fi.Size(),
+						}).Info("snapshot.mem downloaded")
+					} else {
+						log.WithField("path", memPath).Info("snapshot.mem already cached, skipping download")
 					}
 				}
 			} else {
@@ -604,18 +606,21 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 		case <-ticker.C:
 			status := mgr.GetStatus()
 
-			// Maintain idle target
-			if mgr.DiskUsage() > 0.85 {
+			// Maintain idle target.
+			// In chunked mode, skip pre-allocation: each repo needs a different
+			// snapshot, so generic warm VMs would load the wrong data and be
+			// useless when an actual job arrives. The control plane drives
+			// allocation on-demand via gRPC AllocateRunner with the correct
+			// RepoSlug. In single-repo (non-chunked) mode, warm pool is fine
+			// because there is only one snapshot.
+			if chunkedMgr != nil {
+				// Chunked mode: no local pre-allocation; control plane drives it.
+			} else if mgr.DiskUsage() > 0.85 {
 				log.Warn("Disk usage exceeds 85%, skipping runner allocation")
 			} else if !mgr.IsDraining() && status.IdleRunners < idleTarget && mgr.CanAddRunner() {
 				log.Debug("Adding runner to maintain idle pool")
 				allocTimer := telemetry.NewStopwatch()
-				var err error
-				if chunkedMgr != nil {
-					_, err = chunkedMgr.AllocateRunnerChunked(ctx, runner.AllocateRequest{})
-				} else {
-					_, err = mgr.AllocateRunner(ctx, runner.AllocateRequest{})
-				}
+				_, err := mgr.AllocateRunner(ctx, runner.AllocateRequest{})
 				if err != nil {
 					log.WithError(err).Warn("Failed to allocate idle runner")
 					if metricsClient != nil {
@@ -838,7 +843,7 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				}(hbResp.SnapshotVersion)
 			}
 
-			// Handle per-repo manifest sync directives
+				// Handle per-repo manifest sync directives
 			if len(hbResp.SyncVersions) > 0 && chunkedMgr != nil {
 				for repoSlug, version := range hbResp.SyncVersions {
 					go func(slug, ver string) {

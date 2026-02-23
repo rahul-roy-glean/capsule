@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+
+	repopkg "github.com/rahul-roy-glean/bazel-firecracker/pkg/repo"
 )
 
 // JobQueue manages job lifecycle from queued through completion with retry.
@@ -110,6 +112,7 @@ func (jq *JobQueue) processQueuedJobs(ctx context.Context) {
 			Repo:      repo,
 			Branch:    branch,
 			Commit:    commitSHA,
+			RepoSlug:  repopkg.Slug(repo),
 			Labels:    labelsToMap(parseLabels(labelsJSON)),
 		}
 

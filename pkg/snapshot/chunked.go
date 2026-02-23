@@ -717,15 +717,19 @@ func (cs *ChunkStore) eagerFetchLoop(limiter *rate.Limiter, eg *errgroup.Group) 
 
 // ChunkedSnapshotBuilder creates chunked snapshots from existing snapshot files
 type ChunkedSnapshotBuilder struct {
-	store  *ChunkStore
-	logger *logrus.Entry
+	store      *ChunkStore
+	logger     *logrus.Entry
+	// MemBackend controls how memory is stored: "chunked" (UFFD lazy via MemChunks,
+	// default) or "file" (single compressed blob via MemFilePath for file-backed restore).
+	MemBackend string
 }
 
 // NewChunkedSnapshotBuilder creates a new chunked snapshot builder
 func NewChunkedSnapshotBuilder(store *ChunkStore, logger *logrus.Logger) *ChunkedSnapshotBuilder {
 	return &ChunkedSnapshotBuilder{
-		store:  store,
-		logger: logger.WithField("component", "chunked-snapshot-builder"),
+		store:      store,
+		logger:     logger.WithField("component", "chunked-snapshot-builder"),
+		MemBackend: "chunked",
 	}
 }
 
@@ -766,20 +770,34 @@ func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths
 		meta.StateHash = stateHash
 	}
 
-	// Upload memory file as a single compressed file (not chunked).
-	// This enables file-backed restore instead of UFFD lazy loading,
-	// eliminating the per-page-fault latency that causes 3-14 minute boot times.
+	// Chunk memory file into MemChunks for UFFD lazy loading.
+	// Previously this was uploaded as a single compressed file (MemFilePath) to
+	// avoid per-page-fault GCS latency, but that required downloading the full
+	// 8GB snapshot.mem per repo per host before any VM could start. With the
+	// chunk LRU cache and eager prefetcher, UFFD lazy loading is fast enough and
+	// avoids the upfront download cost entirely.
 	if paths.Mem != "" {
-		b.logger.Info("Uploading raw memory file...")
-		memGCSPath := fmt.Sprintf("%s/snapshot.mem.zst", version)
-		_, _, err := b.store.UploadRawFile(ctx, paths.Mem, memGCSPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to upload raw memory file: %w", err)
+		if b.MemBackend == "file" {
+			b.logger.Info("Uploading raw memory file (file-backed restore)...")
+			memGCSPath := fmt.Sprintf("%s/snapshot.mem.zst", version)
+			_, _, err := b.store.UploadRawFile(ctx, paths.Mem, memGCSPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to upload raw memory file: %w", err)
+			}
+			meta.MemFilePath = memGCSPath
+		} else {
+			b.logger.Info("Chunking memory file for UFFD lazy loading...")
+			memChunks, err := b.store.ChunkFile(ctx, paths.Mem, DefaultChunkSize)
+			if err != nil {
+				return nil, fmt.Errorf("failed to chunk memory file: %w", err)
+			}
+			meta.MemChunks = memChunks
 		}
-		meta.MemFilePath = memGCSPath
 
 		memStat, _ := os.Stat(paths.Mem)
-		meta.TotalMemSize = memStat.Size()
+		if memStat != nil {
+			meta.TotalMemSize = memStat.Size()
+		}
 	}
 
 	// Chunk rootfs

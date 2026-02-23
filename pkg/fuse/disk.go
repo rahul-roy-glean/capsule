@@ -452,6 +452,49 @@ type DiskStats struct {
 	DirtyChunks int
 }
 
+// PrefetchHead fetches the first n non-zero chunks from the disk into the chunk store
+// cache, blocking until all fetches complete. This is called before VM resume to
+// ensure the ext4 superblock, block group descriptors, and journal are already cached
+// so the guest kernel's filesystem mount and jbd2 journal replay don't stall waiting
+// for FUSE reads.
+func (d *ChunkedDisk) PrefetchHead(ctx context.Context, n int) error {
+	if n <= 0 || len(d.chunks) == 0 {
+		return nil
+	}
+	if n > len(d.chunks) {
+		n = len(d.chunks)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	sem := make(chan struct{}, 8) // 8 concurrent fetches
+
+	for i := 0; i < n; i++ {
+		ref := d.chunks[i]
+		if ref.IsZeroChunk() {
+			continue // zero chunks need no fetching
+		}
+		wg.Add(1)
+		go func(hash string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if _, err := d.chunkStore.GetChunk(ctx, hash); err != nil {
+				errs <- err
+			}
+		}(ref.Hash)
+	}
+
+	wg.Wait()
+	close(errs)
+
+	// Return the first error if any (non-fatal: FUSE will still serve on miss)
+	for err := range errs {
+		return err
+	}
+	return nil
+}
+
 // SaveDirtyChunks uploads dirty chunks to the chunk store and returns updated chunk refs
 func (d *ChunkedDisk) SaveDirtyChunks(ctx context.Context) ([]snapshot.ChunkRef, error) {
 	d.dirtyChunksMu.RLock()
