@@ -654,8 +654,10 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	// When using per-VM namespaces, set up port forwarding (DNAT) so the host
 	// can reach services inside the VM via the host-reachable veth IP.
 	if netns != nil && cm.netnsNetwork != nil {
-		if err := cm.netnsNetwork.ForwardPort(runnerID, 8080); err != nil {
-			cm.chunkedLogger.WithError(err).Warn("Failed to forward port 8080 into namespace")
+		for _, port := range []int{8080, 8081} {
+			if err := cm.netnsNetwork.ForwardPort(runnerID, port); err != nil {
+				cm.chunkedLogger.WithField("port", port).WithError(err).Warn("Failed to forward port into namespace")
+			}
 		}
 	}
 
