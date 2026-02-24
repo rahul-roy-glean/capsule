@@ -194,6 +194,8 @@ func main() {
 	httpMux.Handle("/metrics", promhttp.Handler())
 	httpMux.HandleFunc("/api/v1/runners", controlPlaneServer.HandleGetRunners)
 	httpMux.HandleFunc("/api/v1/runners/allocate", controlPlaneServer.HandleAllocateRunner)
+	httpMux.HandleFunc("/api/v1/runners/status", controlPlaneServer.HandleRunnerStatus)
+	httpMux.HandleFunc("/api/v1/runners/release", controlPlaneServer.HandleRunnerRelease)
 	httpMux.HandleFunc("/api/v1/runners/quarantine", controlPlaneServer.HandleQuarantineRunner)
 	httpMux.HandleFunc("/api/v1/runners/unquarantine", controlPlaneServer.HandleUnquarantineRunner)
 	httpMux.HandleFunc("/api/v1/hosts", controlPlaneServer.HandleGetHosts)
@@ -509,6 +511,7 @@ func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Req
 // HandleAllocateRunner handles manual runner allocation requests.
 // POST /api/v1/runners/allocate
 // Body: {"repo": "org/repo", "branch": "main", "commit": "abc123", "labels": {"firecracker": "true"}}
+// For exec mode: {"chunk_key": "generic-linux", "ci_system": "none"}
 func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -521,13 +524,16 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		Commit    string            `json:"commit"`
 		Labels    map[string]string `json:"labels"`
 		RequestID string            `json:"request_id"`
+		ChunkKey  string            `json:"chunk_key"`
+		CISystem  string            `json:"ci_system"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if req.Repo == "" {
+	// In exec mode (ci_system=none), repo is optional
+	if req.Repo == "" && req.CISystem != "none" {
 		http.Error(w, "repo is required", http.StatusBadRequest)
 		return
 	}
@@ -535,13 +541,18 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		req.RequestID = fmt.Sprintf("manual-%d", time.Now().UnixNano())
 	}
 
-	chunkKey := lookupChunkKeyForRepo(s.scheduler.db, req.Repo)
+	// Determine chunk_key: use explicit chunk_key, or look up from repo
+	chunkKey := req.ChunkKey
+	if chunkKey == "" && req.Repo != "" {
+		chunkKey = lookupChunkKeyForRepo(s.scheduler.db, req.Repo)
+	}
 
 	s.logger.WithFields(logrus.Fields{
 		"request_id": req.RequestID,
 		"repo":       req.Repo,
 		"chunk_key":  chunkKey,
 		"branch":     req.Branch,
+		"ci_system":  req.CISystem,
 	}).Info("Manual runner allocation request")
 
 	resp, err := s.scheduler.AllocateRunner(r.Context(), AllocateRunnerRequest{
@@ -551,6 +562,7 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		Commit:    req.Commit,
 		ChunkKey:  chunkKey,
 		Labels:    req.Labels,
+		CISystem:  req.CISystem,
 	})
 	if err != nil {
 		s.logger.WithError(err).Error("Manual allocation failed")
@@ -569,6 +581,100 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		"host_address": resp.HostAddress,
 		"internal_ip":  resp.InternalIP,
 	})
+}
+
+// HandleRunnerStatus returns the status of a runner.
+// GET /api/v1/runners/status?runner_id=abc-123
+// Returns 200 when ready, 202 when pending, 404 when not found, 503 when unavailable.
+func (s *ControlPlaneServer) HandleRunnerStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	runnerID := r.URL.Query().Get("runner_id")
+	if runnerID == "" {
+		http.Error(w, "runner_id is required", http.StatusBadRequest)
+		return
+	}
+
+	runner, err := s.hostRegistry.GetRunner(runnerID)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "runner not found"})
+		return
+	}
+
+	// Look up host for address
+	host, err := s.hostRegistry.GetHost(runner.HostID)
+	hostAddress := ""
+	if err == nil {
+		hostAddress = host.HTTPAddress
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	switch runner.Status {
+	case "initializing", "booting":
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{
+			"runner_id": runnerID,
+			"status":    "pending",
+		})
+	case "idle", "busy", "running":
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"runner_id":    runnerID,
+			"status":       "ready",
+			"host_address": hostAddress,
+		})
+	case "quarantined", "draining":
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{
+			"runner_id": runnerID,
+			"status":    "unavailable",
+		})
+	default: // terminated or unknown
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "runner not found",
+		})
+	}
+}
+
+// HandleRunnerRelease explicitly releases/destroys a runner.
+// POST /api/v1/runners/release
+// Body: {"runner_id": "abc-123"}
+func (s *ControlPlaneServer) HandleRunnerRelease(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		RunnerID string `json:"runner_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.RunnerID == "" {
+		http.Error(w, "runner_id is required", http.StatusBadRequest)
+		return
+	}
+
+	s.logger.WithField("runner_id", req.RunnerID).Info("Runner release request")
+
+	if err := s.scheduler.ReleaseRunner(r.Context(), req.RunnerID, true); err != nil {
+		s.logger.WithError(err).Error("Runner release failed")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
 func (s *ControlPlaneServer) HandleGetHosts(w http.ResponseWriter, r *http.Request) {

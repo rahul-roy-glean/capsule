@@ -58,6 +58,7 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		GitHubRunnerToken: req.GithubRunnerToken,
 		Labels:            req.Labels,
 		ChunkKey:          req.ChunkKey,
+		CISystem:          req.CiSystem,
 	}
 
 	if req.Resources != nil {

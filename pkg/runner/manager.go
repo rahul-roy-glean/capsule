@@ -563,9 +563,13 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	// When using per-VM namespaces, set up port forwarding (DNAT) so the host
 	// can reach services inside the VM via the host-reachable veth IP.
 	// Port 8080 is the standard service port (e.g., claude_sandbox_service).
+	// Port 8081 is the thaw-agent port (health checks, /exec endpoint).
 	if useNetNS && m.netnsNetwork != nil {
 		if err := m.netnsNetwork.ForwardPort(runnerID, 8080); err != nil {
 			m.logger.WithError(err).Warn("Failed to forward port 8080 into namespace")
+		}
+		if err := m.netnsNetwork.ForwardPort(runnerID, 8081); err != nil {
+			m.logger.WithError(err).Warn("Failed to forward port 8081 into namespace")
 		}
 	}
 
@@ -671,6 +675,11 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 	data.Latest.Runner.Ephemeral = m.config.GitHubRunnerEphemeral
 	if m.ciAdapter != nil {
 		data.Latest.Runner.CISystem = m.ciAdapter.Name()
+	}
+
+	// Set exec mode when explicitly requested via ci_system=none
+	if req.CISystem == "none" {
+		data.Latest.Meta.Mode = "exec"
 	}
 
 	return data

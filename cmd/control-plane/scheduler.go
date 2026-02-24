@@ -39,6 +39,7 @@ type AllocateRunnerRequest struct {
 	ChunkKey          string
 	Labels            map[string]string
 	GitHubRunnerToken string
+	CISystem          string
 	VCPUs             int
 	MemoryMB          int
 }
@@ -115,6 +116,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		Labels:            req.Labels,
 		GithubRunnerToken: req.GitHubRunnerToken,
 		ChunkKey:          chunkKey,
+		CiSystem:          req.CISystem,
 	}
 	if req.VCPUs > 0 || req.MemoryMB > 0 {
 		protoReq.Resources = &pb.Resources{

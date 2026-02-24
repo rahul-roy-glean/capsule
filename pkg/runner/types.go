@@ -89,6 +89,7 @@ type MMDSData struct {
 			InstanceName string `json:"instance_name,omitempty"`
 			Environment  string `json:"environment"`
 			JobID        string `json:"job_id,omitempty"`
+			Mode         string `json:"mode,omitempty"`         // "warmup", "exec", or empty for normal runner
 			CurrentTime  string `json:"current_time,omitempty"` // RFC3339 timestamp from host for clock sync
 		} `json:"meta"`
 		Buildbarn struct {
@@ -133,6 +134,12 @@ type MMDSData struct {
 			// (baked into the snapshot rootfs). Thaw-agent creates a symlink from WorkspaceDir to here.
 			PreClonedPath string `json:"pre_cloned_path,omitempty"`
 		} `json:"git_cache,omitempty"`
+		Exec struct {
+			Command    []string          `json:"command,omitempty"`
+			Env        map[string]string `json:"env,omitempty"`
+			WorkingDir string            `json:"working_dir,omitempty"`
+			TimeoutSec int               `json:"timeout_seconds,omitempty"`
+		} `json:"exec,omitempty"`
 	} `json:"latest"`
 }
 
@@ -192,9 +199,9 @@ type HostConfig struct {
 	ExternalInterface string
 	BridgeName        string
 	// ChunkKey identifies which snapshot this host should use (hash of snapshot commands).
-	ChunkKey          string
-	Environment       string
-	ControlPlaneAddr  string
+	ChunkKey         string
+	Environment      string
+	ControlPlaneAddr string
 
 	// Runner Pool Configuration
 	PoolEnabled            bool `json:"pool_enabled"`

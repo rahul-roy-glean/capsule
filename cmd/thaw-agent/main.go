@@ -204,6 +204,12 @@ type MMDSData struct {
 			// (baked into the snapshot). Thaw-agent creates a symlink from WorkspaceDir to here.
 			PreClonedPath string `json:"pre_cloned_path,omitempty"`
 		} `json:"git_cache,omitempty"`
+		Exec struct {
+			Command    []string          `json:"command,omitempty"`
+			Env        map[string]string `json:"env,omitempty"`
+			WorkingDir string            `json:"working_dir,omitempty"`
+			TimeoutSec int               `json:"timeout_seconds,omitempty"`
+		} `json:"exec,omitempty"`
 		Runner struct {
 			Ephemeral bool   `json:"ephemeral"`
 			CISystem  string `json:"ci_system,omitempty"`
@@ -282,6 +288,7 @@ func main() {
 				fmt.Fprintln(w, line)
 			}
 		})
+		http.HandleFunc("/exec", execHandler)
 		if err := http.ListenAndServe(":8081", nil); err != nil {
 			log.WithError(err).Debug("Early health server failed")
 		}
@@ -602,6 +609,20 @@ func main() {
 		}
 
 		// Fall through to normal runner mode
+	} else if mmdsData.Latest.Meta.Mode == "exec" {
+		// Exec mode: skip CI runner registration, idle waiting for /exec calls
+		go startHealthServer(mmdsData)
+		if err := signalReady(); err != nil {
+			log.WithError(err).Error("Failed to signal ready")
+		}
+		log.WithFields(logrus.Fields{
+			"runner_id": mmdsData.Latest.Meta.RunnerID,
+			"boot_ms":   bootTimer.Total().Milliseconds(),
+		}).Info("Exec mode: ready for commands")
+		if metrics != nil {
+			metrics.LogBootComplete(bootTimer)
+		}
+		select {} // block forever, serve /exec requests
 	}
 
 	// Normal runner mode
@@ -996,6 +1017,12 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					WorkspaceDir  string            `json:"workspace_dir,omitempty"`
 					PreClonedPath string            `json:"pre_cloned_path,omitempty"`
 				} `json:"git_cache,omitempty"`
+				Exec struct {
+					Command    []string          `json:"command,omitempty"`
+					Env        map[string]string `json:"env,omitempty"`
+					WorkingDir string            `json:"working_dir,omitempty"`
+					TimeoutSec int               `json:"timeout_seconds,omitempty"`
+				} `json:"exec,omitempty"`
 				Runner struct {
 					Ephemeral bool   `json:"ephemeral"`
 					CISystem  string `json:"ci_system,omitempty"`
@@ -2327,6 +2354,146 @@ func verifyConnectivity(repoURL string) error {
 
 	log.WithField("host", host).Info("Connectivity check passed")
 	return nil
+}
+
+// execHandler handles POST /exec requests — runs a command inside the VM and
+// streams stdout/stderr/exit as ndjson frames.
+func execHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Command    []string          `json:"command"`
+		Env        map[string]string `json:"env"`
+		WorkingDir string            `json:"working_dir"`
+		TimeoutSec int               `json:"timeout_seconds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(req.Command) == 0 {
+		http.Error(w, "command is required", http.StatusBadRequest)
+		return
+	}
+
+	// Set streaming headers
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "no-cache")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	// Build context with optional timeout
+	ctx := r.Context()
+	if req.TimeoutSec > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(req.TimeoutSec)*time.Second)
+		defer cancel()
+	}
+
+	// Build command
+	cmd := exec.CommandContext(ctx, req.Command[0], req.Command[1:]...)
+
+	// Working directory
+	cmd.Dir = req.WorkingDir
+	if cmd.Dir == "" {
+		cmd.Dir = *workspaceDir
+	}
+
+	// Environment: inherit current env + merge provided env
+	cmd.Env = os.Environ()
+	for k, v := range req.Env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+
+	// Run as runner user
+	runnerUser, err := user.Lookup(*runnerUsername)
+	if err != nil {
+		writeNDJSON(w, flusher, map[string]interface{}{"type": "error", "message": "runner user not found: " + err.Error(), "ts": time.Now().UTC().Format(time.RFC3339Nano)})
+		return
+	}
+	rUID, _ := strconv.ParseUint(runnerUser.Uid, 10, 32)
+	rGID, _ := strconv.ParseUint(runnerUser.Gid, 10, 32)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
+	}
+	cmd.Env = append(cmd.Env, "HOME="+runnerUser.HomeDir)
+
+	// Create pipes
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		writeNDJSON(w, flusher, map[string]interface{}{"type": "error", "message": "stdout pipe: " + err.Error(), "ts": time.Now().UTC().Format(time.RFC3339Nano)})
+		return
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		writeNDJSON(w, flusher, map[string]interface{}{"type": "error", "message": "stderr pipe: " + err.Error(), "ts": time.Now().UTC().Format(time.RFC3339Nano)})
+		return
+	}
+
+	// Start command
+	if err := cmd.Start(); err != nil {
+		writeNDJSON(w, flusher, map[string]interface{}{"type": "error", "message": "start failed: " + err.Error(), "ts": time.Now().UTC().Format(time.RFC3339Nano)})
+		return
+	}
+
+	// Stream stdout/stderr concurrently
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	streamPipe := func(streamType string, pipe io.Reader) {
+		defer wg.Done()
+		scanner := bufio.NewScanner(pipe)
+		scanner.Buffer(make([]byte, 256*1024), 256*1024)
+		for scanner.Scan() {
+			mu.Lock()
+			writeNDJSON(w, flusher, map[string]interface{}{
+				"type": streamType,
+				"data": scanner.Text() + "\n",
+				"ts":   time.Now().UTC().Format(time.RFC3339Nano),
+			})
+			mu.Unlock()
+		}
+	}
+
+	wg.Add(2)
+	go streamPipe("stdout", stdoutPipe)
+	go streamPipe("stderr", stderrPipe)
+	wg.Wait()
+
+	// Wait for command to finish
+	exitCode := 0
+	if err := cmd.Wait(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+
+	// Write timeout error frame if context was cancelled
+	if ctx.Err() == context.DeadlineExceeded {
+		writeNDJSON(w, flusher, map[string]interface{}{"type": "error", "message": "timeout", "ts": time.Now().UTC().Format(time.RFC3339Nano)})
+	}
+
+	// Write exit frame
+	writeNDJSON(w, flusher, map[string]interface{}{"type": "exit", "code": exitCode, "ts": time.Now().UTC().Format(time.RFC3339Nano)})
+}
+
+// writeNDJSON writes a single ndjson frame and flushes.
+func writeNDJSON(w http.ResponseWriter, flusher http.Flusher, data map[string]interface{}) {
+	b, _ := json.Marshal(data)
+	w.Write(b)
+	w.Write([]byte("\n"))
+	flusher.Flush()
 }
 
 // startHealthServer starts a simple HTTP server for health checks and testing
