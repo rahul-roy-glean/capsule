@@ -1835,10 +1835,7 @@ func runShellCommand(args []string, runAsRoot bool, data *MMDSData) error {
 			env = append(env, "GIT_TOKEN="+t)
 		}
 	}
-	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Env = env
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	var procAttr *syscall.SysProcAttr
 	if !runAsRoot {
 		runnerUser, err := user.Lookup(*runnerUsername)
 		if err != nil {
@@ -1846,45 +1843,69 @@ func runShellCommand(args []string, runAsRoot bool, data *MMDSData) error {
 		}
 		rUID, _ := strconv.ParseUint(runnerUser.Uid, 10, 32)
 		rGID, _ := strconv.ParseUint(runnerUser.Gid, 10, 32)
-		cmd.SysProcAttr = &syscall.SysProcAttr{
+		procAttr = &syscall.SysProcAttr{
 			Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
 		}
-		cmd.Env = append(cmd.Env, "HOME="+runnerUser.HomeDir)
+		env = append(env, "HOME="+runnerUser.HomeDir)
 	}
-	return cmd.Run()
+	globalWarmupLogs.Add(fmt.Sprintf("[shell] Running: %s", strings.Join(args, " ")))
+	if err := runStreamedCommand("", env, procAttr, args[0], args[1:]...); err != nil {
+		globalWarmupLogs.Add(fmt.Sprintf("[shell] FAILED: %s: %v", strings.Join(args, " "), err))
+		return err
+	}
+	return nil
 }
 
-// runGCPAuthCommand configures GCP Application Default Credentials and the
-// Docker credential helper for Artifact Registry using the short-lived access
-// token from MMDS. After this command, any subsequent shell command that calls
-// gcloud, docker pull, or uses the GCP client libraries will be authenticated.
+// runGCPAuthCommand configures GCP credentials inside the microVM by:
+//   - Setting environment variables (GOOGLE_OAUTH_ACCESS_TOKEN, CLOUDSDK_AUTH_ACCESS_TOKEN)
+//   - Installing a gcloud shim at /usr/local/bin/gcloud that returns the access token
+//
+// The gcloud shim is critical because keyrings.google-artifactregistry-auth (used by
+// pip inside bazel) calls `gcloud config config-helper --format=json(credential)` to
+// obtain credentials. Since gcloud isn't installed in the microVM and there's no
+// metadata server, the shim fakes the expected responses.
 func runGCPAuthCommand(data *MMDSData) error {
 	token := data.Latest.Job.GCPAccessToken
 	if token == "" {
 		return fmt.Errorf("gcp-auth: no GCP access token in MMDS (gcp_access_token is empty)")
 	}
 
-	// Set env vars that ADC and gcloud pick up automatically.
-	// os.Setenv affects the current process and all child processes spawned after this.
+	// Set env vars for tools that check them directly.
 	os.Setenv("GOOGLE_OAUTH_ACCESS_TOKEN", token)
 	os.Setenv("CLOUDSDK_AUTH_ACCESS_TOKEN", token)
 
-	// Configure gcloud to use this token so `gcloud` CLI commands work.
-	if err := runStreamedCommand("", os.Environ(), nil,
-		"gcloud", "config", "set", "auth/access_token_file", "/dev/stdin"); err != nil {
-		// gcloud may not be installed; log and continue - env vars are enough for most use cases.
-		log.WithError(err).Debug("gcloud config set skipped (gcloud may not be installed)")
+	// Install a gcloud shim that returns the access token for all relevant subcommands.
+	// This makes keyrings.google-artifactregistry-auth and bazel credential helpers work
+	// without a real gcloud installation.
+	shimScript := fmt.Sprintf(`#!/bin/sh
+# Shim installed by thaw-agent for Artifact Registry auth in microVM
+# Returns the access token passed via MMDS from the host
+case "$1" in
+  auth)
+    case "$2" in
+      print-access-token) echo '%s' ;;
+      application-default) echo '%s' ;;
+      *) echo '%s' ;;
+    esac
+    ;;
+  config)
+    # keyrings.google-artifactregistry-auth calls:
+    #   gcloud config config-helper --format=json(credential)
+    # and parses credential.access_token + credential.token_expiry from JSON
+    echo '{"credential":{"access_token":"%s","token_expiry":"2099-12-31T23:59:59Z"}}'
+    ;;
+  *) echo '%s' ;;
+esac
+`, token, token, token, token, token)
+
+	shimPath := filepath.Join("/usr/local/bin", "gcloud")
+	if err := os.WriteFile(shimPath, []byte(shimScript), 0755); err != nil {
+		log.WithError(err).Warn("Failed to write gcloud shim")
+	} else {
+		log.Info("Installed gcloud shim for credential helper")
 	}
 
-	// Configure Docker credential helper for Artifact Registry so
-	// `docker pull` / `docker push` to *.pkg.dev works without extra steps.
-	if err := runStreamedCommand("", append(os.Environ(), "GOOGLE_OAUTH_ACCESS_TOKEN="+token), nil,
-		"gcloud", "auth", "configure-docker", "--quiet",
-		"us-docker.pkg.dev,europe-docker.pkg.dev,asia-docker.pkg.dev,gcr.io"); err != nil {
-		log.WithError(err).Debug("gcloud configure-docker skipped (gcloud may not be installed)")
-	}
-
-	log.Info("GCP credentials configured (ADC + Docker helper)")
+	log.Info("GCP credentials configured (env vars + gcloud shim)")
 	return nil
 }
 

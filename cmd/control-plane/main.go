@@ -41,7 +41,8 @@ var (
 
 	// Telemetry
 	telemetryEnabled = flag.Bool("telemetry-enabled", true, "Enable GCP Cloud Monitoring telemetry")
-	gcpProject       = flag.String("gcp-project", "", "GCP project for telemetry")
+	gcpProject       = flag.String("gcp-project", "", "GCP project for telemetry and snapshot builder VMs")
+	gcpZone          = flag.String("gcp-zone", "us-central1-a", "GCP zone for snapshot builder VMs")
 	environment      = flag.String("environment", "dev", "Environment name for telemetry labels")
 )
 
@@ -121,6 +122,10 @@ func main() {
 	if v := os.Getenv("GCP_PROJECT_ID"); v != "" {
 		gcpProjectVal = v
 	}
+	gcpZoneVal := *gcpZone
+	if v := os.Getenv("GCP_ZONE"); v != "" {
+		gcpZoneVal = v
+	}
 	envVal := *environment
 	if v := os.Getenv("ENVIRONMENT"); v != "" {
 		envVal = v
@@ -149,9 +154,9 @@ func main() {
 	// Create services
 	hostRegistry := NewHostRegistry(db, logger)
 	scheduler := NewScheduler(hostRegistry, db, logger)
-	snapshotManager := NewSnapshotManager(ctx, db, *gcsBucket, logger)
+	snapshotManager := NewSnapshotManager(ctx, db, *gcsBucket, gcpProjectVal, gcpZoneVal, logger)
 	jobQueue := NewJobQueue(db, scheduler, hostRegistry, logger)
-	snapshotConfigRegistry := NewSnapshotConfigRegistry(db, logger)
+	snapshotConfigRegistry := NewSnapshotConfigRegistry(db, snapshotManager, logger)
 
 	// Load existing state from DB (best-effort)
 	if err := hostRegistry.LoadFromDB(ctx); err != nil {
@@ -372,6 +377,9 @@ func initSchema(db *sql.DB) error {
 		// Add chunk_key column to snapshots (rename from repo_slug)
 		`ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS chunk_key VARCHAR(16) DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshots_chunk_key ON snapshots(chunk_key)`,
+		// GitHub App credentials for snapshot configs
+		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS github_app_id VARCHAR(255) DEFAULT ''`,
+		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS github_app_secret VARCHAR(255) DEFAULT ''`,
 		// Add chunk_key column to version_assignments
 		`ALTER TABLE version_assignments ADD COLUMN IF NOT EXISTS chunk_key VARCHAR(16) NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_version_assignments_chunk ON version_assignments(chunk_key)`,

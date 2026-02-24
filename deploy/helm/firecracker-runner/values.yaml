@@ -17,10 +17,8 @@ replicaCount: 1
 serviceAccount:
   create: true
   name: ""
-  annotations: {}
-  # Example (GKE Workload Identity):
-  # annotations:
-  #   iam.gke.io/gcp-service-account: firecracker-runner-dev-control-plane@your-project-id.iam.gserviceaccount.com
+  annotations:
+    iam.gke.io/gcp-service-account: fc-control-plane@scio-ci.iam.gserviceaccount.com
 
 podAnnotations:
   prometheus.io/scrape: "true"
@@ -125,8 +123,8 @@ ingress:
 
 autoscaling:
   enabled: true
-  minReplicas: 2
-  maxReplicas: 10
+  minReplicas: 1
+  maxReplicas: 1
   targetCPUUtilizationPercentage: 70
   targetMemoryUtilizationPercentage: 80
 
