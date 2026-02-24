@@ -42,6 +42,7 @@ type Runner struct {
 	JobID          string
 	Repo           string
 	Branch         string
+	ChunkKey       string
 	CreatedAt      time.Time
 	StartedAt      time.Time
 	CompletedAt    time.Time
@@ -300,9 +301,9 @@ func (hr *HostRegistry) AddRunner(ctx context.Context, runner *Runner) error {
 	defer hr.mu.Unlock()
 
 	_, err := hr.db.ExecContext(ctx, `
-		INSERT INTO runners (id, host_id, status, internal_ip, job_id, repo, branch)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`, runner.ID, runner.HostID, runner.Status, runner.InternalIP, runner.JobID, runner.Repo, runner.Branch)
+		INSERT INTO runners (id, host_id, status, internal_ip, job_id, repo, branch, chunk_key)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	`, runner.ID, runner.HostID, runner.Status, runner.InternalIP, runner.JobID, runner.Repo, runner.Branch, runner.ChunkKey)
 
 	if err != nil {
 		return err

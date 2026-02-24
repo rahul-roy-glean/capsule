@@ -860,6 +860,35 @@ func (b *ChunkedSnapshotBuilder) UploadChunkedMetadata(ctx context.Context, meta
 	return nil
 }
 
+// ReadCurrentVersion reads the current-pointer.json for a chunk key and returns
+// the version string it points to.
+func (cs *ChunkStore) ReadCurrentVersion(ctx context.Context, chunkKey string) (string, error) {
+	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
+	objPath := chunkKey + "/current-pointer.json"
+
+	reader, err := bucket.Object(objPath).NewReader(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to open current pointer: %w", err)
+	}
+	defer reader.Close()
+
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return "", fmt.Errorf("failed to read current pointer: %w", err)
+	}
+
+	var pointer struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(data, &pointer); err != nil {
+		return "", fmt.Errorf("failed to parse current pointer: %w", err)
+	}
+	if pointer.Version == "" {
+		return "", fmt.Errorf("current pointer has empty version")
+	}
+	return pointer.Version, nil
+}
+
 // LoadChunkedMetadata loads chunked snapshot metadata from GCS
 func (cs *ChunkStore) LoadChunkedMetadata(ctx context.Context, version string) (*ChunkedSnapshotMetadata, error) {
 	bucket := cs.gcsClient.Bucket(cs.gcsBucket)

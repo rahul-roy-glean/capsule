@@ -381,6 +381,9 @@ func initSchema(db *sql.DB) error {
 		// Add chunk_key column to version_assignments
 		`ALTER TABLE version_assignments ADD COLUMN IF NOT EXISTS chunk_key VARCHAR(16) NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_version_assignments_chunk ON version_assignments(chunk_key)`,
+		// Add chunk_key column to runners
+		`ALTER TABLE runners ADD COLUMN IF NOT EXISTS chunk_key VARCHAR(16) DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_runners_chunk_key ON runners(chunk_key)`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil {
@@ -524,9 +527,7 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 	}
 
 	var req struct {
-		Repo      string            `json:"repo"`
-		Branch    string            `json:"branch"`
-		Commit    string            `json:"commit"`
+		ChunkKey  string            `json:"chunk_key"`
 		Labels    map[string]string `json:"labels"`
 		RequestID string            `json:"request_id"`
 	}
@@ -535,29 +536,22 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		return
 	}
 
-	if req.Repo == "" {
-		http.Error(w, "repo is required", http.StatusBadRequest)
+	if req.ChunkKey == "" {
+		http.Error(w, "chunk_key is required", http.StatusBadRequest)
 		return
 	}
 	if req.RequestID == "" {
 		req.RequestID = fmt.Sprintf("manual-%d", time.Now().UnixNano())
 	}
 
-	chunkKey := lookupChunkKeyForRepo(s.scheduler.db, req.Repo)
-
 	s.logger.WithFields(logrus.Fields{
 		"request_id": req.RequestID,
-		"repo":       req.Repo,
-		"chunk_key":  chunkKey,
-		"branch":     req.Branch,
+		"chunk_key":  req.ChunkKey,
 	}).Info("Manual runner allocation request")
 
 	resp, err := s.scheduler.AllocateRunner(r.Context(), AllocateRunnerRequest{
 		RequestID: req.RequestID,
-		Repo:      req.Repo,
-		Branch:    req.Branch,
-		Commit:    req.Commit,
-		ChunkKey:  chunkKey,
+		ChunkKey:  req.ChunkKey,
 		Labels:    req.Labels,
 	})
 	if err != nil {
