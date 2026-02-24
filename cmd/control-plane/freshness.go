@@ -135,7 +135,7 @@ func checkConfigFreshness(ctx context.Context, sm *SnapshotManager, configRegist
 		if err != nil {
 			log.WithError(err).Debug("No current snapshot for chunk_key")
 			log.Info("No snapshot exists for chunk_key, triggering build")
-			if _, err := sm.TriggerSnapshotBuildForKey(ctx, cfg.ChunkKey, cfg.Commands, cfg.GitHubAppID, cfg.GitHubAppSecret); err != nil {
+			if _, err := sm.TriggerSnapshotBuildForKey(ctx, cfg.ChunkKey, cfg.Commands, cfg.GitHubAppID, cfg.GitHubAppSecret, false); err != nil {
 				log.WithError(err).Error("Failed to trigger snapshot build")
 			}
 			continue
@@ -147,7 +147,7 @@ func checkConfigFreshness(ctx context.Context, sm *SnapshotManager, configRegist
 				"version": currentSnapshot.Version,
 				"age":     age,
 			}).Info("Snapshot is stale (>24h), triggering rebuild")
-			if _, err := sm.TriggerSnapshotBuildForKey(ctx, cfg.ChunkKey, cfg.Commands, cfg.GitHubAppID, cfg.GitHubAppSecret); err != nil {
+			if _, err := sm.TriggerSnapshotBuildForKey(ctx, cfg.ChunkKey, cfg.Commands, cfg.GitHubAppID, cfg.GitHubAppSecret, false); err != nil {
 				log.WithError(err).Error("Failed to trigger snapshot build")
 			}
 			continue
@@ -170,7 +170,7 @@ func checkConfigFreshness(ctx context.Context, sm *SnapshotManager, configRegist
 				"version":      currentSnapshot.Version,
 				"commit_drift": drift,
 			}).Info("Commit drift detected, triggering rebuild")
-			if _, err := sm.TriggerSnapshotBuildForKey(ctx, cfg.ChunkKey, cfg.Commands, cfg.GitHubAppID, cfg.GitHubAppSecret); err != nil {
+			if _, err := sm.TriggerSnapshotBuildForKey(ctx, cfg.ChunkKey, cfg.Commands, cfg.GitHubAppID, cfg.GitHubAppSecret, false); err != nil {
 				log.WithError(err).Error("Failed to trigger snapshot build")
 			}
 		}

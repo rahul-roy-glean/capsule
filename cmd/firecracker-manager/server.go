@@ -10,6 +10,7 @@ import (
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/runner"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
 // HostAgentServer implements the HostAgent gRPC service
@@ -66,6 +67,13 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 			VCPUs:    int(req.Resources.Vcpus),
 			MemoryMB: int(req.Resources.MemoryMb),
 			DiskGB:   int(req.Resources.DiskGb),
+		}
+	}
+	if req.StartCommand != nil {
+		allocReq.StartCommand = &snapshot.StartCommand{
+			Command:    req.StartCommand.Command,
+			Port:       int(req.StartCommand.Port),
+			HealthPath: req.StartCommand.HealthPath,
 		}
 	}
 

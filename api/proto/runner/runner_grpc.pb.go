@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.1
 // - protoc             v5.29.3
-// source: api/proto/runner.proto
+// source: runner.proto
 
 package runner
 
@@ -443,7 +443,7 @@ var HostAgent_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "api/proto/runner.proto",
+	Metadata: "runner.proto",
 }
 
 const (
@@ -751,5 +751,5 @@ var ControlPlane_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "api/proto/runner.proto",
+	Metadata: "runner.proto",
 }

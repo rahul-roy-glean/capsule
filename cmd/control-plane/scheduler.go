@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
 // Scheduler handles runner allocation across hosts
@@ -36,7 +38,6 @@ type AllocateRunnerRequest struct {
 	ChunkKey          string
 	Labels            map[string]string
 	GitHubRunnerToken string
-	CISystem          string
 	VCPUs             int
 	MemoryMB          int
 }
@@ -60,17 +61,29 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// Derive repo slug for multi-repo support
 	chunkKey := req.ChunkKey
 
-	// Per-repo fairness: check max_concurrent_runners
+	// Look up snapshot config for fairness checks, ci_system, and start_command
+	var ciSystem string
+	var startCmd *snapshot.StartCommand
 	if chunkKey != "" && s.db != nil {
 		var maxConcurrent int
-		err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners FROM snapshot_configs WHERE chunk_key = $1`, chunkKey).Scan(&maxConcurrent)
-		if err == nil && maxConcurrent > 0 {
-			var currentCount int
-			_ = s.db.QueryRowContext(ctx, `
-				SELECT COUNT(*) FROM runners WHERE chunk_key = $1 AND status IN ('running','busy','initializing')
-			`, chunkKey).Scan(&currentCount)
-			if currentCount >= maxConcurrent {
-				return nil, fmt.Errorf("chunk_key %s at max concurrent runners (%d/%d)", chunkKey, currentCount, maxConcurrent)
+		var startCommandJSON sql.NullString
+		err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, ci_system, start_command FROM snapshot_configs WHERE chunk_key = $1`, chunkKey).Scan(&maxConcurrent, &ciSystem, &startCommandJSON)
+		if err == nil {
+			if maxConcurrent > 0 {
+				var currentCount int
+				_ = s.db.QueryRowContext(ctx, `
+					SELECT COUNT(*) FROM runners WHERE chunk_key = $1 AND status IN ('running','busy','initializing')
+				`, chunkKey).Scan(&currentCount)
+				if currentCount >= maxConcurrent {
+					return nil, fmt.Errorf("chunk_key %s at max concurrent runners (%d/%d)", chunkKey, currentCount, maxConcurrent)
+				}
+			}
+			if startCommandJSON.Valid && startCommandJSON.String != "" {
+				startCmd = &snapshot.StartCommand{}
+				if err := json.Unmarshal([]byte(startCommandJSON.String), startCmd); err != nil {
+					s.logger.WithError(err).Warn("Failed to parse start_command from snapshot config")
+					startCmd = nil
+				}
 			}
 		}
 	}
@@ -109,12 +122,19 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		Labels:            req.Labels,
 		GithubRunnerToken: req.GitHubRunnerToken,
 		ChunkKey:          chunkKey,
-		CiSystem:          req.CISystem,
+		CiSystem:          ciSystem,
 	}
 	if req.VCPUs > 0 || req.MemoryMB > 0 {
 		protoReq.Resources = &pb.Resources{
 			Vcpus:    int32(req.VCPUs),
 			MemoryMb: int32(req.MemoryMB),
+		}
+	}
+	if startCmd != nil {
+		protoReq.StartCommand = &pb.StartCommand{
+			Command:    startCmd.Command,
+			Port:       int32(startCmd.Port),
+			HealthPath: startCmd.HealthPath,
 		}
 	}
 

@@ -424,6 +424,9 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		RootfsOverlay:  overlayPath,
 		RepoCacheUpper: repoCacheUpperPath,
 	}
+	if req.StartCommand != nil {
+		runner.ServicePort = req.StartCommand.Port
+	}
 
 	// Build kernel boot args with network configuration
 	// Format: ip=<client-ip>::<gateway-ip>:<netmask>::<interface>:off
@@ -562,14 +565,20 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 
 	// When using per-VM namespaces, set up port forwarding (DNAT) so the host
 	// can reach services inside the VM via the host-reachable veth IP.
-	// Port 8080 is the standard service port (e.g., claude_sandbox_service).
-	// Port 8081 is the thaw-agent port (health checks, /exec endpoint).
+	// Port 10500 is the thaw-agent health/warmup server.
+	// Port 10501 is the thaw-agent debug server (health checks, /exec endpoint).
 	if useNetNS && m.netnsNetwork != nil {
-		if err := m.netnsNetwork.ForwardPort(runnerID, 8080); err != nil {
-			m.logger.WithError(err).Warn("Failed to forward port 8080 into namespace")
+		if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentHealthPort); err != nil {
+			m.logger.WithError(err).WithField("port", snapshot.ThawAgentHealthPort).Warn("Failed to forward port into namespace")
 		}
-		if err := m.netnsNetwork.ForwardPort(runnerID, 8081); err != nil {
-			m.logger.WithError(err).Warn("Failed to forward port 8081 into namespace")
+		if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentDebugPort); err != nil {
+			m.logger.WithError(err).WithField("port", snapshot.ThawAgentDebugPort).Warn("Failed to forward port into namespace")
+		}
+		// Forward user service port if start_command is configured
+		if req.StartCommand != nil && req.StartCommand.Port > 0 {
+			if err := m.netnsNetwork.ForwardPort(runnerID, req.StartCommand.Port); err != nil {
+				m.logger.WithError(err).WithField("port", req.StartCommand.Port).Warn("Failed to forward service port into namespace")
+			}
 		}
 	}
 
@@ -680,6 +689,13 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 	// Set exec mode when explicitly requested via ci_system=none
 	if req.CISystem == "none" {
 		data.Latest.Meta.Mode = "exec"
+	}
+
+	// Populate start_command for user service startup
+	if req.StartCommand != nil {
+		data.Latest.StartCommand.Command = req.StartCommand.Command
+		data.Latest.StartCommand.Port = req.StartCommand.Port
+		data.Latest.StartCommand.HealthPath = req.StartCommand.HealthPath
 	}
 
 	return data

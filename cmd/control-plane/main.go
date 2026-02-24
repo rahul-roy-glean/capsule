@@ -380,6 +380,10 @@ func initSchema(db *sql.DB) error {
 		// GitHub App credentials for snapshot configs
 		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS github_app_id VARCHAR(255) DEFAULT ''`,
 		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS github_app_secret VARCHAR(255) DEFAULT ''`,
+		// Add ci_system column to snapshot_configs (defaults to empty string = no CI system)
+		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS ci_system VARCHAR(64) DEFAULT ''`,
+		// Add start_command column to snapshot_configs (JSON-encoded StartCommand)
+		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS start_command TEXT DEFAULT ''`,
 		// Add chunk_key column to version_assignments
 		`ALTER TABLE version_assignments ADD COLUMN IF NOT EXISTS chunk_key VARCHAR(16) NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_version_assignments_chunk ON version_assignments(chunk_key)`,
@@ -521,8 +525,8 @@ func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Req
 
 // HandleAllocateRunner handles manual runner allocation requests.
 // POST /api/v1/runners/allocate
-// Body: {"repo": "org/repo", "branch": "main", "commit": "abc123", "labels": {"firecracker": "true"}}
-// For exec mode: {"chunk_key": "generic-linux", "ci_system": "none"}
+// Body: {"chunk_key": "abc123", "labels": {"firecracker": "true"}}
+// ci_system is resolved from the snapshot config registered for the chunk_key.
 func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -533,7 +537,6 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		RequestID string            `json:"request_id"`
 		ChunkKey  string            `json:"chunk_key"`
 		Labels    map[string]string `json:"labels"`
-		CISystem  string            `json:"ci_system"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
@@ -551,14 +554,12 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 	s.logger.WithFields(logrus.Fields{
 		"request_id": req.RequestID,
 		"chunk_key":  req.ChunkKey,
-		"ci_system":  req.CISystem,
 	}).Info("Manual runner allocation request")
 
 	resp, err := s.scheduler.AllocateRunner(r.Context(), AllocateRunnerRequest{
 		RequestID: req.RequestID,
 		ChunkKey:  req.ChunkKey,
 		Labels:    req.Labels,
-		CISystem:  req.CISystem,
 	})
 	if err != nil {
 		s.logger.WithError(err).Error("Manual allocation failed")

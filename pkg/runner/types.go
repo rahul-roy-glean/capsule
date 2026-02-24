@@ -3,6 +3,8 @@ package runner
 import (
 	"net"
 	"time"
+
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
 // State represents the state of a runner
@@ -51,6 +53,7 @@ type Runner struct {
 	PreQuarantineState      State
 	QuarantineEgressBlocked bool
 	QuarantinePaused        bool
+	ServicePort             int // Port of the user's service inside the VM (from StartCommand)
 
 	// Pool-related fields
 	PoolKey          *RunnerKey `json:"pool_key,omitempty"`
@@ -77,7 +80,8 @@ type AllocateRequest struct {
 	Resources         Resources
 	Labels            map[string]string
 	GitHubRunnerToken string
-	CISystem          string // CI system identifier
+	CISystem          string                  // CI system identifier
+	StartCommand      *snapshot.StartCommand  // Optional: user service to start inside the VM
 }
 
 // MMDSData represents data to inject into the microVM via MMDS
@@ -140,6 +144,11 @@ type MMDSData struct {
 			WorkingDir string            `json:"working_dir,omitempty"`
 			TimeoutSec int               `json:"timeout_seconds,omitempty"`
 		} `json:"exec,omitempty"`
+		StartCommand struct {
+			Command    []string `json:"command,omitempty"`
+			Port       int      `json:"port,omitempty"`
+			HealthPath string   `json:"health_path,omitempty"`
+		} `json:"start_command,omitempty"`
 	} `json:"latest"`
 }
 
