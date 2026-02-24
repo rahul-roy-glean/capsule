@@ -55,17 +55,19 @@ type SnapshotManager struct {
 }
 
 // NewSnapshotManager creates a new snapshot manager
-func NewSnapshotManager(ctx context.Context, db *sql.DB, gcsBucket string, logger *logrus.Logger) *SnapshotManager {
+func NewSnapshotManager(ctx context.Context, db *sql.DB, gcsBucket, gcpProject, gcpZone string, logger *logrus.Logger) *SnapshotManager {
 	client, err := storage.NewClient(ctx)
 	if err != nil {
 		logger.WithError(err).Warn("Failed to create GCS client")
 	}
 
 	sm := &SnapshotManager{
-		db:        db,
-		gcsClient: client,
-		gcsBucket: gcsBucket,
-		logger:    logger.WithField("component", "snapshot-manager"),
+		db:         db,
+		gcsClient:  client,
+		gcsBucket:  gcsBucket,
+		gcpProject: gcpProject,
+		gcpZone:    gcpZone,
+		logger:     logger.WithField("component", "snapshot-manager"),
 	}
 
 	// Load current active snapshot version
@@ -379,7 +381,7 @@ apt-get install -y -qq git
 
 # Download snapshot-builder binary (should be in the image or GCS)
 if [ ! -f /usr/local/bin/snapshot-builder ]; then
-    gcloud storage cp gs://%s/bin/snapshot-builder /usr/local/bin/snapshot-builder
+    gcloud storage cp gs://%s/build-artifacts/snapshot-builder /usr/local/bin/snapshot-builder
     chmod +x /usr/local/bin/snapshot-builder
 fi
 
@@ -483,7 +485,7 @@ shutdown -h now
 }
 
 // launchSnapshotBuilderVMForKey creates a GCE instance to build a snapshot from commands JSON.
-func (sm *SnapshotManager) launchSnapshotBuilderVMForKey(ctx context.Context, instanceName, chunkKey, commandsJSON, version string) error {
+func (sm *SnapshotManager) launchSnapshotBuilderVMForKey(ctx context.Context, instanceName, chunkKey, commandsJSON, version, githubAppID, githubAppSecret string) error {
 	if sm.gcpProject == "" {
 		sm.logger.Warn("GCP project not configured, skipping VM launch")
 		return nil
@@ -501,22 +503,59 @@ func (sm *SnapshotManager) launchSnapshotBuilderVMForKey(ctx context.Context, in
 	}
 	defer instancesClient.Close()
 
+	// Build optional GitHub App flags
+	githubFlags := ""
+	if githubAppID != "" && githubAppSecret != "" {
+		githubFlags = fmt.Sprintf(`--github-app-id="%s" --github-app-secret="%s" --gcp-project="%s"`,
+			githubAppID, githubAppSecret, sm.gcpProject)
+	}
+
 	startupScript := fmt.Sprintf(`#!/bin/bash
 set -e
 exec > >(tee /var/log/snapshot-builder.log) 2>&1
-echo "Starting snapshot builder..."
+echo "Starting snapshot builder setup..."
+
+# Install Firecracker
+ARCH=$(uname -m)
+FC_VERSION="1.14.1"
+echo "Installing Firecracker v${FC_VERSION}..."
+cd /tmp
+curl -fSL "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-${ARCH}.tgz" -o firecracker.tgz
+tar xzf firecracker.tgz
+mv "release-v${FC_VERSION}-${ARCH}/firecracker-v${FC_VERSION}-${ARCH}" /usr/local/bin/firecracker
+chmod +x /usr/local/bin/firecracker
+rm -rf firecracker.tgz "release-v${FC_VERSION}-${ARCH}"
+
+# Setup KVM
+modprobe kvm_intel || modprobe kvm_amd || true
+chmod 666 /dev/kvm || true
+
+# Download kernel and rootfs from GCS
+echo "Downloading kernel and rootfs..."
+mkdir -p /opt/firecracker
+gcloud storage cp "gs://%s/build-artifacts/kernel.bin" /opt/firecracker/kernel.bin 2>/dev/null \
+    || gcloud storage cp "gs://%s/current/kernel.bin" /opt/firecracker/kernel.bin 2>/dev/null \
+    || echo "WARNING: kernel.bin not found"
+gcloud storage cp "gs://%s/build-artifacts/rootfs.img" /opt/firecracker/rootfs.img 2>/dev/null \
+    || gcloud storage cp "gs://%s/current/rootfs.img" /opt/firecracker/rootfs.img 2>/dev/null \
+    || echo "WARNING: rootfs.img not found"
+
+# Download snapshot-builder binary
 if [ ! -f /usr/local/bin/snapshot-builder ]; then
-    gcloud storage cp gs://%s/bin/snapshot-builder /usr/local/bin/snapshot-builder
+    gcloud storage cp gs://%s/build-artifacts/snapshot-builder /usr/local/bin/snapshot-builder
     chmod +x /usr/local/bin/snapshot-builder
 fi
+
+# Run snapshot builder
 /usr/local/bin/snapshot-builder \
     --snapshot-commands='%s' \
     --gcs-bucket="%s" \
     --output-dir=/tmp/snapshot \
-    --log-level=info
+    --log-level=info \
+    %s
 echo "Snapshot build complete, shutting down..."
 shutdown -h now
-`, sm.gcsBucket, commandsJSON, sm.gcsBucket)
+`, sm.gcsBucket, sm.gcsBucket, sm.gcsBucket, sm.gcsBucket, sm.gcsBucket, commandsJSON, sm.gcsBucket, githubFlags)
 
 	machineType := fmt.Sprintf("zones/%s/machineTypes/n2-standard-8", sm.gcpZone)
 	sourceImage := fmt.Sprintf("projects/%s/global/images/family/%s", sm.gcpProject, "firecracker-host")
@@ -535,6 +574,9 @@ shutdown -h now
 		InstanceResource: &computepb.Instance{
 			Name:        proto.String(instanceName),
 			MachineType: proto.String(machineType),
+			AdvancedMachineFeatures: &computepb.AdvancedMachineFeatures{
+				EnableNestedVirtualization: proto.Bool(true),
+			},
 			Disks: []*computepb.AttachedDisk{
 				{
 					InitializeParams: &computepb.AttachedDiskInitializeParams{
@@ -1169,7 +1211,7 @@ func (sm *SnapshotManager) SetActiveSnapshotForKey(ctx context.Context, chunkKey
 }
 
 // TriggerSnapshotBuildForKey triggers a snapshot build for a specific chunk key.
-func (sm *SnapshotManager) TriggerSnapshotBuildForKey(ctx context.Context, chunkKey string, commands []snapshot.SnapshotCommand) (string, error) {
+func (sm *SnapshotManager) TriggerSnapshotBuildForKey(ctx context.Context, chunkKey string, commands []snapshot.SnapshotCommand, githubAppID, githubAppSecret string) (string, error) {
 	version := fmt.Sprintf("v%s-%s", time.Now().Format("20060102-150405"), chunkKey)
 
 	sm.logger.WithFields(logrus.Fields{
@@ -1192,7 +1234,7 @@ func (sm *SnapshotManager) TriggerSnapshotBuildForKey(ctx context.Context, chunk
 
 	// Launch snapshot builder VM
 	instanceName := fmt.Sprintf("snapshot-builder-%s", version)
-	if err := sm.launchSnapshotBuilderVMForKey(ctx, instanceName, chunkKey, string(commandsJSON), version); err != nil {
+	if err := sm.launchSnapshotBuilderVMForKey(ctx, instanceName, chunkKey, string(commandsJSON), version, githubAppID, githubAppSecret); err != nil {
 		sm.UpdateSnapshotStatus(ctx, version, "failed")
 		return "", fmt.Errorf("failed to launch snapshot builder: %w", err)
 	}
