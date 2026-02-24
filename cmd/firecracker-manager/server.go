@@ -59,6 +59,7 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		Labels:            req.Labels,
 		ChunkKey:          req.ChunkKey,
 		CISystem:          req.CiSystem,
+		SessionID:         req.SessionId,
 	}
 
 	if req.Resources != nil {
@@ -71,12 +72,53 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 
 	var r *runner.Runner
 	var err error
+	var resumed bool
 
-	// Use chunked allocation if available (UFFD + FUSE for lazy loading)
-	if s.chunkedMgr != nil {
-		r, err = s.chunkedMgr.AllocateRunnerChunked(ctx, allocReq)
-	} else {
-		r, err = s.manager.AllocateRunner(ctx, allocReq)
+	// Session-aware allocation: if session_id is provided, try to resume
+	if allocReq.SessionID != "" {
+		// Check if there's already a running runner for this session
+		if existing := s.manager.FindRunnerBySessionID(allocReq.SessionID); existing != nil {
+			if existing.State != runner.StateSuspended {
+				return &pb.AllocateRunnerResponse{
+					Runner:    runnerToProto(existing),
+					SessionId: allocReq.SessionID,
+				}, nil
+			}
+		}
+
+		// Try to resume from session snapshot
+		if s.manager.SessionExists(allocReq.SessionID) {
+			r, err = s.manager.ResumeFromSession(ctx, allocReq.SessionID, allocReq.ChunkKey)
+			if err == nil {
+				resumed = true
+			} else {
+				s.logger.WithError(err).Warn("Failed to resume from session, falling back to fresh allocation")
+				err = nil // Reset error for fresh allocation
+			}
+		}
+	}
+
+	// Fresh allocation if not resumed from session
+	if r == nil {
+		if s.chunkedMgr != nil {
+			r, err = s.chunkedMgr.AllocateRunnerChunked(ctx, allocReq)
+		} else {
+			r, err = s.manager.AllocateRunner(ctx, allocReq)
+		}
+
+		// Bind session_id to the new runner
+		if err == nil && allocReq.SessionID != "" {
+			r.SessionID = allocReq.SessionID
+			r.LastExecAt = r.StartedAt
+		}
+		// Set TTL config from request
+		if err == nil && allocReq.TTLSeconds > 0 {
+			r.TTLSeconds = allocReq.TTLSeconds
+			r.AutoPause = allocReq.AutoPause
+			if r.LastExecAt.IsZero() {
+				r.LastExecAt = r.StartedAt
+			}
+		}
 	}
 
 	if err != nil {
@@ -87,7 +129,9 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 	}
 
 	return &pb.AllocateRunnerResponse{
-		Runner: runnerToProto(r),
+		Runner:    runnerToProto(r),
+		Resumed:   resumed,
+		SessionId: r.SessionID,
 	}, nil
 }
 
@@ -270,6 +314,48 @@ func (s *HostAgentServer) UnquarantineRunner(ctx context.Context, req *pb.Unquar
 	return &pb.UnquarantineRunnerResponse{Success: true}, nil
 }
 
+// PauseRunner pauses a runner and creates a session snapshot
+func (s *HostAgentServer) PauseRunner(ctx context.Context, req *pb.PauseRunnerRequest) (*pb.PauseRunnerResponse, error) {
+	s.logger.WithField("runner_id", req.RunnerId).Info("PauseRunner request")
+
+	result, err := s.manager.PauseRunner(ctx, req.RunnerId)
+	if err != nil {
+		s.logger.WithError(err).Error("Failed to pause runner")
+		return &pb.PauseRunnerResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, nil
+	}
+
+	return &pb.PauseRunnerResponse{
+		Success:           true,
+		SessionId:         result.SessionID,
+		SnapshotSizeBytes: result.SnapshotSizeBytes,
+		Layer:             int32(result.Layer),
+	}, nil
+}
+
+// ResumeRunner resumes a runner from a session snapshot
+func (s *HostAgentServer) ResumeRunner(ctx context.Context, req *pb.ResumeRunnerRequest) (*pb.ResumeRunnerResponse, error) {
+	s.logger.WithFields(logrus.Fields{
+		"session_id": req.SessionId,
+		"chunk_key":  req.ChunkKey,
+	}).Info("ResumeRunner request")
+
+	r, err := s.manager.ResumeFromSession(ctx, req.SessionId, req.ChunkKey)
+	if err != nil {
+		s.logger.WithError(err).Error("Failed to resume runner")
+		return &pb.ResumeRunnerResponse{
+			Error: err.Error(),
+		}, nil
+	}
+
+	return &pb.ResumeRunnerResponse{
+		Runner:             runnerToProto(r),
+		ResumedFromSession: true,
+	}, nil
+}
+
 // runnerToProto converts a runner to protobuf
 func runnerToProto(r *runner.Runner) *pb.Runner {
 	state := pb.RunnerState_RUNNER_STATE_UNSPECIFIED
@@ -294,13 +380,16 @@ func runnerToProto(r *runner.Runner) *pb.Runner {
 		state = pb.RunnerState_RUNNER_STATE_TERMINATED
 	case runner.StatePaused:
 		state = pb.RunnerState_RUNNER_STATE_PAUSED
+	case runner.StatePausing:
+		state = pb.RunnerState_RUNNER_STATE_PAUSING
+	case runner.StateSuspended:
+		state = pb.RunnerState_RUNNER_STATE_SUSPENDED
 	}
 
 	proto := &pb.Runner{
 		Id:              r.ID,
 		HostId:          r.HostID,
 		State:           state,
-		InternalIp:      r.InternalIP.String(),
 		GithubRunnerId:  r.GitHubRunnerID,
 		JobId:           r.JobID,
 		SnapshotVersion: r.SnapshotVersion,
@@ -310,6 +399,10 @@ func runnerToProto(r *runner.Runner) *pb.Runner {
 			MemoryMb: int32(r.Resources.MemoryMB),
 			DiskGb:   int32(r.Resources.DiskGB),
 		},
+	}
+
+	if r.InternalIP != nil {
+		proto.InternalIp = r.InternalIP.String()
 	}
 
 	if !r.StartedAt.IsZero() {

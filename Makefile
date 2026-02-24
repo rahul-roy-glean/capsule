@@ -4,8 +4,8 @@
 .PHONY: firecracker-manager control-plane snapshot-builder thaw-agent
 .PHONY: git-cache-builder git-cache-freshness data-snapshot-builder snapshot-converter
 .PHONY: test-unit test-race test-cover test-integration test-all check
-.PHONY: dev-up dev-build dev-snapshot dev-stack dev-test-exec dev-stop dev-down dev-clean
-.PHONY: dev-setup dev-provision dev-build-local dev-snapshot-local dev-stack-local dev-test-exec-local dev-stop-local
+.PHONY: dev-up dev-build dev-snapshot dev-stack dev-test-exec dev-test-pause-resume dev-stop dev-down dev-clean
+.PHONY: dev-setup dev-provision dev-build-local dev-snapshot-local dev-stack-local dev-test-exec-local dev-test-pause-resume-local dev-stop-local
 
 # Variables
 PROJECT_ID ?= your-project-id
@@ -391,6 +391,10 @@ dev-stack:
 dev-test-exec:
 	$(LIMA_EXEC) bash dev/test-exec.sh
 
+# Run E2E pause/resume test via Lima VM
+dev-test-pause-resume:
+	$(LIMA_EXEC) bash dev/test-pause-resume.sh
+
 # Stop the stack inside Lima VM
 dev-stop:
 	$(LIMA_EXEC) bash dev/stop-stack.sh
@@ -427,6 +431,10 @@ dev-stack-local:
 # Run E2E exec test directly on Linux
 dev-test-exec-local:
 	bash dev/test-exec.sh
+
+# Run E2E pause/resume test directly on Linux
+dev-test-pause-resume-local:
+	bash dev/test-pause-resume.sh
 
 # Stop the stack directly on Linux
 dev-stop-local:

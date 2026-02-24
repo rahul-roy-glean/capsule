@@ -25,6 +25,9 @@ type SnapshotConfig struct {
 	AutoRollout          bool                      `json:"auto_rollout"`
 	GitHubAppID          string                    `json:"github_app_id,omitempty"`
 	GitHubAppSecret      string                    `json:"github_app_secret,omitempty"`
+	RunnerTTLSeconds     int                       `json:"runner_ttl_seconds"`
+	SessionMaxAgeSeconds int                       `json:"session_max_age_seconds"`
+	AutoPause            bool                      `json:"auto_pause"`
 	CreatedAt            time.Time                 `json:"created_at"`
 }
 
@@ -45,7 +48,7 @@ func NewSnapshotConfigRegistry(db *sql.DB, sm *SnapshotManager, logger *logrus.L
 }
 
 // RegisterSnapshotConfig upserts a snapshot config, computing its chunk_key from commands.
-func (r *SnapshotConfigRegistry) RegisterSnapshotConfig(ctx context.Context, displayName string, commands []snapshot.SnapshotCommand, buildSchedule string, maxConcurrent int, githubAppID, githubAppSecret string) (*SnapshotConfig, error) {
+func (r *SnapshotConfigRegistry) RegisterSnapshotConfig(ctx context.Context, displayName string, commands []snapshot.SnapshotCommand, buildSchedule string, maxConcurrent int, githubAppID, githubAppSecret string, runnerTTLSeconds int, sessionMaxAgeSeconds int, autoPause bool) (*SnapshotConfig, error) {
 	chunkKey := snapshot.ComputeChunkKey(commands)
 
 	commandsJSON, err := json.Marshal(commands)
@@ -59,16 +62,19 @@ func (r *SnapshotConfigRegistry) RegisterSnapshotConfig(ctx context.Context, dis
 	}).Info("Registering snapshot config")
 
 	_, err = r.db.ExecContext(ctx, `
-		INSERT INTO snapshot_configs (chunk_key, display_name, commands, build_schedule, max_concurrent_runners, github_app_id, github_app_secret)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO snapshot_configs (chunk_key, display_name, commands, build_schedule, max_concurrent_runners, github_app_id, github_app_secret, runner_ttl_seconds, session_max_age_seconds, auto_pause)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (chunk_key) DO UPDATE SET
 			display_name = EXCLUDED.display_name,
 			commands = EXCLUDED.commands,
 			build_schedule = EXCLUDED.build_schedule,
 			max_concurrent_runners = EXCLUDED.max_concurrent_runners,
 			github_app_id = EXCLUDED.github_app_id,
-			github_app_secret = EXCLUDED.github_app_secret
-	`, chunkKey, displayName, string(commandsJSON), buildSchedule, maxConcurrent, githubAppID, githubAppSecret)
+			github_app_secret = EXCLUDED.github_app_secret,
+			runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
+			session_max_age_seconds = EXCLUDED.session_max_age_seconds,
+			auto_pause = EXCLUDED.auto_pause
+	`, chunkKey, displayName, string(commandsJSON), buildSchedule, maxConcurrent, githubAppID, githubAppSecret, runnerTTLSeconds, sessionMaxAgeSeconds, autoPause)
 	if err != nil {
 		return nil, fmt.Errorf("failed to register snapshot config: %w", err)
 	}
@@ -86,11 +92,15 @@ func (r *SnapshotConfigRegistry) GetSnapshotConfig(ctx context.Context, chunkKey
 	err := r.db.QueryRowContext(ctx, `
 		SELECT chunk_key, display_name, commands, build_schedule,
 		       max_concurrent_runners, current_version, auto_rollout,
-		       github_app_id, github_app_secret, created_at
+		       github_app_id, github_app_secret,
+		       runner_ttl_seconds, session_max_age_seconds, auto_pause,
+		       created_at
 		FROM snapshot_configs WHERE chunk_key = $1
 	`, chunkKey).Scan(&sc.ChunkKey, &sc.DisplayName, &commandsJSON, &sc.BuildSchedule,
 		&sc.MaxConcurrentRunners, &currentVersion, &sc.AutoRollout,
-		&githubAppID, &githubAppSecret, &sc.CreatedAt)
+		&githubAppID, &githubAppSecret,
+		&sc.RunnerTTLSeconds, &sc.SessionMaxAgeSeconds, &sc.AutoPause,
+		&sc.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("snapshot config not found: %s", chunkKey)
 	}
@@ -117,7 +127,9 @@ func (r *SnapshotConfigRegistry) ListSnapshotConfigs(ctx context.Context) ([]*Sn
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT chunk_key, display_name, commands, build_schedule,
 		       max_concurrent_runners, current_version, auto_rollout,
-		       github_app_id, github_app_secret, created_at
+		       github_app_id, github_app_secret,
+		       runner_ttl_seconds, session_max_age_seconds, auto_pause,
+		       created_at
 		FROM snapshot_configs ORDER BY chunk_key
 	`)
 	if err != nil {
@@ -134,7 +146,9 @@ func (r *SnapshotConfigRegistry) ListSnapshotConfigs(ctx context.Context) ([]*Sn
 
 		if err := rows.Scan(&sc.ChunkKey, &sc.DisplayName, &commandsJSON, &sc.BuildSchedule,
 			&sc.MaxConcurrentRunners, &currentVersion, &sc.AutoRollout,
-			&githubAppID, &githubAppSecret, &sc.CreatedAt); err != nil {
+			&githubAppID, &githubAppSecret,
+			&sc.RunnerTTLSeconds, &sc.SessionMaxAgeSeconds, &sc.AutoPause,
+			&sc.CreatedAt); err != nil {
 			return nil, err
 		}
 		if currentVersion.Valid {
@@ -184,6 +198,9 @@ func (r *SnapshotConfigRegistry) HandleCreateSnapshotConfig(w http.ResponseWrite
 		MaxConcurrentRunners int                       `json:"max_concurrent_runners"`
 		GitHubAppID          string                    `json:"github_app_id"`
 		GitHubAppSecret      string                    `json:"github_app_secret"`
+		RunnerTTLSeconds     int                       `json:"runner_ttl_seconds"`
+		SessionMaxAgeSeconds int                       `json:"session_max_age_seconds"`
+		AutoPause            bool                      `json:"auto_pause"`
 	}
 	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -193,7 +210,7 @@ func (r *SnapshotConfigRegistry) HandleCreateSnapshotConfig(w http.ResponseWrite
 		http.Error(w, "commands is required and must be non-empty", http.StatusBadRequest)
 		return
 	}
-	sc, err := r.RegisterSnapshotConfig(req.Context(), body.DisplayName, body.Commands, body.BuildSchedule, body.MaxConcurrentRunners, body.GitHubAppID, body.GitHubAppSecret)
+	sc, err := r.RegisterSnapshotConfig(req.Context(), body.DisplayName, body.Commands, body.BuildSchedule, body.MaxConcurrentRunners, body.GitHubAppID, body.GitHubAppSecret, body.RunnerTTLSeconds, body.SessionMaxAgeSeconds, body.AutoPause)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
