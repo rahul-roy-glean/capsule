@@ -20,6 +20,7 @@ VERSION ?= $(shell git describe --tags --always --dirty)
 GO := go
 GOFLAGS := -ldflags "-X main.version=$(VERSION)"
 GOARCH_TARGET ?= amd64
+export PATH := /usr/local/go/bin:$(PATH)
 
 # Binaries
 BINARIES := firecracker-manager control-plane snapshot-builder thaw-agent git-cache-builder git-cache-freshness data-snapshot-builder snapshot-converter bin-onboard
