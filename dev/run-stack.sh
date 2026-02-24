@@ -49,7 +49,7 @@ fi
 # --- Start control-plane ---
 echo ""
 echo "=== Starting control-plane ==="
-./bin/control-plane \
+nohup ./bin/control-plane \
   --db-host=localhost \
   --db-user=postgres \
   --db-password="" \
@@ -83,24 +83,26 @@ done
 # --- Start firecracker-manager ---
 echo ""
 echo "=== Starting firecracker-manager ==="
-sudo ./bin/firecracker-manager \
+sudo -b sh -c 'nohup '"$REPO_ROOT"'/bin/firecracker-manager \
   --http-port=9080 \
   --grpc-port=50052 \
   --use-netns \
   --ci-system=none \
   --snapshot-bucket=local-dev \
-  --snapshot-cache="$SNAPSHOT_DIR" \
+  --snapshot-cache='"$SNAPSHOT_DIR"' \
   --socket-dir=/tmp/fc-dev/sockets \
   --workspace-dir=/tmp/fc-dev/workspaces \
-  --log-dir="$LOG_DIR" \
+  --log-dir='"$LOG_DIR"' \
   --control-plane=http://localhost:8080 \
   --telemetry-enabled=false \
   --max-runners=4 \
   --idle-target=0 \
   --log-level=debug \
-  > "$LOG_DIR/firecracker-manager.log" 2>&1 &
-MGR_PID=$!
-echo "$MGR_PID" > "$PID_DIR/firecracker-manager.pid"
+  > '"$LOG_DIR"'/firecracker-manager.log 2>&1 &
+echo $! > /tmp/fc-dev/pids/firecracker-manager.pid'
+# Give sudo a moment to fork
+sleep 1
+MGR_PID=$(cat "$PID_DIR/firecracker-manager.pid" 2>/dev/null || echo "unknown")
 echo "firecracker-manager PID: $MGR_PID (log: $LOG_DIR/firecracker-manager.log)"
 
 # Wait for firecracker-manager health
