@@ -373,7 +373,7 @@ func main() {
 						}
 						fi, _ := os.Stat(memPath)
 						log.WithFields(logrus.Fields{
-							"path":      memPath,
+							"path":       memPath,
 							"size_bytes": fi.Size(),
 						}).Info("snapshot.mem downloaded")
 					} else {
@@ -847,7 +847,7 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				}(hbResp.SnapshotVersion)
 			}
 
-				// Handle per-chunk-key manifest sync directives
+			// Handle per-chunk-key manifest sync directives
 			if len(hbResp.SyncVersions) > 0 && chunkedMgr != nil {
 				for chunkKey, version := range hbResp.SyncVersions {
 					go func(key, ver string) {

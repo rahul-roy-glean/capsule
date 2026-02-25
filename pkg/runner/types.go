@@ -91,11 +91,11 @@ type AllocateRequest struct {
 	Resources         Resources
 	Labels            map[string]string
 	GitHubRunnerToken string
-	CISystem          string                  // CI system identifier
-	StartCommand      *snapshot.StartCommand  // Optional: user service to start inside the VM
-	SessionID         string // optional: bind to session for pause/resume
-	TTLSeconds        int    // idle timeout from snapshot config
-	AutoPause         bool   // pause on TTL vs destroy
+	CISystem          string                 // CI system identifier
+	StartCommand      *snapshot.StartCommand // Optional: user service to start inside the VM
+	SessionID         string                 // optional: bind to session for pause/resume
+	TTLSeconds        int                    // idle timeout from snapshot config
+	AutoPause         bool                   // pause on TTL vs destroy
 }
 
 // MMDSData represents data to inject into the microVM via MMDS
@@ -217,7 +217,7 @@ type HostConfig struct {
 	CredentialsImageSizeMB int
 	// QuarantineDir is where the host will write quarantine manifests and keep
 	// per-runner debug metadata when a runner is quarantined.
-	QuarantineDir     string
+	QuarantineDir string
 	// SessionDir is the base directory for session snapshot storage (pause/resume).
 	// Defaults to {SnapshotCachePath}/../sessions (e.g. /mnt/data/sessions).
 	SessionDir        string

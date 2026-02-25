@@ -16,21 +16,21 @@ import (
 
 // SnapshotConfig represents a named snapshot configuration keyed by chunk_key.
 type SnapshotConfig struct {
-	ChunkKey             string                    `json:"chunk_key"`
-	DisplayName          string                    `json:"display_name"`
+	ChunkKey             string                     `json:"chunk_key"`
+	DisplayName          string                     `json:"display_name"`
 	Commands             []snapshot.SnapshotCommand `json:"commands"`
-	BuildSchedule        string                    `json:"build_schedule"`
-	MaxConcurrentRunners int                       `json:"max_concurrent_runners"`
-	CurrentVersion       string                    `json:"current_version"`
-	AutoRollout          bool                      `json:"auto_rollout"`
-	CISystem             string                    `json:"ci_system"`
-	GitHubAppID          string                    `json:"github_app_id,omitempty"`
-	GitHubAppSecret      string                    `json:"github_app_secret,omitempty"`
-	StartCommand         *snapshot.StartCommand    `json:"start_command,omitempty"`
-	RunnerTTLSeconds     int                       `json:"runner_ttl_seconds"`
-	SessionMaxAgeSeconds int                       `json:"session_max_age_seconds"`
-	AutoPause            bool                      `json:"auto_pause"`
-	CreatedAt            time.Time                 `json:"created_at"`
+	BuildSchedule        string                     `json:"build_schedule"`
+	MaxConcurrentRunners int                        `json:"max_concurrent_runners"`
+	CurrentVersion       string                     `json:"current_version"`
+	AutoRollout          bool                       `json:"auto_rollout"`
+	CISystem             string                     `json:"ci_system"`
+	GitHubAppID          string                     `json:"github_app_id,omitempty"`
+	GitHubAppSecret      string                     `json:"github_app_secret,omitempty"`
+	StartCommand         *snapshot.StartCommand     `json:"start_command,omitempty"`
+	RunnerTTLSeconds     int                        `json:"runner_ttl_seconds"`
+	SessionMaxAgeSeconds int                        `json:"session_max_age_seconds"`
+	AutoPause            bool                       `json:"auto_pause"`
+	CreatedAt            time.Time                  `json:"created_at"`
 }
 
 // SnapshotConfigRegistry manages the snapshot_configs table.
@@ -214,17 +214,17 @@ func (r *SnapshotConfigRegistry) HandleCreateSnapshotConfig(w http.ResponseWrite
 		return
 	}
 	var body struct {
-		DisplayName          string                    `json:"display_name"`
+		DisplayName          string                     `json:"display_name"`
 		Commands             []snapshot.SnapshotCommand `json:"commands"`
-		BuildSchedule        string                    `json:"build_schedule"`
-		MaxConcurrentRunners int                       `json:"max_concurrent_runners"`
-		CISystem             string                    `json:"ci_system"`
-		GitHubAppID          string                    `json:"github_app_id"`
-		GitHubAppSecret      string                    `json:"github_app_secret"`
-		StartCommand         *snapshot.StartCommand    `json:"start_command,omitempty"`
-		RunnerTTLSeconds     int                       `json:"runner_ttl_seconds"`
-		SessionMaxAgeSeconds int                       `json:"session_max_age_seconds"`
-		AutoPause            bool                      `json:"auto_pause"`
+		BuildSchedule        string                     `json:"build_schedule"`
+		MaxConcurrentRunners int                        `json:"max_concurrent_runners"`
+		CISystem             string                     `json:"ci_system"`
+		GitHubAppID          string                     `json:"github_app_id"`
+		GitHubAppSecret      string                     `json:"github_app_secret"`
+		StartCommand         *snapshot.StartCommand     `json:"start_command,omitempty"`
+		RunnerTTLSeconds     int                        `json:"runner_ttl_seconds"`
+		SessionMaxAgeSeconds int                        `json:"session_max_age_seconds"`
+		AutoPause            bool                       `json:"auto_pause"`
 	}
 	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
