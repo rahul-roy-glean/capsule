@@ -151,6 +151,16 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 			"mem_cache_bytes":  memCacheSize,
 		}).Info("Created separate disk and memory chunk stores")
 
+		// Wire session stores into base Manager so PauseRunner/ResumeFromSession
+		// can upload/fetch chunks via the same GCS bucket as CI snapshots.
+		// goldenChunkedMeta is set later by SyncManifest when the first heartbeat arrives.
+		if cfg.SessionChunkBucket != "" {
+			baseManager.SetSessionStores(memChunkStore, chunkStore, nil)
+			baseManager.getDirtyDiskChunks = cm.getDirtyDiskChunksForRunner
+			baseManager.setupFUSEDisk = cm.setupFUSEDiskForRunner
+			cm.chunkedLogger.Info("GCS-backed session pause/resume enabled (stores wired)")
+		}
+
 		// Chunked metadata is loaded on demand via getOrLoadManifest (allocation)
 		// and SyncManifest (heartbeat-driven sync). No startup preload needed.
 	}
@@ -1074,10 +1084,14 @@ func (cm *ChunkedManager) SyncManifest(ctx context.Context, workloadKey, version
 		}
 	}
 
+	// Update the golden metadata on the base Manager so PauseRunner can use it
+	// as the base for session diff merging.
+	if cm.sessionMemStore != nil {
+		cm.SetGoldenChunkedMeta(meta)
+	}
+
 	return nil
 }
-
-// GetChunkStore returns the underlying chunk store.
 func (cm *ChunkedManager) GetChunkStore() *snapshot.ChunkStore {
 	return cm.chunkStore
 }
@@ -1088,4 +1102,54 @@ func (cm *ChunkedManager) GetSubnet() *net.IPNet {
 		return cm.netnsNetwork.GetSubnet()
 	}
 	return cm.network.GetSubnet()
+}
+
+// getDirtyDiskChunksForRunner returns the dirty FUSE disk chunks for a runner,
+// or nil if the runner has no FUSE disk. Used as a callback by Manager.PauseRunner
+// to include disk changes in the session upload.
+func (cm *ChunkedManager) getDirtyDiskChunksForRunner(runnerID string) map[int][]byte {
+	cm.mu.RLock()
+	disk, ok := cm.fuseDisks[runnerID]
+	cm.mu.RUnlock()
+	if !ok || disk == nil {
+		return nil
+	}
+	return disk.GetDirtyChunks()
+}
+
+// setupFUSEDiskForRunner creates and mounts a FUSE-backed disk from chunk refs.
+// Used by Manager.ResumeFromSession for GCS-backed cross-host resume.
+func (cm *ChunkedManager) setupFUSEDiskForRunner(runnerID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (string, error) {
+	fuseMountDir := filepath.Join(cm.config.WorkspaceDir, runnerID, "fuse")
+	if err := os.MkdirAll(fuseMountDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create FUSE mount dir: %w", err)
+	}
+
+	fuseDisk, err := fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
+		ChunkStore: cm.chunkStore,
+		Chunks:     chunks,
+		TotalSize:  totalSize,
+		ChunkSize:  chunkSize,
+		MountPoint: fuseMountDir,
+		Logger:     cm.logger.Logger,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create FUSE disk: %w", err)
+	}
+
+	if err := fuseDisk.Mount(); err != nil {
+		return "", fmt.Errorf("failed to mount FUSE disk: %w", err)
+	}
+
+	cm.mu.Lock()
+	cm.fuseDisks[runnerID] = fuseDisk
+	cm.mu.Unlock()
+
+	cm.chunkedLogger.WithFields(logrus.Fields{
+		"runner_id":  runnerID,
+		"chunks":     len(chunks),
+		"total_size": totalSize,
+	}).Info("FUSE disk mounted for session resume")
+
+	return fuseDisk.DiskImagePath(), nil
 }
