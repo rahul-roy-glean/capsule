@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(go build:*)",
-      "WebFetch(domain:www.buildbuddy.io)",
-      "Bash(wc:*)"
-    ]
-  }
-}

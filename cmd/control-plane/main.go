@@ -24,7 +24,6 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/repo"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
 )
 
@@ -42,7 +41,8 @@ var (
 
 	// Telemetry
 	telemetryEnabled = flag.Bool("telemetry-enabled", true, "Enable GCP Cloud Monitoring telemetry")
-	gcpProject       = flag.String("gcp-project", "", "GCP project for telemetry")
+	gcpProject       = flag.String("gcp-project", "", "GCP project for telemetry and snapshot builder VMs")
+	gcpZone          = flag.String("gcp-zone", "us-central1-a", "GCP zone for snapshot builder VMs")
 	environment      = flag.String("environment", "dev", "Environment name for telemetry labels")
 )
 
@@ -122,6 +122,10 @@ func main() {
 	if v := os.Getenv("GCP_PROJECT_ID"); v != "" {
 		gcpProjectVal = v
 	}
+	gcpZoneVal := *gcpZone
+	if v := os.Getenv("GCP_ZONE"); v != "" {
+		gcpZoneVal = v
+	}
 	envVal := *environment
 	if v := os.Getenv("ENVIRONMENT"); v != "" {
 		envVal = v
@@ -150,9 +154,9 @@ func main() {
 	// Create services
 	hostRegistry := NewHostRegistry(db, logger)
 	scheduler := NewScheduler(hostRegistry, db, logger)
-	snapshotManager := NewSnapshotManager(ctx, db, *gcsBucket, logger)
+	snapshotManager := NewSnapshotManager(ctx, db, *gcsBucket, gcpProjectVal, gcpZoneVal, logger)
 	jobQueue := NewJobQueue(db, scheduler, hostRegistry, logger)
-	repoRegistry := NewRepoRegistry(db, logger)
+	snapshotConfigRegistry := NewSnapshotConfigRegistry(db, snapshotManager, logger)
 
 	// Load existing state from DB (best-effort)
 	if err := hostRegistry.LoadFromDB(ctx); err != nil {
@@ -200,9 +204,9 @@ func main() {
 	httpMux.HandleFunc("/api/v1/hosts", controlPlaneServer.HandleGetHosts)
 	httpMux.HandleFunc("/api/v1/hosts/heartbeat", controlPlaneServer.HandleHostHeartbeat)
 	httpMux.HandleFunc("/api/v1/snapshots", controlPlaneServer.HandleGetSnapshots)
-	// Repo registry endpoints (Phase 1)
-	httpMux.HandleFunc("/api/v1/repos/", repoRegistry.HandleRepos)
-	httpMux.HandleFunc("/api/v1/repos", repoRegistry.HandleRepos)
+	// Snapshot config registry endpoints
+	httpMux.HandleFunc("/api/v1/snapshot-configs/", snapshotConfigRegistry.HandleSnapshotConfigs)
+	httpMux.HandleFunc("/api/v1/snapshot-configs", snapshotConfigRegistry.HandleSnapshotConfigs)
 	// Version/rollout endpoints (Phase 4)
 	httpMux.HandleFunc("/api/v1/versions/desired", controlPlaneServer.HandleGetDesiredVersions)
 	httpMux.HandleFunc("/api/v1/versions/fleet", controlPlaneServer.HandleGetFleetConvergence)
@@ -228,7 +232,7 @@ func main() {
 
 	// Start background workers
 	go hostRegistry.HealthCheckLoop(ctx)
-	go snapshotFreshnessLoop(ctx, snapshotManager, repoRegistry, logger)
+	go snapshotFreshnessLoop(ctx, snapshotManager, snapshotConfigRegistry, logger)
 	go startDownscaler(ctx, db, hostRegistry, logger)
 	go jobQueue.jobRetryLoop(ctx)
 	if metricsClient != nil {
@@ -357,6 +361,29 @@ func initSchema(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_version_assignments_repo ON version_assignments(repo_slug)`,
 		`CREATE INDEX IF NOT EXISTS idx_version_assignments_host ON version_assignments(host_id)`,
+		// chunk_key migration: add snapshot_configs table
+		`CREATE TABLE IF NOT EXISTS snapshot_configs (
+			chunk_key              VARCHAR(16) PRIMARY KEY,
+			display_name           VARCHAR(255),
+			commands               TEXT NOT NULL DEFAULT '[]',
+			build_schedule         VARCHAR(64) DEFAULT '',
+			max_concurrent_runners INT DEFAULT 0,
+			current_version        VARCHAR(255),
+			auto_rollout           BOOLEAN DEFAULT true,
+			created_at             TIMESTAMP DEFAULT NOW()
+		)`,
+		// Add chunk_key column to snapshots (rename from repo_slug)
+		`ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS chunk_key VARCHAR(16) DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_snapshots_chunk_key ON snapshots(chunk_key)`,
+		// GitHub App credentials for snapshot configs
+		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS github_app_id VARCHAR(255) DEFAULT ''`,
+		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS github_app_secret VARCHAR(255) DEFAULT ''`,
+		// Add chunk_key column to version_assignments
+		`ALTER TABLE version_assignments ADD COLUMN IF NOT EXISTS chunk_key VARCHAR(16) NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_version_assignments_chunk ON version_assignments(chunk_key)`,
+		// Add chunk_key column to runners
+		`ALTER TABLE runners ADD COLUMN IF NOT EXISTS chunk_key VARCHAR(16) DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_runners_chunk_key ON runners(chunk_key)`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil {
@@ -500,9 +527,7 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 	}
 
 	var req struct {
-		Repo      string            `json:"repo"`
-		Branch    string            `json:"branch"`
-		Commit    string            `json:"commit"`
+		ChunkKey  string            `json:"chunk_key"`
 		Labels    map[string]string `json:"labels"`
 		RequestID string            `json:"request_id"`
 	}
@@ -511,29 +536,22 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		return
 	}
 
-	if req.Repo == "" {
-		http.Error(w, "repo is required", http.StatusBadRequest)
+	if req.ChunkKey == "" {
+		http.Error(w, "chunk_key is required", http.StatusBadRequest)
 		return
 	}
 	if req.RequestID == "" {
 		req.RequestID = fmt.Sprintf("manual-%d", time.Now().UnixNano())
 	}
 
-	repoSlug := repo.Slug(req.Repo)
-
 	s.logger.WithFields(logrus.Fields{
 		"request_id": req.RequestID,
-		"repo":       req.Repo,
-		"repo_slug":  repoSlug,
-		"branch":     req.Branch,
+		"chunk_key":  req.ChunkKey,
 	}).Info("Manual runner allocation request")
 
 	resp, err := s.scheduler.AllocateRunner(r.Context(), AllocateRunnerRequest{
 		RequestID: req.RequestID,
-		Repo:      req.Repo,
-		Branch:    req.Branch,
-		Commit:    req.Commit,
-		RepoSlug:  repoSlug,
+		ChunkKey:  req.ChunkKey,
 		Labels:    req.Labels,
 	})
 	if err != nil {
@@ -634,15 +652,15 @@ func (s *ControlPlaneServer) HandleGetDesiredVersions(w http.ResponseWriter, r *
 }
 
 // HandleGetFleetConvergence returns the fleet convergence state.
-// GET /api/v1/versions/fleet?repo_slug={slug}
+// GET /api/v1/versions/fleet?chunk_key={key}
 func (s *ControlPlaneServer) HandleGetFleetConvergence(w http.ResponseWriter, r *http.Request) {
-	repoSlug := r.URL.Query().Get("repo_slug")
-	if repoSlug == "" {
-		http.Error(w, "repo_slug is required", http.StatusBadRequest)
+	chunkKey := r.URL.Query().Get("chunk_key")
+	if chunkKey == "" {
+		http.Error(w, "chunk_key is required", http.StatusBadRequest)
 		return
 	}
 
-	statuses, err := s.snapshotManager.GetFleetConvergence(r.Context(), repoSlug)
+	statuses, err := s.snapshotManager.GetFleetConvergence(r.Context(), chunkKey)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -650,7 +668,7 @@ func (s *ControlPlaneServer) HandleGetFleetConvergence(w http.ResponseWriter, r 
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"repo_slug": repoSlug,
+		"chunk_key": chunkKey,
 		"hosts":     statuses,
 		"count":     len(statuses),
 	})
@@ -709,13 +727,22 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 			totalRunners := int64(0)
 			totalIdle := int64(0)
 			totalBusy := int64(0)
+			fleetSlotsTotal := int64(0)
+			fleetSlotsUsed := int64(0)
+			activeHosts := int64(0)
 
 			for _, h := range hosts {
 				statusCounts[h.Status]++
 				totalRunners += int64(h.IdleRunners + h.BusyRunners)
 				totalIdle += int64(h.IdleRunners)
 				totalBusy += int64(h.BusyRunners)
+				if h.Status == "ready" {
+					fleetSlotsTotal += int64(h.TotalSlots)
+					fleetSlotsUsed += int64(h.UsedSlots)
+					activeHosts++
+				}
 			}
+			fleetSlotsFree := fleetSlotsTotal - fleetSlotsUsed
 
 			// Record host counts by status
 			for status, count := range statusCounts {
@@ -734,6 +761,18 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 			mc.RecordInt(ctx, telemetry.MetricCPRunnersTotal, totalBusy, telemetry.Labels{
 				telemetry.LabelStatus: "busy",
 			})
+
+			// Record fleet slot metrics — primary autoscaler signal.
+			mc.RecordInt(ctx, telemetry.MetricCPFleetSlotsTotal, fleetSlotsTotal, nil)
+			mc.RecordInt(ctx, telemetry.MetricCPFleetSlotsUsed, fleetSlotsUsed, nil)
+			mc.RecordInt(ctx, telemetry.MetricCPFleetSlotsFree, fleetSlotsFree, nil)
+			// free_slots_per_host: GCP autoscaler scales out when this drops below target.
+			// Use 0 when there are no active hosts (signals immediate scale-out need).
+			freeSlotsPer := int64(0)
+			if activeHosts > 0 {
+				freeSlotsPer = fleetSlotsFree / activeHosts
+			}
+			mc.RecordInt(ctx, telemetry.MetricCPFleetFreeSlotsPer, freeSlotsPer, nil)
 
 			// Record queue depth
 			mc.RecordInt(ctx, telemetry.MetricCPQueueDepth, int64(sched.GetQueueDepth()), nil)

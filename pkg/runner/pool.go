@@ -481,8 +481,8 @@ func (p *Pool) Remove(runnerID string) bool {
 }
 
 // FlushOlderThan evicts all pooled runners whose snapshot version doesn't
-// match any of the desired versions. desiredVersions maps repo_slug to the
-// target version. Runners whose repo/version combo is not in the map are evicted.
+// match any of the desired versions. desiredVersions maps chunk_key to the
+// target version. Runners whose chunk_key/version combo is not in the map are evicted.
 // If called with a simple version string, it evicts runners not matching that version.
 func (p *Pool) FlushOlderThan(ctx context.Context, version string) int {
 	p.mu.Lock()
@@ -531,7 +531,7 @@ func (p *Pool) FlushOlderThan(ctx context.Context, version string) int {
 }
 
 // FlushByDesiredVersions evicts pooled runners whose snapshot version doesn't
-// match the desired version for their repo. desiredVersions maps repo_slug → version.
+// match the desired version for their chunk key. desiredVersions maps chunk_key → version.
 func (p *Pool) FlushByDesiredVersions(ctx context.Context, desiredVersions map[string]string) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()

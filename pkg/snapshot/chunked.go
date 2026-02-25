@@ -53,7 +53,8 @@ type ChunkedSnapshotMetadata struct {
 	BazelVersion  string     `json:"bazel_version,omitempty"`
 	RepoCommit    string     `json:"repo_commit,omitempty"`
 	Repo          string     `json:"repo,omitempty"`
-	RepoSlug      string     `json:"repo_slug,omitempty"`
+	ChunkKey      string     `json:"chunk_key,omitempty"`
+	Commands      []SnapshotCommand `json:"commands,omitempty"`
 	CreatedAt     time.Time  `json:"created_at"`
 	ChunkSize     int64      `json:"chunk_size"`
 	KernelHash    string     `json:"kernel_hash"`
@@ -857,6 +858,35 @@ func (b *ChunkedSnapshotBuilder) UploadChunkedMetadata(ctx context.Context, meta
 
 	b.logger.WithField("version", meta.Version).Info("Uploaded chunked metadata")
 	return nil
+}
+
+// ReadCurrentVersion reads the current-pointer.json for a chunk key and returns
+// the version string it points to.
+func (cs *ChunkStore) ReadCurrentVersion(ctx context.Context, chunkKey string) (string, error) {
+	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
+	objPath := chunkKey + "/current-pointer.json"
+
+	reader, err := bucket.Object(objPath).NewReader(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to open current pointer: %w", err)
+	}
+	defer reader.Close()
+
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return "", fmt.Errorf("failed to read current pointer: %w", err)
+	}
+
+	var pointer struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(data, &pointer); err != nil {
+		return "", fmt.Errorf("failed to parse current pointer: %w", err)
+	}
+	if pointer.Version == "" {
+		return "", fmt.Errorf("current pointer has empty version")
+	}
+	return pointer.Version, nil
 }
 
 // LoadChunkedMetadata loads chunked snapshot metadata from GCS
