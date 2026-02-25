@@ -34,6 +34,12 @@ service HostAgent {
 
   // UnquarantineRunner removes isolation and optionally resumes a paused runner
   rpc UnquarantineRunner(UnquarantineRunnerRequest) returns (UnquarantineRunnerResponse);
+
+  // PauseRunner snapshots a runner's session and suspends the VM
+  rpc PauseRunner(PauseRunnerRequest) returns (PauseRunnerResponse);
+
+  // ResumeRunner restores a runner from a session snapshot
+  rpc ResumeRunner(ResumeRunnerRequest) returns (ResumeRunnerResponse);
 }
 
 // ControlPlane service runs in GKE
@@ -69,7 +75,9 @@ enum RunnerState {
   RUNNER_STATE_QUARANTINED = 7;
   RUNNER_STATE_RETIRING = 8;
   RUNNER_STATE_TERMINATED = 9;
-  RUNNER_STATE_PAUSED = 10;  // VM paused and pooled for reuse
+  RUNNER_STATE_PAUSED = 10;      // VM paused and pooled for reuse
+  RUNNER_STATE_PAUSING = 11;     // snapshot in progress
+  RUNNER_STATE_SUSPENDED = 12;   // VM destroyed, session snapshot exists
 }
 
 // Host states
@@ -157,12 +165,15 @@ message AllocateRunnerRequest {
   string ci_runner_token = 8;     // Generic CI runner registration token
   string ci_system = 9;           // CI system identifier (e.g., "github-actions", "none")
   string chunk_key = 10;          // Hash of snapshot commands; identifies which snapshot to boot
+  string session_id = 11;         // optional: bind to session for pause/resume
 }
 
 // AllocateRunnerResponse
 message AllocateRunnerResponse {
   Runner runner = 1;
   string error = 2;
+  bool resumed = 3;          // true if restored from session snapshot
+  string session_id = 4;     // session_id (echoed back or generated)
 }
 
 // ReleaseRunnerRequest
@@ -290,4 +301,25 @@ message TriggerSnapshotBuildResponse {
   string status = 2;
 }
 
+message PauseRunnerRequest {
+  string runner_id = 1;
+}
 
+message PauseRunnerResponse {
+  bool success = 1;
+  string error = 2;
+  string session_id = 3;
+  int64 snapshot_size_bytes = 4;
+  int32 layer = 5;
+}
+
+message ResumeRunnerRequest {
+  string session_id = 1;
+  string chunk_key = 2;
+}
+
+message ResumeRunnerResponse {
+  Runner runner = 1;
+  string error = 2;
+  bool resumed_from_session = 3;
+}

@@ -19,6 +19,8 @@ const (
 	StateRetiring     State = "retiring"
 	StateTerminated   State = "terminated"
 	StatePaused       State = "paused" // VM paused and eligible for pool reuse
+	StatePausing      State = "pausing"
+	StateSuspended    State = "suspended"
 )
 
 // Runner represents a single Bazel runner instance
@@ -58,6 +60,15 @@ type Runner struct {
 	TaskCount        int        `json:"task_count"`
 	MemoryUsageBytes int64      `json:"memory_usage_bytes,omitempty"`
 	DiskUsageBytes   int64      `json:"disk_usage_bytes,omitempty"`
+
+	// Session pause/resume fields
+	SessionID     string    `json:"session_id,omitempty"`
+	TTLSeconds    int       `json:"ttl_seconds,omitempty"`
+	AutoPause     bool      `json:"auto_pause,omitempty"`
+	LastExecAt    time.Time `json:"last_exec_at,omitempty"`
+	ActiveExecs   int32     `json:"active_execs,omitempty"`
+	SessionDir    string    `json:"session_dir,omitempty"`
+	SessionLayers int       `json:"session_layers,omitempty"`
 }
 
 // Resources represents the resources allocated to a runner
@@ -78,6 +89,9 @@ type AllocateRequest struct {
 	Labels            map[string]string
 	GitHubRunnerToken string
 	CISystem          string // CI system identifier
+	SessionID         string // optional: bind to session for pause/resume
+	TTLSeconds        int    // idle timeout from snapshot config
+	AutoPause         bool   // pause on TTL vs destroy
 }
 
 // MMDSData represents data to inject into the microVM via MMDS
@@ -195,6 +209,9 @@ type HostConfig struct {
 	// QuarantineDir is where the host will write quarantine manifests and keep
 	// per-runner debug metadata when a runner is quarantined.
 	QuarantineDir     string
+	// SessionDir is the base directory for session snapshot storage (pause/resume).
+	// Defaults to {SnapshotCachePath}/../sessions (e.g. /mnt/data/sessions).
+	SessionDir        string
 	MicroVMSubnet     string
 	ExternalInterface string
 	BridgeName        string
