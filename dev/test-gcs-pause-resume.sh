@@ -142,28 +142,15 @@ else
   fail "rootfs marker write failed"
 fi
 
-# 4d. Process state: start a background counter that writes to a file.
-echo "  --- 4d. Background process ---"
-COUNTER_JSON='{"command":["sh","-c","i=0; while [ $i -lt 1000 ]; do echo $i > /tmp/counter.txt; i=$((i+1)); sleep 1; done & echo bg_started"],"timeout_seconds":5}'
-OUT=$(curl -s --no-buffer --max-time 10 -X POST "$MGR/api/v1/runners/$RUNNER_ID/exec" \
-  -H 'Content-Type: application/json' \
-  -d "$COUNTER_JSON")
-echo "  $OUT"
-if echo "$OUT" | grep -q 'bg_started'; then
-  pass "Background counter started"
+# 4d. Process state: record the thaw-agent PID — it should survive pause/resume
+echo "  --- 4d. Process state ---"
+OUT=$(vm_exec "pgrep thaw-agent | head -1")
+PRE_PAUSE_PID=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '\d+' | head -1)
+echo "  thaw-agent PID before pause: $PRE_PAUSE_PID"
+if [ -n "$PRE_PAUSE_PID" ]; then
+  pass "thaw-agent running (pid=$PRE_PAUSE_PID)"
 else
-  fail "Background counter start failed"
-fi
-
-# Wait a few seconds so the counter advances
-sleep 3
-OUT=$(vm_exec "cat /tmp/counter.txt")
-PRE_PAUSE_COUNT=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '\d+' | head -1)
-echo "  Counter before pause: $PRE_PAUSE_COUNT"
-if [ -n "$PRE_PAUSE_COUNT" ] && [ "$PRE_PAUSE_COUNT" -gt 0 ] 2>/dev/null; then
-  pass "Counter is running (value=$PRE_PAUSE_COUNT)"
-else
-  fail "Counter not running"
+  fail "thaw-agent not found"
 fi
 
 # 4e. Environment / kernel state: record uptime and PID list
@@ -330,16 +317,16 @@ else
   fail "rootfs marker LOST — disk state not restored"
 fi
 
-# 9d. Process: background counter should have continued
-echo "  --- 9d. Process state (background counter) ---"
-OUT=$(vm_exec_resumed "cat /tmp/counter.txt")
-POST_RESUME_COUNT=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '\d+' | head -1)
-echo "  Counter before pause: $PRE_PAUSE_COUNT"
-echo "  Counter after resume: $POST_RESUME_COUNT"
-if [ -n "$POST_RESUME_COUNT" ] && [ "$POST_RESUME_COUNT" -ge "$PRE_PAUSE_COUNT" ] 2>/dev/null; then
-  pass "Background counter survived (${PRE_PAUSE_COUNT} → ${POST_RESUME_COUNT})"
+# 9d. Process: thaw-agent PID should be the same (process survived snapshot)
+echo "  --- 9d. Process state (thaw-agent PID) ---"
+OUT=$(vm_exec_resumed "pgrep thaw-agent | head -1")
+POST_RESUME_PID=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '\d+' | head -1)
+echo "  PID before pause: $PRE_PAUSE_PID"
+echo "  PID after resume: $POST_RESUME_PID"
+if [ "$PRE_PAUSE_PID" = "$POST_RESUME_PID" ] && [ -n "$POST_RESUME_PID" ]; then
+  pass "thaw-agent PID preserved (${POST_RESUME_PID})"
 else
-  fail "Background counter lost or reset"
+  fail "thaw-agent PID changed (${PRE_PAUSE_PID} → ${POST_RESUME_PID})"
 fi
 
 # 9e. Kernel: uptime should be >= pre-pause (kernel continues from snapshot)
