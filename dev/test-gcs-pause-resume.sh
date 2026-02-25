@@ -132,9 +132,9 @@ else
   fail "2MB tmpfs file write failed"
 fi
 
-# 4c. Disk state: write to persistent filesystem (/home lives on rootfs)
+# 4c. Disk state: write to persistent filesystem (use /var/tmp which is on rootfs and world-writable)
 echo "  --- 4c. Disk state (rootfs) ---"
-OUT=$(vm_exec "echo gcs-disk-marker-67890 > /home/gcs-disk-test.txt && cat /home/gcs-disk-test.txt")
+OUT=$(vm_exec "echo gcs-disk-marker-67890 > /var/tmp/gcs-disk-test.txt && cat /var/tmp/gcs-disk-test.txt")
 echo "  $OUT"
 if echo "$OUT" | grep -q 'gcs-disk-marker-67890'; then
   pass "rootfs marker written"
@@ -142,9 +142,12 @@ else
   fail "rootfs marker write failed"
 fi
 
-# 4d. Process state: start a background counter that writes to a file
+# 4d. Process state: start a background counter that writes to a file.
 echo "  --- 4d. Background process ---"
-OUT=$(vm_exec "nohup sh -c 'i=0; while true; do echo \\\$i > /tmp/counter.txt; i=\\\$((i+1)); sleep 1; done' >/dev/null 2>&1 & echo bg_started")
+COUNTER_JSON='{"command":["sh","-c","i=0; while [ $i -lt 1000 ]; do echo $i > /tmp/counter.txt; i=$((i+1)); sleep 1; done & echo bg_started"],"timeout_seconds":5}'
+OUT=$(curl -s --no-buffer --max-time 10 -X POST "$MGR/api/v1/runners/$RUNNER_ID/exec" \
+  -H 'Content-Type: application/json' \
+  -d "$COUNTER_JSON")
 echo "  $OUT"
 if echo "$OUT" | grep -q 'bg_started'; then
   pass "Background counter started"
@@ -165,8 +168,8 @@ fi
 
 # 4e. Environment / kernel state: record uptime and PID list
 echo "  --- 4e. Kernel state ---"
-OUT=$(vm_exec "cat /proc/uptime | awk '{print \\\$1}'")
-PRE_PAUSE_UPTIME=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[0-9.]+' | head -1)
+OUT=$(vm_exec "head -c 20 /proc/uptime")
+PRE_PAUSE_UPTIME=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[0-9]+\.[0-9]+' | head -1)
 echo "  Uptime before pause: ${PRE_PAUSE_UPTIME}s"
 
 # ---------------------------------------------------------------------------
@@ -319,7 +322,7 @@ fi
 
 # 9c. Disk: rootfs marker
 echo "  --- 9c. Disk state (rootfs marker) ---"
-OUT=$(vm_exec_resumed "cat /home/gcs-disk-test.txt")
+OUT=$(vm_exec_resumed "cat /var/tmp/gcs-disk-test.txt")
 echo "  $OUT"
 if echo "$OUT" | grep -q 'gcs-disk-marker-67890'; then
   pass "rootfs marker preserved"
@@ -341,8 +344,8 @@ fi
 
 # 9e. Kernel: uptime should be >= pre-pause (kernel continues from snapshot)
 echo "  --- 9e. Kernel state (uptime) ---"
-OUT=$(vm_exec_resumed "cat /proc/uptime | awk '{print \\\$1}'")
-POST_RESUME_UPTIME=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[0-9.]+' | head -1)
+OUT=$(vm_exec_resumed "head -c 20 /proc/uptime")
+POST_RESUME_UPTIME=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[0-9]+\.[0-9]+' | head -1)
 echo "  Uptime before pause: ${PRE_PAUSE_UPTIME}s"
 echo "  Uptime after resume: ${POST_RESUME_UPTIME}s"
 # Uptime comparison: kernel's monotonic clock continues from the snapshot point
