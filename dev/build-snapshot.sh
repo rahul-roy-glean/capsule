@@ -1,12 +1,17 @@
 #!/bin/bash
 # Build a full Firecracker snapshot (kernel + rootfs + snapshot.mem + snapshot.state)
-# for local dev testing. Runs the snapshot-builder locally, captures the output files
-# before the GCS upload step (which will fail without credentials), and copies them
-# to /tmp/fc-dev/snapshots/ where the manager expects them.
+# for local dev testing. Runs the snapshot-builder, then copies local files to
+# /tmp/fc-dev/snapshots/ where the manager expects them.
 #
 # Once a snapshot exists, the manager uses snapshot restore (fast) instead of cold boot.
 #
 # Usage: make dev-snapshot
+#
+# Environment variables:
+#   GCS_BUCKET         - GCS bucket for chunked snapshot upload (default: none, local-only)
+#   GCS_PREFIX         - GCS path prefix (default: v1)
+#   ENABLE_CHUNKED     - Upload chunked snapshot to GCS (default: false; true requires GCS_BUCKET)
+#   SNAPSHOT_COMMANDS  - JSON array of warmup commands (default: echo dev-snapshot-ready)
 #
 # Prerequisites:
 #   - make dev-build   (builds all binaries + rootfs.img + kernel.bin)
@@ -20,7 +25,7 @@ LOG_DIR="/tmp/fc-dev/logs"
 cd "$REPO_ROOT"
 export PATH="/usr/local/go/bin:$PATH"
 
-echo "=== Building Firecracker Snapshot (local) ==="
+echo "=== Building Firecracker Snapshot ==="
 
 # --- Prerequisites ---
 if [ ! -f "$REPO_ROOT/bin/snapshot-builder" ]; then
@@ -48,21 +53,26 @@ rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
 
 # Snapshot commands: for dev, a minimal warmup. Override with SNAPSHOT_COMMANDS env var.
-# The thaw-agent runs these commands during warmup before the snapshot is taken.
 SNAPSHOT_COMMANDS=${SNAPSHOT_COMMANDS:-'[{"type":"shell","args":["echo","dev-snapshot-ready"]}]'}
 
+# GCS config: when GCS_BUCKET is set, enable chunked upload so the golden snapshot
+# is available in GCS for cross-host session resume testing.
+GCS_BUCKET=${GCS_BUCKET:-local-dev-unused}
+GCS_PREFIX=${GCS_PREFIX:-v1}
+ENABLE_CHUNKED=${ENABLE_CHUNKED:-false}
+
 echo "Snapshot commands: $SNAPSHOT_COMMANDS"
+echo "GCS bucket: $GCS_BUCKET"
+echo "Enable chunked: $ENABLE_CHUNKED"
 echo "Output dir: $OUTPUT_DIR"
 echo ""
 
 # Run snapshot-builder (needs root for networking + TAP devices).
-# The builder creates all files locally, then tries to upload to GCS.
-# The GCS upload will fail (no credentials), but the local files are what we need.
-# We intentionally allow this command to fail (|| true) and check for files after.
 echo "--- Running snapshot-builder ---"
 set +e
 sudo "$REPO_ROOT/bin/snapshot-builder" \
-  --gcs-bucket=local-dev-unused \
+  --gcs-bucket="$GCS_BUCKET" \
+  --gcs-prefix="$GCS_PREFIX" \
   --output-dir="$OUTPUT_DIR" \
   --kernel-path="$SNAPSHOT_DIR/kernel.bin" \
   --rootfs-path="$SNAPSHOT_DIR/rootfs.img" \
@@ -72,7 +82,7 @@ sudo "$REPO_ROOT/bin/snapshot-builder" \
   --warmup-timeout=5m \
   --repo-cache-seed-size-gb=1 \
   --repo-cache-upper-size-gb=1 \
-  --enable-chunked=false \
+  --enable-chunked="$ENABLE_CHUNKED" \
   --snapshot-commands="$SNAPSHOT_COMMANDS" \
   --log-level=info \
   2>&1 | tee "$LOG_DIR/snapshot-builder.log"
