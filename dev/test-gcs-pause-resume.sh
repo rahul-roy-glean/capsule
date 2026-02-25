@@ -35,11 +35,14 @@ echo "Session ID: $SESSION_ID"
 # ---------------------------------------------------------------------------
 header "1. Register snapshot config"
 # ---------------------------------------------------------------------------
+# IMPORTANT: commands must match what was used in `build-snapshot.sh` so the
+# workload_key hash matches the golden chunked snapshot in GCS.
+SNAPSHOT_COMMANDS=${SNAPSHOT_COMMANDS:-'[{"type":"shell","args":["echo","dev-snapshot-ready"]}]'}
 CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/snapshot-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "gcs-pause-resume-test",
-    "commands": [{"type":"shell","command":"echo pause-test"}],
+    "commands": '"$SNAPSHOT_COMMANDS"',
     "runner_ttl_seconds": 300,
     "auto_pause": true,
     "session_max_age_seconds": 3600
