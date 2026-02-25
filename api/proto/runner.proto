@@ -153,6 +153,13 @@ message Snapshot {
   google.protobuf.Timestamp created_at = 7;
 }
 
+// StartCommand describes a user service to run inside the microVM after snapshot restore.
+message StartCommand {
+  repeated string command = 1;
+  int32 port = 2;
+  string health_path = 3;
+}
+
 // AllocateRunnerRequest
 message AllocateRunnerRequest {
   string request_id = 1;
@@ -165,7 +172,8 @@ message AllocateRunnerRequest {
   string ci_runner_token = 8;     // Generic CI runner registration token
   string ci_system = 9;           // CI system identifier (e.g., "github-actions", "none")
   string chunk_key = 10;          // Hash of snapshot commands; identifies which snapshot to boot
-  string session_id = 11;         // optional: bind to session for pause/resume
+  StartCommand start_command = 11; // Optional: user service to start inside the VM
+  string session_id = 12;         // optional: bind to session for pause/resume
 }
 
 // AllocateRunnerResponse

@@ -459,12 +459,6 @@ func main() {
 		}
 	}
 
-	// Update current pointer (chunk-key-scoped)
-	log.Info("Updating current pointer...")
-	if err := uploader.UpdateCurrentPointerForRepo(ctx, version, chunkKey); err != nil {
-		log.WithError(err).Fatal("Failed to update current pointer")
-	}
-
 	// Build and upload chunked snapshot for lazy loading
 	if *enableChunked {
 		log.Info("Building chunked snapshot for lazy loading...")
@@ -606,6 +600,13 @@ func main() {
 		}
 	}
 
+	// Update current pointer (chunk-key-scoped) — done last so the pointer
+	// only moves after all snapshot data has been fully uploaded.
+	log.Info("Updating current pointer...")
+	if err := uploader.UpdateCurrentPointerForRepo(ctx, version, chunkKey); err != nil {
+		log.WithError(err).Fatal("Failed to update current pointer")
+	}
+
 	log.WithFields(logrus.Fields{
 		"version":    version,
 		"size_bytes": totalSize,
@@ -648,9 +649,9 @@ func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, log 
 
 	log.WithField("guest_ip", guestIP).Info("Waiting for warmup to complete...")
 
-	healthURL := fmt.Sprintf("http://%s:8080/health", guestIP)
-	warmupURL := fmt.Sprintf("http://%s:8080/warmup-status", guestIP)
-	logsURL := fmt.Sprintf("http://%s:8080/warmup-logs", guestIP)
+	healthURL := fmt.Sprintf("http://%s:%d/health", guestIP, snapshot.ThawAgentHealthPort)
+	warmupURL := fmt.Sprintf("http://%s:%d/warmup-status", guestIP, snapshot.ThawAgentHealthPort)
+	logsURL := fmt.Sprintf("http://%s:%d/warmup-logs", guestIP, snapshot.ThawAgentHealthPort)
 
 	client := &http.Client{
 		Timeout: 5 * time.Second,

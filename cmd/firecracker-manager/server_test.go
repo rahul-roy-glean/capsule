@@ -23,8 +23,8 @@ func TestRunnerToProto_AllStates(t *testing.T) {
 		{runner.StateRetiring, "RUNNER_STATE_RETIRING"},
 		{runner.StateTerminated, "RUNNER_STATE_TERMINATED"},
 		{runner.StatePaused, "RUNNER_STATE_PAUSED"},
-		{runner.StatePausing, "11"},    // Manually added enum; descriptor returns numeric string
-		{runner.StateSuspended, "12"},  // Manually added enum; descriptor returns numeric string
+		{runner.StatePausing, "RUNNER_STATE_PAUSING"},
+		{runner.StateSuspended, "RUNNER_STATE_SUSPENDED"},
 		{runner.State("unknown"), "RUNNER_STATE_UNSPECIFIED"},
 	}
 
@@ -156,7 +156,7 @@ func TestRunnerToProto_NilIP(t *testing.T) {
 	if proto.InternalIp != "" {
 		t.Errorf("InternalIp should be empty for nil IP, got %q", proto.InternalIp)
 	}
-	if proto.State.String() != "12" { // Manually added enum value
-		t.Errorf("State = %q, want 12 (SUSPENDED)", proto.State.String())
+	if proto.State.String() != "RUNNER_STATE_SUSPENDED" {
+		t.Errorf("State = %q, want RUNNER_STATE_SUSPENDED", proto.State.String())
 	}
 }

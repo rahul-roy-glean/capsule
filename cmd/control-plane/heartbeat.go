@@ -7,31 +7,31 @@ import (
 )
 
 type hostHeartbeatRequest struct {
-	InstanceName    string            `json:"instance_name"`
-	Zone            string            `json:"zone"`
-	GRPCAddress     string            `json:"grpc_address"`
-	HTTPAddress     string            `json:"http_address"`
-	TotalSlots      int               `json:"total_slots"`
-	UsedSlots       int               `json:"used_slots"`
-	IdleRunners     int               `json:"idle_runners"`
-	BusyRunners     int               `json:"busy_runners"`
-	SnapshotVersion string            `json:"snapshot_version"`
-	Draining        bool              `json:"draining"`
+	InstanceName    string `json:"instance_name"`
+	Zone            string `json:"zone"`
+	GRPCAddress     string `json:"grpc_address"`
+	HTTPAddress     string `json:"http_address"`
+	TotalSlots      int    `json:"total_slots"`
+	UsedSlots       int    `json:"used_slots"`
+	IdleRunners     int    `json:"idle_runners"`
+	BusyRunners     int    `json:"busy_runners"`
+	SnapshotVersion string `json:"snapshot_version"`
+	Draining        bool   `json:"draining"`
 	// LoadedManifests reports which chunk manifests are already loaded on this host
 	// (chunk_key → version). Used by the control plane for cache-affinity scheduling.
 	LoadedManifests map[string]string `json:"loaded_manifests,omitempty"`
 }
 
 type hostHeartbeatResponse struct {
-	Acknowledged       bool              `json:"acknowledged"`
-	ShouldDrain        bool              `json:"should_drain"`
-	ShouldSyncSnapshot bool              `json:"should_sync_snapshot,omitempty"`
-	SnapshotVersion    string            `json:"snapshot_version,omitempty"`
+	Acknowledged       bool   `json:"acknowledged"`
+	ShouldDrain        bool   `json:"should_drain"`
+	ShouldSyncSnapshot bool   `json:"should_sync_snapshot,omitempty"`
+	SnapshotVersion    string `json:"snapshot_version,omitempty"`
 	// SyncVersions tells the host which repo manifests (and snapshot.mem files) to
 	// pre-download. Only repos whose desired version differs from what the host has
 	// loaded are included, so a host only downloads what it's missing.
-	SyncVersions       map[string]string `json:"sync_versions,omitempty"`
-	Error              string            `json:"error,omitempty"`
+	SyncVersions map[string]string `json:"sync_versions,omitempty"`
+	Error        string            `json:"error,omitempty"`
 }
 
 func (s *ControlPlaneServer) HandleHostHeartbeat(w http.ResponseWriter, r *http.Request) {

@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.1
 // - protoc             v5.29.3
-// source: api/proto/runner.proto
+// source: runner.proto
 
 package runner
 
@@ -56,9 +56,9 @@ type HostAgentClient interface {
 	QuarantineRunner(ctx context.Context, in *QuarantineRunnerRequest, opts ...grpc.CallOption) (*QuarantineRunnerResponse, error)
 	// UnquarantineRunner removes isolation and optionally resumes a paused runner
 	UnquarantineRunner(ctx context.Context, in *UnquarantineRunnerRequest, opts ...grpc.CallOption) (*UnquarantineRunnerResponse, error)
-	// PauseRunner pauses a runner and creates a session snapshot
+	// PauseRunner snapshots a runner's session and suspends the VM
 	PauseRunner(ctx context.Context, in *PauseRunnerRequest, opts ...grpc.CallOption) (*PauseRunnerResponse, error)
-	// ResumeRunner resumes a runner from a session snapshot
+	// ResumeRunner restores a runner from a session snapshot
 	ResumeRunner(ctx context.Context, in *ResumeRunnerRequest, opts ...grpc.CallOption) (*ResumeRunnerResponse, error)
 }
 
@@ -204,9 +204,9 @@ type HostAgentServer interface {
 	QuarantineRunner(context.Context, *QuarantineRunnerRequest) (*QuarantineRunnerResponse, error)
 	// UnquarantineRunner removes isolation and optionally resumes a paused runner
 	UnquarantineRunner(context.Context, *UnquarantineRunnerRequest) (*UnquarantineRunnerResponse, error)
-	// PauseRunner pauses a runner and creates a session snapshot
+	// PauseRunner snapshots a runner's session and suspends the VM
 	PauseRunner(context.Context, *PauseRunnerRequest) (*PauseRunnerResponse, error)
-	// ResumeRunner resumes a runner from a session snapshot
+	// ResumeRunner restores a runner from a session snapshot
 	ResumeRunner(context.Context, *ResumeRunnerRequest) (*ResumeRunnerResponse, error)
 	mustEmbedUnimplementedHostAgentServer()
 }
@@ -434,6 +434,42 @@ func _HostAgent_UnquarantineRunner_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _HostAgent_PauseRunner_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PauseRunnerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HostAgentServer).PauseRunner(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HostAgent_PauseRunner_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HostAgentServer).PauseRunner(ctx, req.(*PauseRunnerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HostAgent_ResumeRunner_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResumeRunnerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HostAgentServer).ResumeRunner(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HostAgent_ResumeRunner_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HostAgentServer).ResumeRunner(ctx, req.(*ResumeRunnerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // HostAgent_ServiceDesc is the grpc.ServiceDesc for HostAgent service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -477,9 +513,17 @@ var HostAgent_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "UnquarantineRunner",
 			Handler:    _HostAgent_UnquarantineRunner_Handler,
 		},
+		{
+			MethodName: "PauseRunner",
+			Handler:    _HostAgent_PauseRunner_Handler,
+		},
+		{
+			MethodName: "ResumeRunner",
+			Handler:    _HostAgent_ResumeRunner_Handler,
+		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "api/proto/runner.proto",
+	Metadata: "runner.proto",
 }
 
 const (
@@ -787,5 +831,5 @@ var ControlPlane_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "api/proto/runner.proto",
+	Metadata: "runner.proto",
 }

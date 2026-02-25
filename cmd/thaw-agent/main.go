@@ -111,7 +111,7 @@ var globalWarmupLogs = &WarmupLogBuffer{}
 // globalLogBuffer captures all logrus log entries for the /logs HTTP endpoint.
 // This allows debugging thaw-agent behavior from the host via:
 //
-//	curl http://<vm-ip>:8081/logs
+//	curl http://<vm-ip>:10501/logs
 var globalLogBuffer = &WarmupLogBuffer{}
 
 // logCaptureHook is a logrus hook that captures log entries into globalLogBuffer.
@@ -217,6 +217,11 @@ type MMDSData struct {
 		Warmup struct {
 			Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
 		} `json:"warmup,omitempty"`
+		StartCommand struct {
+			Command    []string `json:"command,omitempty"`
+			Port       int      `json:"port,omitempty"`
+			HealthPath string   `json:"health_path,omitempty"`
+		} `json:"start_command,omitempty"`
 	} `json:"latest"`
 }
 
@@ -226,7 +231,7 @@ var bootTimer *telemetry.Timer
 
 func main() {
 	// Top-level panic recovery: keep the process alive so the health server
-	// (:8081) remains accessible for debugging even if initialization panics.
+	// (:10501) remains accessible for debugging even if initialization panics.
 	defer func() {
 		if r := recover(); r != nil {
 			if log != nil {
@@ -289,7 +294,8 @@ func main() {
 			}
 		})
 		http.HandleFunc("/exec", execHandler)
-		if err := http.ListenAndServe(":8081", nil); err != nil {
+		http.HandleFunc("/service-logs", serviceLogsHandler)
+		if err := http.ListenAndServe(":10501", nil); err != nil {
 			log.WithError(err).Debug("Early health server failed")
 		}
 	}()
@@ -610,8 +616,14 @@ func main() {
 
 		// Fall through to normal runner mode
 	} else if mmdsData.Latest.Meta.Mode == "exec" {
-		// Exec mode: skip CI runner registration, idle waiting for /exec calls
+		// Exec mode: run start_command if configured, then idle
 		go startHealthServer(mmdsData)
+		// Run start_command before signaling ready
+		if len(mmdsData.Latest.StartCommand.Command) > 0 {
+			if err := runStartCommand(mmdsData); err != nil {
+				log.WithError(err).Error("Failed to start user service")
+			}
+		}
 		if err := signalReady(); err != nil {
 			log.WithError(err).Error("Failed to signal ready")
 		}
@@ -622,7 +634,7 @@ func main() {
 		if metrics != nil {
 			metrics.LogBootComplete(bootTimer)
 		}
-		select {} // block forever, serve /exec requests
+		select {} // block forever, serve /exec requests and user service
 	}
 
 	// Normal runner mode
@@ -630,6 +642,15 @@ func main() {
 	// Start health server in background FIRST so we can always monitor the VM
 	go startHealthServer(mmdsData)
 	log.Info("Health server started in background")
+
+	// Run start_command if configured (before CI registration)
+	if len(mmdsData.Latest.StartCommand.Command) > 0 {
+		setStep("start_command")
+		if err := runStartCommand(mmdsData); err != nil {
+			log.WithError(err).Error("Failed to start user service")
+		}
+		bootTimer.Phase("start_command")
+	}
 
 	// Run CI runner registration
 	setStep("ci_registration")
@@ -1030,6 +1051,11 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 				Warmup struct {
 					Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
 				} `json:"warmup,omitempty"`
+				StartCommand struct {
+					Command    []string `json:"command,omitempty"`
+					Port       int      `json:"port,omitempty"`
+					HealthPath string   `json:"health_path,omitempty"`
+				} `json:"start_command,omitempty"`
 			}
 			if err := json.Unmarshal(body, &inner); err != nil {
 				return nil, fmt.Errorf("failed to parse MMDS data: %w", err)
@@ -2517,6 +2543,125 @@ func writeNDJSON(w http.ResponseWriter, flusher http.Flusher, data map[string]in
 	flusher.Flush()
 }
 
+const serviceLogPath = "/var/log/start-command.log"
+
+// runStartCommand starts the user's service process in the background and polls
+// its health endpoint until it returns 200 or the timeout expires.
+func runStartCommand(mmdsData *MMDSData) error {
+	sc := mmdsData.Latest.StartCommand
+	if len(sc.Command) == 0 {
+		return nil
+	}
+
+	log.WithFields(logrus.Fields{
+		"command":     sc.Command,
+		"port":        sc.Port,
+		"health_path": sc.HealthPath,
+	}).Info("Starting user service via start_command")
+
+	cmd := exec.Command(sc.Command[0], sc.Command[1:]...)
+	cmd.Dir = *workspaceDir
+
+	// Open log file for stdout+stderr
+	logFile, err := os.OpenFile(serviceLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open service log file: %w", err)
+	}
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
+	if err := cmd.Start(); err != nil {
+		logFile.Close()
+		return fmt.Errorf("failed to start service: %w", err)
+	}
+
+	log.WithField("pid", cmd.Process.Pid).Info("Service process started")
+
+	// Monitor for early exit in background
+	go func() {
+		err := cmd.Wait()
+		logFile.Close()
+		if err != nil {
+			log.WithError(err).Error("Service process exited with error")
+		} else {
+			log.Info("Service process exited cleanly")
+		}
+	}()
+
+	// Poll health endpoint if configured
+	if sc.Port > 0 && sc.HealthPath != "" {
+		healthURL := fmt.Sprintf("http://localhost:%d%s", sc.Port, sc.HealthPath)
+		client := &http.Client{Timeout: 2 * time.Second}
+
+		deadline := time.Now().Add(2 * time.Minute)
+		for time.Now().Before(deadline) {
+			resp, err := client.Get(healthURL)
+			if err == nil {
+				resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					log.WithField("health_url", healthURL).Info("Service health check passed")
+					return nil
+				}
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		return fmt.Errorf("service health check timed out after 2 minutes: %s", healthURL)
+	}
+
+	return nil
+}
+
+// serviceLogsHandler serves the service log file on the debug port.
+// GET /service-logs — returns full log content
+// GET /service-logs?follow=true — streams new lines as they appear (chunked transfer encoding)
+func serviceLogsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("follow") == "true" {
+		// Streaming mode
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming not supported", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Transfer-Encoding", "chunked")
+		w.WriteHeader(http.StatusOK)
+
+		f, err := os.Open(serviceLogPath)
+		if err != nil {
+			fmt.Fprintf(w, "no service logs yet: %v\n", err)
+			flusher.Flush()
+			return
+		}
+		defer f.Close()
+
+		// Seek to end and stream new lines
+		f.Seek(0, io.SeekEnd)
+		scanner := bufio.NewScanner(f)
+		for {
+			for scanner.Scan() {
+				fmt.Fprintln(w, scanner.Text())
+				flusher.Flush()
+			}
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+				// Continue polling for new lines
+			}
+		}
+	}
+
+	// Non-streaming: return full file
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	data, err := os.ReadFile(serviceLogPath)
+	if err != nil {
+		http.Error(w, "no service logs available", http.StatusNotFound)
+		return
+	}
+	w.Write(data)
+}
+
 // startHealthServer starts a simple HTTP server for health checks and testing
 func startHealthServer(mmdsData *MMDSData) {
 	defer func() {
@@ -2525,9 +2670,9 @@ func startHealthServer(mmdsData *MMDSData) {
 		}
 	}()
 
-	log.Info("Creating health server on :8080...")
+	log.Info("Creating health server on :10500...")
 
-	// Use a separate ServeMux to avoid conflicts with the default mux (used by :8081)
+	// Use a separate ServeMux to avoid conflicts with the default mux (used by :10501)
 	mux := http.NewServeMux()
 
 	// Health check endpoint
@@ -2669,23 +2814,23 @@ func startHealthServer(mmdsData *MMDSData) {
 	})
 
 	server := &http.Server{
-		Addr:    ":8080",
+		Addr:    ":10500",
 		Handler: mux,
 	}
 
-	// Check if :8080 is already bound (from warmup mode). If so, skip —
+	// Check if :10500 is already bound (from warmup mode). If so, skip —
 	// the warmup health server is already running and has the same endpoints.
-	ln, err := net.Listen("tcp", ":8080")
+	ln, err := net.Listen("tcp", ":10500")
 	if err != nil {
-		log.Info("Health server :8080 already running (from warmup), skipping")
+		log.Info("Health server :10500 already running (from warmup), skipping")
 		return
 	}
 	ln.Close()
 
-	log.Info("Attempting to start health server on :8080...")
+	log.Info("Attempting to start health server on :10500...")
 	if err := server.ListenAndServe(); err != nil {
-		log.WithError(err).Error("Health server on :8080 failed to start or stopped")
+		log.WithError(err).Error("Health server on :10500 failed to start or stopped")
 	} else {
-		log.Info("Health server on :8080 stopped gracefully")
+		log.Info("Health server on :10500 stopped gracefully")
 	}
 }
