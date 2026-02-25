@@ -137,10 +137,12 @@ func (u *SessionChunkUploader) MergeAndUploadMem(ctx context.Context, memDiffPat
 		}
 		if r.ref.Hash != ZeroChunkHash {
 			mergedByIdx[r.idx] = r.ref
-		} else {
-			// Dirty chunk turned out to be all zeros — remove from index.
-			delete(mergedByIdx, r.idx)
 		}
+		// Note: we intentionally do NOT delete base entries when a dirty chunk
+		// merges to all zeros. The sparse diff file cannot distinguish "VM wrote
+		// zeros" from "sparse hole where base data should show through." Keeping
+		// the base entry is the safe default — at worst we serve stale data for
+		// a page the VM zeroed, which is harmless for memory semantics.
 	}
 
 	// Build new ChunkIndex extents (sorted by offset).

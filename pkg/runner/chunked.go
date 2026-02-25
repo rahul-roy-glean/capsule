@@ -218,6 +218,14 @@ func (cm *ChunkedManager) getOrLoadManifest(ctx context.Context, workloadKey, ve
 	cm.chunkedMetas[workloadKey] = meta
 	cm.mu.Unlock()
 
+	// Also update the golden metadata on the base Manager so PauseRunner
+	// has the correct base for session diff merging. This ensures it's set
+	// even if SyncManifest hasn't been called yet (e.g. first allocate before
+	// the heartbeat loop fires).
+	if cm.sessionMemStore != nil {
+		cm.SetGoldenChunkedMeta(meta)
+	}
+
 	cm.chunkedLogger.WithFields(logrus.Fields{
 		"workload_key": workloadKey,
 		"version":      meta.Version,
