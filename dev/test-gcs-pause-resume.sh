@@ -185,7 +185,7 @@ header "8. Resume: allocate with same session_id (should use GCS)"
 # ---------------------------------------------------------------------------
 RESUME_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
   -H 'Content-Type: application/json' \
-  -d "{\"ci_system\":\"none\", \"session_id\":\"$SESSION_ID\"}")
+  -d "{\"ci_system\":\"none\", \"workload_key\":\"$WORKLOAD_KEY\", \"session_id\":\"$SESSION_ID\"}")
 echo "  Response: $RESUME_RESP"
 
 RESUME_RUNNER_ID=$(echo "$RESUME_RESP" | jq -r '.runner_id')
