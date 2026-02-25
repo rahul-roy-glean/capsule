@@ -49,20 +49,20 @@ const (
 // ChunkedSnapshotMetadata holds metadata for a chunked snapshot.
 // Instead of storing full files, we store references to content-addressed chunks.
 type ChunkedSnapshotMetadata struct {
-	Version       string     `json:"version"`
-	BazelVersion  string     `json:"bazel_version,omitempty"`
-	RepoCommit    string     `json:"repo_commit,omitempty"`
-	Repo          string     `json:"repo,omitempty"`
-	ChunkKey      string     `json:"chunk_key,omitempty"`
+	Version       string            `json:"version"`
+	BazelVersion  string            `json:"bazel_version,omitempty"`
+	RepoCommit    string            `json:"repo_commit,omitempty"`
+	Repo          string            `json:"repo,omitempty"`
+	ChunkKey      string            `json:"chunk_key,omitempty"`
 	Commands      []SnapshotCommand `json:"commands,omitempty"`
-	CreatedAt     time.Time  `json:"created_at"`
-	ChunkSize     int64      `json:"chunk_size"`
-	KernelHash    string     `json:"kernel_hash"`
-	StateHash     string     `json:"state_hash"`
-	MemChunks     []ChunkRef `json:"mem_chunks"`
-	RootfsChunks  []ChunkRef `json:"rootfs_chunks"`
-	TotalMemSize  int64      `json:"total_mem_size"`
-	TotalDiskSize int64      `json:"total_disk_size"`
+	CreatedAt     time.Time         `json:"created_at"`
+	ChunkSize     int64             `json:"chunk_size"`
+	KernelHash    string            `json:"kernel_hash"`
+	StateHash     string            `json:"state_hash"`
+	MemChunks     []ChunkRef        `json:"mem_chunks"`
+	RootfsChunks  []ChunkRef        `json:"rootfs_chunks"`
+	TotalMemSize  int64             `json:"total_mem_size"`
+	TotalDiskSize int64             `json:"total_disk_size"`
 	// MemFilePath is the GCS object path of the raw memory file (zstd-compressed).
 	// When set, the memory is downloaded as a single file and restored via
 	// file-backed mem_backend instead of UFFD lazy loading.
@@ -718,8 +718,8 @@ func (cs *ChunkStore) eagerFetchLoop(limiter *rate.Limiter, eg *errgroup.Group) 
 
 // ChunkedSnapshotBuilder creates chunked snapshots from existing snapshot files
 type ChunkedSnapshotBuilder struct {
-	store      *ChunkStore
-	logger     *logrus.Entry
+	store  *ChunkStore
+	logger *logrus.Entry
 	// MemBackend controls how memory is stored: "chunked" (UFFD lazy via MemChunks,
 	// default) or "file" (single compressed blob via MemFilePath for file-backed restore).
 	MemBackend string

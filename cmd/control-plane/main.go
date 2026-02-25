@@ -19,6 +19,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
@@ -199,6 +200,10 @@ func main() {
 	httpMux.Handle("/metrics", promhttp.Handler())
 	httpMux.HandleFunc("/api/v1/runners", controlPlaneServer.HandleGetRunners)
 	httpMux.HandleFunc("/api/v1/runners/allocate", controlPlaneServer.HandleAllocateRunner)
+	httpMux.HandleFunc("/api/v1/runners/status", controlPlaneServer.HandleRunnerStatus)
+	httpMux.HandleFunc("/api/v1/runners/release", controlPlaneServer.HandleRunnerRelease)
+	httpMux.HandleFunc("/api/v1/runners/pause", controlPlaneServer.HandlePauseRunner)
+	httpMux.HandleFunc("/api/v1/runners/connect", controlPlaneServer.HandleConnectRunner)
 	httpMux.HandleFunc("/api/v1/runners/quarantine", controlPlaneServer.HandleQuarantineRunner)
 	httpMux.HandleFunc("/api/v1/runners/unquarantine", controlPlaneServer.HandleUnquarantineRunner)
 	httpMux.HandleFunc("/api/v1/hosts", controlPlaneServer.HandleGetHosts)
@@ -378,9 +383,48 @@ func initSchema(db *sql.DB) error {
 		// GitHub App credentials for snapshot configs
 		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS github_app_id VARCHAR(255) DEFAULT ''`,
 		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS github_app_secret VARCHAR(255) DEFAULT ''`,
+		// Add ci_system column to snapshot_configs (defaults to empty string = no CI system)
+		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS ci_system VARCHAR(64) DEFAULT ''`,
+		// Add start_command column to snapshot_configs (JSON-encoded StartCommand)
+		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS start_command TEXT DEFAULT ''`,
 		// Add chunk_key column to version_assignments
 		`ALTER TABLE version_assignments ADD COLUMN IF NOT EXISTS chunk_key VARCHAR(16) NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_version_assignments_chunk ON version_assignments(chunk_key)`,
+		// Session pause/resume: TTL and auto-pause config
+		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS runner_ttl_seconds INT DEFAULT 0`,
+		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS session_max_age_seconds INT DEFAULT 86400`,
+		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS auto_pause BOOLEAN DEFAULT false`,
+		// Session snapshots tracking for pause/resume
+		`CREATE TABLE IF NOT EXISTS session_snapshots (
+			session_id    TEXT PRIMARY KEY,
+			runner_id     TEXT NOT NULL,
+			chunk_key     VARCHAR(16) NOT NULL,
+			host_id       UUID REFERENCES hosts(id),
+			status        VARCHAR(20) NOT NULL DEFAULT 'active',
+			layer_count   INT DEFAULT 0,
+			total_size_bytes BIGINT DEFAULT 0,
+			metadata      JSONB,
+			created_at    TIMESTAMP DEFAULT NOW(),
+			paused_at     TIMESTAMP,
+			expires_at    TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_session_chunk ON session_snapshots(chunk_key)`,
+		`CREATE INDEX IF NOT EXISTS idx_session_host ON session_snapshots(host_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_session_status ON session_snapshots(status)`,
+		// runner_id lookups on session_snapshots (HandleRunnerStatus, HandleConnectRunner)
+		`CREATE INDEX IF NOT EXISTS idx_session_runner ON session_snapshots(runner_id)`,
+		// Expiry cleanup: scan suspended sessions past their TTL
+		`CREATE INDEX IF NOT EXISTS idx_session_expires ON session_snapshots(status, expires_at) WHERE status = 'suspended'`,
+		// runners: per-repo fairness check (scheduler.go: COUNT(*) WHERE repo=$1 AND status IN (...))
+		`CREATE INDEX IF NOT EXISTS idx_runners_repo_status ON runners(repo, status)`,
+		// jobs: queue drain (WHERE status='queued' ORDER BY queued_at)
+		`CREATE INDEX IF NOT EXISTS idx_jobs_queued ON jobs(status, queued_at) WHERE status = 'queued'`,
+		// jobs: completion by github_job_id
+		`CREATE INDEX IF NOT EXISTS idx_jobs_github_job_id ON jobs(github_job_id)`,
+		// snapshots: chunk_key + status + created_at for version lookups
+		`CREATE INDEX IF NOT EXISTS idx_snapshots_chunk_status ON snapshots(chunk_key, status, created_at DESC)`,
+		// version_assignments: compound for subquery in GetFleetConvergence
+		`CREATE INDEX IF NOT EXISTS idx_version_assignments_chunk_host ON version_assignments(chunk_key, host_id)`,
 		// Add chunk_key column to runners
 		`ALTER TABLE runners ADD COLUMN IF NOT EXISTS chunk_key VARCHAR(16) DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_runners_chunk_key ON runners(chunk_key)`,
@@ -519,7 +563,8 @@ func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Req
 
 // HandleAllocateRunner handles manual runner allocation requests.
 // POST /api/v1/runners/allocate
-// Body: {"repo": "org/repo", "branch": "main", "commit": "abc123", "labels": {"firecracker": "true"}}
+// Body: {"chunk_key": "abc123", "labels": {"firecracker": "true"}}
+// ci_system is resolved from the snapshot config registered for the chunk_key.
 func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -527,9 +572,10 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 	}
 
 	var req struct {
+		RequestID string            `json:"request_id"`
 		ChunkKey  string            `json:"chunk_key"`
 		Labels    map[string]string `json:"labels"`
-		RequestID string            `json:"request_id"`
+		SessionID string            `json:"session_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
@@ -553,6 +599,7 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		RequestID: req.RequestID,
 		ChunkKey:  req.ChunkKey,
 		Labels:    req.Labels,
+		SessionID: req.SessionID,
 	})
 	if err != nil {
 		s.logger.WithError(err).Error("Manual allocation failed")
@@ -570,6 +617,281 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		"host_id":      resp.HostID,
 		"host_address": resp.HostAddress,
 		"internal_ip":  resp.InternalIP,
+		"session_id":   resp.SessionID,
+		"resumed":      resp.Resumed,
+	})
+}
+
+// HandleRunnerStatus returns the status of a runner.
+// GET /api/v1/runners/status?runner_id=abc-123
+// Returns 200 when ready, 202 when pending, 404 when not found, 503 when unavailable.
+func (s *ControlPlaneServer) HandleRunnerStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	runnerID := r.URL.Query().Get("runner_id")
+	if runnerID == "" {
+		http.Error(w, "runner_id is required", http.StatusBadRequest)
+		return
+	}
+
+	runner, err := s.hostRegistry.GetRunner(runnerID)
+	if err != nil {
+		// Check session_snapshots for suspended sessions
+		var status string
+		scanErr := s.scheduler.db.QueryRowContext(r.Context(),
+			`SELECT status FROM session_snapshots WHERE runner_id = $1`, runnerID).Scan(&status)
+		if scanErr == nil && status == "suspended" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{
+				"runner_id": runnerID,
+				"status":    "suspended",
+			})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "runner not found"})
+		return
+	}
+
+	// Look up host for address
+	host, err := s.hostRegistry.GetHost(runner.HostID)
+	hostAddress := ""
+	if err == nil {
+		hostAddress = host.HTTPAddress
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	switch runner.Status {
+	case "initializing", "booting":
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{
+			"runner_id": runnerID,
+			"status":    "pending",
+		})
+	case "idle", "busy", "running":
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"runner_id":    runnerID,
+			"status":       "ready",
+			"host_address": hostAddress,
+		})
+	case "quarantined", "draining":
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{
+			"runner_id": runnerID,
+			"status":    "unavailable",
+		})
+	default: // terminated or unknown
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "runner not found",
+		})
+	}
+}
+
+// HandleRunnerRelease explicitly releases/destroys a runner.
+// POST /api/v1/runners/release
+// Body: {"runner_id": "abc-123"}
+func (s *ControlPlaneServer) HandleRunnerRelease(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		RunnerID string `json:"runner_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.RunnerID == "" {
+		http.Error(w, "runner_id is required", http.StatusBadRequest)
+		return
+	}
+
+	s.logger.WithField("runner_id", req.RunnerID).Info("Runner release request")
+
+	if err := s.scheduler.ReleaseRunner(r.Context(), req.RunnerID, true); err != nil {
+		s.logger.WithError(err).Error("Runner release failed")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// HandlePauseRunner pauses a runner via its host agent.
+// POST /api/v1/runners/pause
+// Body: {"runner_id": "abc-123"}
+func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		RunnerID string `json:"runner_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.RunnerID == "" {
+		http.Error(w, "runner_id is required", http.StatusBadRequest)
+		return
+	}
+
+	s.logger.WithField("runner_id", req.RunnerID).Info("Pause runner request")
+
+	runner, err := s.hostRegistry.GetRunner(req.RunnerID)
+	if err != nil {
+		http.Error(w, "runner not found", http.StatusNotFound)
+		return
+	}
+	host, err := s.hostRegistry.GetHost(runner.HostID)
+	if err != nil {
+		http.Error(w, "host not found", http.StatusInternalServerError)
+		return
+	}
+
+	// Forward to host agent gRPC
+	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		http.Error(w, "failed to connect to host", http.StatusInternalServerError)
+		return
+	}
+	defer conn.Close()
+
+	client := pb.NewHostAgentClient(conn)
+	resp, err := client.PauseRunner(r.Context(), &pb.PauseRunnerRequest{RunnerId: req.RunnerID})
+	if err != nil {
+		http.Error(w, "pause failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if resp.Error != "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": resp.Error})
+		return
+	}
+
+	// Update session_snapshots table
+	if resp.SessionId != "" {
+		_, _ = s.scheduler.db.ExecContext(r.Context(), `
+			INSERT INTO session_snapshots (session_id, runner_id, chunk_key, host_id, status, layer_count, paused_at)
+			VALUES ($1, $2, '', $3, 'suspended', $4, NOW())
+			ON CONFLICT (session_id) DO UPDATE SET
+				status = 'suspended',
+				layer_count = EXCLUDED.layer_count,
+				paused_at = NOW()
+		`, resp.SessionId, req.RunnerID, host.ID, resp.Layer+1)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":             resp.Success,
+		"session_id":          resp.SessionId,
+		"snapshot_size_bytes": resp.SnapshotSizeBytes,
+		"layer":               resp.Layer,
+	})
+}
+
+// HandleConnectRunner connects to a runner: extends TTL if running, resumes if suspended.
+// POST /api/v1/runners/connect
+// Body: {"runner_id": "abc-123"}
+func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		RunnerID string `json:"runner_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.RunnerID == "" {
+		http.Error(w, "runner_id is required", http.StatusBadRequest)
+		return
+	}
+
+	runner, err := s.hostRegistry.GetRunner(req.RunnerID)
+	if err != nil {
+		// Check if suspended in session_snapshots
+		var sessionID, hostID string
+		var status string
+		scanErr := s.scheduler.db.QueryRowContext(r.Context(),
+			`SELECT session_id, host_id, status FROM session_snapshots WHERE runner_id = $1`,
+			req.RunnerID).Scan(&sessionID, &hostID, &status)
+		if scanErr != nil || status != "suspended" {
+			http.Error(w, "runner not found", http.StatusNotFound)
+			return
+		}
+
+		// Resume from session via host
+		host, err := s.hostRegistry.GetHost(hostID)
+		if err != nil {
+			http.Error(w, "host not found for suspended session", http.StatusInternalServerError)
+			return
+		}
+		conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			http.Error(w, "failed to connect to host", http.StatusInternalServerError)
+			return
+		}
+		defer conn.Close()
+
+		client := pb.NewHostAgentClient(conn)
+		resp, err := client.ResumeRunner(r.Context(), &pb.ResumeRunnerRequest{SessionId: sessionID})
+		if err != nil || resp.Error != "" {
+			errMsg := "resume failed"
+			if err != nil {
+				errMsg = err.Error()
+			} else {
+				errMsg = resp.Error
+			}
+			http.Error(w, errMsg, http.StatusInternalServerError)
+			return
+		}
+
+		// Update session status
+		_, _ = s.scheduler.db.ExecContext(r.Context(),
+			`UPDATE session_snapshots SET status = 'active' WHERE session_id = $1`, sessionID)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":    "resumed",
+			"runner_id": resp.Runner.GetId(),
+		})
+		return
+	}
+
+	// Runner exists — it's running, forward connect to extend TTL
+	host, err := s.hostRegistry.GetHost(runner.HostID)
+	if err != nil {
+		http.Error(w, "host not found", http.StatusInternalServerError)
+		return
+	}
+
+	// Forward to host's HTTP connect endpoint
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":       "connected",
+		"runner_id":    req.RunnerID,
+		"host_address": host.HTTPAddress,
 	})
 }
 

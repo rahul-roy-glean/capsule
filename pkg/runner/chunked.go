@@ -499,6 +499,9 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		// FUSE disk provides the rootfs via lazy loading
 		RootfsOverlay: fuseDisk.DiskImagePath(),
 	}
+	if req.StartCommand != nil {
+		runner.ServicePort = req.StartCommand.Port
+	}
 
 	// Build kernel boot args
 	netCfg := tap.GetNetworkConfig()
@@ -654,9 +657,15 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	// When using per-VM namespaces, set up port forwarding (DNAT) so the host
 	// can reach services inside the VM via the host-reachable veth IP.
 	if netns != nil && cm.netnsNetwork != nil {
-		for _, port := range []int{8080, 8081} {
+		for _, port := range []int{snapshot.ThawAgentHealthPort, snapshot.ThawAgentDebugPort} {
 			if err := cm.netnsNetwork.ForwardPort(runnerID, port); err != nil {
 				cm.chunkedLogger.WithField("port", port).WithError(err).Warn("Failed to forward port into namespace")
+			}
+		}
+		// Forward user service port if start_command is configured
+		if req.StartCommand != nil && req.StartCommand.Port > 0 {
+			if err := cm.netnsNetwork.ForwardPort(runnerID, req.StartCommand.Port); err != nil {
+				cm.chunkedLogger.WithField("port", req.StartCommand.Port).WithError(err).Warn("Failed to forward service port into namespace")
 			}
 		}
 	}

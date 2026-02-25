@@ -19,18 +19,18 @@ import (
 
 // SnapshotMetadata holds metadata about a snapshot
 type SnapshotMetadata struct {
-	Version      string    `json:"version"`
-	BazelVersion string    `json:"bazel_version"`
-	RepoCommit   string    `json:"repo_commit"`
-	Repo         string    `json:"repo,omitempty"`
-	ChunkKey     string    `json:"chunk_key,omitempty"`
+	Version      string            `json:"version"`
+	BazelVersion string            `json:"bazel_version"`
+	RepoCommit   string            `json:"repo_commit"`
+	Repo         string            `json:"repo,omitempty"`
+	ChunkKey     string            `json:"chunk_key,omitempty"`
 	Commands     []SnapshotCommand `json:"commands,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
-	SizeBytes    int64     `json:"size_bytes"`
-	KernelPath   string    `json:"kernel_path"`
-	RootfsPath   string    `json:"rootfs_path"`
-	MemPath      string    `json:"mem_path"`
-	StatePath    string    `json:"state_path"`
+	CreatedAt    time.Time         `json:"created_at"`
+	SizeBytes    int64             `json:"size_bytes"`
+	KernelPath   string            `json:"kernel_path"`
+	RootfsPath   string            `json:"rootfs_path"`
+	MemPath      string            `json:"mem_path"`
+	StatePath    string            `json:"state_path"`
 	// RepoCacheSeedPath is a path (relative to the snapshot version dir) to the
 	// shared Bazel repository cache seed disk image (ext4).
 	RepoCacheSeedPath string `json:"repo_cache_seed_path,omitempty"`
@@ -62,20 +62,26 @@ type Cache struct {
 type CacheConfig struct {
 	LocalPath string
 	GCSBucket string
-	ChunkKey string
+	ChunkKey  string
 	Logger    *logrus.Logger
 }
 
 // NewCache creates a new snapshot cache manager
 func NewCache(ctx context.Context, cfg CacheConfig) (*Cache, error) {
-	client, err := storage.NewClient(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create GCS client: %w", err)
-	}
-
 	logger := cfg.Logger
 	if logger == nil {
 		logger = logrus.New()
+	}
+
+	// GCS client is only needed when a real bucket is configured.
+	// Skip creation for local-only dev setups to avoid requiring GCP credentials.
+	var client *storage.Client
+	if cfg.GCSBucket != "" {
+		var err error
+		client, err = storage.NewClient(ctx)
+		if err != nil {
+			logger.WithError(err).Warn("Failed to create GCS client, snapshot sync from GCS will be unavailable")
+		}
 	}
 
 	cache := &Cache{
@@ -99,6 +105,11 @@ func NewCache(ctx context.Context, cfg CacheConfig) (*Cache, error) {
 
 // SyncFromGCS syncs snapshot files from GCS to local cache
 func (c *Cache) SyncFromGCS(ctx context.Context, version string) error {
+	if c.gcsClient == nil {
+		c.logger.Warn("GCS client not available, skipping snapshot sync")
+		return nil
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -245,6 +256,10 @@ func (c *Cache) CurrentVersion() string {
 
 // ListVersions lists available snapshot versions in GCS
 func (c *Cache) ListVersions(ctx context.Context) ([]string, error) {
+	if c.gcsClient == nil {
+		return nil, fmt.Errorf("GCS client not available")
+	}
+
 	c.logger.Debug("Listing snapshot versions from GCS")
 
 	bucket := c.gcsClient.Bucket(c.gcsBucket)
@@ -277,6 +292,10 @@ func (c *Cache) ListVersions(ctx context.Context) ([]string, error) {
 
 // GetRemoteMetadata fetches metadata for a specific version from GCS
 func (c *Cache) GetRemoteMetadata(ctx context.Context, version string) (*SnapshotMetadata, error) {
+	if c.gcsClient == nil {
+		return nil, fmt.Errorf("GCS client not available")
+	}
+
 	bucket := c.gcsClient.Bucket(c.gcsBucket)
 	obj := bucket.Object(fmt.Sprintf("%s/metadata.json", version))
 
@@ -301,6 +320,10 @@ func (c *Cache) GetRemoteMetadata(ctx context.Context, version string) (*Snapsho
 
 // IsStale checks if the local cache is stale compared to GCS
 func (c *Cache) IsStale(ctx context.Context) (bool, error) {
+	if c.gcsClient == nil {
+		return false, nil
+	}
+
 	c.mu.RLock()
 	localVer := c.currentVer
 	c.mu.RUnlock()

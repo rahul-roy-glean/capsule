@@ -53,6 +53,7 @@ func newTestManager(opts ...func(*Manager)) *Manager {
 		runners:      make(map[string]*Runner),
 		slotToRunner: make(map[int]string),
 		runnerToSlot: make(map[string]int),
+		uffdHandlers: make(map[string]uffdStopper),
 		logger:       logger.WithField("test", true),
 	}
 	for _, opt := range opts {

@@ -93,3 +93,5 @@ temp/
 __pycache__/
 
 /deploy/terraform/tfplan
+
+.claude/settings.local.json
