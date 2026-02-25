@@ -184,6 +184,7 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 		}
 
 		cm.netnsNetwork = netnsNet
+		cm.Manager.SetNetNSNetwork(netnsNet)
 		cm.chunkedLogger.Info("Network namespace mode enabled")
 	}
 

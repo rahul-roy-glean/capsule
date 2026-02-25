@@ -633,11 +633,11 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 
 	// Set up port forwarding for netns
 	if useNetNS && m.netnsNetwork != nil {
-		if err := m.netnsNetwork.ForwardPort(runnerID, 8080); err != nil {
-			m.logger.WithError(err).Warn("Failed to forward port 8080")
+		if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentHealthPort); err != nil {
+			m.logger.WithError(err).Warn("Failed to forward thaw-agent health port")
 		}
-		if err := m.netnsNetwork.ForwardPort(runnerID, 8081); err != nil {
-			m.logger.WithError(err).Warn("Failed to forward port 8081")
+		if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentDebugPort); err != nil {
+			m.logger.WithError(err).Warn("Failed to forward thaw-agent debug port")
 		}
 	}
 
