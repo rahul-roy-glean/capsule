@@ -518,7 +518,7 @@ func TestUploadSnapshotE2E(t *testing.T) {
 	}
 
 	version := "test-upload-e2e"
-	metadata := SnapshotMetadata{Version: version, ChunkKey: "test-org-repo"}
+	metadata := SnapshotMetadata{Version: version, WorkloadKey: "test-org-repo"}
 
 	if err := uploader.UploadSnapshot(ctx, dir, metadata); err != nil {
 		t.Fatalf("UploadSnapshot failed: %v", err)

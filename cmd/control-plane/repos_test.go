@@ -33,7 +33,7 @@ func TestHandleSnapshotConfigs_CreateInvalidJSON(t *testing.T) {
 	}
 }
 
-func TestHandleSnapshotConfigs_GetEmptyChunkKey(t *testing.T) {
+func TestHandleSnapshotConfigs_GetEmptyWorkloadKey(t *testing.T) {
 	r := &SnapshotConfigRegistry{}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/snapshot-configs/", nil)
@@ -41,7 +41,7 @@ func TestHandleSnapshotConfigs_GetEmptyChunkKey(t *testing.T) {
 	r.HandleGetSnapshotConfig(w, req)
 
 	if w.Code != http.StatusBadRequest {
-		t.Errorf("GET with empty chunk_key: got status %d, want %d", w.Code, http.StatusBadRequest)
+		t.Errorf("GET with empty workload_key: got status %d, want %d", w.Code, http.StatusBadRequest)
 	}
 }
 

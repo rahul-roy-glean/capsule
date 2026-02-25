@@ -87,8 +87,10 @@ var (
 
 	// Chunked snapshot flags (BuildBuddy-style lazy loading)
 	useChunkedSnapshots = flag.Bool("use-chunked-snapshots", false, "Enable chunked snapshot restore with UFFD (lazy memory) and FUSE (lazy disk)")
-	chunkCacheSizeGB    = flag.Int("chunk-cache-size-gb", 2, "Size in GB of local LRU chunk cache")
-	memBackend          = flag.String("mem-backend", "file", "Memory restore backend: 'chunked' (UFFD lazy loading) or 'file' (download full snapshot.mem at startup, default). Overrides the backend recorded in snapshot metadata.")
+	chunkCacheSizeGB    = flag.Int("chunk-cache-size-gb", 2, "Size in GB of disk chunk LRU cache (FUSE)")
+	memCacheSizeGB      = flag.Int("mem-cache-size-gb", 2, "Size in GB of memory chunk LRU cache (UFFD)")
+	memBackend          = flag.String("mem-backend", "chunked", "Memory restore backend: 'chunked' (UFFD lazy loading, default) or 'file' (download full snapshot.mem at startup). Overrides the backend recorded in snapshot metadata.")
+	gcsPrefix           = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
 
 	// Network namespace mode (alternative to slot-based TAPs)
 	useNetNS = flag.Bool("use-netns", false, "Use network namespaces instead of slot-based TAP devices (simplifies snapshot restore)")
@@ -319,7 +321,8 @@ func main() {
 		log.WithFields(logrus.Fields{
 			"chunked_snapshots": *useChunkedSnapshots,
 			"use_netns":         *useNetNS,
-			"chunk_cache_gb":    *chunkCacheSizeGB,
+			"disk_cache_gb":     *chunkCacheSizeGB,
+			"mem_cache_gb":      *memCacheSizeGB,
 		}).Info("Creating chunked manager with BuildBuddy-style optimizations")
 
 		chunkedCfg := runner.ChunkedManagerConfig{
@@ -328,7 +331,9 @@ func main() {
 			UseChunkedSnapshots: *useChunkedSnapshots,
 			UseNetNS:            *useNetNS,
 			ChunkCacheSizeBytes: int64(*chunkCacheSizeGB) * 1024 * 1024 * 1024,
+			MemCacheSizeBytes:   int64(*memCacheSizeGB) * 1024 * 1024 * 1024,
 			MemBackend:          *memBackend,
+			GCSPrefix:           *gcsPrefix,
 		}
 
 		var err error
@@ -339,54 +344,10 @@ func main() {
 		defer chunkedMgr.Close()
 		mgr = chunkedMgr.Manager // Use embedded manager for compatibility
 
-		// When using chunked snapshots, eagerly fetch just the kernel from
-		// the chunk store so it's available as a local file for Firecracker
-		// boot config. Everything else (rootfs, memory) is loaded lazily
-		// via FUSE and UFFD. This replaces the traditional SyncFromGCS
-		// which would download the entire snapshot.
-		if *useChunkedSnapshots {
-			if meta := chunkedMgr.GetChunkedMetadata(); meta != nil && meta.KernelHash != "" {
-				log.Info("Eagerly fetching kernel from chunk store...")
-				kernelData, err := chunkedMgr.GetChunkStore().GetChunk(ctx, meta.KernelHash)
-				if err != nil {
-					log.WithError(err).Fatal("Failed to fetch kernel chunk")
-				}
-				kernelPath := filepath.Join(*snapshotCache, "kernel.bin")
-				if err := os.WriteFile(kernelPath, kernelData, 0644); err != nil {
-					log.WithError(err).Fatal("Failed to write kernel to local cache")
-				}
-				log.WithFields(logrus.Fields{
-					"kernel_size": len(kernelData),
-					"path":        kernelPath,
-				}).Info("Kernel fetched from chunk store")
-
-				// When using file-backed memory, also download snapshot.mem now
-				// so AllocateRunnerChunked can find it at restore time.
-				// At 8GB this takes ~30s on a fresh host but is only done once;
-				// all 4 runners share the same file via read-only mmap.
-				if *memBackend == "file" && meta.MemFilePath != "" {
-					memPath := filepath.Join(*snapshotCache, "snapshot.mem")
-					if _, err := os.Stat(memPath); err != nil {
-						log.WithField("gcs_path", meta.MemFilePath).Info("Downloading snapshot.mem (file-backed memory mode)...")
-						if err := chunkedMgr.GetChunkStore().DownloadRawFile(ctx, meta.MemFilePath, memPath); err != nil {
-							log.WithError(err).Fatal("Failed to download snapshot.mem")
-						}
-						fi, _ := os.Stat(memPath)
-						log.WithFields(logrus.Fields{
-							"path":       memPath,
-							"size_bytes": fi.Size(),
-						}).Info("snapshot.mem downloaded")
-					} else {
-						log.WithField("path", memPath).Info("snapshot.mem already cached, skipping download")
-					}
-				}
-			} else {
-				log.Warn("No chunked metadata or kernel hash available, falling back to traditional sync")
-				if err := mgr.SyncSnapshot(ctx, "current"); err != nil {
-					log.WithError(err).Fatal("Failed to sync snapshot from GCS")
-				}
-			}
-		}
+		// In chunked mode, no downloads happen at startup. The kernel,
+		// snapshot.mem (file mode), and manifest are all fetched on demand
+		// when the first SyncManifest (heartbeat) or AllocateRunner arrives.
+		log.Info("Chunked mode: deferring all downloads until first manifest sync")
 	} else {
 		var err error
 		mgr, err = runner.NewManager(ctx, cfg, ciAdapter, logger)
@@ -572,9 +533,8 @@ func snapshotSyncHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handle
 		if version == "" {
 			version = r.URL.Query().Get("version")
 		}
-		if version == "" {
-			version = "current" // Default to "current" folder in GCS
-		}
+		// version is empty if not specified; SyncFromGCS will resolve via
+		// current-pointer.json.
 
 		log.WithField("version", version).Info("Snapshot sync requested")
 
@@ -611,11 +571,11 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			status := mgr.GetStatus()
 
 			// Maintain idle target.
-			// In chunked mode, skip pre-allocation: each chunk key needs a different
+			// In chunked mode, skip pre-allocation: each workload key needs a different
 			// snapshot, so generic warm VMs would load the wrong data and be
 			// useless when an actual job arrives. The control plane drives
 			// allocation on-demand via gRPC AllocateRunner with the correct
-			// ChunkKey. In single-snapshot (non-chunked) mode, warm pool is fine
+			// WorkloadKey. In single-snapshot (non-chunked) mode, warm pool is fine
 			// because there is only one snapshot.
 			if chunkedMgr != nil {
 				// Chunked mode: no local pre-allocation; control plane drives it.
@@ -667,15 +627,18 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				if chunkedMgr != nil {
 					cs := chunkedMgr.GetChunkedStats()
 					metricsClient.RecordChunkedMetrics(ctx, telemetry.ChunkedMetrics{
-						CacheSize:    cs.CacheSize,
-						CacheMaxSize: cs.CacheMaxSize,
-						CacheItems:   cs.CacheItems,
-						PageFaults:   cs.TotalPageFaults,
-						CacheHits:    cs.TotalCacheHits,
-						ChunkFetches: cs.TotalChunkFetches,
-						DiskReads:    cs.TotalDiskReads,
-						DiskWrites:   cs.TotalDiskWrites,
-						DirtyChunks:  cs.TotalDirtyChunks,
+						DiskCacheSize:    cs.DiskCacheSize,
+						DiskCacheMaxSize: cs.DiskCacheMaxSize,
+						DiskCacheItems:   cs.DiskCacheItems,
+						MemCacheSize:     cs.MemCacheSize,
+						MemCacheMaxSize:  cs.MemCacheMaxSize,
+						MemCacheItems:    cs.MemCacheItems,
+						PageFaults:       cs.TotalPageFaults,
+						CacheHits:        cs.TotalCacheHits,
+						ChunkFetches:     cs.TotalChunkFetches,
+						DiskReads:        cs.TotalDiskReads,
+						DiskWrites:       cs.TotalDiskWrites,
+						DirtyChunks:      cs.TotalDirtyChunks,
 					})
 				}
 
@@ -847,19 +810,19 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				}(hbResp.SnapshotVersion)
 			}
 
-			// Handle per-chunk-key manifest sync directives
+			// Handle per-workload-key manifest sync directives
 			if len(hbResp.SyncVersions) > 0 && chunkedMgr != nil {
-				for chunkKey, version := range hbResp.SyncVersions {
+				for workloadKey, version := range hbResp.SyncVersions {
 					go func(key, ver string) {
 						syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 						defer cancel()
 						if err := chunkedMgr.SyncManifest(syncCtx, key, ver); err != nil {
 							log.WithError(err).WithFields(logrus.Fields{
-								"chunk_key": key,
-								"version":   ver,
-							}).Warn("Failed to sync manifest for chunk key")
+								"workload_key": key,
+								"version":      ver,
+							}).Warn("Failed to sync manifest for workload key")
 						}
-					}(chunkKey, version)
+					}(workloadKey, version)
 				}
 			}
 		}
@@ -1457,7 +1420,7 @@ func handleConnectRunner(w http.ResponseWriter, r *http.Request, mgr *runner.Man
 			http.Error(w, "runner has no session_id", http.StatusBadRequest)
 			return
 		}
-		resumed, err := mgr.ResumeFromSession(r.Context(), rn.SessionID, rn.ChunkKey)
+		resumed, err := mgr.ResumeFromSession(r.Context(), rn.SessionID, rn.WorkloadKey)
 		if err != nil {
 			log.WithError(err).WithField("runner_id", runnerID).Error("Failed to resume runner")
 			w.Header().Set("Content-Type", "application/json")

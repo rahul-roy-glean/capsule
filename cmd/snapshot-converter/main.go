@@ -37,6 +37,8 @@ var (
 	localCache      = flag.String("local-cache", "/tmp/chunk-cache", "Local chunk cache directory")
 	bazelVer        = flag.String("bazel-version", "", "Bazel version in the snapshot")
 	repoCommit      = flag.String("repo-commit", "", "Repository commit hash in the snapshot")
+	workloadKeyFlag = flag.String("workload-key", "", "Workload key for scoping GCS paths (required)")
+	gcsPrefix       = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
 )
 
 func main() {
@@ -64,6 +66,9 @@ func main() {
 		// Generate version from timestamp
 		*snapshotVersion = fmt.Sprintf("v%s", time.Now().Format("20060102-150405"))
 		log.WithField("version", *snapshotVersion).Info("Generated version from timestamp")
+	}
+	if *workloadKeyFlag == "" {
+		log.Fatal("--workload-key is required")
 	}
 
 	// Verify source files exist
@@ -104,7 +109,9 @@ func main() {
 	// Create chunk store
 	chunkStore, err := snapshot.NewChunkStore(ctx, snapshot.ChunkStoreConfig{
 		GCSBucket:      *gcsBucket,
+		GCSPrefix:      *gcsPrefix,
 		LocalCachePath: *localCache,
+		ChunkSubdir:    "disk",
 		Logger:         logger,
 	})
 	if err != nil {
@@ -131,11 +138,11 @@ func main() {
 	}
 
 	// Create chunked snapshot builder
-	builder := snapshot.NewChunkedSnapshotBuilder(chunkStore, logger)
+	builder := snapshot.NewChunkedSnapshotBuilder(chunkStore, nil, logger)
 
 	// Build chunked snapshot
 	log.Info("Building chunked snapshot (this may take a while for large snapshots)...")
-	meta, err := builder.BuildChunkedSnapshot(ctx, paths, *snapshotVersion)
+	meta, err := builder.BuildChunkedSnapshot(ctx, paths, *snapshotVersion, *workloadKeyFlag)
 	if err != nil {
 		log.WithError(err).Fatal("Failed to build chunked snapshot")
 	}

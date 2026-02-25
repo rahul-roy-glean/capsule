@@ -18,24 +18,26 @@ import (
 
 // Scheduler handles runner allocation across hosts
 type Scheduler struct {
-	hostRegistry *HostRegistry
-	db           *sql.DB
-	logger       *logrus.Entry
+	hostRegistry    *HostRegistry
+	db              *sql.DB
+	snapshotManager *SnapshotManager
+	logger          *logrus.Entry
 }
 
 // NewScheduler creates a new scheduler
-func NewScheduler(hr *HostRegistry, db *sql.DB, logger *logrus.Logger) *Scheduler {
+func NewScheduler(hr *HostRegistry, db *sql.DB, sm *SnapshotManager, logger *logrus.Logger) *Scheduler {
 	return &Scheduler{
-		hostRegistry: hr,
-		db:           db,
-		logger:       logger.WithField("component", "scheduler"),
+		hostRegistry:    hr,
+		db:              db,
+		snapshotManager: sm,
+		logger:          logger.WithField("component", "scheduler"),
 	}
 }
 
 // AllocateRunnerRequest represents a request to allocate a runner
 type AllocateRunnerRequest struct {
 	RequestID         string
-	ChunkKey          string
+	WorkloadKey       string
 	Labels            map[string]string
 	GitHubRunnerToken string
 	CISystem          string
@@ -58,28 +60,28 @@ type AllocateRunnerResponse struct {
 // AllocateRunner allocates a runner on the best available host
 func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerRequest) (*AllocateRunnerResponse, error) {
 	s.logger.WithFields(logrus.Fields{
-		"request_id": req.RequestID,
-		"chunk_key":  req.ChunkKey,
+		"request_id":   req.RequestID,
+		"workload_key": req.WorkloadKey,
 	}).Info("Allocating runner")
 
 	// Derive repo slug for multi-repo support
-	chunkKey := req.ChunkKey
+	workloadKey := req.WorkloadKey
 
 	// Look up snapshot config for fairness checks, ci_system, and start_command
 	var ciSystem string
 	var startCmd *snapshot.StartCommand
-	if chunkKey != "" && s.db != nil {
+	if workloadKey != "" && s.db != nil {
 		var maxConcurrent int
 		var startCommandJSON sql.NullString
-		err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, ci_system, start_command FROM snapshot_configs WHERE chunk_key = $1`, chunkKey).Scan(&maxConcurrent, &ciSystem, &startCommandJSON)
+		err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, ci_system, start_command FROM snapshot_configs WHERE workload_key = $1`, workloadKey).Scan(&maxConcurrent, &ciSystem, &startCommandJSON)
 		if err == nil {
 			if maxConcurrent > 0 {
 				var currentCount int
 				_ = s.db.QueryRowContext(ctx, `
-					SELECT COUNT(*) FROM runners WHERE chunk_key = $1 AND status IN ('running','busy','initializing')
-				`, chunkKey).Scan(&currentCount)
+					SELECT COUNT(*) FROM runners WHERE workload_key = $1 AND status IN ('running','busy','initializing')
+				`, workloadKey).Scan(&currentCount)
 				if currentCount >= maxConcurrent {
-					return nil, fmt.Errorf("chunk_key %s at max concurrent runners (%d/%d)", chunkKey, currentCount, maxConcurrent)
+					return nil, fmt.Errorf("workload_key %s at max concurrent runners (%d/%d)", workloadKey, currentCount, maxConcurrent)
 				}
 			}
 			if startCommandJSON.Valid && startCommandJSON.String != "" {
@@ -98,8 +100,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		return nil, fmt.Errorf("no available hosts")
 	}
 
-	// Score and select best host (with chunk-key cache affinity)
-	host := s.selectBestHostForChunkKey(hosts, chunkKey)
+	// Score and select best host (with workload-key cache affinity)
+	host := s.selectBestHostForWorkloadKey(hosts, workloadKey)
 	if host == nil {
 		return nil, fmt.Errorf("no suitable host found")
 	}
@@ -120,14 +122,27 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// Create host agent client
 	client := pb.NewHostAgentClient(conn)
 
+	// Resolve the desired snapshot version for this workload_key + host
+	var snapshotVersion string
+	if workloadKey != "" && s.snapshotManager != nil && s.snapshotManager.db != nil {
+		desired, _ := s.snapshotManager.GetDesiredVersions(ctx, host.ID)
+		if v, ok := desired[workloadKey]; ok {
+			snapshotVersion = v
+		}
+	}
+	if snapshotVersion == "" && workloadKey != "" && s.snapshotManager != nil {
+		snapshotVersion = s.snapshotManager.GetCurrentVersionForKey(workloadKey)
+	}
+
 	// Build the proto request
 	protoReq := &pb.AllocateRunnerRequest{
 		RequestId:         req.RequestID,
 		Labels:            req.Labels,
 		GithubRunnerToken: req.GitHubRunnerToken,
-		ChunkKey:          chunkKey,
+		WorkloadKey:       workloadKey,
 		CiSystem:          ciSystem,
 		SessionId:         req.SessionID,
+		SnapshotVersion:   snapshotVersion,
 	}
 	if req.VCPUs > 0 || req.MemoryMB > 0 {
 		protoReq.Resources = &pb.Resources{
@@ -161,11 +176,11 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// Register runner in our registry
 	if resp.Runner != nil {
 		if err := s.hostRegistry.AddRunner(ctx, &Runner{
-			ID:         resp.Runner.Id,
-			HostID:     host.ID,
-			InternalIP: resp.Runner.InternalIp,
-			Status:     "running",
-			ChunkKey:   chunkKey,
+			ID:          resp.Runner.Id,
+			HostID:      host.ID,
+			InternalIP:  resp.Runner.InternalIp,
+			Status:      "running",
+			WorkloadKey: workloadKey,
 		}); err != nil {
 			s.logger.WithError(err).Warn("Failed to register runner in control plane registry")
 		}
@@ -181,8 +196,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	}, nil
 }
 
-// selectBestHostForChunkKey selects the best host with chunk-key cache affinity.
-func (s *Scheduler) selectBestHostForChunkKey(hosts []*Host, chunkKey string) *Host {
+// selectBestHostForWorkloadKey selects the best host with workload-key cache affinity.
+func (s *Scheduler) selectBestHostForWorkloadKey(hosts []*Host, workloadKey string) *Host {
 	if len(hosts) == 0 {
 		return nil
 	}
@@ -194,7 +209,7 @@ func (s *Scheduler) selectBestHostForChunkKey(hosts []*Host, chunkKey string) *H
 
 	var scored []scoredHost
 	for _, h := range hosts {
-		score := s.scoreHostForChunkKey(h, chunkKey)
+		score := s.scoreHostForWorkloadKey(h, workloadKey)
 		scored = append(scored, scoredHost{host: h, score: score})
 	}
 
@@ -205,14 +220,14 @@ func (s *Scheduler) selectBestHostForChunkKey(hosts []*Host, chunkKey string) *H
 	return scored[0].host
 }
 
-// scoreHostForChunkKey calculates a score for a host with chunk-key cache affinity.
-func (s *Scheduler) scoreHostForChunkKey(h *Host, chunkKey string) float64 {
+// scoreHostForWorkloadKey calculates a score for a host with workload-key cache affinity.
+func (s *Scheduler) scoreHostForWorkloadKey(h *Host, workloadKey string) float64 {
 	score := s.scoreHost(h)
 
 	// Repo-aware cache affinity scoring:
 	// If we have loaded manifests info (from heartbeat), prefer hosts with warm caches.
-	if chunkKey != "" && h.LoadedManifests != nil {
-		if version, ok := h.LoadedManifests[chunkKey]; ok {
+	if workloadKey != "" && h.LoadedManifests != nil {
+		if version, ok := h.LoadedManifests[workloadKey]; ok {
 			// Host has a manifest loaded for this repo
 			// Check if it's the current version (ideal) or any version (warm-ish)
 			if version != "" {

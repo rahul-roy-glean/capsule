@@ -38,6 +38,7 @@ var (
 	dbName     = flag.String("db-name", "firecracker_runner", "Database name")
 	dbSSLMode  = flag.String("db-ssl-mode", "disable", "Database SSL mode")
 	gcsBucket  = flag.String("gcs-bucket", "", "GCS bucket for snapshots")
+	gcsPrefix  = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
 	logLevel   = flag.String("log-level", "info", "Log level")
 
 	// Telemetry
@@ -154,8 +155,8 @@ func main() {
 
 	// Create services
 	hostRegistry := NewHostRegistry(db, logger)
-	scheduler := NewScheduler(hostRegistry, db, logger)
-	snapshotManager := NewSnapshotManager(ctx, db, *gcsBucket, gcpProjectVal, gcpZoneVal, logger)
+	snapshotManager := NewSnapshotManager(ctx, db, *gcsBucket, *gcsPrefix, gcpProjectVal, gcpZoneVal, logger)
+	scheduler := NewScheduler(hostRegistry, db, snapshotManager, logger)
 	jobQueue := NewJobQueue(db, scheduler, hostRegistry, logger)
 	snapshotConfigRegistry := NewSnapshotConfigRegistry(db, snapshotManager, logger)
 
@@ -366,9 +367,9 @@ func initSchema(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_version_assignments_repo ON version_assignments(repo_slug)`,
 		`CREATE INDEX IF NOT EXISTS idx_version_assignments_host ON version_assignments(host_id)`,
-		// chunk_key migration: add snapshot_configs table
+		// workload_key migration: add snapshot_configs table
 		`CREATE TABLE IF NOT EXISTS snapshot_configs (
-			chunk_key              VARCHAR(16) PRIMARY KEY,
+			workload_key              VARCHAR(16) PRIMARY KEY,
 			display_name           VARCHAR(255),
 			commands               TEXT NOT NULL DEFAULT '[]',
 			build_schedule         VARCHAR(64) DEFAULT '',
@@ -377,9 +378,14 @@ func initSchema(db *sql.DB) error {
 			auto_rollout           BOOLEAN DEFAULT true,
 			created_at             TIMESTAMP DEFAULT NOW()
 		)`,
-		// Add chunk_key column to snapshots (rename from repo_slug)
-		`ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS chunk_key VARCHAR(16) DEFAULT ''`,
-		`CREATE INDEX IF NOT EXISTS idx_snapshots_chunk_key ON snapshots(chunk_key)`,
+		// Rename chunk_key -> workload_key in existing tables (idempotent: no-op if column doesn't exist)
+		`DO $$ BEGIN ALTER TABLE snapshot_configs RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; END $$`,
+		`DO $$ BEGIN ALTER TABLE snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; END $$`,
+		`DO $$ BEGIN ALTER TABLE version_assignments RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; END $$`,
+		`DO $$ BEGIN ALTER TABLE session_snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; END $$`,
+		// Add workload_key column to snapshots (for fresh installs without chunk_key)
+		`ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_snapshots_workload_key ON snapshots(workload_key)`,
 		// GitHub App credentials for snapshot configs
 		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS github_app_id VARCHAR(255) DEFAULT ''`,
 		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS github_app_secret VARCHAR(255) DEFAULT ''`,
@@ -387,9 +393,9 @@ func initSchema(db *sql.DB) error {
 		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS ci_system VARCHAR(64) DEFAULT ''`,
 		// Add start_command column to snapshot_configs (JSON-encoded StartCommand)
 		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS start_command TEXT DEFAULT ''`,
-		// Add chunk_key column to version_assignments
-		`ALTER TABLE version_assignments ADD COLUMN IF NOT EXISTS chunk_key VARCHAR(16) NOT NULL DEFAULT ''`,
-		`CREATE INDEX IF NOT EXISTS idx_version_assignments_chunk ON version_assignments(chunk_key)`,
+		// Add workload_key column to version_assignments
+		`ALTER TABLE version_assignments ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_version_assignments_workload ON version_assignments(workload_key)`,
 		// Session pause/resume: TTL and auto-pause config
 		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS runner_ttl_seconds INT DEFAULT 0`,
 		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS session_max_age_seconds INT DEFAULT 86400`,
@@ -398,7 +404,7 @@ func initSchema(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS session_snapshots (
 			session_id    TEXT PRIMARY KEY,
 			runner_id     TEXT NOT NULL,
-			chunk_key     VARCHAR(16) NOT NULL,
+			workload_key     VARCHAR(16) NOT NULL,
 			host_id       UUID REFERENCES hosts(id),
 			status        VARCHAR(20) NOT NULL DEFAULT 'active',
 			layer_count   INT DEFAULT 0,
@@ -408,7 +414,7 @@ func initSchema(db *sql.DB) error {
 			paused_at     TIMESTAMP,
 			expires_at    TIMESTAMP
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_session_chunk ON session_snapshots(chunk_key)`,
+		`CREATE INDEX IF NOT EXISTS idx_session_workload ON session_snapshots(workload_key)`,
 		`CREATE INDEX IF NOT EXISTS idx_session_host ON session_snapshots(host_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_session_status ON session_snapshots(status)`,
 		// runner_id lookups on session_snapshots (HandleRunnerStatus, HandleConnectRunner)
@@ -421,13 +427,13 @@ func initSchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_jobs_queued ON jobs(status, queued_at) WHERE status = 'queued'`,
 		// jobs: completion by github_job_id
 		`CREATE INDEX IF NOT EXISTS idx_jobs_github_job_id ON jobs(github_job_id)`,
-		// snapshots: chunk_key + status + created_at for version lookups
-		`CREATE INDEX IF NOT EXISTS idx_snapshots_chunk_status ON snapshots(chunk_key, status, created_at DESC)`,
+		// snapshots: workload_key + status + created_at for version lookups
+		`CREATE INDEX IF NOT EXISTS idx_snapshots_workload_status ON snapshots(workload_key, status, created_at DESC)`,
 		// version_assignments: compound for subquery in GetFleetConvergence
-		`CREATE INDEX IF NOT EXISTS idx_version_assignments_chunk_host ON version_assignments(chunk_key, host_id)`,
-		// Add chunk_key column to runners
-		`ALTER TABLE runners ADD COLUMN IF NOT EXISTS chunk_key VARCHAR(16) DEFAULT ''`,
-		`CREATE INDEX IF NOT EXISTS idx_runners_chunk_key ON runners(chunk_key)`,
+		`CREATE INDEX IF NOT EXISTS idx_version_assignments_workload_host ON version_assignments(workload_key, host_id)`,
+		// Add workload_key column to runners
+		`ALTER TABLE runners ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_runners_workload_key ON runners(workload_key)`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil {
@@ -496,13 +502,8 @@ func (s *ControlPlaneServer) Heartbeat(ctx context.Context, req *pb.HeartbeatReq
 		s.logger.WithError(err).Warn("Failed to update heartbeat")
 	}
 
-	currentSnapshot := s.snapshotManager.GetCurrentVersion()
-	shouldSync := currentSnapshot != "" && currentSnapshot != req.Status.SnapshotVersion
-
 	return &pb.HeartbeatResponse{
-		Acknowledged:       true,
-		SnapshotVersion:    currentSnapshot,
-		ShouldSyncSnapshot: shouldSync,
+		Acknowledged: true,
 	}, nil
 }
 
@@ -563,8 +564,8 @@ func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Req
 
 // HandleAllocateRunner handles manual runner allocation requests.
 // POST /api/v1/runners/allocate
-// Body: {"chunk_key": "abc123", "labels": {"firecracker": "true"}}
-// ci_system is resolved from the snapshot config registered for the chunk_key.
+// Body: {"workload_key": "abc123", "labels": {"firecracker": "true"}}
+// ci_system is resolved from the snapshot config registered for the workload_key.
 func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -572,18 +573,18 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 	}
 
 	var req struct {
-		RequestID string            `json:"request_id"`
-		ChunkKey  string            `json:"chunk_key"`
-		Labels    map[string]string `json:"labels"`
-		SessionID string            `json:"session_id"`
+		RequestID   string            `json:"request_id"`
+		WorkloadKey string            `json:"workload_key"`
+		Labels      map[string]string `json:"labels"`
+		SessionID   string            `json:"session_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if req.ChunkKey == "" {
-		http.Error(w, "chunk_key is required", http.StatusBadRequest)
+	if req.WorkloadKey == "" {
+		http.Error(w, "workload_key is required", http.StatusBadRequest)
 		return
 	}
 	if req.RequestID == "" {
@@ -591,15 +592,15 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 	}
 
 	s.logger.WithFields(logrus.Fields{
-		"request_id": req.RequestID,
-		"chunk_key":  req.ChunkKey,
+		"request_id":   req.RequestID,
+		"workload_key": req.WorkloadKey,
 	}).Info("Manual runner allocation request")
 
 	resp, err := s.scheduler.AllocateRunner(r.Context(), AllocateRunnerRequest{
-		RequestID: req.RequestID,
-		ChunkKey:  req.ChunkKey,
-		Labels:    req.Labels,
-		SessionID: req.SessionID,
+		RequestID:   req.RequestID,
+		WorkloadKey: req.WorkloadKey,
+		Labels:      req.Labels,
+		SessionID:   req.SessionID,
 	})
 	if err != nil {
 		s.logger.WithError(err).Error("Manual allocation failed")
@@ -787,7 +788,7 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 	// Update session_snapshots table
 	if resp.SessionId != "" {
 		_, _ = s.scheduler.db.ExecContext(r.Context(), `
-			INSERT INTO session_snapshots (session_id, runner_id, chunk_key, host_id, status, layer_count, paused_at)
+			INSERT INTO session_snapshots (session_id, runner_id, workload_key, host_id, status, layer_count, paused_at)
 			VALUES ($1, $2, '', $3, 'suspended', $4, NOW())
 			ON CONFLICT (session_id) DO UPDATE SET
 				status = 'suspended',
@@ -974,15 +975,15 @@ func (s *ControlPlaneServer) HandleGetDesiredVersions(w http.ResponseWriter, r *
 }
 
 // HandleGetFleetConvergence returns the fleet convergence state.
-// GET /api/v1/versions/fleet?chunk_key={key}
+// GET /api/v1/versions/fleet?workload_key={key}
 func (s *ControlPlaneServer) HandleGetFleetConvergence(w http.ResponseWriter, r *http.Request) {
-	chunkKey := r.URL.Query().Get("chunk_key")
-	if chunkKey == "" {
-		http.Error(w, "chunk_key is required", http.StatusBadRequest)
+	workloadKey := r.URL.Query().Get("workload_key")
+	if workloadKey == "" {
+		http.Error(w, "workload_key is required", http.StatusBadRequest)
 		return
 	}
 
-	statuses, err := s.snapshotManager.GetFleetConvergence(r.Context(), chunkKey)
+	statuses, err := s.snapshotManager.GetFleetConvergence(r.Context(), workloadKey)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -990,9 +991,9 @@ func (s *ControlPlaneServer) HandleGetFleetConvergence(w http.ResponseWriter, r 
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"chunk_key": chunkKey,
-		"hosts":     statuses,
-		"count":     len(statuses),
+		"workload_key": workloadKey,
+		"hosts":        statuses,
+		"count":        len(statuses),
 	})
 }
 

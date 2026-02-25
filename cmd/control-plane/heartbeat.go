@@ -18,15 +18,13 @@ type hostHeartbeatRequest struct {
 	SnapshotVersion string `json:"snapshot_version"`
 	Draining        bool   `json:"draining"`
 	// LoadedManifests reports which chunk manifests are already loaded on this host
-	// (chunk_key → version). Used by the control plane for cache-affinity scheduling.
+	// (workload_key → version). Used by the control plane for cache-affinity scheduling.
 	LoadedManifests map[string]string `json:"loaded_manifests,omitempty"`
 }
 
 type hostHeartbeatResponse struct {
-	Acknowledged       bool   `json:"acknowledged"`
-	ShouldDrain        bool   `json:"should_drain"`
-	ShouldSyncSnapshot bool   `json:"should_sync_snapshot,omitempty"`
-	SnapshotVersion    string `json:"snapshot_version,omitempty"`
+	Acknowledged bool `json:"acknowledged"`
+	ShouldDrain  bool `json:"should_drain"`
 	// SyncVersions tells the host which repo manifests (and snapshot.mem files) to
 	// pre-download. Only repos whose desired version differs from what the host has
 	// loaded are included, so a host only downloads what it's missing.
@@ -76,37 +74,31 @@ func (s *ControlPlaneServer) HandleHostHeartbeat(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Check if host needs a snapshot sync (legacy single-repo path)
-	currentSnapshot := s.snapshotManager.GetCurrentVersion()
-	shouldSync := currentSnapshot != "" && currentSnapshot != req.SnapshotVersion
-
-	// Compute per-repo sync directives: only send repos whose desired version the
-	// host doesn't already have loaded. This avoids re-downloading snapshot.mem on
-	// every heartbeat and prevents every host from downloading every repo.
+	// Compute per-workload-key sync directives: only send workload keys whose
+	// desired version the host doesn't already have loaded. This avoids
+	// re-downloading snapshot.mem on every heartbeat.
 	var syncVersions map[string]string
 	if s.snapshotManager.db != nil {
 		desired, err := s.snapshotManager.GetDesiredVersions(r.Context(), host.ID)
 		if err != nil {
 			s.logger.WithError(err).Warn("Failed to get desired versions for heartbeat")
 		} else {
-			for chunkKey, ver := range desired {
-				loaded, hasLoaded := req.LoadedManifests[chunkKey]
+			for workloadKey, ver := range desired {
+				loaded, hasLoaded := req.LoadedManifests[workloadKey]
 				if !hasLoaded || loaded != ver {
 					if syncVersions == nil {
 						syncVersions = make(map[string]string)
 					}
-					syncVersions[chunkKey] = ver
+					syncVersions[workloadKey] = ver
 				}
 			}
 		}
 	}
 
 	writeJSON(w, http.StatusOK, hostHeartbeatResponse{
-		Acknowledged:       true,
-		ShouldDrain:        shouldDrain,
-		ShouldSyncSnapshot: shouldSync,
-		SnapshotVersion:    currentSnapshot,
-		SyncVersions:       syncVersions,
+		Acknowledged: true,
+		ShouldDrain:  shouldDrain,
+		SyncVersions: syncVersions,
 	})
 }
 

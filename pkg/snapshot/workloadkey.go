@@ -14,9 +14,9 @@ type SnapshotCommand struct {
 	RunAsRoot bool     `json:"run_as_root"` // if true, run as root; otherwise run as the configured runner user
 }
 
-// ComputeChunkKey returns a stable 16-char hex key. Commands are sorted
+// ComputeWorkloadKey returns a stable 16-char hex key. Commands are sorted
 // canonically before hashing so insertion order does not matter.
-func ComputeChunkKey(commands []SnapshotCommand) string {
+func ComputeWorkloadKey(commands []SnapshotCommand) string {
 	sorted := make([]SnapshotCommand, len(commands))
 	copy(sorted, commands)
 	sort.Slice(sorted, func(i, j int) bool {

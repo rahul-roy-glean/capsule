@@ -70,7 +70,7 @@ func stepDataSnapshotBuild(cfg *Config, logger *logrus.Logger) error {
 	args := []string{
 		"--project", cfg.Platform.GCPProject,
 		"--zone", cfg.Platform.Zone,
-		"--snapshot-gcs", fmt.Sprintf("gs://%s/current/", gcsBucket),
+		"--snapshot-gcs", fmt.Sprintf("gs://%s/v1/build-artifacts/", gcsBucket),
 		"--metadata-bucket", gcsBucket,
 	}
 

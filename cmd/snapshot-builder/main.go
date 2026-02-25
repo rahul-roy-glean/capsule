@@ -41,7 +41,8 @@ var (
 	gitCachePath         = flag.String("git-cache-path", "", "Path to pre-populated git-cache.img (from git-cache-builder). If set, uses this instead of cloning during warmup.")
 	logLevel             = flag.String("log-level", "info", "Log level")
 	enableChunked        = flag.Bool("enable-chunked", true, "Also build a chunked snapshot for lazy loading")
-	memBackend           = flag.String("mem-backend", "file", "Memory backend for chunked snapshots: 'file' (upload snapshot.mem as single blob, default) or 'chunked' (UFFD lazy loading via MemChunks)")
+	memBackend           = flag.String("mem-backend", "chunked", "Memory backend for chunked snapshots: 'chunked' (UFFD lazy loading via MemChunks, default) or 'file' (upload snapshot.mem as single blob)")
+	gcsPrefix            = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
 
 	incremental = flag.Bool("incremental", false, "Restore from previous snapshot for incremental rebuild")
 
@@ -136,7 +137,7 @@ func main() {
 		log.WithError(err).Warn("Failed to get GCP access token (Artifact Registry auth won't work in warmup VM)")
 	}
 
-	// Parse snapshot commands early — needed for chunk key and version.
+	// Parse snapshot commands early — needed for workload key and version.
 	var commands []snapshot.SnapshotCommand
 	if err := json.Unmarshal([]byte(*snapshotCommands), &commands); err != nil {
 		log.WithError(err).Fatal("invalid --snapshot-commands")
@@ -144,11 +145,11 @@ func main() {
 	if len(commands) == 0 {
 		log.Fatal("--snapshot-commands must be non-empty")
 	}
-	chunkKey := snapshot.ComputeChunkKey(commands)
-	log.WithField("chunk_key", chunkKey).Info("Computed chunk key from snapshot commands")
+	workloadKey := snapshot.ComputeWorkloadKey(commands)
+	log.WithField("workload_key", workloadKey).Info("Computed workload key from snapshot commands")
 
 	// Generate version string
-	version := fmt.Sprintf("v%s-%s", time.Now().Format("20060102-150405"), chunkKey)
+	version := fmt.Sprintf("v%s-%s", time.Now().Format("20060102-150405"), workloadKey)
 	log.WithField("version", version).Info("Building snapshot")
 
 	// Create output directory
@@ -428,7 +429,7 @@ func main() {
 		Version:           version,
 		RepoCommit:        getGitCommit(*outputDir),
 		Repo:              metaRepoURL,
-		ChunkKey:          chunkKey,
+		WorkloadKey:       workloadKey,
 		Commands:          commands,
 		CreatedAt:         time.Now(),
 		SizeBytes:         totalSize,
@@ -442,6 +443,7 @@ func main() {
 	// Upload to GCS
 	uploader, err := snapshot.NewUploader(ctx, snapshot.UploaderConfig{
 		GCSBucket: *gcsBucket,
+		GCSPrefix: *gcsPrefix,
 		Logger:    logger,
 	})
 	if err != nil {
@@ -465,7 +467,9 @@ func main() {
 
 		chunkStore, err := snapshot.NewChunkStore(ctx, snapshot.ChunkStoreConfig{
 			GCSBucket:      *gcsBucket,
+			GCSPrefix:      *gcsPrefix,
 			LocalCachePath: filepath.Join(*outputDir, "chunk-cache"),
+			ChunkSubdir:    "disk",
 			Logger:         logger,
 		})
 		if err != nil {
@@ -473,7 +477,19 @@ func main() {
 		}
 		defer chunkStore.Close()
 
-		builder := snapshot.NewChunkedSnapshotBuilder(chunkStore, logger)
+		memChunkStore, err := snapshot.NewChunkStore(ctx, snapshot.ChunkStoreConfig{
+			GCSBucket:      *gcsBucket,
+			GCSPrefix:      *gcsPrefix,
+			LocalCachePath: filepath.Join(*outputDir, "chunk-cache"),
+			ChunkSubdir:    "mem",
+			Logger:         logger,
+		})
+		if err != nil {
+			log.WithError(err).Fatal("Failed to create mem chunk store")
+		}
+		defer memChunkStore.Close()
+
+		builder := snapshot.NewChunkedSnapshotBuilder(chunkStore, memChunkStore, logger)
 		builder.MemBackend = *memBackend
 
 		// Compute rootfs source hash for storing in metadata (enables incremental change detection).
@@ -494,6 +510,8 @@ func main() {
 
 			chunkedMeta := &snapshot.ChunkedSnapshotMetadata{
 				Version:          version,
+				WorkloadKey:      workloadKey,
+				Commands:         commands,
 				CreatedAt:        time.Now(),
 				ChunkSize:        snapshot.DefaultChunkSize,
 				RootfsSourceHash: rootfsSourceHash,
@@ -523,14 +541,14 @@ func main() {
 
 			// Store memory according to --mem-backend flag.
 			if *memBackend == "file" {
-				memGCSPath := fmt.Sprintf("%s/snapshot.mem.zst", version)
-				_, _, err = chunkStore.UploadRawFile(ctx, memPath, memGCSPath)
+				memGCSPath := fmt.Sprintf("%s/snapshot_state/%s/snapshot.mem.zst", workloadKey, version)
+				_, _, err = memChunkStore.UploadRawFile(ctx, memPath, memGCSPath)
 				if err != nil {
 					log.WithError(err).Fatal("Failed to upload raw memory file")
 				}
 				chunkedMeta.MemFilePath = memGCSPath
 			} else {
-				memChunks, err := chunkStore.ChunkFile(ctx, memPath, snapshot.DefaultChunkSize)
+				memChunks, err := memChunkStore.ChunkFile(ctx, memPath, snapshot.DefaultChunkSize)
 				if err != nil {
 					log.WithError(err).Fatal("Failed to chunk memory file")
 				}
@@ -553,12 +571,6 @@ func main() {
 				log.WithError(err).Fatal("Failed to upload chunked metadata")
 			}
 
-			currentMeta := *chunkedMeta
-			currentMeta.Version = "current"
-			if err := builder.UploadChunkedMetadata(ctx, &currentMeta); err != nil {
-				log.WithError(err).Fatal("Failed to upload current chunked metadata")
-			}
-
 			log.WithFields(logrus.Fields{
 				"mem_file":    chunkedMeta.MemFilePath,
 				"disk_chunks": len(chunkedMeta.RootfsChunks),
@@ -575,22 +587,16 @@ func main() {
 				Version:       version,
 			}
 
-			chunkedMeta, err := builder.BuildChunkedSnapshot(ctx, snapshotPaths, version)
+			chunkedMeta, err := builder.BuildChunkedSnapshot(ctx, snapshotPaths, version, workloadKey)
 			if err != nil {
 				log.WithError(err).Fatal("Failed to build chunked snapshot")
 			}
 			chunkedMeta.RootfsSourceHash = rootfsSourceHash
+			chunkedMeta.Commands = commands
 
 			if err := builder.UploadChunkedMetadata(ctx, chunkedMeta); err != nil {
 				log.WithError(err).Fatal("Failed to upload chunked metadata")
 			}
-
-			currentMeta := *chunkedMeta
-			currentMeta.Version = "current"
-			if err := builder.UploadChunkedMetadata(ctx, &currentMeta); err != nil {
-				log.WithError(err).Fatal("Failed to upload current chunked metadata")
-			}
-			currentMeta.Version = version
 
 			log.WithFields(logrus.Fields{
 				"mem_chunks":  len(chunkedMeta.MemChunks),
@@ -600,10 +606,10 @@ func main() {
 		}
 	}
 
-	// Update current pointer (chunk-key-scoped) — done last so the pointer
+	// Update current pointer (workload-key-scoped) — done last so the pointer
 	// only moves after all snapshot data has been fully uploaded.
 	log.Info("Updating current pointer...")
-	if err := uploader.UpdateCurrentPointerForRepo(ctx, version, chunkKey); err != nil {
+	if err := uploader.UpdateCurrentPointerForRepo(ctx, version, workloadKey); err != nil {
 		log.WithError(err).Fatal("Failed to update current pointer")
 	}
 
@@ -1027,17 +1033,26 @@ func restoreFromPreviousSnapshot(
 	// 1. Create chunk store and load previous chunked metadata
 	chunkStore, err := snapshot.NewChunkStore(ctx, snapshot.ChunkStoreConfig{
 		GCSBucket:      *gcsBucket,
+		GCSPrefix:      *gcsPrefix,
 		LocalCachePath: filepath.Join(incrDir, "chunk-cache"),
+		ChunkSubdir:    "disk",
 		Logger:         logger,
 	})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to create chunk store: %w", err)
 	}
 
-	chunkedMeta, err := chunkStore.LoadChunkedMetadata(ctx, "current")
+	// Resolve the current version via pointer file, then load its metadata.
+	wk := snapshot.ComputeWorkloadKey(commands)
+	currentVersion, err := chunkStore.ReadCurrentVersion(ctx, wk)
 	if err != nil {
 		chunkStore.Close()
-		return nil, nil, nil, fmt.Errorf("no previous chunked snapshot found: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to resolve current version for workload key %q: %w", wk, err)
+	}
+	chunkedMeta, err := chunkStore.LoadChunkedMetadata(ctx, wk, currentVersion)
+	if err != nil {
+		chunkStore.Close()
+		return nil, nil, nil, fmt.Errorf("no previous chunked snapshot found for version %s: %w", currentVersion, err)
 	}
 	log.WithFields(logrus.Fields{
 		"version":       chunkedMeta.Version,

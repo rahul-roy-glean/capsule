@@ -36,7 +36,7 @@ type Runner struct {
 	SnapshotVersion         string
 	GitHubRunnerID          string
 	GitHubRepo              string // Repository for pool key matching
-	ChunkKey                string // Chunk key for snapshot routing in multi-snapshot support
+	WorkloadKey             string // Workload key for snapshot routing in multi-snapshot support
 	CISystem                string // CI system used for this runner (e.g., "github-actions")
 	JobID                   string
 	Resources               Resources
@@ -87,7 +87,8 @@ type AllocateRequest struct {
 	Repo              string
 	Branch            string
 	Commit            string
-	ChunkKey          string // Chunk key identifying which snapshot to use for this runner
+	WorkloadKey       string // Workload key identifying which snapshot to use for this runner
+	SnapshotVersion   string // Explicit snapshot version; skips current-pointer.json lookup when set
 	Resources         Resources
 	Labels            map[string]string
 	GitHubRunnerToken string
@@ -224,8 +225,8 @@ type HostConfig struct {
 	MicroVMSubnet     string
 	ExternalInterface string
 	BridgeName        string
-	// ChunkKey identifies which snapshot this host should use (hash of snapshot commands).
-	ChunkKey         string
+	// WorkloadKey identifies which snapshot this host should use (hash of snapshot commands).
+	WorkloadKey      string
 	Environment      string
 	ControlPlaneAddr string
 

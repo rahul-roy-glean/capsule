@@ -354,22 +354,28 @@ func (c *Client) RecordHostMetrics(ctx context.Context, m HostMetrics) {
 
 // ChunkedMetrics holds chunked snapshot system metrics.
 type ChunkedMetrics struct {
-	CacheSize    int64
-	CacheMaxSize int64
-	CacheItems   int
-	PageFaults   uint64
-	CacheHits    uint64
-	ChunkFetches uint64
-	DiskReads    uint64
-	DiskWrites   uint64
-	DirtyChunks  int
+	DiskCacheSize    int64
+	DiskCacheMaxSize int64
+	DiskCacheItems   int
+	MemCacheSize     int64
+	MemCacheMaxSize  int64
+	MemCacheItems    int
+	PageFaults       uint64
+	CacheHits        uint64
+	ChunkFetches     uint64
+	DiskReads        uint64
+	DiskWrites       uint64
+	DirtyChunks      int
 }
 
 // RecordChunkedMetrics records chunked snapshot system metrics.
 func (c *Client) RecordChunkedMetrics(ctx context.Context, m ChunkedMetrics) {
-	c.RecordInt(ctx, MetricChunkCacheSize, m.CacheSize, nil)
-	c.RecordInt(ctx, MetricChunkCacheMaxSize, m.CacheMaxSize, nil)
-	c.RecordInt(ctx, MetricChunkCacheItems, int64(m.CacheItems), nil)
+	c.RecordInt(ctx, MetricDiskCacheSize, m.DiskCacheSize, nil)
+	c.RecordInt(ctx, MetricDiskCacheMaxSize, m.DiskCacheMaxSize, nil)
+	c.RecordInt(ctx, MetricDiskCacheItems, int64(m.DiskCacheItems), nil)
+	c.RecordInt(ctx, MetricMemCacheSize, m.MemCacheSize, nil)
+	c.RecordInt(ctx, MetricMemCacheMaxSize, m.MemCacheMaxSize, nil)
+	c.RecordInt(ctx, MetricMemCacheItems, int64(m.MemCacheItems), nil)
 	c.RecordInt(ctx, MetricChunkPageFaults, int64(m.PageFaults), nil)
 	c.RecordInt(ctx, MetricChunkCacheHits, int64(m.CacheHits), nil)
 	c.RecordInt(ctx, MetricChunkFetches, int64(m.ChunkFetches), nil)

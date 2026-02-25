@@ -31,7 +31,8 @@ var (
 	triggerRebuild    = flag.Bool("trigger-rebuild", false, "Trigger Cloud Build rebuild if stale")
 	cloudBuildTrigger = flag.String("cloud-build-trigger", "", "Cloud Build trigger ID for rebuild")
 
-	logLevel = flag.String("log-level", "info", "Log level")
+	logLevel  = flag.String("log-level", "info", "Log level")
+	gcsPrefix = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
 )
 
 // GitCacheMetadata from git-cache-builder
@@ -127,8 +128,20 @@ func main() {
 	}
 }
 
+func prefixedPath(prefix, path string) string {
+	if prefix == "" {
+		return path
+	}
+	return prefix + "/" + path
+}
+
 func downloadMetadata(ctx context.Context, bucket string) (*GitCacheMetadata, error) {
-	gcsPath := fmt.Sprintf("gs://%s/git-cache/current/metadata.json", bucket)
+	// Resolve the current version via pointer file
+	version, err := resolveCurrentPointer(ctx, bucket, "git-cache")
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve git-cache current pointer: %w", err)
+	}
+	gcsPath := fmt.Sprintf("gs://%s/%s", bucket, prefixedPath(*gcsPrefix, fmt.Sprintf("git-cache/%s/metadata.json", version)))
 
 	// Download to temp file
 	tmpFile, err := os.CreateTemp("", "git-cache-metadata-*.json")
@@ -154,6 +167,39 @@ func downloadMetadata(ctx context.Context, bucket string) (*GitCacheMetadata, er
 	}
 
 	return &metadata, nil
+}
+
+// resolveCurrentPointer reads the current-pointer.json for a given prefix (e.g. "git-cache")
+// from GCS and returns the version string.
+func resolveCurrentPointer(ctx context.Context, bucket, prefix string) (string, error) {
+	pointerPath := fmt.Sprintf("gs://%s/%s", bucket, prefixedPath(*gcsPrefix, prefix+"/current-pointer.json"))
+	tmpFile, err := os.CreateTemp("", "pointer-*.json")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.Close()
+
+	cmd := exec.CommandContext(ctx, "gcloud", "storage", "cp", pointerPath, tmpFile.Name())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("gcloud storage cp %s failed: %s: %w", pointerPath, strings.TrimSpace(string(output)), err)
+	}
+
+	data, err := os.ReadFile(tmpFile.Name())
+	if err != nil {
+		return "", err
+	}
+
+	var pointer struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(data, &pointer); err != nil {
+		return "", err
+	}
+	if pointer.Version == "" {
+		return "", fmt.Errorf("empty version in %s", pointerPath)
+	}
+	return pointer.Version, nil
 }
 
 func checkFreshness(ctx context.Context, metadata *GitCacheMetadata, token string, maxAgeHours, maxCommitDrift int, log *logrus.Entry) *FreshnessReport {

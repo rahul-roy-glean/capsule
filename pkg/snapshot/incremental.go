@@ -218,24 +218,16 @@ func (d *SnapshotDiff) Summary() string {
 		d.OldVersion, d.NewVersion, len(d.ChangedDiskChunks), len(d.ChangedMemChunks))
 }
 
-// UpdateSnapshotPointer updates the "current" pointer to a new chunked snapshot version
+// UpdateSnapshotPointer uploads the versioned metadata for a new chunked snapshot version.
+// The current-pointer.json mechanism is the canonical way to resolve the active version.
 func (u *IncrementalUploader) UpdateSnapshotPointer(ctx context.Context, meta *ChunkedSnapshotMetadata) error {
-	// Upload metadata to both version-specific and "current" locations
-	builder := NewChunkedSnapshotBuilder(u.store, u.logger.Logger)
+	builder := NewChunkedSnapshotBuilder(u.store, nil, u.logger.Logger)
 
-	// Upload to versioned location
 	if err := builder.UploadChunkedMetadata(ctx, meta); err != nil {
 		return fmt.Errorf("failed to upload versioned metadata: %w", err)
 	}
 
-	// Upload to "current" location
-	currentMeta := *meta
-	currentMeta.Version = "current"
-	if err := builder.UploadChunkedMetadata(ctx, &currentMeta); err != nil {
-		return fmt.Errorf("failed to upload current metadata: %w", err)
-	}
-
-	u.logger.WithField("version", meta.Version).Info("Updated current snapshot pointer")
+	u.logger.WithField("version", meta.Version).Info("Updated snapshot pointer")
 	return nil
 }
 
@@ -248,7 +240,7 @@ func (u *IncrementalUploader) UpdateSnapshotPointer(ctx context.Context, meta *C
 // referenced by repo B must not be deleted just because repo A deprecated its
 // snapshot. The caller is responsible for collecting versions across all repos.
 // Use GarbageCollectAllRepos for the safe multi-repo variant.
-func (u *IncrementalUploader) GarbageCollect(ctx context.Context, keepVersions []string) error {
+func (u *IncrementalUploader) GarbageCollect(ctx context.Context, workloadKey string, keepVersions []string) error {
 	u.logger.WithField("keep_versions", keepVersions).Info("Starting garbage collection")
 
 	if len(keepVersions) == 0 {
@@ -259,7 +251,7 @@ func (u *IncrementalUploader) GarbageCollect(ctx context.Context, keepVersions [
 	// 1. Load metadata for all versions to keep
 	referencedHashes := make(map[string]bool)
 	for _, version := range keepVersions {
-		meta, err := u.store.LoadChunkedMetadata(ctx, version)
+		meta, err := u.store.LoadChunkedMetadata(ctx, workloadKey, version)
 		if err != nil {
 			u.logger.WithError(err).WithField("version", version).Warn("Failed to load metadata for GC, skipping version")
 			continue
@@ -277,7 +269,7 @@ func (u *IncrementalUploader) GarbageCollect(ctx context.Context, keepVersions [
 }
 
 // GarbageCollectAllRepos is the safe multi-repo variant of GarbageCollect.
-// It accepts a map of chunk_key → []version_paths (GCS metadata paths) and
+// It accepts a map of workload_key → []version_paths (GCS metadata paths) and
 // builds the referenced set across ALL repos before deleting anything.
 // This prevents repo A's GC from deleting chunks still referenced by repo B.
 func (u *IncrementalUploader) GarbageCollectAllRepos(ctx context.Context, repoVersions map[string][]string) error {
@@ -286,13 +278,13 @@ func (u *IncrementalUploader) GarbageCollectAllRepos(ctx context.Context, repoVe
 	referencedHashes := make(map[string]bool)
 	totalVersions := 0
 
-	for chunkKey, versions := range repoVersions {
+	for workloadKey, versions := range repoVersions {
 		for _, version := range versions {
-			meta, err := u.store.LoadChunkedMetadata(ctx, version)
+			meta, err := u.store.LoadChunkedMetadata(ctx, workloadKey, version)
 			if err != nil {
 				u.logger.WithError(err).WithFields(logrus.Fields{
-					"chunk_key": chunkKey,
-					"version":   version,
+					"workload_key": workloadKey,
+					"version":      version,
 				}).Warn("Failed to load metadata for GC, skipping version")
 				continue
 			}

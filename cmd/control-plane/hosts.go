@@ -26,7 +26,7 @@ type Host struct {
 	GRPCAddress      string
 	HTTPAddress      string
 	CreatedAt        time.Time
-	// LoadedManifests tracks which chunked snapshot manifests are loaded per chunk key (chunk_key → version)
+	// LoadedManifests tracks which chunked snapshot manifests are loaded per workload key (workload_key → version)
 	LoadedManifests map[string]string
 	// DiskUsage is the reported disk usage percentage (0.0-1.0)
 	DiskUsage float64
@@ -42,7 +42,7 @@ type Runner struct {
 	JobID          string
 	Repo           string
 	Branch         string
-	ChunkKey       string
+	WorkloadKey    string
 	CreatedAt      time.Time
 	StartedAt      time.Time
 	CompletedAt    time.Time
@@ -301,9 +301,9 @@ func (hr *HostRegistry) AddRunner(ctx context.Context, runner *Runner) error {
 	defer hr.mu.Unlock()
 
 	_, err := hr.db.ExecContext(ctx, `
-		INSERT INTO runners (id, host_id, status, internal_ip, job_id, repo, branch, chunk_key)
+		INSERT INTO runners (id, host_id, status, internal_ip, job_id, repo, branch, workload_key)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`, runner.ID, runner.HostID, runner.Status, runner.InternalIP, runner.JobID, runner.Repo, runner.Branch, runner.ChunkKey)
+	`, runner.ID, runner.HostID, runner.Status, runner.InternalIP, runner.JobID, runner.Repo, runner.Branch, runner.WorkloadKey)
 
 	if err != nil {
 		return err

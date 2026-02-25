@@ -53,7 +53,7 @@ type ChunkedSnapshotMetadata struct {
 	BazelVersion  string            `json:"bazel_version,omitempty"`
 	RepoCommit    string            `json:"repo_commit,omitempty"`
 	Repo          string            `json:"repo,omitempty"`
-	ChunkKey      string            `json:"chunk_key,omitempty"`
+	WorkloadKey   string            `json:"workload_key,omitempty"`
 	Commands      []SnapshotCommand `json:"commands,omitempty"`
 	CreatedAt     time.Time         `json:"created_at"`
 	ChunkSize     int64             `json:"chunk_size"`
@@ -86,12 +86,14 @@ type ChunkRef struct {
 
 // ChunkStore manages storage and retrieval of content-addressed chunks
 type ChunkStore struct {
-	gcsBucket  string
-	gcsClient  *storage.Client
-	localCache string
-	encoder    *zstd.Encoder
-	decoder    *zstd.Decoder
-	logger     *logrus.Entry
+	gcsBucket   string
+	gcsPrefix   string // top-level prefix for all GCS paths (e.g. "v1")
+	gcsClient   *storage.Client
+	localCache  string
+	chunkSubdir string // "disk", "mem", or "" for legacy flat layout
+	encoder     *zstd.Encoder
+	decoder     *zstd.Decoder
+	logger      *logrus.Entry
 
 	// In-memory LRU cache for decompressed chunks
 	chunkCache *LRUCache
@@ -107,8 +109,10 @@ type ChunkStore struct {
 // ChunkStoreConfig holds configuration for the chunk store
 type ChunkStoreConfig struct {
 	GCSBucket           string
+	GCSPrefix           string // Top-level prefix for all GCS paths (e.g. "v1"); empty means no prefix
 	LocalCachePath      string
-	ChunkCacheSizeBytes int64 // In-memory cache size (default 2GB)
+	ChunkCacheSizeBytes int64  // In-memory cache size (default 2GB)
+	ChunkSubdir         string // Subdirectory under chunks/ (e.g. "disk" or "mem"); empty means flat "chunks/"
 	Logger              *logrus.Logger
 }
 
@@ -158,8 +162,10 @@ func NewChunkStore(ctx context.Context, cfg ChunkStoreConfig) (*ChunkStore, erro
 
 	return &ChunkStore{
 		gcsBucket:        cfg.GCSBucket,
+		gcsPrefix:        cfg.GCSPrefix,
 		gcsClient:        client,
 		localCache:       cfg.LocalCachePath,
+		chunkSubdir:      cfg.ChunkSubdir,
 		encoder:          encoder,
 		decoder:          decoder,
 		logger:           logger.WithField("component", "chunk-store"),
@@ -444,10 +450,30 @@ func (cs *ChunkStore) ReassembleFile(ctx context.Context, refs []ChunkRef, destP
 	return g.Wait()
 }
 
-// chunkPath returns the GCS path for a chunk
+// gcsPath prepends the configured GCS prefix to a path.
+// E.g. with prefix "v1": gcsPath("chunks/disk/ab/abc") → "v1/chunks/disk/ab/abc"
+func (cs *ChunkStore) gcsPath(path string) string {
+	if cs.gcsPrefix != "" {
+		return cs.gcsPrefix + "/" + path
+	}
+	return path
+}
+
+// GCSPrefix returns the configured GCS prefix (e.g. "v1").
+func (cs *ChunkStore) GCSPrefix() string {
+	return cs.gcsPrefix
+}
+
+// chunkPath returns the GCS path for a chunk.
+// Layout: chunks/{subdir}/{hash[:2]}/{hash} (e.g. chunks/disk/ab/abcdef...)
 func (cs *ChunkStore) chunkPath(hash string) string {
-	// Use hash prefix for better GCS distribution
-	return fmt.Sprintf("%s/%s/%s", ChunksPrefix, hash[:2], hash)
+	var raw string
+	if cs.chunkSubdir != "" {
+		raw = fmt.Sprintf("%s/%s/%s/%s", ChunksPrefix, cs.chunkSubdir, hash[:2], hash)
+	} else {
+		raw = fmt.Sprintf("%s/%s/%s", ChunksPrefix, hash[:2], hash)
+	}
+	return cs.gcsPath(raw)
 }
 
 // chunkExists checks if a chunk already exists in GCS
@@ -599,7 +625,11 @@ func (cs *ChunkStore) DownloadRawFile(ctx context.Context, gcsObjectPath, localD
 // ListChunks lists all chunk hashes stored in GCS under the chunks/ prefix.
 func (cs *ChunkStore) ListChunks(ctx context.Context) ([]string, error) {
 	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
-	prefix := ChunksPrefix + "/"
+	rawPrefix := ChunksPrefix + "/"
+	if cs.chunkSubdir != "" {
+		rawPrefix = ChunksPrefix + "/" + cs.chunkSubdir + "/"
+	}
+	prefix := cs.gcsPath(rawPrefix)
 
 	it := bucket.Objects(ctx, &storage.Query{Prefix: prefix})
 	var hashes []string
@@ -636,6 +666,11 @@ func (cs *ChunkStore) Close() error {
 		return cs.gcsClient.Close()
 	}
 	return nil
+}
+
+// CacheStats returns statistics for the in-memory LRU chunk cache.
+func (cs *ChunkStore) CacheStats() CacheStats {
+	return cs.chunkCache.Stats()
 }
 
 // StartEagerFetcher starts background goroutines for eager chunk prefetching.
@@ -718,31 +753,44 @@ func (cs *ChunkStore) eagerFetchLoop(limiter *rate.Limiter, eg *errgroup.Group) 
 
 // ChunkedSnapshotBuilder creates chunked snapshots from existing snapshot files
 type ChunkedSnapshotBuilder struct {
-	store  *ChunkStore
-	logger *logrus.Entry
+	store    *ChunkStore // disk chunks (rootfs, kernel, state, repo-cache-seed)
+	memStore *ChunkStore // memory chunks (UFFD); nil falls back to store
+	logger   *logrus.Entry
 	// MemBackend controls how memory is stored: "chunked" (UFFD lazy via MemChunks,
 	// default) or "file" (single compressed blob via MemFilePath for file-backed restore).
 	MemBackend string
 }
 
-// NewChunkedSnapshotBuilder creates a new chunked snapshot builder
-func NewChunkedSnapshotBuilder(store *ChunkStore, logger *logrus.Logger) *ChunkedSnapshotBuilder {
+// NewChunkedSnapshotBuilder creates a new chunked snapshot builder.
+// memStore is used for memory chunks (chunks/mem/); if nil, store is used for everything.
+func NewChunkedSnapshotBuilder(store *ChunkStore, memStore *ChunkStore, logger *logrus.Logger) *ChunkedSnapshotBuilder {
 	return &ChunkedSnapshotBuilder{
 		store:      store,
+		memStore:   memStore,
 		logger:     logger.WithField("component", "chunked-snapshot-builder"),
 		MemBackend: "chunked",
 	}
 }
 
-// BuildChunkedSnapshot creates a chunked snapshot from traditional snapshot files
-func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths *SnapshotPaths, version string) (*ChunkedSnapshotMetadata, error) {
+// getMemStore returns the chunk store to use for memory chunks.
+func (b *ChunkedSnapshotBuilder) getMemStore() *ChunkStore {
+	if b.memStore != nil {
+		return b.memStore
+	}
+	return b.store
+}
+
+// BuildChunkedSnapshot creates a chunked snapshot from traditional snapshot files.
+// workloadKey is used for scoping GCS paths under {workloadKey}/snapshot_state/{version}/.
+func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths *SnapshotPaths, version, workloadKey string) (*ChunkedSnapshotMetadata, error) {
 	b.logger.WithField("version", version).Info("Building chunked snapshot")
 	start := time.Now()
 
 	meta := &ChunkedSnapshotMetadata{
-		Version:   version,
-		CreatedAt: time.Now(),
-		ChunkSize: DefaultChunkSize,
+		Version:     version,
+		WorkloadKey: workloadKey,
+		CreatedAt:   time.Now(),
+		ChunkSize:   DefaultChunkSize,
 	}
 
 	// Chunk kernel (small, usually single chunk)
@@ -780,15 +828,15 @@ func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths
 	if paths.Mem != "" {
 		if b.MemBackend == "file" {
 			b.logger.Info("Uploading raw memory file (file-backed restore)...")
-			memGCSPath := fmt.Sprintf("%s/snapshot.mem.zst", version)
-			_, _, err := b.store.UploadRawFile(ctx, paths.Mem, memGCSPath)
+			memGCSPath := b.store.gcsPath(fmt.Sprintf("%s/snapshot_state/%s/snapshot.mem.zst", meta.WorkloadKey, version))
+			_, _, err := b.getMemStore().UploadRawFile(ctx, paths.Mem, memGCSPath)
 			if err != nil {
 				return nil, fmt.Errorf("failed to upload raw memory file: %w", err)
 			}
 			meta.MemFilePath = memGCSPath
 		} else {
 			b.logger.Info("Chunking memory file for UFFD lazy loading...")
-			memChunks, err := b.store.ChunkFile(ctx, paths.Mem, DefaultChunkSize)
+			memChunks, err := b.getMemStore().ChunkFile(ctx, paths.Mem, DefaultChunkSize)
 			if err != nil {
 				return nil, fmt.Errorf("failed to chunk memory file: %w", err)
 			}
@@ -834,10 +882,11 @@ func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths
 	return meta, nil
 }
 
-// UploadChunkedMetadata uploads the chunked snapshot metadata to GCS
+// UploadChunkedMetadata uploads the chunked snapshot metadata to GCS.
+// Path: {workload_key}/snapshot_state/{version}/chunked-metadata.json
 func (b *ChunkedSnapshotBuilder) UploadChunkedMetadata(ctx context.Context, meta *ChunkedSnapshotMetadata) error {
 	bucket := b.store.gcsClient.Bucket(b.store.gcsBucket)
-	objPath := fmt.Sprintf("%s/chunked-metadata.json", meta.Version)
+	objPath := b.store.gcsPath(fmt.Sprintf("%s/snapshot_state/%s/chunked-metadata.json", meta.WorkloadKey, meta.Version))
 
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
@@ -860,11 +909,11 @@ func (b *ChunkedSnapshotBuilder) UploadChunkedMetadata(ctx context.Context, meta
 	return nil
 }
 
-// ReadCurrentVersion reads the current-pointer.json for a chunk key and returns
+// ReadCurrentVersion reads the current-pointer.json for a workload key and returns
 // the version string it points to.
-func (cs *ChunkStore) ReadCurrentVersion(ctx context.Context, chunkKey string) (string, error) {
+func (cs *ChunkStore) ReadCurrentVersion(ctx context.Context, workloadKey string) (string, error) {
 	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
-	objPath := chunkKey + "/current-pointer.json"
+	objPath := cs.gcsPath(workloadKey + "/current-pointer.json")
 
 	reader, err := bucket.Object(objPath).NewReader(ctx)
 	if err != nil {
@@ -889,10 +938,11 @@ func (cs *ChunkStore) ReadCurrentVersion(ctx context.Context, chunkKey string) (
 	return pointer.Version, nil
 }
 
-// LoadChunkedMetadata loads chunked snapshot metadata from GCS
-func (cs *ChunkStore) LoadChunkedMetadata(ctx context.Context, version string) (*ChunkedSnapshotMetadata, error) {
+// LoadChunkedMetadata loads chunked snapshot metadata from GCS.
+// Path: {workload_key}/snapshot_state/{version}/chunked-metadata.json
+func (cs *ChunkStore) LoadChunkedMetadata(ctx context.Context, workloadKey, version string) (*ChunkedSnapshotMetadata, error) {
 	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
-	objPath := fmt.Sprintf("%s/chunked-metadata.json", version)
+	objPath := cs.gcsPath(fmt.Sprintf("%s/snapshot_state/%s/chunked-metadata.json", workloadKey, version))
 
 	reader, err := bucket.Object(objPath).NewReader(ctx)
 	if err != nil {

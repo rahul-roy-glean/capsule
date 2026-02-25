@@ -66,10 +66,17 @@ const (
 	MetricNetworkBytesTx     = "network/bytes_tx_total"
 	MetricNetworkBytesRx     = "network/bytes_rx_total"
 
-	// Chunked snapshot metrics
-	MetricChunkCacheSize     = "chunked/cache_size_bytes"
-	MetricChunkCacheMaxSize  = "chunked/cache_max_size_bytes"
-	MetricChunkCacheItems    = "chunked/cache_items"
+	// Chunked snapshot metrics — disk cache (FUSE)
+	MetricDiskCacheSize    = "chunked/disk_cache_size_bytes"
+	MetricDiskCacheMaxSize = "chunked/disk_cache_max_size_bytes"
+	MetricDiskCacheItems   = "chunked/disk_cache_items"
+
+	// Chunked snapshot metrics — memory cache (UFFD)
+	MetricMemCacheSize    = "chunked/mem_cache_size_bytes"
+	MetricMemCacheMaxSize = "chunked/mem_cache_max_size_bytes"
+	MetricMemCacheItems   = "chunked/mem_cache_items"
+
+	// Chunked snapshot metrics — general
 	MetricChunkPageFaults    = "chunked/page_faults_total"
 	MetricChunkCacheHits     = "chunked/cache_hits_total"
 	MetricChunkFetches       = "chunked/chunk_fetches_total"
@@ -104,7 +111,7 @@ const (
 	LabelEvent       = "event"
 	LabelJobID       = "job_id"
 	LabelHostID      = "host_id"
-	LabelChunkKey    = "chunk_key"
+	LabelWorkloadKey = "workload_key"
 )
 
 // E2E canary metrics

@@ -222,7 +222,7 @@ func TestEnforceTTLs_ZeroLastExecAt(t *testing.T) {
 func TestSessionMetadata_JSON(t *testing.T) {
 	meta := SessionMetadata{
 		SessionID:          "sess-abc",
-		ChunkKey:           "chunk123",
+		WorkloadKey:        "chunk123",
 		RunnerID:           "runner-1",
 		HostID:             "host-1",
 		Layers:             2,
@@ -263,7 +263,7 @@ func TestSessionMetadata_JSON(t *testing.T) {
 
 func TestSessionMetadata_BackwardsCompatible(t *testing.T) {
 	// Old metadata without TTL fields should unmarshal fine
-	oldJSON := `{"session_id":"s1","chunk_key":"ck","runner_id":"r1","host_id":"h1","layers":1,"rootfs_path":"/tmp/x"}`
+	oldJSON := `{"session_id":"s1","workload_key":"ck","runner_id":"r1","host_id":"h1","layers":1,"rootfs_path":"/tmp/x"}`
 
 	var meta SessionMetadata
 	if err := json.Unmarshal([]byte(oldJSON), &meta); err != nil {
@@ -352,12 +352,12 @@ func TestGetSessionMetadata(t *testing.T) {
 	sessDir := filepath.Join(tmpDir, "sess-1")
 	os.MkdirAll(sessDir, 0755)
 	meta := SessionMetadata{
-		SessionID:  "sess-1",
-		ChunkKey:   "ck123",
-		RunnerID:   "runner-1",
-		Layers:     3,
-		TTLSeconds: 60,
-		AutoPause:  true,
+		SessionID:   "sess-1",
+		WorkloadKey: "ck123",
+		RunnerID:    "runner-1",
+		Layers:      3,
+		TTLSeconds:  60,
+		AutoPause:   true,
 	}
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
@@ -366,8 +366,8 @@ func TestGetSessionMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSessionMetadata failed: %v", err)
 	}
-	if got.ChunkKey != "ck123" {
-		t.Errorf("ChunkKey = %q, want %q", got.ChunkKey, "ck123")
+	if got.WorkloadKey != "ck123" {
+		t.Errorf("WorkloadKey = %q, want %q", got.WorkloadKey, "ck123")
 	}
 	if got.Layers != 3 {
 		t.Errorf("Layers = %d, want 3", got.Layers)
@@ -508,22 +508,22 @@ func TestResumeFromSession_NotFound(t *testing.T) {
 	}
 }
 
-func TestResumeFromSession_ChunkKeyMismatch(t *testing.T) {
+func TestResumeFromSession_WorkloadKeyMismatch(t *testing.T) {
 	tmpDir := t.TempDir()
 	m := newTestManager(func(m *Manager) {
 		m.config.SessionDir = tmpDir
 	})
 
-	// Write metadata with chunk_key "abc"
+	// Write metadata with workload_key "abc"
 	sessDir := filepath.Join(tmpDir, "sess-1")
 	os.MkdirAll(sessDir, 0755)
-	meta := SessionMetadata{SessionID: "sess-1", ChunkKey: "abc", Layers: 1}
+	meta := SessionMetadata{SessionID: "sess-1", WorkloadKey: "abc", Layers: 1}
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
 	_, err := m.ResumeFromSession(context.Background(), "sess-1", "xyz")
 	if err == nil {
-		t.Error("ResumeFromSession should fail on chunk_key mismatch")
+		t.Error("ResumeFromSession should fail on workload_key mismatch")
 	}
 }
 
@@ -535,7 +535,7 @@ func TestResumeFromSession_NoLayers(t *testing.T) {
 
 	sessDir := filepath.Join(tmpDir, "sess-1")
 	os.MkdirAll(sessDir, 0755)
-	meta := SessionMetadata{SessionID: "sess-1", ChunkKey: "abc", Layers: 0}
+	meta := SessionMetadata{SessionID: "sess-1", WorkloadKey: "abc", Layers: 0}
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
@@ -554,7 +554,7 @@ func TestResumeFromSession_Draining(t *testing.T) {
 
 	sessDir := filepath.Join(tmpDir, "sess-1")
 	os.MkdirAll(sessDir, 0755)
-	meta := SessionMetadata{SessionID: "sess-1", ChunkKey: "abc", Layers: 1}
+	meta := SessionMetadata{SessionID: "sess-1", WorkloadKey: "abc", Layers: 1}
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
@@ -577,7 +577,7 @@ func TestResumeFromSession_AtCapacity(t *testing.T) {
 
 	sessDir := filepath.Join(tmpDir, "sess-1")
 	os.MkdirAll(sessDir, 0755)
-	meta := SessionMetadata{SessionID: "sess-1", ChunkKey: "abc", RunnerID: "r3", Layers: 1}
+	meta := SessionMetadata{SessionID: "sess-1", WorkloadKey: "abc", RunnerID: "r3", Layers: 1}
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
@@ -596,7 +596,7 @@ func TestResumeFromSession_SuspendedNotCountedForCapacity(t *testing.T) {
 
 	sessDir := filepath.Join(tmpDir, "sess-1")
 	os.MkdirAll(sessDir, 0755)
-	meta := SessionMetadata{SessionID: "sess-1", ChunkKey: "abc", RunnerID: "r3", Layers: 1}
+	meta := SessionMetadata{SessionID: "sess-1", WorkloadKey: "abc", RunnerID: "r3", Layers: 1}
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
@@ -641,7 +641,7 @@ func TestResumeFromSession_DuplicateActiveSession(t *testing.T) {
 
 	sessDir := filepath.Join(tmpDir, "sess-1")
 	os.MkdirAll(sessDir, 0755)
-	meta := SessionMetadata{SessionID: "sess-1", ChunkKey: "abc", RunnerID: "r1", Layers: 1}
+	meta := SessionMetadata{SessionID: "sess-1", WorkloadKey: "abc", RunnerID: "r1", Layers: 1}
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 

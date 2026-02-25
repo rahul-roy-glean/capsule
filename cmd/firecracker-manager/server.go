@@ -47,8 +47,8 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		"chunked_mode": s.chunkedMgr != nil,
 	}).Info("AllocateRunner request")
 
-	if req.ChunkKey == "" {
-		return nil, status.Error(codes.InvalidArgument, "chunk_key is required")
+	if req.WorkloadKey == "" {
+		return nil, status.Error(codes.InvalidArgument, "workload_key is required")
 	}
 
 	allocReq := runner.AllocateRequest{
@@ -58,7 +58,8 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		Commit:            req.Commit,
 		GitHubRunnerToken: req.GithubRunnerToken,
 		Labels:            req.Labels,
-		ChunkKey:          req.ChunkKey,
+		WorkloadKey:       req.WorkloadKey,
+		SnapshotVersion:   req.SnapshotVersion,
 		CISystem:          req.CiSystem,
 		SessionID:         req.SessionId,
 	}
@@ -96,7 +97,7 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 
 		// Try to resume from session snapshot
 		if s.manager.SessionExists(allocReq.SessionID) {
-			r, err = s.manager.ResumeFromSession(ctx, allocReq.SessionID, allocReq.ChunkKey)
+			r, err = s.manager.ResumeFromSession(ctx, allocReq.SessionID, allocReq.WorkloadKey)
 			if err == nil {
 				resumed = true
 			} else {
@@ -346,11 +347,11 @@ func (s *HostAgentServer) PauseRunner(ctx context.Context, req *pb.PauseRunnerRe
 // ResumeRunner resumes a runner from a session snapshot
 func (s *HostAgentServer) ResumeRunner(ctx context.Context, req *pb.ResumeRunnerRequest) (*pb.ResumeRunnerResponse, error) {
 	s.logger.WithFields(logrus.Fields{
-		"session_id": req.SessionId,
-		"chunk_key":  req.ChunkKey,
+		"session_id":   req.SessionId,
+		"workload_key": req.WorkloadKey,
 	}).Info("ResumeRunner request")
 
-	r, err := s.manager.ResumeFromSession(ctx, req.SessionId, req.ChunkKey)
+	r, err := s.manager.ResumeFromSession(ctx, req.SessionId, req.WorkloadKey)
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to resume runner")
 		return &pb.ResumeRunnerResponse{

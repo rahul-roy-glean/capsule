@@ -6,14 +6,14 @@ import (
 	"time"
 )
 
-func TestAllocateRequest_ChunkKey(t *testing.T) {
+func TestAllocateRequest_WorkloadKey(t *testing.T) {
 	meta := SnapshotMetadata{
-		Version:    "v20260221-120000-main",
-		Repo:       "https://github.com/org/repo",
-		ChunkKey:   "abc1234567890abc",
-		CreatedAt:  time.Now(),
-		KernelPath: "kernel.bin",
-		RootfsPath: "rootfs.img",
+		Version:     "v20260221-120000-main",
+		Repo:        "https://github.com/org/repo",
+		WorkloadKey: "abc1234567890abc",
+		CreatedAt:   time.Now(),
+		KernelPath:  "kernel.bin",
+		RootfsPath:  "rootfs.img",
 	}
 
 	data, err := json.Marshal(meta)
@@ -29,8 +29,8 @@ func TestAllocateRequest_ChunkKey(t *testing.T) {
 	if decoded.Repo != meta.Repo {
 		t.Errorf("Repo = %q, want %q", decoded.Repo, meta.Repo)
 	}
-	if decoded.ChunkKey != meta.ChunkKey {
-		t.Errorf("ChunkKey = %q, want %q", decoded.ChunkKey, meta.ChunkKey)
+	if decoded.WorkloadKey != meta.WorkloadKey {
+		t.Errorf("WorkloadKey = %q, want %q", decoded.WorkloadKey, meta.WorkloadKey)
 	}
 }
 
@@ -49,19 +49,19 @@ func TestSnapshotMetadata_BackwardsCompatible(t *testing.T) {
 	if meta.Repo != "" {
 		t.Errorf("Repo should be empty for old metadata, got %q", meta.Repo)
 	}
-	if meta.ChunkKey != "" {
-		t.Errorf("ChunkKey should be empty for old metadata, got %q", meta.ChunkKey)
+	if meta.WorkloadKey != "" {
+		t.Errorf("WorkloadKey should be empty for old metadata, got %q", meta.WorkloadKey)
 	}
 }
 
-func TestChunkedSnapshotMetadata_ChunkKeyFields(t *testing.T) {
+func TestChunkedSnapshotMetadata_WorkloadKeyFields(t *testing.T) {
 	meta := ChunkedSnapshotMetadata{
-		Version:    "v20260221-120000-main",
-		Repo:       "https://github.com/org/repo",
-		ChunkKey:   "abc1234567890abc",
-		ChunkSize:  DefaultChunkSize,
-		KernelHash: "abc123",
-		StateHash:  "def456",
+		Version:     "v20260221-120000-main",
+		Repo:        "https://github.com/org/repo",
+		WorkloadKey: "abc1234567890abc",
+		ChunkSize:   DefaultChunkSize,
+		KernelHash:  "abc123",
+		StateHash:   "def456",
 	}
 
 	data, err := json.Marshal(meta)
@@ -77,8 +77,8 @@ func TestChunkedSnapshotMetadata_ChunkKeyFields(t *testing.T) {
 	if decoded.Repo != meta.Repo {
 		t.Errorf("Repo = %q, want %q", decoded.Repo, meta.Repo)
 	}
-	if decoded.ChunkKey != meta.ChunkKey {
-		t.Errorf("ChunkKey = %q, want %q", decoded.ChunkKey, meta.ChunkKey)
+	if decoded.WorkloadKey != meta.WorkloadKey {
+		t.Errorf("WorkloadKey = %q, want %q", decoded.WorkloadKey, meta.WorkloadKey)
 	}
 	if decoded.ChunkSize != DefaultChunkSize {
 		t.Errorf("ChunkSize = %d, want %d", decoded.ChunkSize, DefaultChunkSize)
@@ -99,8 +99,8 @@ func TestChunkedSnapshotMetadata_BackwardsCompatible(t *testing.T) {
 	if meta.Repo != "" {
 		t.Errorf("Repo should be empty for old metadata, got %q", meta.Repo)
 	}
-	if meta.ChunkKey != "" {
-		t.Errorf("ChunkKey should be empty for old metadata, got %q", meta.ChunkKey)
+	if meta.WorkloadKey != "" {
+		t.Errorf("WorkloadKey should be empty for old metadata, got %q", meta.WorkloadKey)
 	}
 }
 

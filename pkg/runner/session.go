@@ -42,13 +42,13 @@ type PauseResult struct {
 
 // SessionMetadata is written to each session directory as metadata.json.
 type SessionMetadata struct {
-	SessionID string    `json:"session_id"`
-	ChunkKey  string    `json:"chunk_key"`
-	RunnerID  string    `json:"runner_id"`
-	HostID    string    `json:"host_id"`
-	Layers    int       `json:"layers"`
-	CreatedAt time.Time `json:"created_at"`
-	PausedAt  time.Time `json:"paused_at"`
+	SessionID   string    `json:"session_id"`
+	WorkloadKey string    `json:"workload_key"`
+	RunnerID    string    `json:"runner_id"`
+	HostID      string    `json:"host_id"`
+	Layers      int       `json:"layers"`
+	CreatedAt   time.Time `json:"created_at"`
+	PausedAt    time.Time `json:"paused_at"`
 	// RootfsPath is the path to the dirty rootfs overlay for this session.
 	RootfsPath string `json:"rootfs_path"`
 	// RepoCacheUpperPath is the per-runner repo cache writable layer.
@@ -133,7 +133,7 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 	sessionDir := filepath.Join(m.sessionBaseDir(), sessionID)
 	metadata := SessionMetadata{
 		SessionID:          sessionID,
-		ChunkKey:           runner.ChunkKey,
+		WorkloadKey:        runner.WorkloadKey,
 		RunnerID:           runnerID,
 		HostID:             m.config.HostID,
 		Layers:             layerN + 1,
@@ -201,7 +201,7 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 }
 
 // ResumeFromSession restores a runner from a session snapshot using layered UFFD.
-func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, chunkKey string) (*Runner, error) {
+func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey string) (*Runner, error) {
 	sessionDir := filepath.Join(m.sessionBaseDir(), sessionID)
 
 	// Read metadata
@@ -215,8 +215,8 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, chunkKey str
 		return nil, fmt.Errorf("invalid session metadata: %w", err)
 	}
 
-	if chunkKey != "" && metadata.ChunkKey != chunkKey {
-		return nil, fmt.Errorf("chunk_key mismatch: session has %s, requested %s", metadata.ChunkKey, chunkKey)
+	if workloadKey != "" && metadata.WorkloadKey != workloadKey {
+		return nil, fmt.Errorf("workload_key mismatch: session has %s, requested %s", metadata.WorkloadKey, workloadKey)
 	}
 
 	if metadata.Layers == 0 {
@@ -250,9 +250,9 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, chunkKey str
 	m.mu.Unlock()
 
 	m.logger.WithFields(logrus.Fields{
-		"session_id": sessionID,
-		"layers":     metadata.Layers,
-		"chunk_key":  metadata.ChunkKey,
+		"session_id":   sessionID,
+		"layers":       metadata.Layers,
+		"workload_key": metadata.WorkloadKey,
 	}).Info("Resuming runner from session snapshot")
 
 	// Get golden snapshot paths
@@ -442,7 +442,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, chunkKey str
 		TapDevice:       tap.Name,
 		MAC:             tap.MAC,
 		SnapshotVersion: snapshotPaths.Version,
-		ChunkKey:        metadata.ChunkKey,
+		WorkloadKey:     metadata.WorkloadKey,
 		Resources: Resources{
 			VCPUs:    m.config.VCPUsPerRunner,
 			MemoryMB: m.config.MemoryMBPerRunner,
@@ -471,7 +471,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, chunkKey str
 
 	// Inject MMDS data
 	mmdsData := m.buildMMDSData(ctx, runner, tap, AllocateRequest{
-		ChunkKey: metadata.ChunkKey,
+		WorkloadKey: metadata.WorkloadKey,
 	})
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		m.logger.WithError(err).Warn("Failed to set MMDS data on resumed runner")

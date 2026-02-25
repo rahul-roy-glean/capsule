@@ -85,10 +85,10 @@ func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logge
 
 	// Create snapshot cache
 	cache, err := snapshot.NewCache(ctx, snapshot.CacheConfig{
-		LocalPath: cfg.SnapshotCachePath,
-		GCSBucket: cfg.SnapshotBucket,
-		ChunkKey:  cfg.ChunkKey,
-		Logger:    logger,
+		LocalPath:   cfg.SnapshotCachePath,
+		GCSBucket:   cfg.SnapshotBucket,
+		WorkloadKey: cfg.WorkloadKey,
+		Logger:      logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create snapshot cache: %w", err)
