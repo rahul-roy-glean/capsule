@@ -84,35 +84,34 @@ done
 echo ""
 echo "=== Starting firecracker-manager ==="
 
-# Build optional flags from environment variables.
+# Build the full command as an array, then pass to sudo.
 SESSION_CHUNK_BUCKET=${SESSION_CHUNK_BUCKET:-}
 SNAPSHOT_BUCKET=${SNAPSHOT_BUCKET:-local-dev}
-EXTRA_MGR_FLAGS=""
-if [ -n "$SESSION_CHUNK_BUCKET" ]; then
-  # GCS-backed sessions require chunked snapshot mode (for the chunk stores).
-  EXTRA_MGR_FLAGS="--use-chunked-snapshots --snapshot-bucket=$SESSION_CHUNK_BUCKET --session-chunk-bucket=$SESSION_CHUNK_BUCKET"
-  echo "  GCS session bucket: $SESSION_CHUNK_BUCKET (chunked mode enabled)"
-else
-  EXTRA_MGR_FLAGS="--snapshot-bucket=$SNAPSHOT_BUCKET"
-fi
 
-sudo -b sh -c 'nohup '"$REPO_ROOT"'/bin/firecracker-manager \
+MGR_CMD="$REPO_ROOT/bin/firecracker-manager \
   --http-port=9080 \
   --grpc-port=50052 \
   --use-netns \
   --ci-system=none \
-  --snapshot-cache='"$SNAPSHOT_DIR"' \
+  --snapshot-cache=$SNAPSHOT_DIR \
   --socket-dir=/tmp/fc-dev/sockets \
   --workspace-dir=/tmp/fc-dev/workspaces \
-  --log-dir='"$LOG_DIR"' \
+  --log-dir=$LOG_DIR \
   --control-plane=http://localhost:8080 \
   --telemetry-enabled=false \
   --max-runners=4 \
   --idle-target=0 \
-  --log-level=debug \
-  '"$EXTRA_MGR_FLAGS"' \
-  > '"$LOG_DIR"'/firecracker-manager.log 2>&1 &
-echo $! > /tmp/fc-dev/pids/firecracker-manager.pid'
+  --log-level=debug"
+
+if [ -n "$SESSION_CHUNK_BUCKET" ]; then
+  MGR_CMD="$MGR_CMD --use-chunked-snapshots --snapshot-bucket=$SESSION_CHUNK_BUCKET --session-chunk-bucket=$SESSION_CHUNK_BUCKET"
+  echo "  GCS session bucket: $SESSION_CHUNK_BUCKET (chunked mode enabled)"
+else
+  MGR_CMD="$MGR_CMD --snapshot-bucket=$SNAPSHOT_BUCKET"
+fi
+
+sudo bash -c "nohup $MGR_CMD > $LOG_DIR/firecracker-manager.log 2>&1 &
+echo \$! > /tmp/fc-dev/pids/firecracker-manager.pid"
 # Give sudo a moment to fork
 sleep 1
 MGR_PID=$(cat "$PID_DIR/firecracker-manager.pid" 2>/dev/null || echo "unknown")
