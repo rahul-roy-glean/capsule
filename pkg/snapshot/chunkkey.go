@@ -9,9 +9,9 @@ import (
 
 // SnapshotCommand describes a single warmup step baked into a snapshot.
 type SnapshotCommand struct {
-	Type       string   `json:"type"`         // "git-clone", "gcp-auth", "shell"
-	Args       []string `json:"args"`
-	RunAsRoot  bool     `json:"run_as_root"`  // if true, run as root; otherwise run as the configured runner user
+	Type      string   `json:"type"` // "git-clone", "gcp-auth", "shell"
+	Args      []string `json:"args"`
+	RunAsRoot bool     `json:"run_as_root"` // if true, run as root; otherwise run as the configured runner user
 }
 
 // ComputeChunkKey returns a stable 16-char hex key. Commands are sorted

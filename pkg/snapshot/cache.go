@@ -19,18 +19,18 @@ import (
 
 // SnapshotMetadata holds metadata about a snapshot
 type SnapshotMetadata struct {
-	Version      string    `json:"version"`
-	BazelVersion string    `json:"bazel_version"`
-	RepoCommit   string    `json:"repo_commit"`
-	Repo         string    `json:"repo,omitempty"`
-	ChunkKey     string    `json:"chunk_key,omitempty"`
+	Version      string            `json:"version"`
+	BazelVersion string            `json:"bazel_version"`
+	RepoCommit   string            `json:"repo_commit"`
+	Repo         string            `json:"repo,omitempty"`
+	ChunkKey     string            `json:"chunk_key,omitempty"`
 	Commands     []SnapshotCommand `json:"commands,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
-	SizeBytes    int64     `json:"size_bytes"`
-	KernelPath   string    `json:"kernel_path"`
-	RootfsPath   string    `json:"rootfs_path"`
-	MemPath      string    `json:"mem_path"`
-	StatePath    string    `json:"state_path"`
+	CreatedAt    time.Time         `json:"created_at"`
+	SizeBytes    int64             `json:"size_bytes"`
+	KernelPath   string            `json:"kernel_path"`
+	RootfsPath   string            `json:"rootfs_path"`
+	MemPath      string            `json:"mem_path"`
+	StatePath    string            `json:"state_path"`
 	// RepoCacheSeedPath is a path (relative to the snapshot version dir) to the
 	// shared Bazel repository cache seed disk image (ext4).
 	RepoCacheSeedPath string `json:"repo_cache_seed_path,omitempty"`
@@ -62,7 +62,7 @@ type Cache struct {
 type CacheConfig struct {
 	LocalPath string
 	GCSBucket string
-	ChunkKey string
+	ChunkKey  string
 	Logger    *logrus.Logger
 }
 

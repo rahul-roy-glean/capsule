@@ -36,10 +36,10 @@ const (
 	// Fleet slot metrics — used as the primary autoscaler signal.
 	// free_slots_per_host is the canonical scale-out metric: when it drops below
 	// a target (e.g. 2), the GCP autoscaler adds more host VMs.
-	MetricCPFleetSlotsTotal      = "control_plane/fleet_slots_total"
-	MetricCPFleetSlotsUsed       = "control_plane/fleet_slots_used"
-	MetricCPFleetSlotsFree       = "control_plane/fleet_slots_free"
-	MetricCPFleetFreeSlotsPer    = "control_plane/fleet_free_slots_per_host"
+	MetricCPFleetSlotsTotal   = "control_plane/fleet_slots_total"
+	MetricCPFleetSlotsUsed    = "control_plane/fleet_slots_used"
+	MetricCPFleetSlotsFree    = "control_plane/fleet_slots_free"
+	MetricCPFleetFreeSlotsPer = "control_plane/fleet_free_slots_per_host"
 
 	// Snapshot metrics
 	MetricSnapshotBuildDuration  = "snapshot/build_duration_seconds"

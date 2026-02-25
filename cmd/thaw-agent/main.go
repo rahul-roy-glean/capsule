@@ -1123,11 +1123,11 @@ func waitForMMDSOnce(ctx context.Context) (*MMDSData, error) {
 	}
 
 	log.WithFields(logrus.Fields{
-		"runner_id":     data.Latest.Meta.RunnerID,
-		"mode":          data.Latest.Meta.Mode,
-		"job_repo":      data.Latest.Job.Repo,
-		"has_git_token": data.Latest.Job.GitToken != "",
-		"git_token_len": len(data.Latest.Job.GitToken),
+		"runner_id":       data.Latest.Meta.RunnerID,
+		"mode":            data.Latest.Meta.Mode,
+		"job_repo":        data.Latest.Job.Repo,
+		"has_git_token":   data.Latest.Job.GitToken != "",
+		"git_token_len":   len(data.Latest.Job.GitToken),
 		"warmup_commands": len(data.Latest.Warmup.Commands),
 	}).Debug("Parsed MMDS data (first pass)")
 

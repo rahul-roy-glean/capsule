@@ -217,7 +217,7 @@ func (vm *VM) RestoreFromSnapshot(ctx context.Context, snapshotPath, memPath str
 	// during LoadSnapshot at the paths recorded in the snapshot state file.
 	// These paths must exist (the caller sets up symlinks to handle path differences).
 	if err := vm.client.LoadSnapshot(ctx, SnapshotLoadParams{
-		SnapshotPath:        snapshotPath,
+		SnapshotPath: snapshotPath,
 		MemBackend: &MemBackend{
 			BackendPath: memPath,
 			BackendType: "File",
