@@ -49,11 +49,12 @@ func newTestManager(opts ...func(*Manager)) *Manager {
 	logger := logrus.New()
 	logger.SetLevel(logrus.DebugLevel)
 	m := &Manager{
-		config:       HostConfig{MaxRunners: 4, HostID: "test-host", Environment: "test"},
-		runners:      make(map[string]*Runner),
-		slotToRunner: make(map[int]string),
-		runnerToSlot: make(map[string]int),
-		logger:       logger.WithField("test", true),
+		config:         HostConfig{MaxRunners: 4, HostID: "test-host", Environment: "test"},
+		runners:        make(map[string]*Runner),
+		slotToRunner:   make(map[int]string),
+		runnerToSlot:   make(map[string]int),
+		uffdHandlers:   make(map[string]uffdStopper),
+		logger:         logger.WithField("test", true),
 	}
 	for _, opt := range opts {
 		opt(m)

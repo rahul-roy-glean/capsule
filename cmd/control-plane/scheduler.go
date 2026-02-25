@@ -38,6 +38,8 @@ type AllocateRunnerRequest struct {
 	ChunkKey          string
 	Labels            map[string]string
 	GitHubRunnerToken string
+	CISystem          string
+	SessionID         string
 	VCPUs             int
 	MemoryMB          int
 }
@@ -48,6 +50,8 @@ type AllocateRunnerResponse struct {
 	HostID      string
 	HostAddress string
 	InternalIP  string
+	SessionID   string
+	Resumed     bool
 	Error       string
 }
 
@@ -123,6 +127,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		GithubRunnerToken: req.GitHubRunnerToken,
 		ChunkKey:          chunkKey,
 		CiSystem:          ciSystem,
+		SessionId:         req.SessionID,
 	}
 	if req.VCPUs > 0 || req.MemoryMB > 0 {
 		protoReq.Resources = &pb.Resources{
@@ -171,6 +176,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		HostID:      host.ID,
 		HostAddress: host.GRPCAddress,
 		InternalIP:  resp.Runner.GetInternalIp(),
+		SessionID:   resp.GetSessionId(),
+		Resumed:     resp.GetResumed(),
 	}, nil
 }
 

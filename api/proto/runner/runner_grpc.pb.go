@@ -28,6 +28,8 @@ const (
 	HostAgent_GetRunner_FullMethodName          = "/runner.HostAgent/GetRunner"
 	HostAgent_QuarantineRunner_FullMethodName   = "/runner.HostAgent/QuarantineRunner"
 	HostAgent_UnquarantineRunner_FullMethodName = "/runner.HostAgent/UnquarantineRunner"
+	HostAgent_PauseRunner_FullMethodName        = "/runner.HostAgent/PauseRunner"
+	HostAgent_ResumeRunner_FullMethodName       = "/runner.HostAgent/ResumeRunner"
 )
 
 // HostAgentClient is the client API for HostAgent service.
@@ -54,6 +56,10 @@ type HostAgentClient interface {
 	QuarantineRunner(ctx context.Context, in *QuarantineRunnerRequest, opts ...grpc.CallOption) (*QuarantineRunnerResponse, error)
 	// UnquarantineRunner removes isolation and optionally resumes a paused runner
 	UnquarantineRunner(ctx context.Context, in *UnquarantineRunnerRequest, opts ...grpc.CallOption) (*UnquarantineRunnerResponse, error)
+	// PauseRunner snapshots a runner's session and suspends the VM
+	PauseRunner(ctx context.Context, in *PauseRunnerRequest, opts ...grpc.CallOption) (*PauseRunnerResponse, error)
+	// ResumeRunner restores a runner from a session snapshot
+	ResumeRunner(ctx context.Context, in *ResumeRunnerRequest, opts ...grpc.CallOption) (*ResumeRunnerResponse, error)
 }
 
 type hostAgentClient struct {
@@ -154,6 +160,26 @@ func (c *hostAgentClient) UnquarantineRunner(ctx context.Context, in *Unquaranti
 	return out, nil
 }
 
+func (c *hostAgentClient) PauseRunner(ctx context.Context, in *PauseRunnerRequest, opts ...grpc.CallOption) (*PauseRunnerResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PauseRunnerResponse)
+	err := c.cc.Invoke(ctx, HostAgent_PauseRunner_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *hostAgentClient) ResumeRunner(ctx context.Context, in *ResumeRunnerRequest, opts ...grpc.CallOption) (*ResumeRunnerResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResumeRunnerResponse)
+	err := c.cc.Invoke(ctx, HostAgent_ResumeRunner_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // HostAgentServer is the server API for HostAgent service.
 // All implementations must embed UnimplementedHostAgentServer
 // for forward compatibility.
@@ -178,6 +204,10 @@ type HostAgentServer interface {
 	QuarantineRunner(context.Context, *QuarantineRunnerRequest) (*QuarantineRunnerResponse, error)
 	// UnquarantineRunner removes isolation and optionally resumes a paused runner
 	UnquarantineRunner(context.Context, *UnquarantineRunnerRequest) (*UnquarantineRunnerResponse, error)
+	// PauseRunner snapshots a runner's session and suspends the VM
+	PauseRunner(context.Context, *PauseRunnerRequest) (*PauseRunnerResponse, error)
+	// ResumeRunner restores a runner from a session snapshot
+	ResumeRunner(context.Context, *ResumeRunnerRequest) (*ResumeRunnerResponse, error)
 	mustEmbedUnimplementedHostAgentServer()
 }
 
@@ -214,6 +244,12 @@ func (UnimplementedHostAgentServer) QuarantineRunner(context.Context, *Quarantin
 }
 func (UnimplementedHostAgentServer) UnquarantineRunner(context.Context, *UnquarantineRunnerRequest) (*UnquarantineRunnerResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UnquarantineRunner not implemented")
+}
+func (UnimplementedHostAgentServer) PauseRunner(context.Context, *PauseRunnerRequest) (*PauseRunnerResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PauseRunner not implemented")
+}
+func (UnimplementedHostAgentServer) ResumeRunner(context.Context, *ResumeRunnerRequest) (*ResumeRunnerResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResumeRunner not implemented")
 }
 func (UnimplementedHostAgentServer) mustEmbedUnimplementedHostAgentServer() {}
 func (UnimplementedHostAgentServer) testEmbeddedByValue()                   {}
@@ -398,6 +434,42 @@ func _HostAgent_UnquarantineRunner_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _HostAgent_PauseRunner_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PauseRunnerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HostAgentServer).PauseRunner(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HostAgent_PauseRunner_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HostAgentServer).PauseRunner(ctx, req.(*PauseRunnerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HostAgent_ResumeRunner_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResumeRunnerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HostAgentServer).ResumeRunner(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HostAgent_ResumeRunner_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HostAgentServer).ResumeRunner(ctx, req.(*ResumeRunnerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // HostAgent_ServiceDesc is the grpc.ServiceDesc for HostAgent service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -440,6 +512,14 @@ var HostAgent_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UnquarantineRunner",
 			Handler:    _HostAgent_UnquarantineRunner_Handler,
+		},
+		{
+			MethodName: "PauseRunner",
+			Handler:    _HostAgent_PauseRunner_Handler,
+		},
+		{
+			MethodName: "ResumeRunner",
+			Handler:    _HostAgent_ResumeRunner_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

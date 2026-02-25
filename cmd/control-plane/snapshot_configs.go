@@ -27,6 +27,9 @@ type SnapshotConfig struct {
 	GitHubAppID          string                    `json:"github_app_id,omitempty"`
 	GitHubAppSecret      string                    `json:"github_app_secret,omitempty"`
 	StartCommand         *snapshot.StartCommand    `json:"start_command,omitempty"`
+	RunnerTTLSeconds     int                       `json:"runner_ttl_seconds"`
+	SessionMaxAgeSeconds int                       `json:"session_max_age_seconds"`
+	AutoPause            bool                      `json:"auto_pause"`
 	CreatedAt            time.Time                 `json:"created_at"`
 }
 
@@ -47,7 +50,7 @@ func NewSnapshotConfigRegistry(db *sql.DB, sm *SnapshotManager, logger *logrus.L
 }
 
 // RegisterSnapshotConfig upserts a snapshot config, computing its chunk_key from commands.
-func (r *SnapshotConfigRegistry) RegisterSnapshotConfig(ctx context.Context, displayName string, commands []snapshot.SnapshotCommand, buildSchedule string, maxConcurrent int, ciSystem, githubAppID, githubAppSecret string, startCommand *snapshot.StartCommand) (*SnapshotConfig, error) {
+func (r *SnapshotConfigRegistry) RegisterSnapshotConfig(ctx context.Context, displayName string, commands []snapshot.SnapshotCommand, buildSchedule string, maxConcurrent int, ciSystem, githubAppID, githubAppSecret string, startCommand *snapshot.StartCommand, runnerTTLSeconds int, sessionMaxAgeSeconds int, autoPause bool) (*SnapshotConfig, error) {
 	chunkKey := snapshot.ComputeChunkKey(commands)
 
 	commandsJSON, err := json.Marshal(commands)
@@ -71,8 +74,8 @@ func (r *SnapshotConfigRegistry) RegisterSnapshotConfig(ctx context.Context, dis
 	}).Info("Registering snapshot config")
 
 	_, err = r.db.ExecContext(ctx, `
-		INSERT INTO snapshot_configs (chunk_key, display_name, commands, build_schedule, max_concurrent_runners, ci_system, github_app_id, github_app_secret, start_command)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		INSERT INTO snapshot_configs (chunk_key, display_name, commands, build_schedule, max_concurrent_runners, ci_system, github_app_id, github_app_secret, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (chunk_key) DO UPDATE SET
 			display_name = EXCLUDED.display_name,
 			commands = EXCLUDED.commands,
@@ -81,8 +84,11 @@ func (r *SnapshotConfigRegistry) RegisterSnapshotConfig(ctx context.Context, dis
 			ci_system = EXCLUDED.ci_system,
 			github_app_id = EXCLUDED.github_app_id,
 			github_app_secret = EXCLUDED.github_app_secret,
-			start_command = EXCLUDED.start_command
-	`, chunkKey, displayName, string(commandsJSON), buildSchedule, maxConcurrent, ciSystem, githubAppID, githubAppSecret, startCommandJSON)
+			start_command = EXCLUDED.start_command,
+			runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
+			session_max_age_seconds = EXCLUDED.session_max_age_seconds,
+			auto_pause = EXCLUDED.auto_pause
+	`, chunkKey, displayName, string(commandsJSON), buildSchedule, maxConcurrent, ciSystem, githubAppID, githubAppSecret, startCommandJSON, runnerTTLSeconds, sessionMaxAgeSeconds, autoPause)
 	if err != nil {
 		return nil, fmt.Errorf("failed to register snapshot config: %w", err)
 	}
@@ -100,11 +106,15 @@ func (r *SnapshotConfigRegistry) GetSnapshotConfig(ctx context.Context, chunkKey
 	err := r.db.QueryRowContext(ctx, `
 		SELECT chunk_key, display_name, commands, build_schedule,
 		       max_concurrent_runners, current_version, auto_rollout,
-		       ci_system, github_app_id, github_app_secret, start_command, created_at
+		       ci_system, github_app_id, github_app_secret, start_command,
+		       runner_ttl_seconds, session_max_age_seconds, auto_pause,
+		       created_at
 		FROM snapshot_configs WHERE chunk_key = $1
 	`, chunkKey).Scan(&sc.ChunkKey, &sc.DisplayName, &commandsJSON, &sc.BuildSchedule,
 		&sc.MaxConcurrentRunners, &currentVersion, &sc.AutoRollout,
-		&sc.CISystem, &githubAppID, &githubAppSecret, &startCommandJSON, &sc.CreatedAt)
+		&sc.CISystem, &githubAppID, &githubAppSecret, &startCommandJSON,
+		&sc.RunnerTTLSeconds, &sc.SessionMaxAgeSeconds, &sc.AutoPause,
+		&sc.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("snapshot config not found: %s", chunkKey)
 	}
@@ -135,7 +145,9 @@ func (r *SnapshotConfigRegistry) ListSnapshotConfigs(ctx context.Context) ([]*Sn
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT chunk_key, display_name, commands, build_schedule,
 		       max_concurrent_runners, current_version, auto_rollout,
-		       ci_system, github_app_id, github_app_secret, start_command, created_at
+		       ci_system, github_app_id, github_app_secret, start_command,
+		       runner_ttl_seconds, session_max_age_seconds, auto_pause,
+		       created_at
 		FROM snapshot_configs ORDER BY chunk_key
 	`)
 	if err != nil {
@@ -152,7 +164,9 @@ func (r *SnapshotConfigRegistry) ListSnapshotConfigs(ctx context.Context) ([]*Sn
 
 		if err := rows.Scan(&sc.ChunkKey, &sc.DisplayName, &commandsJSON, &sc.BuildSchedule,
 			&sc.MaxConcurrentRunners, &currentVersion, &sc.AutoRollout,
-			&sc.CISystem, &githubAppID, &githubAppSecret, &startCommandJSON, &sc.CreatedAt); err != nil {
+			&sc.CISystem, &githubAppID, &githubAppSecret, &startCommandJSON,
+			&sc.RunnerTTLSeconds, &sc.SessionMaxAgeSeconds, &sc.AutoPause,
+			&sc.CreatedAt); err != nil {
 			return nil, err
 		}
 		if currentVersion.Valid {
@@ -208,6 +222,9 @@ func (r *SnapshotConfigRegistry) HandleCreateSnapshotConfig(w http.ResponseWrite
 		GitHubAppID          string                    `json:"github_app_id"`
 		GitHubAppSecret      string                    `json:"github_app_secret"`
 		StartCommand         *snapshot.StartCommand    `json:"start_command,omitempty"`
+		RunnerTTLSeconds     int                       `json:"runner_ttl_seconds"`
+		SessionMaxAgeSeconds int                       `json:"session_max_age_seconds"`
+		AutoPause            bool                      `json:"auto_pause"`
 	}
 	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -217,7 +234,7 @@ func (r *SnapshotConfigRegistry) HandleCreateSnapshotConfig(w http.ResponseWrite
 		http.Error(w, "commands is required and must be non-empty", http.StatusBadRequest)
 		return
 	}
-	sc, err := r.RegisterSnapshotConfig(req.Context(), body.DisplayName, body.Commands, body.BuildSchedule, body.MaxConcurrentRunners, body.CISystem, body.GitHubAppID, body.GitHubAppSecret, body.StartCommand)
+	sc, err := r.RegisterSnapshotConfig(req.Context(), body.DisplayName, body.Commands, body.BuildSchedule, body.MaxConcurrentRunners, body.CISystem, body.GitHubAppID, body.GitHubAppSecret, body.StartCommand, body.RunnerTTLSeconds, body.SessionMaxAgeSeconds, body.AutoPause)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
