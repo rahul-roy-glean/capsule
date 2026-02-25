@@ -19,6 +19,7 @@ type SnapshotConfig struct {
 	WorkloadKey          string                     `json:"workload_key"`
 	DisplayName          string                     `json:"display_name"`
 	Commands             []snapshot.SnapshotCommand `json:"commands"`
+	IncrementalCommands  []snapshot.SnapshotCommand `json:"incremental_commands,omitempty"`
 	BuildSchedule        string                     `json:"build_schedule"`
 	MaxConcurrentRunners int                        `json:"max_concurrent_runners"`
 	CurrentVersion       string                     `json:"current_version"`
@@ -50,12 +51,17 @@ func NewSnapshotConfigRegistry(db *sql.DB, sm *SnapshotManager, logger *logrus.L
 }
 
 // RegisterSnapshotConfig upserts a snapshot config, computing its workload_key from commands.
-func (r *SnapshotConfigRegistry) RegisterSnapshotConfig(ctx context.Context, displayName string, commands []snapshot.SnapshotCommand, buildSchedule string, maxConcurrent int, ciSystem, githubAppID, githubAppSecret string, startCommand *snapshot.StartCommand, runnerTTLSeconds int, sessionMaxAgeSeconds int, autoPause bool) (*SnapshotConfig, error) {
+func (r *SnapshotConfigRegistry) RegisterSnapshotConfig(ctx context.Context, displayName string, commands []snapshot.SnapshotCommand, incrementalCommands []snapshot.SnapshotCommand, buildSchedule string, maxConcurrent int, ciSystem, githubAppID, githubAppSecret string, startCommand *snapshot.StartCommand, runnerTTLSeconds int, sessionMaxAgeSeconds int, autoPause bool) (*SnapshotConfig, error) {
 	workloadKey := snapshot.ComputeWorkloadKey(commands)
 
 	commandsJSON, err := json.Marshal(commands)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal commands: %w", err)
+	}
+
+	incrementalCommandsJSON, err := json.Marshal(incrementalCommands)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal incremental_commands: %w", err)
 	}
 
 	var startCommandJSON string
@@ -74,11 +80,12 @@ func (r *SnapshotConfigRegistry) RegisterSnapshotConfig(ctx context.Context, dis
 	}).Info("Registering snapshot config")
 
 	_, err = r.db.ExecContext(ctx, `
-		INSERT INTO snapshot_configs (workload_key, display_name, commands, build_schedule, max_concurrent_runners, ci_system, github_app_id, github_app_secret, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		INSERT INTO snapshot_configs (workload_key, display_name, commands, incremental_commands, build_schedule, max_concurrent_runners, ci_system, github_app_id, github_app_secret, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		ON CONFLICT (workload_key) DO UPDATE SET
 			display_name = EXCLUDED.display_name,
 			commands = EXCLUDED.commands,
+			incremental_commands = EXCLUDED.incremental_commands,
 			build_schedule = EXCLUDED.build_schedule,
 			max_concurrent_runners = EXCLUDED.max_concurrent_runners,
 			ci_system = EXCLUDED.ci_system,
@@ -88,7 +95,7 @@ func (r *SnapshotConfigRegistry) RegisterSnapshotConfig(ctx context.Context, dis
 			runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
 			session_max_age_seconds = EXCLUDED.session_max_age_seconds,
 			auto_pause = EXCLUDED.auto_pause
-	`, workloadKey, displayName, string(commandsJSON), buildSchedule, maxConcurrent, ciSystem, githubAppID, githubAppSecret, startCommandJSON, runnerTTLSeconds, sessionMaxAgeSeconds, autoPause)
+	`, workloadKey, displayName, string(commandsJSON), string(incrementalCommandsJSON), buildSchedule, maxConcurrent, ciSystem, githubAppID, githubAppSecret, startCommandJSON, runnerTTLSeconds, sessionMaxAgeSeconds, autoPause)
 	if err != nil {
 		return nil, fmt.Errorf("failed to register snapshot config: %w", err)
 	}
@@ -103,14 +110,16 @@ func (r *SnapshotConfigRegistry) GetSnapshotConfig(ctx context.Context, workload
 	var commandsJSON string
 	var githubAppID, githubAppSecret, startCommandJSON sql.NullString
 
+	var incrementalCommandsJSON sql.NullString
+
 	err := r.db.QueryRowContext(ctx, `
-		SELECT workload_key, display_name, commands, build_schedule,
+		SELECT workload_key, display_name, commands, incremental_commands, build_schedule,
 		       max_concurrent_runners, current_version, auto_rollout,
 		       ci_system, github_app_id, github_app_secret, start_command,
 		       runner_ttl_seconds, session_max_age_seconds, auto_pause,
 		       created_at
 		FROM snapshot_configs WHERE workload_key = $1
-	`, workloadKey).Scan(&sc.WorkloadKey, &sc.DisplayName, &commandsJSON, &sc.BuildSchedule,
+	`, workloadKey).Scan(&sc.WorkloadKey, &sc.DisplayName, &commandsJSON, &incrementalCommandsJSON, &sc.BuildSchedule,
 		&sc.MaxConcurrentRunners, &currentVersion, &sc.AutoRollout,
 		&sc.CISystem, &githubAppID, &githubAppSecret, &startCommandJSON,
 		&sc.RunnerTTLSeconds, &sc.SessionMaxAgeSeconds, &sc.AutoPause,
@@ -133,6 +142,9 @@ func (r *SnapshotConfigRegistry) GetSnapshotConfig(ctx context.Context, workload
 	if commandsJSON != "" {
 		json.Unmarshal([]byte(commandsJSON), &sc.Commands)
 	}
+	if incrementalCommandsJSON.Valid && incrementalCommandsJSON.String != "" {
+		json.Unmarshal([]byte(incrementalCommandsJSON.String), &sc.IncrementalCommands)
+	}
 	if startCommandJSON.Valid && startCommandJSON.String != "" {
 		sc.StartCommand = &snapshot.StartCommand{}
 		json.Unmarshal([]byte(startCommandJSON.String), sc.StartCommand)
@@ -143,7 +155,7 @@ func (r *SnapshotConfigRegistry) GetSnapshotConfig(ctx context.Context, workload
 // ListSnapshotConfigs returns all registered snapshot configs.
 func (r *SnapshotConfigRegistry) ListSnapshotConfigs(ctx context.Context) ([]*SnapshotConfig, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT workload_key, display_name, commands, build_schedule,
+		SELECT workload_key, display_name, commands, incremental_commands, build_schedule,
 		       max_concurrent_runners, current_version, auto_rollout,
 		       ci_system, github_app_id, github_app_secret, start_command,
 		       runner_ttl_seconds, session_max_age_seconds, auto_pause,
@@ -160,9 +172,10 @@ func (r *SnapshotConfigRegistry) ListSnapshotConfigs(ctx context.Context) ([]*Sn
 		var sc SnapshotConfig
 		var currentVersion sql.NullString
 		var commandsJSON string
+		var incrementalCommandsJSON sql.NullString
 		var githubAppID, githubAppSecret, startCommandJSON sql.NullString
 
-		if err := rows.Scan(&sc.WorkloadKey, &sc.DisplayName, &commandsJSON, &sc.BuildSchedule,
+		if err := rows.Scan(&sc.WorkloadKey, &sc.DisplayName, &commandsJSON, &incrementalCommandsJSON, &sc.BuildSchedule,
 			&sc.MaxConcurrentRunners, &currentVersion, &sc.AutoRollout,
 			&sc.CISystem, &githubAppID, &githubAppSecret, &startCommandJSON,
 			&sc.RunnerTTLSeconds, &sc.SessionMaxAgeSeconds, &sc.AutoPause,
@@ -180,6 +193,9 @@ func (r *SnapshotConfigRegistry) ListSnapshotConfigs(ctx context.Context) ([]*Sn
 		}
 		if commandsJSON != "" {
 			json.Unmarshal([]byte(commandsJSON), &sc.Commands)
+		}
+		if incrementalCommandsJSON.Valid && incrementalCommandsJSON.String != "" {
+			json.Unmarshal([]byte(incrementalCommandsJSON.String), &sc.IncrementalCommands)
 		}
 		if startCommandJSON.Valid && startCommandJSON.String != "" {
 			sc.StartCommand = &snapshot.StartCommand{}
@@ -216,6 +232,7 @@ func (r *SnapshotConfigRegistry) HandleCreateSnapshotConfig(w http.ResponseWrite
 	var body struct {
 		DisplayName          string                     `json:"display_name"`
 		Commands             []snapshot.SnapshotCommand `json:"commands"`
+		IncrementalCommands  []snapshot.SnapshotCommand `json:"incremental_commands"`
 		BuildSchedule        string                     `json:"build_schedule"`
 		MaxConcurrentRunners int                        `json:"max_concurrent_runners"`
 		CISystem             string                     `json:"ci_system"`
@@ -234,7 +251,7 @@ func (r *SnapshotConfigRegistry) HandleCreateSnapshotConfig(w http.ResponseWrite
 		http.Error(w, "commands is required and must be non-empty", http.StatusBadRequest)
 		return
 	}
-	sc, err := r.RegisterSnapshotConfig(req.Context(), body.DisplayName, body.Commands, body.BuildSchedule, body.MaxConcurrentRunners, body.CISystem, body.GitHubAppID, body.GitHubAppSecret, body.StartCommand, body.RunnerTTLSeconds, body.SessionMaxAgeSeconds, body.AutoPause)
+	sc, err := r.RegisterSnapshotConfig(req.Context(), body.DisplayName, body.Commands, body.IncrementalCommands, body.BuildSchedule, body.MaxConcurrentRunners, body.CISystem, body.GitHubAppID, body.GitHubAppSecret, body.StartCommand, body.RunnerTTLSeconds, body.SessionMaxAgeSeconds, body.AutoPause)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -295,7 +312,7 @@ func (r *SnapshotConfigRegistry) HandleTriggerBuild(w http.ResponseWriter, req *
 
 	incremental := req.URL.Query().Get("incremental") == "true"
 
-	version, err := r.snapshotManager.TriggerSnapshotBuildForKey(req.Context(), sc.WorkloadKey, sc.Commands, sc.GitHubAppID, sc.GitHubAppSecret, incremental)
+	version, err := r.snapshotManager.TriggerSnapshotBuildForKey(req.Context(), sc.WorkloadKey, sc.Commands, sc.IncrementalCommands, sc.GitHubAppID, sc.GitHubAppSecret, incremental)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to trigger build: %s", err), http.StatusInternalServerError)
 		return

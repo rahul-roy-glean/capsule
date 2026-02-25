@@ -387,6 +387,7 @@ func main() {
 		MetricPrefix: *telemetryPrefix,
 		Component:    "firecracker-manager",
 		Environment:  *environment,
+		InstanceID:   hostID,
 		InstanceName: instanceName,
 		Zone:         zone,
 	}

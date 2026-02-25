@@ -25,6 +25,9 @@ type Config struct {
 	// Environment is the deployment environment (e.g., "dev", "prod")
 	Environment string
 
+	// InstanceID is the numeric GCE instance ID (required for gce_instance resource type)
+	InstanceID string
+
 	// InstanceName is the VM instance name (for host metrics)
 	InstanceName string
 

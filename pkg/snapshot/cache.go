@@ -95,7 +95,6 @@ func NewCache(ctx context.Context, cfg CacheConfig) (*Cache, error) {
 		logger:      logger.WithField("component", "snapshot-cache"),
 	}
 
-
 	// Ensure local path exists
 	if err := os.MkdirAll(cfg.LocalPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create local cache directory: %w", err)

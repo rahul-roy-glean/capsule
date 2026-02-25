@@ -378,11 +378,11 @@ func initSchema(db *sql.DB) error {
 			auto_rollout           BOOLEAN DEFAULT true,
 			created_at             TIMESTAMP DEFAULT NOW()
 		)`,
-		// Rename chunk_key -> workload_key in existing tables (idempotent: no-op if column doesn't exist)
-		`DO $$ BEGIN ALTER TABLE snapshot_configs RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; END $$`,
-		`DO $$ BEGIN ALTER TABLE snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; END $$`,
-		`DO $$ BEGIN ALTER TABLE version_assignments RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; END $$`,
-		`DO $$ BEGIN ALTER TABLE session_snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; END $$`,
+		// Rename chunk_key -> workload_key in existing tables (idempotent: no-op if column doesn't exist or target already exists)
+		`DO $$ BEGIN ALTER TABLE snapshot_configs RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
+		`DO $$ BEGIN ALTER TABLE snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
+		`DO $$ BEGIN ALTER TABLE version_assignments RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
+		`DO $$ BEGIN ALTER TABLE session_snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
 		// Add workload_key column to snapshots (for fresh installs without chunk_key)
 		`ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshots_workload_key ON snapshots(workload_key)`,
@@ -434,6 +434,8 @@ func initSchema(db *sql.DB) error {
 		// Add workload_key column to runners
 		`ALTER TABLE runners ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_runners_workload_key ON runners(workload_key)`,
+		// Incremental commands for snapshot configs
+		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS incremental_commands JSONB DEFAULT '[]'`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil {

@@ -55,9 +55,9 @@ func NewClient(ctx context.Context, config Config, logger *logrus.Logger) (*Clie
 	}
 
 	// Use gce_instance for host-level metrics
-	if config.InstanceName != "" && config.Zone != "" {
+	if config.InstanceID != "" && config.Zone != "" {
 		resourceType = "gce_instance"
-		resourceLabels["instance_id"] = config.InstanceName
+		resourceLabels["instance_id"] = config.InstanceID
 		resourceLabels["zone"] = config.Zone
 	}
 

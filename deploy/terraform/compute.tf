@@ -105,6 +105,8 @@ resource "google_compute_instance_template" "firecracker_host" {
     # Indicates whether data disk was created from snapshot (fast) or empty (needs GCS download)
     use-data-snapshot     = var.use_data_snapshot ? "true" : "false"
     use-chunked-snapshots = var.use_chunked_snapshots ? "true" : "false"
+    chunk-cache-size-gb   = var.chunk_cache_size_gb
+    mem-cache-size-gb     = var.mem_cache_size_gb
     use-netns             = var.use_netns ? "true" : "false"
   }
 
@@ -397,6 +399,12 @@ LOGROTATE
     if [ "$USE_CHUNKED_SNAPSHOTS" = "true" ]; then
       EXEC_START="$EXEC_START --use-chunked-snapshots"
       EXEC_START="$EXEC_START --snapshot-bucket=$SNAPSHOT_BUCKET"
+      CHUNK_CACHE_SIZE_GB=$(curl -sf -H "Metadata-Flavor: Google" \
+        http://metadata.google.internal/computeMetadata/v1/instance/attributes/chunk-cache-size-gb || echo "2")
+      MEM_CACHE_SIZE_GB=$(curl -sf -H "Metadata-Flavor: Google" \
+        http://metadata.google.internal/computeMetadata/v1/instance/attributes/mem-cache-size-gb || echo "2")
+      EXEC_START="$EXEC_START --chunk-cache-size-gb=$CHUNK_CACHE_SIZE_GB"
+      EXEC_START="$EXEC_START --mem-cache-size-gb=$MEM_CACHE_SIZE_GB"
     fi
 
     # Add network namespace flag if enabled
