@@ -278,20 +278,30 @@ pass "Resumed runner is ready"
 header "9. Verify ALL state preserved after GCS resume"
 # ---------------------------------------------------------------------------
 
-# Quick network/exec check before running full verification
-echo "  --- Pre-check: exec reachable on resumed VM ---"
-sleep 2  # give port forwarding DNAT rules a moment to take effect
-PRECHECK=$(curl -s --no-buffer --max-time 10 -X POST "$MGR/api/v1/runners/$RESUME_RUNNER_ID/exec" \
-  -H 'Content-Type: application/json' \
-  -d '{"command":["echo","exec-alive"],"timeout_seconds":5}' 2>&1 || echo "EXEC_TIMEOUT")
-echo "  Pre-check: $PRECHECK"
-if echo "$PRECHECK" | grep -q 'exec-alive'; then
+# Wait for exec to actually work (thaw-agent needs time to re-bind after resume)
+echo "  --- Pre-check: waiting for exec to become responsive ---"
+EXEC_READY=false
+for i in $(seq 1 30); do
+  PRECHECK=$(curl -s --no-buffer --max-time 5 -X POST "$MGR/api/v1/runners/$RESUME_RUNNER_ID/exec" \
+    -H 'Content-Type: application/json' \
+    -d '{"command":["echo","exec-alive"],"timeout_seconds":3}' 2>&1 || echo "EXEC_TIMEOUT")
+  if echo "$PRECHECK" | grep -q 'exec-alive'; then
+    echo "  Exec responsive after ${i}s"
+    EXEC_READY=true
+    break
+  fi
+  echo -n "."
+  sleep 1
+done
+echo ""
+
+if $EXEC_READY; then
   pass "Exec reachable on resumed VM"
 else
-  fail "Exec NOT reachable on resumed VM"
-  echo "  Manager log (last 20 lines):"
-  tail -20 /tmp/fc-dev/logs/firecracker-manager.log
-  # Continue anyway to see what other checks show
+  fail "Exec NOT reachable on resumed VM after 30s"
+  echo "  Last response: $PRECHECK"
+  echo "  Manager log (last 10 lines):"
+  tail -10 /tmp/fc-dev/logs/firecracker-manager.log
 fi
 
 # Helper to run a command inside the resumed VM (never fails the script)
