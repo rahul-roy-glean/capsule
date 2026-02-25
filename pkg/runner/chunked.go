@@ -518,6 +518,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		TapDevice:       tap.Name,
 		MAC:             tap.MAC,
 		SnapshotVersion: meta.Version,
+		WorkloadKey:     workloadKey,
 		Resources: Resources{
 			VCPUs:    cm.config.VCPUsPerRunner,
 			MemoryMB: cm.config.MemoryMBPerRunner,
