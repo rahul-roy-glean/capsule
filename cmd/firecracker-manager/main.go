@@ -496,6 +496,9 @@ func main() {
 	httpMux.HandleFunc("/api/v1/pool/stats", poolStatsHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/runners/", runnerProxyHandler(mgr, logger))
 
+	// Start TTL enforcement loop for session auto-pause
+	mgr.StartTTLEnforcement(ctx)
+
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *httpPort),
 		Handler: httpMux,
@@ -1108,6 +1111,30 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 			return
 		}
 
+		// Handle /api/v1/runners/{id}/exec (execute command in VM)
+		if execParts := strings.SplitN(suffix, "/exec", 2); len(execParts) == 2 && execParts[1] == "" {
+			runnerID := execParts[0]
+			runnerID = strings.TrimSuffix(runnerID, "/")
+			handleExecCommand(w, r, mgr, log, runnerID)
+			return
+		}
+
+		// Handle /api/v1/runners/{id}/pause (pause runner and create session snapshot)
+		if pauseParts := strings.SplitN(suffix, "/pause", 2); len(pauseParts) == 2 && pauseParts[1] == "" {
+			runnerID := pauseParts[0]
+			runnerID = strings.TrimSuffix(runnerID, "/")
+			handlePauseRunner(w, r, mgr, log, runnerID)
+			return
+		}
+
+		// Handle /api/v1/runners/{id}/connect (extend TTL or resume)
+		if connectParts := strings.SplitN(suffix, "/connect", 2); len(connectParts) == 2 && connectParts[1] == "" {
+			runnerID := connectParts[0]
+			runnerID = strings.TrimSuffix(runnerID, "/")
+			handleConnectRunner(w, r, mgr, log, runnerID)
+			return
+		}
+
 		// Split into runnerID and the rest
 		parts := strings.SplitN(suffix, "/proxy/", 2)
 		if len(parts) != 2 {
@@ -1164,6 +1191,81 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 	}
 }
 
+// handleExecCommand proxies a POST /exec request to a runner's thaw-agent,
+// streaming the ndjson response back to the client line-by-line.
+func handleExecCommand(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Look up runner
+	rn, err := mgr.GetRunner(runnerID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("runner not found: %s", runnerID), http.StatusNotFound)
+		return
+	}
+	if rn.InternalIP == nil {
+		http.Error(w, "runner has no internal IP", http.StatusServiceUnavailable)
+		return
+	}
+	if rn.State == runner.StateQuarantined || rn.State == runner.StateTerminated {
+		http.Error(w, fmt.Sprintf("runner is %s", rn.State), http.StatusConflict)
+		return
+	}
+
+	// Build target URL to thaw-agent's /exec on port 8081
+	targetURL := fmt.Sprintf("http://%s:8081/exec", rn.InternalIP.String())
+
+	log.WithFields(logrus.Fields{
+		"runner_id": runnerID,
+		"target":    targetURL,
+	}).Debug("Proxying exec request to thaw-agent")
+
+	// Track active execs for TTL enforcement
+	mgr.IncrementActiveExecs(runnerID)
+	defer mgr.DecrementActiveExecs(runnerID)
+
+	// Forward the request to thaw-agent
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, r.Body)
+	if err != nil {
+		http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
+		return
+	}
+	upstreamReq.Header.Set("Content-Type", r.Header.Get("Content-Type"))
+
+	client := &http.Client{Timeout: 0} // no client-side timeout, thaw-agent handles it
+	resp, err := client.Do(upstreamReq)
+	if err != nil {
+		log.WithError(err).WithField("runner_id", runnerID).Warn("Failed to reach thaw-agent for exec")
+		http.Error(w, "bad gateway: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy headers and set streaming headers
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(resp.StatusCode)
+	flusher.Flush()
+
+	// Stream response body line-by-line
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	for scanner.Scan() {
+		w.Write(scanner.Bytes())
+		w.Write([]byte("\n"))
+		flusher.Flush()
+	}
+}
+
 // waitForDataMount blocks until the parent mount point of workspaceDir (e.g.
 // /mnt/data) has a real filesystem mounted on it. This prevents the manager
 // from creating files on the root filesystem that get hidden when the data
@@ -1217,4 +1319,84 @@ func isMounted(target string) bool {
 		}
 	}
 	return false
+}
+
+// handlePauseRunner handles POST /api/v1/runners/{id}/pause
+func handlePauseRunner(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	result, err := mgr.PauseRunner(r.Context(), runnerID)
+	if err != nil {
+		log.WithError(err).WithField("runner_id", runnerID).Error("Failed to pause runner")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"session_id":          result.SessionID,
+		"layer":               result.Layer,
+		"snapshot_size_bytes": result.SnapshotSizeBytes,
+	})
+}
+
+// handleConnectRunner handles POST /api/v1/runners/{id}/connect
+// If running: extends TTL (200). If suspended: resumes (201).
+func handleConnectRunner(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	rn, err := mgr.GetRunner(runnerID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("runner not found: %s", runnerID), http.StatusNotFound)
+		return
+	}
+
+	switch rn.State {
+	case runner.StateIdle, runner.StateBusy:
+		// Runner is active — reset TTL timer
+		mgr.ResetTTL(runnerID)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":    "connected",
+			"runner_id": runnerID,
+		})
+
+	case runner.StateSuspended:
+		// Runner is suspended — resume from session
+		if rn.SessionID == "" {
+			http.Error(w, "runner has no session_id", http.StatusBadRequest)
+			return
+		}
+		resumed, err := mgr.ResumeFromSession(r.Context(), rn.SessionID, rn.ChunkKey)
+		if err != nil {
+			log.WithError(err).WithField("runner_id", runnerID).Error("Failed to resume runner")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":    "resumed",
+			"runner_id": resumed.ID,
+		})
+
+	default:
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":  fmt.Sprintf("runner is in state %s, cannot connect", rn.State),
+			"status": string(rn.State),
+		})
+	}
 }

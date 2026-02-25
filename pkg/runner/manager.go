@@ -27,12 +27,18 @@ type recentAllocation struct {
 	allocTime time.Time
 }
 
+// uffdStopper is implemented by UFFD handlers that need cleanup on runner release.
+type uffdStopper interface {
+	Stop()
+}
+
 // Manager manages the lifecycle of runners on a host
 type Manager struct {
 	config         HostConfig
 	runners        map[string]*Runner
 	recentRequests map[string]*recentAllocation // keyed by RequestID, TTL 5min
 	vms            map[string]*firecracker.VM
+	uffdHandlers   map[string]uffdStopper // layered UFFD handlers per runner (session resume)
 	snapshotCache  *snapshot.Cache
 	network        *network.NATNetwork
 	// credentialsImage is an ext4 image containing credentials (e.g. Buildbarn certs),
@@ -132,6 +138,7 @@ func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logge
 		runners:          make(map[string]*Runner),
 		recentRequests:   make(map[string]*recentAllocation),
 		vms:              make(map[string]*firecracker.VM),
+		uffdHandlers:     make(map[string]uffdStopper),
 		snapshotCache:    cache,
 		network:          natNet,
 		credentialsImage: credentialsImg,
@@ -563,9 +570,13 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	// When using per-VM namespaces, set up port forwarding (DNAT) so the host
 	// can reach services inside the VM via the host-reachable veth IP.
 	// Port 8080 is the standard service port (e.g., claude_sandbox_service).
+	// Port 8081 is the thaw-agent port (health checks, /exec endpoint).
 	if useNetNS && m.netnsNetwork != nil {
 		if err := m.netnsNetwork.ForwardPort(runnerID, 8080); err != nil {
 			m.logger.WithError(err).Warn("Failed to forward port 8080 into namespace")
+		}
+		if err := m.netnsNetwork.ForwardPort(runnerID, 8081); err != nil {
+			m.logger.WithError(err).Warn("Failed to forward port 8081 into namespace")
 		}
 	}
 
@@ -673,6 +684,11 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 		data.Latest.Runner.CISystem = m.ciAdapter.Name()
 	}
 
+	// Set exec mode when explicitly requested via ci_system=none
+	if req.CISystem == "none" {
+		data.Latest.Meta.Mode = "exec"
+	}
+
 	return data
 }
 
@@ -704,7 +720,33 @@ func (m *Manager) ReleaseRunner(runnerID string, destroy bool) error {
 		delete(m.vms, runnerID)
 	}
 
-	m.cleanupRunner(runnerID, runner.TapDevice, runner.RootfsOverlay, runner.RepoCacheUpper)
+	// Stop UFFD handler if one exists
+	if handler, ok := m.uffdHandlers[runnerID]; ok {
+		handler.Stop()
+		delete(m.uffdHandlers, runnerID)
+	}
+
+	// Suspended runners already had network released during pause; only clean up overlay/files
+	if runner.State == StateSuspended {
+		if runner.RootfsOverlay != "" {
+			os.Remove(runner.RootfsOverlay)
+		}
+		if runner.RepoCacheUpper != "" {
+			os.Remove(runner.RepoCacheUpper)
+		}
+		os.Remove(filepath.Join(m.config.SocketDir, runnerID+".sock"))
+	} else {
+		m.cleanupRunner(runnerID, runner.TapDevice, runner.RootfsOverlay, runner.RepoCacheUpper)
+	}
+
+	// Clean up session snapshot files if this runner had a session
+	if runner.SessionID != "" {
+		sessionDir := filepath.Join(m.sessionBaseDir(), runner.SessionID)
+		if err := os.RemoveAll(sessionDir); err != nil {
+			m.logger.WithError(err).WithField("session_id", runner.SessionID).Warn("Failed to clean up session dir")
+		}
+	}
+
 	delete(m.runners, runnerID)
 
 	return nil

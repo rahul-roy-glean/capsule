@@ -19,6 +19,8 @@ const (
 	StateRetiring     State = "retiring"
 	StateTerminated   State = "terminated"
 	StatePaused       State = "paused" // VM paused and eligible for pool reuse
+	StatePausing      State = "pausing"
+	StateSuspended    State = "suspended"
 )
 
 // Runner represents a single Bazel runner instance
@@ -58,6 +60,15 @@ type Runner struct {
 	TaskCount        int        `json:"task_count"`
 	MemoryUsageBytes int64      `json:"memory_usage_bytes,omitempty"`
 	DiskUsageBytes   int64      `json:"disk_usage_bytes,omitempty"`
+
+	// Session pause/resume fields
+	SessionID     string    `json:"session_id,omitempty"`
+	TTLSeconds    int       `json:"ttl_seconds,omitempty"`
+	AutoPause     bool      `json:"auto_pause,omitempty"`
+	LastExecAt    time.Time `json:"last_exec_at,omitempty"`
+	ActiveExecs   int32     `json:"active_execs,omitempty"`
+	SessionDir    string    `json:"session_dir,omitempty"`
+	SessionLayers int       `json:"session_layers,omitempty"`
 }
 
 // Resources represents the resources allocated to a runner
@@ -78,6 +89,9 @@ type AllocateRequest struct {
 	Labels            map[string]string
 	GitHubRunnerToken string
 	CISystem          string // CI system identifier
+	SessionID         string // optional: bind to session for pause/resume
+	TTLSeconds        int    // idle timeout from snapshot config
+	AutoPause         bool   // pause on TTL vs destroy
 }
 
 // MMDSData represents data to inject into the microVM via MMDS
@@ -89,6 +103,7 @@ type MMDSData struct {
 			InstanceName string `json:"instance_name,omitempty"`
 			Environment  string `json:"environment"`
 			JobID        string `json:"job_id,omitempty"`
+			Mode         string `json:"mode,omitempty"`         // "warmup", "exec", or empty for normal runner
 			CurrentTime  string `json:"current_time,omitempty"` // RFC3339 timestamp from host for clock sync
 		} `json:"meta"`
 		Buildbarn struct {
@@ -133,6 +148,12 @@ type MMDSData struct {
 			// (baked into the snapshot rootfs). Thaw-agent creates a symlink from WorkspaceDir to here.
 			PreClonedPath string `json:"pre_cloned_path,omitempty"`
 		} `json:"git_cache,omitempty"`
+		Exec struct {
+			Command    []string          `json:"command,omitempty"`
+			Env        map[string]string `json:"env,omitempty"`
+			WorkingDir string            `json:"working_dir,omitempty"`
+			TimeoutSec int               `json:"timeout_seconds,omitempty"`
+		} `json:"exec,omitempty"`
 	} `json:"latest"`
 }
 
@@ -188,13 +209,16 @@ type HostConfig struct {
 	// QuarantineDir is where the host will write quarantine manifests and keep
 	// per-runner debug metadata when a runner is quarantined.
 	QuarantineDir     string
+	// SessionDir is the base directory for session snapshot storage (pause/resume).
+	// Defaults to {SnapshotCachePath}/../sessions (e.g. /mnt/data/sessions).
+	SessionDir        string
 	MicroVMSubnet     string
 	ExternalInterface string
 	BridgeName        string
 	// ChunkKey identifies which snapshot this host should use (hash of snapshot commands).
-	ChunkKey          string
-	Environment       string
-	ControlPlaneAddr  string
+	ChunkKey         string
+	Environment      string
+	ControlPlaneAddr string
 
 	// Runner Pool Configuration
 	PoolEnabled            bool `json:"pool_enabled"`

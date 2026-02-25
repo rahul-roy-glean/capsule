@@ -23,6 +23,8 @@ func TestRunnerToProto_AllStates(t *testing.T) {
 		{runner.StateRetiring, "RUNNER_STATE_RETIRING"},
 		{runner.StateTerminated, "RUNNER_STATE_TERMINATED"},
 		{runner.StatePaused, "RUNNER_STATE_PAUSED"},
+		{runner.StatePausing, "11"},    // Manually added enum; descriptor returns numeric string
+		{runner.StateSuspended, "12"},  // Manually added enum; descriptor returns numeric string
 		{runner.State("unknown"), "RUNNER_STATE_UNSPECIFIED"},
 	}
 
@@ -135,5 +137,26 @@ func TestRunnerToProto_TimestampFields(t *testing.T) {
 	}
 	if proto.StartedAt != nil {
 		t.Error("StartedAt should be nil for zero time")
+	}
+}
+
+func TestRunnerToProto_NilIP(t *testing.T) {
+	// Suspended runners have nil InternalIP — should not panic
+	r := &runner.Runner{
+		ID:        "test-id",
+		HostID:    "test-host",
+		State:     runner.StateSuspended,
+		Resources: runner.Resources{VCPUs: 2, MemoryMB: 4096},
+		CreatedAt: time.Now(),
+		// InternalIP is nil
+	}
+
+	proto := runnerToProto(r)
+
+	if proto.InternalIp != "" {
+		t.Errorf("InternalIp should be empty for nil IP, got %q", proto.InternalIp)
+	}
+	if proto.State.String() != "12" { // Manually added enum value
+		t.Errorf("State = %q, want 12 (SUSPENDED)", proto.State.String())
 	}
 }

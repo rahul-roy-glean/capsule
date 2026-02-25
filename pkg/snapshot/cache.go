@@ -68,14 +68,20 @@ type CacheConfig struct {
 
 // NewCache creates a new snapshot cache manager
 func NewCache(ctx context.Context, cfg CacheConfig) (*Cache, error) {
-	client, err := storage.NewClient(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create GCS client: %w", err)
-	}
-
 	logger := cfg.Logger
 	if logger == nil {
 		logger = logrus.New()
+	}
+
+	// GCS client is only needed when a real bucket is configured.
+	// Skip creation for local-only dev setups to avoid requiring GCP credentials.
+	var client *storage.Client
+	if cfg.GCSBucket != "" {
+		var err error
+		client, err = storage.NewClient(ctx)
+		if err != nil {
+			logger.WithError(err).Warn("Failed to create GCS client, snapshot sync from GCS will be unavailable")
+		}
 	}
 
 	cache := &Cache{
@@ -99,6 +105,11 @@ func NewCache(ctx context.Context, cfg CacheConfig) (*Cache, error) {
 
 // SyncFromGCS syncs snapshot files from GCS to local cache
 func (c *Cache) SyncFromGCS(ctx context.Context, version string) error {
+	if c.gcsClient == nil {
+		c.logger.Warn("GCS client not available, skipping snapshot sync")
+		return nil
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -245,6 +256,10 @@ func (c *Cache) CurrentVersion() string {
 
 // ListVersions lists available snapshot versions in GCS
 func (c *Cache) ListVersions(ctx context.Context) ([]string, error) {
+	if c.gcsClient == nil {
+		return nil, fmt.Errorf("GCS client not available")
+	}
+
 	c.logger.Debug("Listing snapshot versions from GCS")
 
 	bucket := c.gcsClient.Bucket(c.gcsBucket)
@@ -277,6 +292,10 @@ func (c *Cache) ListVersions(ctx context.Context) ([]string, error) {
 
 // GetRemoteMetadata fetches metadata for a specific version from GCS
 func (c *Cache) GetRemoteMetadata(ctx context.Context, version string) (*SnapshotMetadata, error) {
+	if c.gcsClient == nil {
+		return nil, fmt.Errorf("GCS client not available")
+	}
+
 	bucket := c.gcsClient.Bucket(c.gcsBucket)
 	obj := bucket.Object(fmt.Sprintf("%s/metadata.json", version))
 
@@ -301,6 +320,10 @@ func (c *Cache) GetRemoteMetadata(ctx context.Context, version string) (*Snapsho
 
 // IsStale checks if the local cache is stale compared to GCS
 func (c *Cache) IsStale(ctx context.Context) (bool, error) {
+	if c.gcsClient == nil {
+		return false, nil
+	}
+
 	c.mu.RLock()
 	localVer := c.currentVer
 	c.mu.RUnlock()
