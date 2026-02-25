@@ -83,12 +83,24 @@ done
 # --- Start firecracker-manager ---
 echo ""
 echo "=== Starting firecracker-manager ==="
+
+# Build optional flags from environment variables.
+SESSION_CHUNK_BUCKET=${SESSION_CHUNK_BUCKET:-}
+SNAPSHOT_BUCKET=${SNAPSHOT_BUCKET:-local-dev}
+EXTRA_MGR_FLAGS=""
+if [ -n "$SESSION_CHUNK_BUCKET" ]; then
+  # GCS-backed sessions require chunked snapshot mode (for the chunk stores).
+  EXTRA_MGR_FLAGS="--use-chunked-snapshots --snapshot-bucket=$SESSION_CHUNK_BUCKET --session-chunk-bucket=$SESSION_CHUNK_BUCKET"
+  echo "  GCS session bucket: $SESSION_CHUNK_BUCKET (chunked mode enabled)"
+else
+  EXTRA_MGR_FLAGS="--snapshot-bucket=$SNAPSHOT_BUCKET"
+fi
+
 sudo -b sh -c 'nohup '"$REPO_ROOT"'/bin/firecracker-manager \
   --http-port=9080 \
   --grpc-port=50052 \
   --use-netns \
   --ci-system=none \
-  --snapshot-bucket=local-dev \
   --snapshot-cache='"$SNAPSHOT_DIR"' \
   --socket-dir=/tmp/fc-dev/sockets \
   --workspace-dir=/tmp/fc-dev/workspaces \
@@ -98,6 +110,7 @@ sudo -b sh -c 'nohup '"$REPO_ROOT"'/bin/firecracker-manager \
   --max-runners=4 \
   --idle-target=0 \
   --log-level=debug \
+  '"$EXTRA_MGR_FLAGS"' \
   > '"$LOG_DIR"'/firecracker-manager.log 2>&1 &
 echo $! > /tmp/fc-dev/pids/firecracker-manager.pid'
 # Give sudo a moment to fork

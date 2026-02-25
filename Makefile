@@ -341,6 +341,7 @@ help:
 	@echo "  dev-stack            - Start control-plane + firecracker-manager"
 	@echo "  dev-test-exec        - Run E2E exec test (allocate->exec->release)"
 	@echo "  dev-test-pause-resume - Run E2E pause/resume test"
+	@echo "  dev-test-gcs-pause-resume - Run E2E GCS-backed pause/resume test (needs SESSION_CHUNK_BUCKET)"
 	@echo "  dev-stop             - Stop the stack"
 	@echo ""
 	@echo "Example workflow (disk snapshots):"
@@ -378,6 +379,11 @@ dev-test-exec:
 # Run E2E pause/resume test
 dev-test-pause-resume:
 	bash dev/test-pause-resume.sh
+
+# Run E2E GCS-backed pause/resume test (cross-host simulation)
+# Requires: SESSION_CHUNK_BUCKET=<bucket> (same bucket used for dev-snapshot and dev-stack)
+dev-test-gcs-pause-resume:
+	bash dev/test-gcs-pause-resume.sh
 
 # Stop the stack
 dev-stop:
