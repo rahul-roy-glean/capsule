@@ -7,6 +7,8 @@
 package runner
 
 import (
+	"fmt"
+
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
@@ -36,6 +38,8 @@ const (
 	RunnerState_RUNNER_STATE_RETIRING     RunnerState = 8
 	RunnerState_RUNNER_STATE_TERMINATED   RunnerState = 9
 	RunnerState_RUNNER_STATE_PAUSED       RunnerState = 10 // VM paused and pooled for reuse
+	RunnerState_RUNNER_STATE_PAUSING      RunnerState = 11 // Snapshot in progress
+	RunnerState_RUNNER_STATE_SUSPENDED    RunnerState = 12 // VM destroyed, session snapshot exists
 )
 
 // Enum value maps for RunnerState.
@@ -52,6 +56,8 @@ var (
 		8:  "RUNNER_STATE_RETIRING",
 		9:  "RUNNER_STATE_TERMINATED",
 		10: "RUNNER_STATE_PAUSED",
+		11: "RUNNER_STATE_PAUSING",
+		12: "RUNNER_STATE_SUSPENDED",
 	}
 	RunnerState_value = map[string]int32{
 		"RUNNER_STATE_UNSPECIFIED":  0,
@@ -65,6 +71,8 @@ var (
 		"RUNNER_STATE_RETIRING":     8,
 		"RUNNER_STATE_TERMINATED":   9,
 		"RUNNER_STATE_PAUSED":       10,
+		"RUNNER_STATE_PAUSING":      11,
+		"RUNNER_STATE_SUSPENDED":    12,
 	}
 )
 
@@ -702,6 +710,7 @@ type AllocateRunnerRequest struct {
 	CiRunnerToken     string            `protobuf:"bytes,8,opt,name=ci_runner_token,json=ciRunnerToken,proto3" json:"ci_runner_token,omitempty"`             // Generic CI runner registration token
 	CiSystem          string            `protobuf:"bytes,9,opt,name=ci_system,json=ciSystem,proto3" json:"ci_system,omitempty"`                              // CI system identifier (e.g., "github-actions", "none")
 	ChunkKey          string            `protobuf:"bytes,10,opt,name=chunk_key,json=chunkKey,proto3" json:"chunk_key,omitempty"`                             // Hash of snapshot commands; identifies which snapshot to boot
+	SessionId         string            `protobuf:"bytes,11,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`                             // Optional: bind to session for pause/resume
 }
 
 func (x *AllocateRunnerRequest) Reset() {
@@ -804,14 +813,23 @@ func (x *AllocateRunnerRequest) GetChunkKey() string {
 	return ""
 }
 
+func (x *AllocateRunnerRequest) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
 // AllocateRunnerResponse
 type AllocateRunnerResponse struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache
 	unknownFields protoimpl.UnknownFields
 
-	Runner *Runner `protobuf:"bytes,1,opt,name=runner,proto3" json:"runner,omitempty"`
-	Error  string  `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	Runner    *Runner `protobuf:"bytes,1,opt,name=runner,proto3" json:"runner,omitempty"`
+	Error     string  `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	Resumed   bool    `protobuf:"varint,3,opt,name=resumed,proto3" json:"resumed,omitempty"`
+	SessionId string  `protobuf:"bytes,4,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
 }
 
 func (x *AllocateRunnerResponse) Reset() {
@@ -857,6 +875,156 @@ func (x *AllocateRunnerResponse) GetError() string {
 	}
 	return ""
 }
+
+func (x *AllocateRunnerResponse) GetResumed() bool {
+	if x != nil {
+		return x.Resumed
+	}
+	return false
+}
+
+func (x *AllocateRunnerResponse) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+// PauseRunnerRequest
+type PauseRunnerRequest struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	RunnerId string `protobuf:"bytes,1,opt,name=runner_id,json=runnerId,proto3" json:"runner_id,omitempty"`
+}
+
+func (x *PauseRunnerRequest) GetRunnerId() string {
+	if x != nil {
+		return x.RunnerId
+	}
+	return ""
+}
+
+func (x *PauseRunnerRequest) ProtoReflect() protoreflect.Message { return nil }
+func (x *PauseRunnerRequest) Reset()                             { *x = PauseRunnerRequest{} }
+func (x *PauseRunnerRequest) String() string                     { return fmt.Sprintf("PauseRunnerRequest{runner_id:%s}", x.RunnerId) }
+
+// PauseRunnerResponse
+type PauseRunnerResponse struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	Success           bool   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Error             string `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	SessionId         string `protobuf:"bytes,3,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	SnapshotSizeBytes int64  `protobuf:"varint,4,opt,name=snapshot_size_bytes,json=snapshotSizeBytes,proto3" json:"snapshot_size_bytes,omitempty"`
+	Layer             int32  `protobuf:"varint,5,opt,name=layer,proto3" json:"layer,omitempty"`
+}
+
+func (x *PauseRunnerResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *PauseRunnerResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+func (x *PauseRunnerResponse) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+func (x *PauseRunnerResponse) GetSnapshotSizeBytes() int64 {
+	if x != nil {
+		return x.SnapshotSizeBytes
+	}
+	return 0
+}
+
+func (x *PauseRunnerResponse) GetLayer() int32 {
+	if x != nil {
+		return x.Layer
+	}
+	return 0
+}
+
+func (x *PauseRunnerResponse) ProtoReflect() protoreflect.Message { return nil }
+func (x *PauseRunnerResponse) Reset()                             { *x = PauseRunnerResponse{} }
+func (x *PauseRunnerResponse) String() string                     { return fmt.Sprintf("PauseRunnerResponse{success:%v}", x.Success) }
+
+// ResumeRunnerRequest
+type ResumeRunnerRequest struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	SessionId string `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	ChunkKey  string `protobuf:"bytes,2,opt,name=chunk_key,json=chunkKey,proto3" json:"chunk_key,omitempty"`
+}
+
+func (x *ResumeRunnerRequest) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+func (x *ResumeRunnerRequest) GetChunkKey() string {
+	if x != nil {
+		return x.ChunkKey
+	}
+	return ""
+}
+
+func (x *ResumeRunnerRequest) ProtoReflect() protoreflect.Message { return nil }
+func (x *ResumeRunnerRequest) Reset()                             { *x = ResumeRunnerRequest{} }
+func (x *ResumeRunnerRequest) String() string                     { return fmt.Sprintf("ResumeRunnerRequest{session_id:%s}", x.SessionId) }
+
+// ResumeRunnerResponse
+type ResumeRunnerResponse struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	Runner             *Runner `protobuf:"bytes,1,opt,name=runner,proto3" json:"runner,omitempty"`
+	Error              string  `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	ResumedFromSession bool    `protobuf:"varint,3,opt,name=resumed_from_session,json=resumedFromSession,proto3" json:"resumed_from_session,omitempty"`
+}
+
+func (x *ResumeRunnerResponse) GetRunner() *Runner {
+	if x != nil {
+		return x.Runner
+	}
+	return nil
+}
+
+func (x *ResumeRunnerResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+func (x *ResumeRunnerResponse) GetResumedFromSession() bool {
+	if x != nil {
+		return x.ResumedFromSession
+	}
+	return false
+}
+
+func (x *ResumeRunnerResponse) ProtoReflect() protoreflect.Message { return nil }
+func (x *ResumeRunnerResponse) Reset()                             { *x = ResumeRunnerResponse{} }
+func (x *ResumeRunnerResponse) String() string                     { return fmt.Sprintf("ResumeRunnerResponse{resumed:%v}", x.ResumedFromSession) }
 
 // ReleaseRunnerRequest
 type ReleaseRunnerRequest struct {

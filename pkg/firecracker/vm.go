@@ -217,12 +217,13 @@ func (vm *VM) RestoreFromSnapshot(ctx context.Context, snapshotPath, memPath str
 	// during LoadSnapshot at the paths recorded in the snapshot state file.
 	// These paths must exist (the caller sets up symlinks to handle path differences).
 	if err := vm.client.LoadSnapshot(ctx, SnapshotLoadParams{
-		SnapshotPath: snapshotPath,
+		SnapshotPath:        snapshotPath,
 		MemBackend: &MemBackend{
 			BackendPath: memPath,
 			BackendType: "File",
 		},
-		ResumeVM: resume,
+		EnableDiffSnapshots: true,
+		ResumeVM:            resume,
 	}); err != nil {
 		return fmt.Errorf("failed to load snapshot: %w", err)
 	}
@@ -277,6 +278,44 @@ func (vm *VM) CreateSnapshot(ctx context.Context, snapshotPath, memPath string) 
 	}
 
 	vm.logger.Info("Snapshot created successfully")
+	return nil
+}
+
+// CreateDiffSnapshot creates a diff snapshot of the running microVM.
+// Diff snapshots only capture dirty pages since the last snapshot or restore,
+// resulting in much smaller memory files. Requires track_dirty_pages to have
+// been enabled at load time (via EnableDiffSnapshots in SnapshotLoadParams).
+func (vm *VM) CreateDiffSnapshot(ctx context.Context, snapshotPath, memDiffPath string) error {
+	vm.logger.WithFields(logrus.Fields{
+		"snapshot": snapshotPath,
+		"mem_diff": memDiffPath,
+	}).Info("Creating diff snapshot")
+
+	// Ensure directories exist
+	if err := os.MkdirAll(filepath.Dir(snapshotPath), 0755); err != nil {
+		return fmt.Errorf("failed to create snapshot directory: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(memDiffPath), 0755); err != nil {
+		return fmt.Errorf("failed to create memory directory: %w", err)
+	}
+
+	// Pause the VM first
+	if err := vm.client.PauseVM(ctx); err != nil {
+		return fmt.Errorf("failed to pause VM: %w", err)
+	}
+
+	// Create the diff snapshot
+	if err := vm.client.CreateSnapshot(ctx, SnapshotCreateParams{
+		SnapshotPath: snapshotPath,
+		MemFilePath:  memDiffPath,
+		SnapshotType: "Diff",
+	}); err != nil {
+		// Try to resume on failure
+		vm.client.ResumeVM(ctx)
+		return fmt.Errorf("failed to create diff snapshot: %w", err)
+	}
+
+	vm.logger.Info("Diff snapshot created successfully")
 	return nil
 }
 
@@ -342,7 +381,8 @@ func (vm *VM) RestoreFromSnapshotWithUFFD(ctx context.Context, snapshotPath, uff
 			BackendPath: uffdSocketPath,
 			BackendType: "Uffd",
 		},
-		ResumeVM: resume,
+		EnableDiffSnapshots: true,
+		ResumeVM:            resume,
 	}); err != nil {
 		return fmt.Errorf("failed to load snapshot with UFFD: %w", err)
 	}
