@@ -193,14 +193,19 @@ for DIRTY_MB in 0 1 4 16 64; do
   # Cleanup
   release_runner "$RESUME_ID"
 
-  # Small pause between runs to let resources clean up
-  sleep 2
+  # Wait for slot to be fully freed before next iteration
+  sleep 3
 done
 
 echo ""
 echo "==========================================="
 echo "  Sequential benchmark complete"
 echo "==========================================="
+
+# Wait for all resources to be fully released before concurrent benchmark
+echo ""
+echo "Waiting for resource cleanup before concurrent benchmark..."
+sleep 5
 
 # ==========================================================================
 # Part 2: Concurrent scaling benchmark
@@ -219,7 +224,7 @@ TMPDIR_BENCH=$(mktemp -d)
 # Writes timing to $TMPDIR_BENCH/result-$slot.txt
 run_single_cycle() {
   local slot=$1 wk=$2 dirty_mb=$3
-  local sid="bench-conc-$(date +%s)-slot${slot}"
+  local sid="bench-conc-$(date +%s)-slot${slot}-$$"
   local result_file="$TMPDIR_BENCH/result-${slot}.txt"
 
   # Allocate
@@ -227,11 +232,12 @@ run_single_cycle() {
   local resp=$(allocate "$wk" "$sid")
   local rid=$(echo "$resp" | jq -r '.runner_id')
   if [ -z "$rid" ] || [ "$rid" = "null" ]; then
+    echo "ALLOC_FAIL slot=$slot resp=$resp" >> "$TMPDIR_BENCH/errors.log"
     echo "ALLOC_FAIL" > "$result_file"
     return
   fi
-  wait_ready "$rid" 60
-  wait_exec_ready "$rid" 30
+  wait_ready "$rid" 60 || { echo "READY_TIMEOUT slot=$slot rid=$rid" >> "$TMPDIR_BENCH/errors.log"; echo "ALLOC_FAIL" > "$result_file"; release_runner "$rid"; return; }
+  wait_exec_ready "$rid" 30 || { echo "EXEC_READY_TIMEOUT slot=$slot rid=$rid" >> "$TMPDIR_BENCH/errors.log"; echo "ALLOC_FAIL" > "$result_file"; release_runner "$rid"; return; }
   local t_alloc=$(now_ms)
 
   # Write dirty data + marker
@@ -254,12 +260,13 @@ run_single_cycle() {
   local rrid=$(echo "$rresp" | jq -r '.runner_id')
   local resumed=$(echo "$rresp" | jq -r '.resumed // false')
   if [ "$resumed" != "true" ]; then
+    echo "RESUME_FAIL slot=$slot resp=$rresp" >> "$TMPDIR_BENCH/errors.log"
     echo "RESUME_FAIL" > "$result_file"
     release_runner "$rid" 2>/dev/null || true
     return
   fi
-  wait_ready "$rrid" 60
-  wait_exec_ready "$rrid" 30
+  wait_ready "$rrid" 60 || true
+  wait_exec_ready "$rrid" 30 || true
   local t_resume=$(now_ms)
 
   # Verify
@@ -281,8 +288,9 @@ printf "%-8s %10s %10s %10s %10s %10s %10s %10s %8s\n" \
   "----" "---------" "---------" "----------" "---------" "---------" "----------" "-------" "------"
 
 for N in $CONCURRENCY_LEVELS; do
-  # Clean up any leftover VMs
-  sleep 2
+  # Clean up any leftover VMs and wait for slots to free
+  sleep 5
+  > "$TMPDIR_BENCH/errors.log"  # reset error log
 
   echo -n "  Running $N concurrent cycles (${DIRTY_MB_CONCURRENT}MB dirty each)..."
 
@@ -353,6 +361,12 @@ for N in $CONCURRENCY_LEVELS; do
 
   printf "%-8s %10d %10d %10d %10d %10d %10d %10d %8s\n" \
     "${N}x" "$A_P50" "$P_P50" "$R_P50" "$A_MAX" "$P_MAX" "$R_MAX" "$WALL_MS" "$STATUS"
+
+  # Print errors if any
+  if [ -s "$TMPDIR_BENCH/errors.log" ]; then
+    echo "    Errors:"
+    sed 's/^/      /' "$TMPDIR_BENCH/errors.log"
+  fi
 
   # Clean result files
   rm -f "$TMPDIR_BENCH"/result-*.txt

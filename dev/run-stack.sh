@@ -99,7 +99,7 @@ MGR_CMD="$REPO_ROOT/bin/firecracker-manager \
   --log-dir=$LOG_DIR \
   --control-plane=http://localhost:8080 \
   --telemetry-enabled=false \
-  --max-runners=4 \
+  --max-runners=8 \
   --idle-target=0 \
   --log-level=debug"
 
