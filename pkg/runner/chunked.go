@@ -169,17 +169,16 @@ func (cm *ChunkedManager) getOrLoadManifest(ctx context.Context, chunkKey, versi
 	}
 	cm.mu.RUnlock()
 
-	// Load from GCS.
-	// The chunked metadata lives at <chunkKey>/<version>/chunked-metadata.json
-	// or <chunkKey>/current/chunked-metadata.json for the current pointer.
-	var path string
-	if version != "" {
-		path = chunkKey + "/" + version
-	} else {
-		path = chunkKey + "/current"
+	// If no version specified, resolve via the current-pointer.json for this chunk key.
+	if version == "" {
+		var err error
+		version, err = cm.chunkStore.ReadCurrentVersion(ctx, chunkKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read current version for chunk key %s: %w", chunkKey, err)
+		}
 	}
 
-	meta, err := cm.chunkStore.LoadChunkedMetadata(ctx, path)
+	meta, err := cm.chunkStore.LoadChunkedMetadata(ctx, version)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load chunked metadata for %s/%s: %w", chunkKey, version, err)
 	}
@@ -655,8 +654,10 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	// When using per-VM namespaces, set up port forwarding (DNAT) so the host
 	// can reach services inside the VM via the host-reachable veth IP.
 	if netns != nil && cm.netnsNetwork != nil {
-		if err := cm.netnsNetwork.ForwardPort(runnerID, 8080); err != nil {
-			cm.chunkedLogger.WithError(err).Warn("Failed to forward port 8080 into namespace")
+		for _, port := range []int{8080, 8081} {
+			if err := cm.netnsNetwork.ForwardPort(runnerID, port); err != nil {
+				cm.chunkedLogger.WithField("port", port).WithError(err).Warn("Failed to forward port into namespace")
+			}
 		}
 	}
 

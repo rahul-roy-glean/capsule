@@ -110,9 +110,6 @@ func (jq *JobQueue) processQueuedJobs(ctx context.Context) {
 		// Attempt allocation
 		req := AllocateRunnerRequest{
 			RequestID: fmt.Sprintf("gh-%d", githubJobID),
-			Repo:      repo,
-			Branch:    branch,
-			Commit:    commitSHA,
 			ChunkKey:  chunkKey,
 			Labels:    labelsToMap(parseLabels(labelsJSON)),
 		}

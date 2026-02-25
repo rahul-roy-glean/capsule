@@ -33,9 +33,6 @@ func NewScheduler(hr *HostRegistry, db *sql.DB, logger *logrus.Logger) *Schedule
 // AllocateRunnerRequest represents a request to allocate a runner
 type AllocateRunnerRequest struct {
 	RequestID         string
-	Repo              string
-	Branch            string
-	Commit            string
 	ChunkKey          string
 	Labels            map[string]string
 	GitHubRunnerToken string
@@ -60,8 +57,7 @@ type AllocateRunnerResponse struct {
 func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerRequest) (*AllocateRunnerResponse, error) {
 	s.logger.WithFields(logrus.Fields{
 		"request_id": req.RequestID,
-		"repo":       req.Repo,
-		"branch":     req.Branch,
+		"chunk_key":  req.ChunkKey,
 	}).Info("Allocating runner")
 
 	// Derive repo slug for multi-repo support
@@ -74,8 +70,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		if err == nil && maxConcurrent > 0 {
 			var currentCount int
 			_ = s.db.QueryRowContext(ctx, `
-				SELECT COUNT(*) FROM runners WHERE repo = $1 AND status IN ('running','busy','initializing')
-			`, req.Repo).Scan(&currentCount)
+				SELECT COUNT(*) FROM runners WHERE chunk_key = $1 AND status IN ('running','busy','initializing')
+			`, chunkKey).Scan(&currentCount)
 			if currentCount >= maxConcurrent {
 				return nil, fmt.Errorf("chunk_key %s at max concurrent runners (%d/%d)", chunkKey, currentCount, maxConcurrent)
 			}
@@ -113,9 +109,6 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// Build the proto request
 	protoReq := &pb.AllocateRunnerRequest{
 		RequestId:         req.RequestID,
-		Repo:              req.Repo,
-		Branch:            req.Branch,
-		Commit:            req.Commit,
 		Labels:            req.Labels,
 		GithubRunnerToken: req.GitHubRunnerToken,
 		ChunkKey:          chunkKey,
@@ -151,6 +144,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			HostID:     host.ID,
 			InternalIP: resp.Runner.InternalIp,
 			Status:     "running",
+			ChunkKey:   chunkKey,
 		}); err != nil {
 			s.logger.WithError(err).Warn("Failed to register runner in control plane registry")
 		}
