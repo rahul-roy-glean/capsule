@@ -385,6 +385,11 @@ dev-test-pause-resume:
 dev-test-gcs-pause-resume:
 	bash dev/test-gcs-pause-resume.sh
 
+# Run pause/resume performance benchmark
+# Requires: SESSION_CHUNK_BUCKET=<bucket> (same bucket used for dev-snapshot and dev-stack)
+dev-bench-pause-resume:
+	bash dev/bench-pause-resume.sh
+
 # Stop the stack
 dev-stop:
 	bash dev/stop-stack.sh
