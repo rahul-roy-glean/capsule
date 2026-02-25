@@ -38,7 +38,7 @@ header "1. Register snapshot config"
 # IMPORTANT: commands must match what was used in `build-snapshot.sh` so the
 # workload_key hash matches the golden chunked snapshot in GCS.
 SNAPSHOT_COMMANDS=${SNAPSHOT_COMMANDS:-'[{"type":"shell","args":["echo","dev-snapshot-ready"]}]'}
-CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/snapshot-configs" \
+CONFIG_RESP=$(curl -s -X POST "$CP/api/v1/snapshot-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "gcs-pause-resume-test",
@@ -60,7 +60,7 @@ fi
 # ---------------------------------------------------------------------------
 header "2. Allocate runner with session_id"
 # ---------------------------------------------------------------------------
-ALLOC_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
+ALLOC_RESP=$(curl -s -X POST "$CP/api/v1/runners/allocate" \
   -H 'Content-Type: application/json' \
   -d "{\"ci_system\":\"none\", \"workload_key\":\"$WORKLOAD_KEY\", \"session_id\":\"$SESSION_ID\"}")
 echo "  Response: $ALLOC_RESP"
@@ -101,7 +101,7 @@ fi
 # ---------------------------------------------------------------------------
 header "4. Execute: write marker file in VM"
 # ---------------------------------------------------------------------------
-EXEC_OUT=$(curl -sf --no-buffer -X POST "$MGR/api/v1/runners/$RUNNER_ID/exec" \
+EXEC_OUT=$(curl -s --no-buffer -X POST "$MGR/api/v1/runners/$RUNNER_ID/exec" \
   -H 'Content-Type: application/json' \
   -d '{"command":["sh","-c","echo gcs-cross-host-marker > /tmp/gcs-test.txt && cat /tmp/gcs-test.txt"],"timeout_seconds":10}')
 echo "  $EXEC_OUT"
@@ -115,7 +115,7 @@ fi
 # ---------------------------------------------------------------------------
 header "5. Pause runner (should upload to GCS)"
 # ---------------------------------------------------------------------------
-PAUSE_RESP=$(curl -sf -X POST "$MGR/api/v1/runners/$RUNNER_ID/pause" \
+PAUSE_RESP=$(curl -s -X POST "$MGR/api/v1/runners/$RUNNER_ID/pause" \
   -H 'Content-Type: application/json')
 echo "  Response: $PAUSE_RESP"
 
@@ -183,7 +183,7 @@ fi
 # ---------------------------------------------------------------------------
 header "8. Resume: allocate with same session_id (should use GCS)"
 # ---------------------------------------------------------------------------
-RESUME_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
+RESUME_RESP=$(curl -s -X POST "$CP/api/v1/runners/allocate" \
   -H 'Content-Type: application/json' \
   -d "{\"ci_system\":\"none\", \"workload_key\":\"$WORKLOAD_KEY\", \"session_id\":\"$SESSION_ID\"}")
 echo "  Response: $RESUME_RESP"
@@ -228,7 +228,7 @@ pass "Resumed runner is ready"
 # ---------------------------------------------------------------------------
 header "9. Verify state preserved: read marker file"
 # ---------------------------------------------------------------------------
-VERIFY_OUT=$(curl -sf --no-buffer -X POST "$MGR/api/v1/runners/$RESUME_RUNNER_ID/exec" \
+VERIFY_OUT=$(curl -s --no-buffer -X POST "$MGR/api/v1/runners/$RESUME_RUNNER_ID/exec" \
   -H 'Content-Type: application/json' \
   -d '{"command":["cat","/tmp/gcs-test.txt"],"timeout_seconds":10}' 2>&1 || echo "EXEC_FAILED")
 echo "  $VERIFY_OUT"
@@ -242,7 +242,7 @@ fi
 # ---------------------------------------------------------------------------
 header "10. Cleanup: release runner"
 # ---------------------------------------------------------------------------
-RELEASE_RESP=$(curl -sf -X POST "$CP/api/v1/runners/release" \
+RELEASE_RESP=$(curl -s -X POST "$CP/api/v1/runners/release" \
   -H 'Content-Type: application/json' \
   -d "{\"runner_id\":\"$RESUME_RUNNER_ID\"}")
 
