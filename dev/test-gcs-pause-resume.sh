@@ -62,7 +62,7 @@ header "2. Allocate runner with session_id"
 # ---------------------------------------------------------------------------
 ALLOC_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
   -H 'Content-Type: application/json' \
-  -d "{\"ci_system\":\"none\", \"session_id\":\"$SESSION_ID\"}")
+  -d "{\"ci_system\":\"none\", \"workload_key\":\"$WORKLOAD_KEY\", \"session_id\":\"$SESSION_ID\"}")
 echo "  Response: $ALLOC_RESP"
 
 RUNNER_ID=$(echo "$ALLOC_RESP" | jq -r '.runner_id')
