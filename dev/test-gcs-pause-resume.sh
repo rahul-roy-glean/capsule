@@ -237,8 +237,10 @@ echo "  Response: $RESUME_RESP"
 
 RESUME_RUNNER_ID=$(echo "$RESUME_RESP" | jq -r '.runner_id')
 RESUMED=$(echo "$RESUME_RESP" | jq -r '.resumed // false')
+RESUME_IP=$(echo "$RESUME_RESP" | jq -r '.internal_ip // empty')
 echo "  Runner ID: $RESUME_RUNNER_ID"
 echo "  Resumed: $RESUMED"
+echo "  Internal IP: $RESUME_IP"
 
 if [ "$RESUMED" = "true" ]; then
   pass "Session resumed"
@@ -276,12 +278,28 @@ pass "Resumed runner is ready"
 header "9. Verify ALL state preserved after GCS resume"
 # ---------------------------------------------------------------------------
 
-# Helper to run a command inside the resumed VM
+# Quick network/exec check before running full verification
+echo "  --- Pre-check: exec reachable on resumed VM ---"
+sleep 2  # give port forwarding DNAT rules a moment to take effect
+PRECHECK=$(curl -s --no-buffer --max-time 10 -X POST "$MGR/api/v1/runners/$RESUME_RUNNER_ID/exec" \
+  -H 'Content-Type: application/json' \
+  -d '{"command":["echo","exec-alive"],"timeout_seconds":5}' 2>&1 || echo "EXEC_TIMEOUT")
+echo "  Pre-check: $PRECHECK"
+if echo "$PRECHECK" | grep -q 'exec-alive'; then
+  pass "Exec reachable on resumed VM"
+else
+  fail "Exec NOT reachable on resumed VM"
+  echo "  Manager log (last 20 lines):"
+  tail -20 /tmp/fc-dev/logs/firecracker-manager.log
+  # Continue anyway to see what other checks show
+fi
+
+# Helper to run a command inside the resumed VM (never fails the script)
 vm_exec_resumed() {
   local cmd="$1"
   curl -s --no-buffer --max-time 30 -X POST "$MGR/api/v1/runners/$RESUME_RUNNER_ID/exec" \
     -H 'Content-Type: application/json' \
-    -d "{\"command\":[\"sh\",\"-c\",\"$cmd\"],\"timeout_seconds\":20}"
+    -d "{\"command\":[\"sh\",\"-c\",\"$cmd\"],\"timeout_seconds\":20}" 2>&1 || echo "EXEC_TIMEOUT"
 }
 
 # 9a. Memory: tmpfs marker
