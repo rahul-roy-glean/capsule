@@ -90,8 +90,8 @@ var (
 	chunkCacheSizeGB    = flag.Int("chunk-cache-size-gb", 2, "Size in GB of disk chunk LRU cache (FUSE)")
 	memCacheSizeGB      = flag.Int("mem-cache-size-gb", 2, "Size in GB of memory chunk LRU cache (UFFD)")
 	memBackend          = flag.String("mem-backend", "chunked", "Memory restore backend: 'chunked' (UFFD lazy loading, default) or 'file' (download full snapshot.mem at startup). Overrides the backend recorded in snapshot metadata.")
-	gcsPrefix           = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
-	sessionChunkBucket  = flag.String("session-chunk-bucket", "", "GCS bucket for cloud-backed session pause/resume. When set, PauseRunner uploads chunks to GCS and ResumeFromSession fetches lazily via UFFD+FUSE. Uses the same bucket as --snapshot-bucket when set to 'same'. Empty disables (local-only sessions).")
+	gcsPrefix          = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
+	enableSessionChunks = flag.Bool("enable-session-chunks", false, "Enable cloud-backed session pause/resume. Uses --snapshot-bucket for chunk storage. When enabled, PauseRunner uploads chunks to GCS and ResumeFromSession fetches lazily via UFFD+FUSE.")
 
 	// Network namespace mode (alternative to slot-based TAPs)
 	useNetNS = flag.Bool("use-netns", false, "Use network namespaces instead of slot-based TAP devices (simplifies snapshot restore)")
@@ -273,11 +273,9 @@ func main() {
 		PoolRecycleTimeoutSecs: *poolRecycleTimeout,
 	}
 
-	// Resolve session chunk bucket: "same" means use the snapshot bucket.
-	if *sessionChunkBucket == "same" {
+	// Enable cloud-backed session chunks using the snapshot bucket.
+	if *enableSessionChunks {
 		cfg.SessionChunkBucket = *snapshotBucket
-	} else {
-		cfg.SessionChunkBucket = *sessionChunkBucket
 	}
 	cfg.GCSPrefix = *gcsPrefix
 

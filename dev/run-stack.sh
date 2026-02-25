@@ -104,8 +104,8 @@ MGR_CMD="$REPO_ROOT/bin/firecracker-manager \
   --log-level=debug"
 
 if [ -n "$SESSION_CHUNK_BUCKET" ]; then
-  MGR_CMD="$MGR_CMD --use-chunked-snapshots --snapshot-bucket=$SESSION_CHUNK_BUCKET --session-chunk-bucket=$SESSION_CHUNK_BUCKET"
-  echo "  GCS session bucket: $SESSION_CHUNK_BUCKET (chunked mode enabled)"
+  MGR_CMD="$MGR_CMD --use-chunked-snapshots --snapshot-bucket=$SESSION_CHUNK_BUCKET --enable-session-chunks"
+  echo "  GCS session chunks: enabled (bucket: $SESSION_CHUNK_BUCKET)"
 else
   MGR_CMD="$MGR_CMD --snapshot-bucket=$SNAPSHOT_BUCKET"
 fi
