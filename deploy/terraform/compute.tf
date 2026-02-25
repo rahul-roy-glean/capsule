@@ -508,10 +508,15 @@ resource "google_compute_region_autoscaler" "hosts" {
     # busy nested microVMs.
     mode = "ONLY_UP"
 
-    # Scale based on custom metric: queue depth
+    # Scale based on free microVM slots per host, published by the control plane.
+    # The control plane publishes fleet_free_slots_per_host every 30s based on
+    # TotalSlots/UsedSlots reported via host heartbeats — independent of CI system.
+    # Target=2 means: scale out when fewer than 2 free slots per host on average,
+    # ensuring there is always headroom to accept new jobs without waiting for a
+    # new host VM to boot.
     metric {
-      name   = "custom.googleapis.com/firecracker/queue_depth_per_host"
-      target = 10
+      name   = "custom.googleapis.com/firecracker/control_plane/fleet_free_slots_per_host"
+      target = 2
       type   = "GAUGE"
     }
 

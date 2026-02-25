@@ -33,6 +33,14 @@ const (
 	MetricCPRunnersTotal      = "control_plane/runners_total"
 	MetricCPDownscalerActions = "control_plane/downscaler_actions_total"
 
+	// Fleet slot metrics — used as the primary autoscaler signal.
+	// free_slots_per_host is the canonical scale-out metric: when it drops below
+	// a target (e.g. 2), the GCP autoscaler adds more host VMs.
+	MetricCPFleetSlotsTotal      = "control_plane/fleet_slots_total"
+	MetricCPFleetSlotsUsed       = "control_plane/fleet_slots_used"
+	MetricCPFleetSlotsFree       = "control_plane/fleet_slots_free"
+	MetricCPFleetFreeSlotsPer    = "control_plane/fleet_free_slots_per_host"
+
 	// Snapshot metrics
 	MetricSnapshotBuildDuration  = "snapshot/build_duration_seconds"
 	MetricSnapshotUploadDuration = "snapshot/upload_duration_seconds"
@@ -96,7 +104,7 @@ const (
 	LabelEvent       = "event"
 	LabelJobID       = "job_id"
 	LabelHostID      = "host_id"
-	LabelRepoSlug    = "repo_slug"
+	LabelChunkKey    = "chunk_key"
 )
 
 // E2E canary metrics

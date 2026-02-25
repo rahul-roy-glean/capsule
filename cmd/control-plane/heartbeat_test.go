@@ -147,6 +147,6 @@ func TestHandleGetFleetConvergence_MissingParam(t *testing.T) {
 	srv.HandleGetFleetConvergence(w, req)
 
 	if w.Code != http.StatusBadRequest {
-		t.Errorf("Expected 400 for missing repo_slug, got %d", w.Code)
+		t.Errorf("Expected 400 for missing chunk_key, got %d", w.Code)
 	}
 }

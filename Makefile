@@ -103,12 +103,16 @@ clean:
 docker-build: docker-build-control-plane docker-build-snapshot-builder
 
 docker-build-control-plane:
-	docker buildx build --platform linux/amd64 --load -t $(REGISTRY)/firecracker-control-plane:$(VERSION) -f deploy/docker/Dockerfile.control-plane .
-	docker tag $(REGISTRY)/firecracker-control-plane:$(VERSION) $(REGISTRY)/firecracker-control-plane:latest
+	docker buildx build --platform linux/amd64 --load \
+		-t $(REGISTRY)/firecracker-control-plane:$(VERSION) \
+		-t $(REGISTRY)/firecracker-control-plane:latest \
+		-f deploy/docker/Dockerfile.control-plane .
 
 docker-build-snapshot-builder:
-	docker buildx build --platform linux/amd64 --load -t $(REGISTRY)/firecracker-snapshot-builder:$(VERSION) -f deploy/docker/Dockerfile.snapshot-builder .
-	docker tag $(REGISTRY)/firecracker-snapshot-builder:$(VERSION) $(REGISTRY)/firecracker-snapshot-builder:latest
+	docker buildx build --platform linux/amd64 --load \
+		-t $(REGISTRY)/firecracker-snapshot-builder:$(VERSION) \
+		-t $(REGISTRY)/firecracker-snapshot-builder:latest \
+		-f deploy/docker/Dockerfile.snapshot-builder .
 
 docker-push:
 	docker push $(REGISTRY)/firecracker-control-plane:$(VERSION)

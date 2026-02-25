@@ -21,6 +21,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
 )
 
@@ -208,11 +209,7 @@ type MMDSData struct {
 			CISystem  string `json:"ci_system,omitempty"`
 		} `json:"runner,omitempty"`
 		Warmup struct {
-			RepoURL       string `json:"repo_url,omitempty"`
-			RepoBranch    string `json:"repo_branch,omitempty"`
-			BazelVersion  string `json:"bazel_version,omitempty"`
-			WarmupTargets string `json:"warmup_targets,omitempty"`
-			Bazelrc       string `json:"bazelrc,omitempty"`
+			Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
 		} `json:"warmup,omitempty"`
 	} `json:"latest"`
 }
@@ -613,22 +610,8 @@ func main() {
 	go startHealthServer(mmdsData)
 	log.Info("Health server started in background")
 
-	// Run bazel verification and CI runner registration in parallel.
-	// These are independent: bazel_verify checks the Bazel server survived restore,
-	// while ci_runner registers with GitHub and starts run.sh.
-	setStep("bazel_verify_and_ci_registration")
-
-	// Start bazel verification in background
-	bazelDone := make(chan struct{})
-	preClonedRepo := getPreClonedPath(mmdsData)
-	go func() {
-		defer close(bazelDone)
-		if preClonedRepo != "" {
-			verifyBazelServer(preClonedRepo)
-		}
-	}()
-
-	// Run CI runner registration concurrently
+	// Run CI runner registration
+	setStep("ci_registration")
 	ciSystem := mmdsData.Latest.Runner.CISystem
 	if ciSystem == "" && mmdsData.Latest.Job.GitHubRunnerToken != "" {
 		ciSystem = "github-actions" // backwards compat
@@ -675,8 +658,6 @@ func main() {
 		}
 	}
 
-	// Wait for bazel verification to finish (usually completes before CI registration)
-	<-bazelDone
 	bootTimer.Phase("ci_runner")
 
 	// Signal ready
@@ -1020,11 +1001,7 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					CISystem  string `json:"ci_system,omitempty"`
 				} `json:"runner,omitempty"`
 				Warmup struct {
-					RepoURL       string `json:"repo_url,omitempty"`
-					RepoBranch    string `json:"repo_branch,omitempty"`
-					BazelVersion  string `json:"bazel_version,omitempty"`
-					WarmupTargets string `json:"warmup_targets,omitempty"`
-					Bazelrc       string `json:"bazelrc,omitempty"`
+					Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
 				} `json:"warmup,omitempty"`
 			}
 			if err := json.Unmarshal(body, &inner); err != nil {
@@ -1098,7 +1075,7 @@ func waitForMMDSOnce(ctx context.Context) (*MMDSData, error) {
 		"job_repo":      data.Latest.Job.Repo,
 		"has_git_token": data.Latest.Job.GitToken != "",
 		"git_token_len": len(data.Latest.Job.GitToken),
-		"warmup_repo":   data.Latest.Warmup.RepoURL,
+		"warmup_commands": len(data.Latest.Warmup.Commands),
 	}).Debug("Parsed MMDS data (first pass)")
 
 	// Handle unwrapped format - try to parse directly into Latest
@@ -1106,12 +1083,12 @@ func waitForMMDSOnce(ctx context.Context) (*MMDSData, error) {
 		log.Debug("RunnerID empty after first parse, trying unwrapped format")
 		if err := json.Unmarshal(body, &data.Latest); err == nil {
 			log.WithFields(logrus.Fields{
-				"runner_id":     data.Latest.Meta.RunnerID,
-				"mode":          data.Latest.Meta.Mode,
-				"job_repo":      data.Latest.Job.Repo,
-				"has_git_token": data.Latest.Job.GitToken != "",
-				"git_token_len": len(data.Latest.Job.GitToken),
-				"warmup_repo":   data.Latest.Warmup.RepoURL,
+				"runner_id":       data.Latest.Meta.RunnerID,
+				"mode":            data.Latest.Meta.Mode,
+				"job_repo":        data.Latest.Job.Repo,
+				"has_git_token":   data.Latest.Job.GitToken != "",
+				"git_token_len":   len(data.Latest.Job.GitToken),
+				"warmup_commands": len(data.Latest.Warmup.Commands),
 			}).Debug("Parsed MMDS data (unwrapped format)")
 		} else {
 			log.WithError(err).Debug("Failed to parse MMDS in unwrapped format")
@@ -1758,269 +1735,122 @@ func signalReady() error {
 	return os.WriteFile(*readyFile, []byte(time.Now().Format(time.RFC3339)), 0644)
 }
 
-// runWarmupMode runs the Bazel warmup process for snapshot building
+// runWarmupMode runs the snapshot warmup process by dispatching each command,
+// then runs infra-level finalization steps (runner update, page pre-warm) that
+// are always needed regardless of which user commands were specified.
 func runWarmupMode(data *MMDSData) error {
-	warmup := data.Latest.Warmup
-	if warmup.RepoURL == "" {
-		return fmt.Errorf("no repo_url in warmup config")
-	}
-
-	// Look up runner user so we can clone as the correct user.
-	// This ensures the snapshot has proper ownership and workflows
-	// won't hit git's "dubious ownership" error.
-	runnerUser, err := user.Lookup(*runnerUsername)
-	if err != nil {
-		return fmt.Errorf("runner user not found: %w", err)
-	}
-	rUID, _ := strconv.ParseUint(runnerUser.Uid, 10, 32)
-	rGID, _ := strconv.ParseUint(runnerUser.Gid, 10, 32)
-	runnerCred := &syscall.SysProcAttr{
-		Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
-	}
-	runnerHome := "HOME=" + runnerUser.HomeDir
-
-	// Clone to rootfs (which has more space) but symlink to expected GitHub Actions location
-	// This allows the workflow to find the repo at /mnt/ephemeral/workdir/scio/scio
-	// while actually storing it on the persistent rootfs at /workspace/scio/scio
-
-	// Extract org/repo from URL for directory structure (GitHub Actions convention)
-	repoPath := extractRepoDir(warmup.RepoURL) // Returns "scio/scio" for github.com/askscio/scio
-
-	// Store on rootfs with enough space
-	actualRepoDir := filepath.Join("/workspace", repoPath)
-
-	// Create symlink from expected location to actual location
-	workDir := data.Latest.GitCache.WorkspaceDir
-	if workDir == "" {
-		workDir = "/mnt/ephemeral/workdir"
-	}
-	expectedRepoDir := filepath.Join(workDir, repoPath)
-
-	// Clone to actual location on rootfs
-	repoDir := actualRepoDir
-
-	log.WithFields(logrus.Fields{
-		"actual_repo_dir":   actualRepoDir,
-		"expected_repo_dir": expectedRepoDir,
-		"work_dir":          workDir,
-	}).Info("Setting up repo directories for warmup")
-
-	// Pre-flight: verify network connectivity before attempting clone
-	updateWarmupState("connectivity_check", "Verifying network connectivity...")
-	if err := verifyConnectivity(warmup.RepoURL); err != nil {
-		return fmt.Errorf("connectivity check failed (cannot reach GitHub): %w", err)
-	}
-	log.Info("Network connectivity verified")
-
-	// Phase 1: Clone repository
-	updateWarmupState("cloning", "Cloning repository...")
-	log.WithFields(logrus.Fields{
-		"repo_url":      warmup.RepoURL,
-		"branch":        warmup.RepoBranch,
-		"repo_dir":      repoDir,
-		"work_dir":      workDir,
-		"has_git_token": data.Latest.Job.GitToken != "",
-		"job_repo":      data.Latest.Job.Repo,
-	}).Info("Cloning repository for warmup")
-
-	// Create parent directory for the clone target (e.g., /workspace/scio for scio/scio)
-	// and chown it to the runner user so the clone (running as runner user) can write to it.
-	parentDir := filepath.Dir(repoDir)
-	if err := os.MkdirAll(parentDir, 0755); err != nil {
-		return fmt.Errorf("failed to create repo parent dir: %w", err)
-	}
-	os.Chown(parentDir, int(rUID), int(rGID))
-
-	branch := warmup.RepoBranch
-	if branch == "" {
-		branch = "main"
-	}
-
-	// Skip clone if repo already exists (e.g., pre-populated in rootfs)
-	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err == nil {
-		log.Info("Repository already exists, skipping clone")
-	} else {
-		// Check available space before cloning
-		var stat syscall.Statfs_t
-		if err := syscall.Statfs(filepath.Dir(repoDir), &stat); err == nil {
-			availMB := (stat.Bavail * uint64(stat.Bsize)) / (1024 * 1024)
-			log.WithField("avail_mb", availMB).Info("Available space in workspace")
-		}
-
-		// Check if git-cache is enabled and has the repo (for private repos without network auth)
-		var cloned bool
-		if data.Latest.GitCache.Enabled {
-			cachePath := findGitCacheReference(data, warmup.RepoURL)
-			if cachePath != "" {
-				log.WithFields(logrus.Fields{
-					"cache_path": cachePath,
-					"repo_dir":   repoDir,
-				}).Info("Using git-cache for local clone (no network auth needed)")
-
-				// Clone locally from the cache as runner user
-				cloneCmd := exec.Command("git", "clone", "--branch", branch, "file://"+cachePath, repoDir)
-				cloneCmd.SysProcAttr = runnerCred
-				cloneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", runnerHome)
-				output, err := cloneCmd.CombinedOutput()
-				if err != nil {
-					log.WithFields(logrus.Fields{
-						"error":  err.Error(),
-						"output": string(output),
-					}).Warn("Local clone from git-cache failed, will try network clone")
-				} else {
-					// Set the remote to the real GitHub URL for future fetches
-					setURLCmd := exec.Command("git", "-C", repoDir, "remote", "set-url", "origin", "https://github.com/"+warmup.RepoURL)
-					setURLCmd.SysProcAttr = runnerCred
-					setURLCmd.Env = append(os.Environ(), runnerHome)
-					setURLCmd.Run()
-					cloned = true
-					log.Info("Local clone from git-cache completed successfully")
-				}
-			}
-		}
-
-		// Fall back to network clone if git-cache didn't work
-		if !cloned {
-			// Build clone URL with auth token if available (for private repos)
-			cloneURL := warmup.RepoURL
-			log.WithFields(logrus.Fields{
-				"warmup_repo_url":   warmup.RepoURL,
-				"job_repo":          data.Latest.Job.Repo,
-				"job_git_token":     fmt.Sprintf("len=%d, empty=%v, first5=%s", len(data.Latest.Job.GitToken), data.Latest.Job.GitToken == "", safePrefix(data.Latest.Job.GitToken, 5)),
-				"git_cache_enabled": data.Latest.GitCache.Enabled,
-			}).Debug("Clone decision - checking token")
-
-			if data.Latest.Job.GitToken != "" {
-				// Use GitHub App installation token for auth
-				// Format: https://x-access-token:TOKEN@github.com/org/repo
-				repoPath := strings.TrimPrefix(warmup.RepoURL, "https://github.com/")
-				repoPath = strings.TrimPrefix(repoPath, "github.com/")
-				cloneURL = fmt.Sprintf("https://x-access-token:%s@github.com/%s", data.Latest.Job.GitToken, repoPath)
-				log.WithField("clone_url_host", "x-access-token:***@github.com/"+repoPath).Info("Using GitHub App token for authenticated clone")
-			} else {
-				log.Warn("No git_token found in MMDS job data - clone will be unauthenticated")
-				// Try to build a plain HTTPS URL
-				if !strings.HasPrefix(cloneURL, "https://") && !strings.HasPrefix(cloneURL, "git@") {
-					cloneURL = "https://github.com/" + cloneURL
-				}
-				log.WithField("clone_url", cloneURL).Debug("Using unauthenticated clone URL")
-			}
-
-			log.WithFields(logrus.Fields{
-				"branch":   branch,
-				"repo_dir": repoDir,
-			}).Info("Starting git clone")
-
-			// Configure git for reliability over NAT as the runner user
-			// (system-level config is already set in Dockerfile, these are user-level overrides)
-			gitConfigEnv := append(os.Environ(), runnerHome)
-			for _, kv := range [][2]string{
-				{"http.postBuffer", "524288000"},
-				{"http.lowSpeedLimit", "1000"},
-				{"http.lowSpeedTime", "60"},
-				{"http.version", "HTTP/1.1"},
-			} {
-				cfgCmd := exec.Command("git", "config", "--global", kv[0], kv[1])
-				cfgCmd.SysProcAttr = runnerCred
-				cfgCmd.Env = gitConfigEnv
-				cfgCmd.Run()
-			}
-
-			cloneCmd := exec.Command("git", "clone", "--depth=1", "--branch", branch, cloneURL, repoDir)
-			cloneCmd.SysProcAttr = runnerCred
-			cloneCmd.Env = append(os.Environ(),
-				"GIT_TERMINAL_PROMPT=0",
-				runnerHome,
-			)
-			output, err := cloneCmd.CombinedOutput()
-			if err != nil {
-				log.WithFields(logrus.Fields{
-					"error":  err.Error(),
-					"output": string(output),
-				}).Error("Git clone failed")
-				return fmt.Errorf("git clone failed: %w (output: %s)", err, string(output))
-			}
-			log.Info("Git clone completed successfully")
-
-			// Set remote URL to non-authenticated URL for future operations
-			// (GitHub Actions will handle auth for subsequent fetches)
-			if data.Latest.Job.GitToken != "" {
-				repoPath := strings.TrimPrefix(warmup.RepoURL, "https://github.com/")
-				repoPath = strings.TrimPrefix(repoPath, "github.com/")
-				setURLCmd := exec.Command("git", "-C", repoDir, "remote", "set-url", "origin", "https://github.com/"+repoPath)
-				setURLCmd.SysProcAttr = runnerCred
-				setURLCmd.Env = append(os.Environ(), runnerHome)
-				setURLCmd.Run()
-			}
+	for _, cmd := range data.Latest.Warmup.Commands {
+		if err := dispatchCommand(cmd, data); err != nil {
+			return fmt.Errorf("command %s failed: %w", cmd.Type, err)
 		}
 	}
 
-	// Create symlink from expected location to actual location for GitHub Actions compatibility
-	// e.g., /mnt/ephemeral/workdir/scio/scio -> /workspace/scio/scio
-	if actualRepoDir != expectedRepoDir {
-		// Ensure parent directory of symlink exists
-		if err := os.MkdirAll(filepath.Dir(expectedRepoDir), 0755); err != nil {
-			log.WithError(err).Warn("Failed to create symlink parent directory")
-		} else {
-			// Remove any existing symlink or directory
-			os.RemoveAll(expectedRepoDir)
-			if err := os.Symlink(actualRepoDir, expectedRepoDir); err != nil {
-				log.WithError(err).Warn("Failed to create symlink to repo")
-			} else {
-				log.WithFields(logrus.Fields{
-					"link":   expectedRepoDir,
-					"target": actualRepoDir,
-				}).Info("Created symlink for GitHub Actions compatibility")
-			}
+	// Infra finalization: GitHub Actions runner update and page pre-warm.
+	// Only relevant for github-actions CI system (or when a runner token is present).
+	ciSystem := data.Latest.Runner.CISystem
+	if ciSystem == "" && data.Latest.Job.GitHubRunnerToken != "" {
+		ciSystem = "github-actions"
+	}
+	if ciSystem == "github-actions" {
+		runnerUser, err := user.Lookup(*runnerUsername)
+		if err != nil {
+			return fmt.Errorf("runner user not found: %w", err)
 		}
+		rUID, _ := strconv.ParseUint(runnerUser.Uid, 10, 32)
+		rGID, _ := strconv.ParseUint(runnerUser.Gid, 10, 32)
+		runnerCred := &syscall.SysProcAttr{
+			Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
+		}
+		runnerHome := "HOME=" + runnerUser.HomeDir
+
+		updateWarmupState("runner_update", "Updating GitHub Actions runner...")
+		updateGitHubRunner(*runnerDir, runnerCred, runnerHome)
+
+		updateWarmupState("runner_prewarm", "Pre-warming runner pages...")
+		preWarmRunnerPages(*runnerDir, runnerCred, runnerHome)
 	}
 
-	// Phase 2: Configure Bazel
-	updateWarmupState("configuring", "Configuring Bazel...")
+	updateWarmupState("syncing", "Syncing caches to disk...")
+	exec.Command("sync").Run()
 
-	// Resolve bazelrc path:
-	// 1. If MMDS warmup.bazelrc is set, use <repoDir>/<bazelrc> (error if missing)
-	// 2. Else if <repoDir>/.bazelrc exists, use it
-	// 3. Else don't pass --bazelrc at all
-	var bazelrcPath string
-	if warmup.Bazelrc != "" {
-		candidate := filepath.Join(repoDir, warmup.Bazelrc)
-		if _, err := os.Stat(candidate); err != nil {
-			log.WithFields(logrus.Fields{
-				"bazelrc": warmup.Bazelrc,
-				"path":    candidate,
-			}).WithError(err).Error("Specified bazelrc file not found")
-			globalWarmupLogs.Add("[error] bazelrc not found: " + candidate)
-			return fmt.Errorf("specified bazelrc %q not found: %w", warmup.Bazelrc, err)
+	return nil
+}
+
+// dispatchCommand routes a SnapshotCommand to its handler.
+func dispatchCommand(cmd snapshot.SnapshotCommand, data *MMDSData) error {
+	switch cmd.Type {
+	case "git-clone":
+		return runGitCloneCommand(cmd.Args, data)
+	case "gcp-auth":
+		return runGCPAuthCommand(data)
+	case "shell":
+		return runShellCommand(cmd.Args, cmd.RunAsRoot, data)
+	default:
+		return fmt.Errorf("unknown command type: %q", cmd.Type)
+	}
+}
+
+// runShellCommand runs an arbitrary shell command with MMDS credentials
+// injected as environment variables so callers can use $GOOGLE_OAUTH_ACCESS_TOKEN,
+// $GIT_TOKEN, etc. without any extra setup steps.
+// When runAsRoot is false the command is run as the configured runner user.
+func runShellCommand(args []string, runAsRoot bool, data *MMDSData) error {
+	if len(args) == 0 {
+		return fmt.Errorf("shell command requires at least one argument")
+	}
+	env := os.Environ()
+	if data != nil {
+		if t := data.Latest.Job.GCPAccessToken; t != "" {
+			env = append(env, "GOOGLE_OAUTH_ACCESS_TOKEN="+t)
+			env = append(env, "CLOUDSDK_AUTH_ACCESS_TOKEN="+t)
 		}
-		bazelrcPath = candidate
-		log.WithField("bazelrc", bazelrcPath).Info("Using bazelrc from MMDS")
-		globalWarmupLogs.Add("[config] Using bazelrc: " + warmup.Bazelrc)
-	} else if _, err := os.Stat(filepath.Join(repoDir, ".bazelrc")); err == nil {
-		bazelrcPath = filepath.Join(repoDir, ".bazelrc")
-		log.WithField("bazelrc", bazelrcPath).Info("Using repo .bazelrc")
-		globalWarmupLogs.Add("[config] Using repo .bazelrc")
-	} else {
-		log.Info("No bazelrc found, not passing --bazelrc flag")
-		globalWarmupLogs.Add("[config] No bazelrc")
+		if t := data.Latest.Job.GitToken; t != "" {
+			env = append(env, "GIT_TOKEN="+t)
+		}
+	}
+	var procAttr *syscall.SysProcAttr
+	if !runAsRoot {
+		runnerUser, err := user.Lookup(*runnerUsername)
+		if err != nil {
+			return fmt.Errorf("runner user %q not found: %w", *runnerUsername, err)
+		}
+		rUID, _ := strconv.ParseUint(runnerUser.Uid, 10, 32)
+		rGID, _ := strconv.ParseUint(runnerUser.Gid, 10, 32)
+		procAttr = &syscall.SysProcAttr{
+			Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
+		}
+		env = append(env, "HOME="+runnerUser.HomeDir)
+	}
+	globalWarmupLogs.Add(fmt.Sprintf("[shell] Running: %s", strings.Join(args, " ")))
+	if err := runStreamedCommand("", env, procAttr, args[0], args[1:]...); err != nil {
+		globalWarmupLogs.Add(fmt.Sprintf("[shell] FAILED: %s: %v", strings.Join(args, " "), err))
+		return err
+	}
+	return nil
+}
+
+// runGCPAuthCommand configures GCP credentials inside the microVM by:
+//   - Setting environment variables (GOOGLE_OAUTH_ACCESS_TOKEN, CLOUDSDK_AUTH_ACCESS_TOKEN)
+//   - Installing a gcloud shim at /usr/local/bin/gcloud that returns the access token
+//
+// The gcloud shim is critical because keyrings.google-artifactregistry-auth (used by
+// pip inside bazel) calls `gcloud config config-helper --format=json(credential)` to
+// obtain credentials. Since gcloud isn't installed in the microVM and there's no
+// metadata server, the shim fakes the expected responses.
+func runGCPAuthCommand(data *MMDSData) error {
+	token := data.Latest.Job.GCPAccessToken
+	if token == "" {
+		return fmt.Errorf("gcp-auth: no GCP access token in MMDS (gcp_access_token is empty)")
 	}
 
-	bazelEnv := append(os.Environ(), "HOME=/home/"+*runnerUsername)
+	// Set env vars for tools that check them directly.
+	os.Setenv("GOOGLE_OAUTH_ACCESS_TOKEN", token)
+	os.Setenv("CLOUDSDK_AUTH_ACCESS_TOKEN", token)
 
-	// Configure GCP auth if access token is available (for Artifact Registry access)
-	if data.Latest.Job.GCPAccessToken != "" {
-		log.Info("Configuring GCP auth for Artifact Registry access")
-		globalWarmupLogs.Add("[auth] Configuring GCP auth for Artifact Registry")
-
-		token := data.Latest.Job.GCPAccessToken
-
-		// The scio repo's .bazelrc uses credential helpers:
-		//   common --credential_helper="*.us-central1-python.pkg.dev=%workspace%/tools/ci_registry_cred_helper.sh"
-		// That script calls `gcloud auth print-access-token`, but gcloud isn't in the microVM.
-		// Fix: install a fake `gcloud` shim that returns our access token.
-		// This makes the existing credential helper work without modification.
-		shimDir := "/usr/local/bin"
-		shimScript := fmt.Sprintf(`#!/bin/sh
+	// Install a gcloud shim that returns the access token for all relevant subcommands.
+	// This makes keyrings.google-artifactregistry-auth and bazel credential helpers work
+	// without a real gcloud installation.
+	shimScript := fmt.Sprintf(`#!/bin/sh
 # Shim installed by thaw-agent for Artifact Registry auth in microVM
 # Returns the access token passed via MMDS from the host
 case "$1" in
@@ -2041,131 +1871,123 @@ case "$1" in
 esac
 `, token, token, token, token, token)
 
-		shimPath := filepath.Join(shimDir, "gcloud")
-		if err := os.WriteFile(shimPath, []byte(shimScript), 0755); err != nil {
-			log.WithError(err).Warn("Failed to write gcloud shim")
-		} else {
-			log.Info("Installed gcloud shim for credential helper")
-		}
-
-		// Also set env vars as fallback
-		bazelEnv = append(bazelEnv, "CLOUDSDK_AUTH_ACCESS_TOKEN="+token)
-
-		log.Info("GCP auth configured for warmup")
+	shimPath := filepath.Join("/usr/local/bin", "gcloud")
+	if err := os.WriteFile(shimPath, []byte(shimScript), 0755); err != nil {
+		log.WithError(err).Warn("Failed to write gcloud shim")
 	} else {
-		log.Warn("No GCP access token available - Artifact Registry deps will fail")
-		globalWarmupLogs.Add("[auth] No GCP access token - private PyPI deps will be skipped")
+		log.Info("Installed gcloud shim for credential helper")
 	}
 
-	// Log repo's bazelrc and .bazelversion for debugging
-	if data, err := os.ReadFile(filepath.Join(repoDir, ".bazelrc")); err == nil {
-		log.WithField("content", string(data)).Debug("Repo .bazelrc")
-		globalWarmupLogs.Add("[repo .bazelrc]\n" + string(data))
-	}
-	if data, err := os.ReadFile(filepath.Join(repoDir, ".bazelversion")); err == nil {
-		log.WithField("version", strings.TrimSpace(string(data))).Info("Repo .bazelversion")
-		globalWarmupLogs.Add("[.bazelversion] " + strings.TrimSpace(string(data)))
-	}
-
-	// Phase 3: Fetch external dependencies
-	// Parse fetch targets - supports "//... -- -//terraform/..." syntax (space-separated args)
-	fetchTargets := warmup.WarmupTargets
-	if fetchTargets == "" {
-		fetchTargets = "//..."
-	}
-	var fetchArgs []string
-	if bazelrcPath != "" {
-		fetchArgs = append(fetchArgs, "--bazelrc="+bazelrcPath)
-	}
-	fetchArgs = append(fetchArgs, "fetch")
-	fetchArgs = append(fetchArgs, strings.Fields(fetchTargets)...)
-
-	updateWarmupState("fetching", "Fetching external dependencies...")
-	log.WithField("targets", fetchTargets).Info("Running bazel fetch")
-	globalWarmupLogs.Add("[phase] bazel fetch " + fetchTargets)
-
-	if err := runStreamedCommand(repoDir, bazelEnv, runnerCred, "bazel", fetchArgs[0:]...); err != nil {
-		log.WithError(err).Warn("bazel fetch failed (continuing)")
-		globalWarmupLogs.Add("[error] bazel fetch failed: " + err.Error())
-	} else {
-		globalWarmupLogs.Add("[done] bazel fetch completed")
-	}
-
-	// Count fetched externals
-	externalsDir := filepath.Join("/mnt/ephemeral/caches/repository", "content_addressable")
-	if entries, err := os.ReadDir(externalsDir); err == nil {
-		globalWarmupState.ExternalsFetched = len(entries)
-	}
-
-	// Log cache size
-	if out, err := exec.Command("du", "-sh", "/mnt/ephemeral/caches/repository").CombinedOutput(); err == nil {
-		cacheSize := strings.TrimSpace(string(out))
-		log.WithField("cache_size", cacheSize).Info("Repository cache size after fetch")
-		globalWarmupLogs.Add("[cache] " + cacheSize)
-	}
-
-	// Phase 4: Run analysis (same targets as fetch)
-	var analyzeArgs []string
-	if bazelrcPath != "" {
-		analyzeArgs = append(analyzeArgs, "--bazelrc="+bazelrcPath)
-	}
-	analyzeArgs = append(analyzeArgs, "build", "--nobuild")
-	analyzeArgs = append(analyzeArgs, strings.Fields(fetchTargets)...)
-
-	updateWarmupState("analyzing", "Running Bazel analysis (--nobuild)...")
-	log.WithField("targets", fetchTargets).Info("Running bazel build --nobuild")
-	globalWarmupLogs.Add("[phase] bazel build --nobuild " + fetchTargets)
-
-	if err := runStreamedCommand(repoDir, bazelEnv, runnerCred, "bazel", analyzeArgs[0:]...); err != nil {
-		log.WithError(err).Warn("bazel build --nobuild failed (continuing)")
-		globalWarmupLogs.Add("[error] bazel build --nobuild failed: " + err.Error())
-	} else {
-		globalWarmupLogs.Add("[done] bazel build --nobuild completed")
-	}
-
-	// Phase 5: Start Bazel server (keeps server state in memory for snapshot)
-	updateWarmupState("starting_server", "Starting Bazel server...")
-	log.Info("Starting persistent Bazel server")
-	globalWarmupLogs.Add("[phase] bazel info")
-
-	bazelInfoArgs := []string{}
-	if bazelrcPath != "" {
-		bazelInfoArgs = append(bazelInfoArgs, "--bazelrc="+bazelrcPath)
-	}
-	bazelInfoArgs = append(bazelInfoArgs, "info")
-	if err := runStreamedCommand(repoDir, bazelEnv, runnerCred, "bazel", bazelInfoArgs...); err != nil {
-		log.WithError(err).Warn("bazel info failed")
-		globalWarmupLogs.Add("[error] bazel info failed: " + err.Error())
-	} else {
-		globalWarmupLogs.Add("[done] bazel info completed")
-	}
-
-	// Phase 6a: Update GitHub Actions runner to latest version.
-	// The runner self-updates on startup if a newer version exists, which takes
-	// ~3-4 minutes. By updating during warmup, the snapshot has the latest
-	// version baked in, avoiding the self-update delay after restore.
-	updateWarmupState("runner_update", "Updating GitHub Actions runner...")
-	updateGitHubRunner(*runnerDir, runnerCred, runnerHome)
-
-	// Phase 6b: Pre-warm .NET Runner.Listener pages into memory.
-	// The GitHub Actions runner is a .NET application. After snapshot restore,
-	// its pages need to be demand-faulted from UFFD, which takes ~2+ minutes.
-	// By briefly starting Runner.Listener during warmup, the .NET runtime,
-	// JIT'd code, and managed assemblies get loaded into guest memory and
-	// baked into snapshot.mem — making post-restore startup near-instant.
-	updateWarmupState("runner_prewarm", "Pre-warming .NET runner pages...")
-	preWarmRunnerPages(*runnerDir, runnerCred, runnerHome)
-
-	// Phase 7: Sync caches to disk
-	updateWarmupState("syncing", "Syncing caches to disk...")
-	exec.Command("sync").Run()
-
+	log.Info("GCP credentials configured (env vars + gcloud shim)")
 	return nil
 }
 
-// preWarmRunnerPages loads the .NET Runner.Listener into memory so its pages
-// are baked into the Firecracker snapshot. After restore, demand-paging these
-// pages from UFFD is much faster than reading them from the rootfs disk.
+// runGitCloneCommand implements the "git-clone" warmup step.
+// args[0] = repo URL, args[1] = branch (optional), args[2] = warmup targets (optional),
+// args[3] = bazelrc path relative to repo root (optional)
+func runGitCloneCommand(args []string, data *MMDSData) error {
+	if len(args) == 0 {
+		return fmt.Errorf("git-clone command requires a repo URL argument")
+	}
+	repoURL := args[0]
+	repoBranch := "main"
+	if len(args) > 1 && args[1] != "" {
+		repoBranch = args[1]
+	}
+	// Store bazelrc and warmup targets for use by the caller
+	// (they'll be read from args by runBazelFetchCommand)
+
+	// Look up runner user
+	runnerUser, err := user.Lookup(*runnerUsername)
+	if err != nil {
+		return fmt.Errorf("runner user not found: %w", err)
+	}
+	rUID, _ := strconv.ParseUint(runnerUser.Uid, 10, 32)
+	rGID, _ := strconv.ParseUint(runnerUser.Gid, 10, 32)
+	runnerCred := &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
+	}
+	runnerHome := "HOME=" + runnerUser.HomeDir
+
+	repoPath := extractRepoDir(repoURL)
+	actualRepoDir := filepath.Join("/workspace", repoPath)
+	workDir := data.Latest.GitCache.WorkspaceDir
+	if workDir == "" {
+		workDir = "/mnt/ephemeral/workdir"
+	}
+	expectedRepoDir := filepath.Join(workDir, repoPath)
+	repoDir := actualRepoDir
+
+	log.WithFields(logrus.Fields{
+		"actual_repo_dir":   actualRepoDir,
+		"expected_repo_dir": expectedRepoDir,
+	}).Info("Setting up repo directories for warmup")
+
+	updateWarmupState("connectivity_check", "Verifying network connectivity...")
+	if err := verifyConnectivity(repoURL); err != nil {
+		return fmt.Errorf("connectivity check failed: %w", err)
+	}
+
+	updateWarmupState("cloning", "Cloning repository...")
+	log.WithFields(logrus.Fields{
+		"repo_url": repoURL,
+		"branch":   repoBranch,
+		"repo_dir": repoDir,
+	}).Info("Cloning repository for warmup")
+
+	parentDir := filepath.Dir(repoDir)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		return fmt.Errorf("failed to create repo parent dir: %w", err)
+	}
+	os.Chown(parentDir, int(rUID), int(rGID))
+
+	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err == nil {
+		log.Info("Repository already exists, skipping clone")
+	} else {
+		var cloned bool
+		if data.Latest.GitCache.Enabled {
+			cachePath := findGitCacheReference(data, repoURL)
+			if cachePath != "" {
+				cloneCmd := exec.Command("git", "clone", "--branch", repoBranch, "file://"+cachePath, repoDir)
+				cloneCmd.SysProcAttr = runnerCred
+				cloneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", runnerHome)
+				output, err := cloneCmd.CombinedOutput()
+				if err != nil {
+					log.WithFields(logrus.Fields{"error": err.Error(), "output": string(output)}).Warn("Local clone from git-cache failed, will try network clone")
+				} else {
+					setURLCmd := exec.Command("git", "-C", repoDir, "remote", "set-url", "origin", "https://github.com/"+repoURL)
+					setURLCmd.SysProcAttr = runnerCred
+					setURLCmd.Env = append(os.Environ(), runnerHome)
+					setURLCmd.Run()
+					cloned = true
+				}
+			}
+		}
+		if !cloned {
+			cloneURL := repoURL
+			if data.Latest.Job.GitToken != "" {
+				repoPath := strings.TrimPrefix(repoURL, "https://github.com/")
+				repoPath = strings.TrimPrefix(repoPath, "github.com/")
+				cloneURL = fmt.Sprintf("https://x-access-token:%s@github.com/%s", data.Latest.Job.GitToken, repoPath)
+			} else if !strings.HasPrefix(cloneURL, "https://") && !strings.HasPrefix(cloneURL, "git@") {
+				cloneURL = "https://github.com/" + cloneURL
+			}
+			if err := runStreamedCommand("", append(os.Environ(), runnerHome, "GIT_TERMINAL_PROMPT=0"), runnerCred,
+				"git", "clone", "--branch", repoBranch, "--depth=1", cloneURL, repoDir); err != nil {
+				return fmt.Errorf("git clone failed: %w", err)
+			}
+		}
+	}
+
+	if actualRepoDir != expectedRepoDir {
+		if err := os.MkdirAll(filepath.Dir(expectedRepoDir), 0755); err == nil {
+			os.RemoveAll(expectedRepoDir)
+			os.Symlink(actualRepoDir, expectedRepoDir)
+		}
+	}
+	return nil
+}
+
 func preWarmRunnerPages(runnerPath string, cred *syscall.SysProcAttr, homeEnv string) {
 	start := time.Now()
 	log.WithField("runner_path", runnerPath).Info("Pre-warming .NET runner pages...")
@@ -2526,43 +2348,6 @@ func verifyConnectivity(repoURL string) error {
 
 	log.WithField("host", host).Info("Connectivity check passed")
 	return nil
-}
-
-// verifyBazelServer runs `bazel info server_pid` to check the bazel server
-// survived snapshot restore. Uses bazel's own server discovery — no hardcoded
-// paths, works with any bazelrc configuration.
-func verifyBazelServer(repoDir string) {
-	runnerUser, err := user.Lookup(*runnerUsername)
-	if err != nil {
-		log.WithError(err).Warn("Cannot look up runner user for bazel verify")
-		return
-	}
-	rUID, _ := strconv.ParseUint(runnerUser.Uid, 10, 32)
-	rGID, _ := strconv.ParseUint(runnerUser.Gid, 10, 32)
-
-	cmd := exec.Command("bazel", "info", "server_pid")
-	cmd.Dir = repoDir
-	cmd.Env = append(os.Environ(), "HOME="+runnerUser.HomeDir)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
-	}
-
-	start := time.Now()
-	out, err := cmd.CombinedOutput()
-	elapsed := time.Since(start)
-
-	if err != nil {
-		log.WithFields(logrus.Fields{
-			"duration_ms": elapsed.Milliseconds(),
-			"error":       err,
-			"output":      strings.TrimSpace(string(out)),
-		}).Warn("Bazel server verify failed (will cold-start on first build)")
-	} else {
-		log.WithFields(logrus.Fields{
-			"duration_ms": elapsed.Milliseconds(),
-			"server_pid":  strings.TrimSpace(string(out)),
-		}).Info("Bazel server alive after restore")
-	}
 }
 
 // startHealthServer starts a simple HTTP server for health checks and testing

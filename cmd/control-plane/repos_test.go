@@ -7,67 +7,62 @@ import (
 	"testing"
 )
 
-func TestHandleRepos_MethodRouting(t *testing.T) {
-	// Without a real DB, we can only test routing and error cases.
-	// The handlers will fail on DB access but we can verify they accept correct methods.
+func TestHandleSnapshotConfigs_CreateMissingCommands(t *testing.T) {
+	r := &SnapshotConfigRegistry{}
 
-	// Test that POST to /api/v1/repos with missing body returns 400
-	rr := &RepoRegistry{} // nil DB will cause panic on DB access, but validation should catch first
-
-	// Test empty URL validation
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/repos", strings.NewReader(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/snapshot-configs", strings.NewReader(`{}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	rr.HandleCreateRepo(w, req)
+	r.HandleCreateSnapshotConfig(w, req)
 
 	if w.Code != http.StatusBadRequest {
-		t.Errorf("POST with empty URL: got status %d, want %d", w.Code, http.StatusBadRequest)
+		t.Errorf("POST with empty commands: got status %d, want %d", w.Code, http.StatusBadRequest)
 	}
 }
 
-func TestHandleRepos_InvalidJSON(t *testing.T) {
-	rr := &RepoRegistry{}
+func TestHandleSnapshotConfigs_CreateInvalidJSON(t *testing.T) {
+	r := &SnapshotConfigRegistry{}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/repos", strings.NewReader(`not-json`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/snapshot-configs", strings.NewReader(`not-json`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	rr.HandleCreateRepo(w, req)
+	r.HandleCreateSnapshotConfig(w, req)
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("POST with invalid JSON: got status %d, want %d", w.Code, http.StatusBadRequest)
 	}
 }
 
-func TestHandleGetRepo_EmptySlug(t *testing.T) {
-	rr := &RepoRegistry{}
+func TestHandleSnapshotConfigs_GetEmptyChunkKey(t *testing.T) {
+	r := &SnapshotConfigRegistry{}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/repos/", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/snapshot-configs/", nil)
 	w := httptest.NewRecorder()
-	rr.HandleGetRepo(w, req)
+	r.HandleGetSnapshotConfig(w, req)
 
 	if w.Code != http.StatusBadRequest {
-		t.Errorf("GET with empty slug: got status %d, want %d", w.Code, http.StatusBadRequest)
+		t.Errorf("GET with empty chunk_key: got status %d, want %d", w.Code, http.StatusBadRequest)
 	}
 }
 
-func TestHandleUpdateRepo_MethodNotAllowed(t *testing.T) {
-	rr := &RepoRegistry{}
+func TestHandleSnapshotConfigs_CreateMethodNotAllowed(t *testing.T) {
+	r := &SnapshotConfigRegistry{}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/repos/test-repo", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/snapshot-configs", nil)
 	w := httptest.NewRecorder()
-	rr.HandleUpdateRepo(w, req)
+	r.HandleCreateSnapshotConfig(w, req)
 
 	if w.Code != http.StatusMethodNotAllowed {
-		t.Errorf("GET on update endpoint: got status %d, want %d", w.Code, http.StatusMethodNotAllowed)
+		t.Errorf("GET on create endpoint: got status %d, want %d", w.Code, http.StatusMethodNotAllowed)
 	}
 }
 
-func TestHandleListRepos_MethodNotAllowed(t *testing.T) {
-	rr := &RepoRegistry{}
+func TestHandleSnapshotConfigs_ListMethodNotAllowed(t *testing.T) {
+	r := &SnapshotConfigRegistry{}
 
-	req := httptest.NewRequest(http.MethodDelete, "/api/v1/repos", nil)
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/snapshot-configs", nil)
 	w := httptest.NewRecorder()
-	rr.HandleListRepos(w, req)
+	r.HandleListSnapshotConfigs(w, req)
 
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Errorf("DELETE on list endpoint: got status %d, want %d", w.Code, http.StatusMethodNotAllowed)

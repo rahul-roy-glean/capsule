@@ -19,7 +19,6 @@ import (
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/ci"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
-	repomod "github.com/rahul-roy-glean/bazel-firecracker/pkg/repo"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
@@ -82,7 +81,7 @@ func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logge
 	cache, err := snapshot.NewCache(ctx, snapshot.CacheConfig{
 		LocalPath: cfg.SnapshotCachePath,
 		GCSBucket: cfg.SnapshotBucket,
-		RepoSlug:  repomod.Slug(cfg.GitHubRepo),
+		ChunkKey:  cfg.ChunkKey,
 		Logger:    logger,
 	})
 	if err != nil {

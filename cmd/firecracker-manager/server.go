@@ -9,7 +9,6 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
-	repomod "github.com/rahul-roy-glean/bazel-firecracker/pkg/repo"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/runner"
 )
 
@@ -47,9 +46,8 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		"chunked_mode": s.chunkedMgr != nil,
 	}).Info("AllocateRunner request")
 
-	repoSlug := req.RepoSlug
-	if repoSlug == "" {
-		repoSlug = repomod.Slug(req.Repo)
+	if req.ChunkKey == "" {
+		return nil, status.Error(codes.InvalidArgument, "chunk_key is required")
 	}
 
 	allocReq := runner.AllocateRequest{
@@ -59,7 +57,7 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		Commit:            req.Commit,
 		GitHubRunnerToken: req.GithubRunnerToken,
 		Labels:            req.Labels,
-		RepoSlug:          repoSlug,
+		ChunkKey:          req.ChunkKey,
 	}
 
 	if req.Resources != nil {

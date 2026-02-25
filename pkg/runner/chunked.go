@@ -29,7 +29,7 @@ type ChunkedManager struct {
 	// Chunked snapshot infrastructure
 	chunkStore   *snapshot.ChunkStore
 	chunkCache   *snapshot.LRUCache
-	chunkedMetas map[string]*snapshot.ChunkedSnapshotMetadata // keyed by repoSlug
+	chunkedMetas map[string]*snapshot.ChunkedSnapshotMetadata // keyed by chunkKey
 
 	// Per-runner UFFD handlers and FUSE disks
 	uffdHandlers  map[string]*uffd.Handler
@@ -161,37 +161,36 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 }
 
 // getOrLoadManifest returns the chunked metadata for a repo, loading it from GCS if needed.
-func (cm *ChunkedManager) getOrLoadManifest(ctx context.Context, repoSlug, version string) (*snapshot.ChunkedSnapshotMetadata, error) {
+func (cm *ChunkedManager) getOrLoadManifest(ctx context.Context, chunkKey, version string) (*snapshot.ChunkedSnapshotMetadata, error) {
 	cm.mu.RLock()
-	if meta, ok := cm.chunkedMetas[repoSlug]; ok && (version == "" || meta.Version == version) {
+	if meta, ok := cm.chunkedMetas[chunkKey]; ok && (version == "" || meta.Version == version) {
 		cm.mu.RUnlock()
 		return meta, nil
 	}
 	cm.mu.RUnlock()
 
-	// Load from GCS.
-	// The chunked metadata lives at <repoSlug>/<version>/chunked-metadata.json
-	// or <repoSlug>/current/chunked-metadata.json for the current pointer.
-	var path string
-	if version != "" {
-		path = repoSlug + "/" + version
-	} else {
-		path = repoSlug + "/current"
+	// If no version specified, resolve via the current-pointer.json for this chunk key.
+	if version == "" {
+		var err error
+		version, err = cm.chunkStore.ReadCurrentVersion(ctx, chunkKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read current version for chunk key %s: %w", chunkKey, err)
+		}
 	}
 
-	meta, err := cm.chunkStore.LoadChunkedMetadata(ctx, path)
+	meta, err := cm.chunkStore.LoadChunkedMetadata(ctx, version)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load chunked metadata for %s/%s: %w", repoSlug, version, err)
+		return nil, fmt.Errorf("failed to load chunked metadata for %s/%s: %w", chunkKey, version, err)
 	}
 
 	cm.mu.Lock()
-	cm.chunkedMetas[repoSlug] = meta
+	cm.chunkedMetas[chunkKey] = meta
 	cm.mu.Unlock()
 
 	cm.chunkedLogger.WithFields(logrus.Fields{
-		"repo_slug": repoSlug,
+		"chunk_key": chunkKey,
 		"version":   meta.Version,
-	}).Info("Loaded chunked manifest for repo")
+	}).Info("Loaded chunked manifest for chunk key")
 
 	return meta, nil
 }
@@ -209,18 +208,18 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		return nil, fmt.Errorf("host at capacity: %d/%d runners", len(cm.runners), cm.config.MaxRunners)
 	}
 
-	// Derive repo slug — the request must always carry one (resolved upstream).
-	repoSlug := req.RepoSlug
+	// Derive chunk key — the request must always carry one (resolved upstream).
+	chunkKey := req.ChunkKey
 
-	// Get the appropriate manifest for this repo
+	// Get the appropriate manifest for this chunk key
 	var meta *snapshot.ChunkedSnapshotMetadata
 	if cm.chunkStore != nil {
 		cm.mu.Unlock()
 		var err error
-		meta, err = cm.getOrLoadManifest(ctx, repoSlug, "")
+		meta, err = cm.getOrLoadManifest(ctx, chunkKey, "")
 		cm.mu.Lock()
 		if err != nil {
-			return nil, fmt.Errorf("failed to load manifest for repo %q: %w", repoSlug, err)
+			return nil, fmt.Errorf("failed to load manifest for chunk key %q: %w", chunkKey, err)
 		}
 	}
 
@@ -348,8 +347,8 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	var localMemPath string
 
 	if useFileBackedMem {
-		// Per-repo path so multiple repos don't share a single snapshot.mem.
-		localMemPath = filepath.Join(cm.config.SnapshotCachePath, repoSlug, "snapshot.mem")
+		// Per-chunk-key path so multiple chunk keys don't share a single snapshot.mem.
+		localMemPath = filepath.Join(cm.config.SnapshotCachePath, chunkKey, "snapshot.mem")
 		if _, err := os.Stat(localMemPath); err != nil && meta.MemFilePath != "" {
 			// snapshot.mem not cached locally yet — download on demand from GCS.
 			cm.chunkedLogger.WithFields(logrus.Fields{
@@ -655,8 +654,10 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	// When using per-VM namespaces, set up port forwarding (DNAT) so the host
 	// can reach services inside the VM via the host-reachable veth IP.
 	if netns != nil && cm.netnsNetwork != nil {
-		if err := cm.netnsNetwork.ForwardPort(runnerID, 8080); err != nil {
-			cm.chunkedLogger.WithError(err).Warn("Failed to forward port 8080 into namespace")
+		for _, port := range []int{8080, 8081} {
+			if err := cm.netnsNetwork.ForwardPort(runnerID, port); err != nil {
+				cm.chunkedLogger.WithField("port", port).WithError(err).Warn("Failed to forward port into namespace")
+			}
 		}
 	}
 
@@ -950,18 +951,18 @@ func (cm *ChunkedManager) GetChunkedMetadata() *snapshot.ChunkedSnapshotMetadata
 	return cm.chunkedMetas[""]
 }
 
-// GetManifest returns the loaded chunked metadata for a specific repo slug (may be nil).
-func (cm *ChunkedManager) GetManifest(repoSlug string) (*snapshot.ChunkedSnapshotMetadata, error) {
+// GetManifest returns the loaded chunked metadata for a specific chunk key (may be nil).
+func (cm *ChunkedManager) GetManifest(chunkKey string) (*snapshot.ChunkedSnapshotMetadata, error) {
 	cm.mu.RLock()
-	meta, ok := cm.chunkedMetas[repoSlug]
+	meta, ok := cm.chunkedMetas[chunkKey]
 	cm.mu.RUnlock()
 	if ok {
 		return meta, nil
 	}
-	return nil, fmt.Errorf("manifest not loaded for repo %q", repoSlug)
+	return nil, fmt.Errorf("manifest not loaded for chunk key %q", chunkKey)
 }
 
-// GetLoadedManifests returns a map of repo_slug -> version for loaded manifests.
+// GetLoadedManifests returns a map of chunk_key -> version for loaded manifests.
 func (cm *ChunkedManager) GetLoadedManifests() map[string]string {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
@@ -974,10 +975,10 @@ func (cm *ChunkedManager) GetLoadedManifests() map[string]string {
 	return result
 }
 
-// SyncManifest loads (or refreshes) the chunked manifest for a given repo and version.
-// When using file-backed memory, it also downloads snapshot.mem to the per-repo path.
-func (cm *ChunkedManager) SyncManifest(ctx context.Context, repoSlug, version string) error {
-	meta, err := cm.getOrLoadManifest(ctx, repoSlug, version)
+// SyncManifest loads (or refreshes) the chunked manifest for a given chunk key and version.
+// When using file-backed memory, it also downloads snapshot.mem to the per-chunk-key path.
+func (cm *ChunkedManager) SyncManifest(ctx context.Context, chunkKey, version string) error {
+	meta, err := cm.getOrLoadManifest(ctx, chunkKey, version)
 	if err != nil {
 		return err
 	}
@@ -991,7 +992,7 @@ func (cm *ChunkedManager) SyncManifest(ctx context.Context, repoSlug, version st
 	}
 
 	if useFileMem && meta.MemFilePath != "" && cm.chunkStore != nil {
-		memPath := filepath.Join(cm.config.SnapshotCachePath, repoSlug, "snapshot.mem")
+		memPath := filepath.Join(cm.config.SnapshotCachePath, chunkKey, "snapshot.mem")
 
 		if _, statErr := os.Stat(memPath); statErr != nil {
 			// Ensure parent directory exists.
@@ -999,12 +1000,12 @@ func (cm *ChunkedManager) SyncManifest(ctx context.Context, repoSlug, version st
 				return fmt.Errorf("failed to create directory for snapshot.mem: %w", err)
 			}
 			cm.chunkedLogger.WithFields(logrus.Fields{
-				"repo_slug": repoSlug,
-				"gcs_path":  meta.MemFilePath,
+				"chunk_key":  chunkKey,
+				"gcs_path":   meta.MemFilePath,
 				"local_path": memPath,
-			}).Info("Downloading snapshot.mem for repo")
+			}).Info("Downloading snapshot.mem for chunk key")
 			if err := cm.chunkStore.DownloadRawFile(ctx, meta.MemFilePath, memPath); err != nil {
-				return fmt.Errorf("failed to download snapshot.mem for %s: %w", repoSlug, err)
+				return fmt.Errorf("failed to download snapshot.mem for %s: %w", chunkKey, err)
 			}
 		}
 	}
