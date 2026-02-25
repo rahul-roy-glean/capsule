@@ -345,16 +345,21 @@ else
   fail "rootfs marker LOST — disk state not restored"
 fi
 
-# 9d. Process: thaw-agent PID should be the same (process survived snapshot)
-echo "  --- 9d. Process state (thaw-agent PID) ---"
+# 9d. Process: thaw-agent should still be running (PID may change — it restarts on resume to re-read MMDS)
+echo "  --- 9d. Process state (thaw-agent alive) ---"
 OUT=$(vm_exec_resumed "pgrep thaw-agent | head -1")
 POST_RESUME_PID=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '\d+' | head -1)
 echo "  PID before pause: $PRE_PAUSE_PID"
 echo "  PID after resume: $POST_RESUME_PID"
-if [ "$PRE_PAUSE_PID" = "$POST_RESUME_PID" ] && [ -n "$POST_RESUME_PID" ]; then
-  pass "thaw-agent PID preserved (${POST_RESUME_PID})"
+if [ -n "$POST_RESUME_PID" ]; then
+  pass "thaw-agent running after resume (pid=$POST_RESUME_PID)"
+  if [ "$PRE_PAUSE_PID" = "$POST_RESUME_PID" ]; then
+    echo "    (same PID — process survived snapshot)"
+  else
+    echo "    (new PID — agent restarted on resume, expected)"
+  fi
 else
-  fail "thaw-agent PID changed (${PRE_PAUSE_PID} → ${POST_RESUME_PID})"
+  fail "thaw-agent NOT running after resume"
 fi
 
 # 9e. Kernel: uptime should be >= pre-pause (kernel continues from snapshot)
