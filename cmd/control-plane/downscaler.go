@@ -196,7 +196,7 @@ func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, svc *compute.Se
 		if time.Since(h.LastHeartbeat) > cfg.HeartbeatStaleWindow {
 			continue
 		}
-		if h.UsedSlots != 0 {
+		if h.BusyRunners != 0 {
 			continue
 		}
 
@@ -258,8 +258,8 @@ func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, svc *compute.Se
 	}
 
 	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].UsedSlots != candidates[j].UsedSlots {
-			return candidates[i].UsedSlots < candidates[j].UsedSlots
+		if candidates[i].UsedCPUMillicores != candidates[j].UsedCPUMillicores {
+			return candidates[i].UsedCPUMillicores < candidates[j].UsedCPUMillicores
 		}
 		return candidates[i].InstanceName < candidates[j].InstanceName
 	})

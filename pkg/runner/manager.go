@@ -420,16 +420,13 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		MAC:             tap.MAC,
 		SnapshotVersion: snapshotPaths.Version,
 		GitHubRepo:      req.Repo, // For pool key matching
-		Resources: Resources{
-			VCPUs:    m.config.VCPUsPerRunner,
-			MemoryMB: m.config.MemoryMBPerRunner,
-		},
-		CreatedAt:      time.Now(),
-		SocketPath:     filepath.Join(m.config.SocketDir, runnerID+".sock"),
-		LogPath:        filepath.Join(m.config.LogDir, runnerID+".log"),
-		MetricsPath:    filepath.Join(m.config.LogDir, runnerID+".metrics"),
-		RootfsOverlay:  overlayPath,
-		RepoCacheUpper: repoCacheUpperPath,
+		Resources:       req.Resources,
+		CreatedAt:       time.Now(),
+		SocketPath:      filepath.Join(m.config.SocketDir, runnerID+".sock"),
+		LogPath:         filepath.Join(m.config.LogDir, runnerID+".log"),
+		MetricsPath:     filepath.Join(m.config.LogDir, runnerID+".metrics"),
+		RootfsOverlay:   overlayPath,
+		RepoCacheUpper:  repoCacheUpperPath,
 	}
 	if req.StartCommand != nil {
 		runner.ServicePort = req.StartCommand.Port
@@ -1422,6 +1419,7 @@ func (m *Manager) GetStatus() ManagerStatus {
 	defer m.mu.RUnlock()
 
 	var idle, busy int
+	var usedCPU, usedMem int
 	for _, r := range m.runners {
 		switch r.State {
 		case StateIdle:
@@ -1429,26 +1427,34 @@ func (m *Manager) GetStatus() ManagerStatus {
 		case StateBusy:
 			busy++
 		}
+		usedCPU += r.Resources.VCPUs * 1000
+		usedMem += r.Resources.MemoryMB
 	}
 
 	return ManagerStatus{
-		TotalSlots:      m.config.MaxRunners,
-		UsedSlots:       len(m.runners),
-		IdleRunners:     idle,
-		BusyRunners:     busy,
-		SnapshotVersion: m.snapshotCache.CurrentVersion(),
-		Draining:        m.draining,
+		ActiveRunners:      len(m.runners),
+		IdleRunners:        idle,
+		BusyRunners:        busy,
+		SnapshotVersion:    m.snapshotCache.CurrentVersion(),
+		Draining:           m.draining,
+		TotalCPUMillicores: m.config.TotalCPUMillicores,
+		UsedCPUMillicores:  usedCPU,
+		TotalMemoryMB:      m.config.TotalMemoryMB,
+		UsedMemoryMB:       usedMem,
 	}
 }
 
 // ManagerStatus represents the status of the runner manager
 type ManagerStatus struct {
-	TotalSlots      int
-	UsedSlots       int
-	IdleRunners     int
-	BusyRunners     int
-	SnapshotVersion string
-	Draining        bool
+	ActiveRunners      int
+	IdleRunners        int
+	BusyRunners        int
+	SnapshotVersion    string
+	Draining           bool
+	TotalCPUMillicores int
+	UsedCPUMillicores  int
+	TotalMemoryMB      int
+	UsedMemoryMB       int
 }
 
 // SyncSnapshot syncs a new snapshot version from GCS
@@ -1457,11 +1463,29 @@ func (m *Manager) SyncSnapshot(ctx context.Context, version string) error {
 	return m.snapshotCache.SyncFromGCS(ctx, version)
 }
 
-// CanAddRunner checks if a new runner can be added
-func (m *Manager) CanAddRunner() bool {
+// CanAddRunner checks if a new runner with the given resources can be added.
+// It checks both the hard MaxRunners cap and actual host resource capacity.
+func (m *Manager) CanAddRunner(vcpus, memoryMB int) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return !m.draining && len(m.runners) < m.config.MaxRunners
+
+	if m.draining || len(m.runners) >= m.config.MaxRunners {
+		return false
+	}
+
+	// If host doesn't report total resources, fall back to slot check
+	if m.config.TotalCPUMillicores == 0 {
+		return true
+	}
+
+	var usedCPU, usedMem int
+	for _, r := range m.runners {
+		usedCPU += r.Resources.VCPUs * 1000
+		usedMem += r.Resources.MemoryMB
+	}
+
+	return (m.config.TotalCPUMillicores-usedCPU) >= vcpus*1000 &&
+		(m.config.TotalMemoryMB-usedMem) >= memoryMB
 }
 
 // IdleCount returns the number of idle runners

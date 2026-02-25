@@ -6,8 +6,10 @@ const (
 	MetricHostBootDuration     = "host/boot_duration_seconds"
 	MetricHostGCSSyncDuration  = "host/gcs_sync_duration_seconds"
 	MetricHostGCSSyncBytes     = "host/gcs_sync_bytes"
-	MetricHostSlotsTotal       = "host/slots_total"
-	MetricHostSlotsUsed        = "host/slots_used"
+	MetricHostCPUTotal         = "host/cpu_millicores_total"
+	MetricHostCPUUsed          = "host/cpu_millicores_used"
+	MetricHostMemTotal         = "host/memory_mb_total"
+	MetricHostMemUsed          = "host/memory_mb_used"
 	MetricHostRunnersIdle      = "host/runners_idle"
 	MetricHostRunnersBusy      = "host/runners_busy"
 	MetricHostHeartbeatLatency = "host/heartbeat_latency_seconds"
@@ -33,13 +35,13 @@ const (
 	MetricCPRunnersTotal      = "control_plane/runners_total"
 	MetricCPDownscalerActions = "control_plane/downscaler_actions_total"
 
-	// Fleet slot metrics — used as the primary autoscaler signal.
-	// free_slots_per_host is the canonical scale-out metric: when it drops below
-	// a target (e.g. 2), the GCP autoscaler adds more host VMs.
-	MetricCPFleetSlotsTotal   = "control_plane/fleet_slots_total"
-	MetricCPFleetSlotsUsed    = "control_plane/fleet_slots_used"
-	MetricCPFleetSlotsFree    = "control_plane/fleet_slots_free"
-	MetricCPFleetFreeSlotsPer = "control_plane/fleet_free_slots_per_host"
+	// Fleet resource metrics — used as the primary autoscaler signal.
+	MetricCPFleetCPUTotal = "control_plane/fleet_cpu_millicores_total"
+	MetricCPFleetCPUUsed  = "control_plane/fleet_cpu_millicores_used"
+	MetricCPFleetCPUFree  = "control_plane/fleet_cpu_millicores_free"
+	MetricCPFleetMemTotal = "control_plane/fleet_memory_mb_total"
+	MetricCPFleetMemUsed  = "control_plane/fleet_memory_mb_used"
+	MetricCPFleetMemFree  = "control_plane/fleet_memory_mb_free"
 
 	// Snapshot metrics
 	MetricSnapshotBuildDuration  = "snapshot/build_duration_seconds"

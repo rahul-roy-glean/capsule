@@ -53,6 +53,9 @@ type SessionMetadata struct {
 	RootfsPath string `json:"rootfs_path"`
 	// RepoCacheUpperPath is the per-runner repo cache writable layer.
 	RepoCacheUpperPath string `json:"repo_cache_upper_path"`
+	// Resource config preserved across pause/resume
+	VCPUs    int `json:"vcpus,omitempty"`
+	MemoryMB int `json:"memory_mb,omitempty"`
 	// TTL config preserved across pause/resume
 	TTLSeconds int  `json:"ttl_seconds,omitempty"`
 	AutoPause  bool `json:"auto_pause,omitempty"`
@@ -141,6 +144,8 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 		PausedAt:           time.Now(),
 		RootfsPath:         runner.RootfsOverlay,
 		RepoCacheUpperPath: runner.RepoCacheUpper,
+		VCPUs:              runner.Resources.VCPUs,
+		MemoryMB:           runner.Resources.MemoryMB,
 		TTLSeconds:         runner.TTLSeconds,
 		AutoPause:          runner.AutoPause,
 	}
@@ -354,8 +359,8 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		FirecrackerBin: m.config.FirecrackerBin,
 		KernelPath:     snapshotPaths.Kernel,
 		RootfsPath:     overlayPath,
-		VCPUs:          m.config.VCPUsPerRunner,
-		MemoryMB:       m.config.MemoryMBPerRunner,
+		VCPUs:          metadata.VCPUs,
+		MemoryMB:       metadata.MemoryMB,
 		NetworkIface: &firecracker.NetworkInterface{
 			IfaceID:     "eth0",
 			HostDevName: tap.Name,
@@ -444,8 +449,8 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		SnapshotVersion: snapshotPaths.Version,
 		WorkloadKey:     metadata.WorkloadKey,
 		Resources: Resources{
-			VCPUs:    m.config.VCPUsPerRunner,
-			MemoryMB: m.config.MemoryMBPerRunner,
+			VCPUs:    metadata.VCPUs,
+			MemoryMB: metadata.MemoryMB,
 		},
 		CreatedAt:      metadata.CreatedAt,
 		StartedAt:      time.Now(),

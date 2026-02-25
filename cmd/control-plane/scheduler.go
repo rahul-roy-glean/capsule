@@ -14,6 +14,7 @@ import (
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/tiers"
 )
 
 // Scheduler handles runner allocation across hosts
@@ -67,14 +68,19 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// Derive repo slug for multi-repo support
 	workloadKey := req.WorkloadKey
 
-	// Look up snapshot config for fairness checks, ci_system, and start_command
+	// Look up snapshot config for fairness checks, ci_system, start_command, and tier
 	var ciSystem string
+	var tierName string
 	var startCmd *snapshot.StartCommand
 	if workloadKey != "" && s.db != nil {
 		var maxConcurrent int
 		var startCommandJSON sql.NullString
-		err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, ci_system, start_command FROM snapshot_configs WHERE workload_key = $1`, workloadKey).Scan(&maxConcurrent, &ciSystem, &startCommandJSON)
+		var tierCol sql.NullString
+		err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, ci_system, start_command, tier FROM snapshot_configs WHERE workload_key = $1`, workloadKey).Scan(&maxConcurrent, &ciSystem, &startCommandJSON, &tierCol)
 		if err == nil {
+			if tierCol.Valid && tierCol.String != "" {
+				tierName = tierCol.String
+			}
 			if maxConcurrent > 0 {
 				var currentCount int
 				_ = s.db.QueryRowContext(ctx, `
@@ -94,17 +100,44 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		}
 	}
 
+	// Resolve tier (default to "m")
+	if tierName == "" {
+		tierName = tiers.DefaultTier
+	}
+	tier, _ := tiers.Lookup(tierName)
+
 	// Get available hosts
 	hosts := s.hostRegistry.GetAvailableHosts()
 	if len(hosts) == 0 {
 		return nil, fmt.Errorf("no available hosts")
 	}
 
+	// Filter hosts that can fit this workload's resource requirements
+	var eligible []*Host
+	for _, h := range hosts {
+		if canFitWorkload(h, tier) {
+			eligible = append(eligible, h)
+		}
+	}
+	if len(eligible) == 0 {
+		// Fall back to all available hosts if none pass resource check
+		// (handles hosts that don't yet report resources)
+		eligible = hosts
+	}
+
 	// Score and select best host (with workload-key cache affinity)
-	host := s.selectBestHostForWorkloadKey(hosts, workloadKey)
+	host := s.selectBestHostForWorkloadKey(eligible, workloadKey)
 	if host == nil {
 		return nil, fmt.Errorf("no suitable host found")
 	}
+
+	// Optimistic reservation: increment used resources on the in-memory host.
+	// Next heartbeat from the host will correct any drift.
+	effectiveCPU := tiers.EffectiveCPUMillicores(tier)
+	s.hostRegistry.mu.Lock()
+	host.UsedCPUMillicores += effectiveCPU
+	host.UsedMemoryMB += tier.MemoryMB
+	s.hostRegistry.mu.Unlock()
 
 	s.logger.WithFields(logrus.Fields{
 		"host_id":       host.ID,
@@ -144,11 +177,17 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		SessionId:         req.SessionID,
 		SnapshotVersion:   snapshotVersion,
 	}
-	if req.VCPUs > 0 || req.MemoryMB > 0 {
-		protoReq.Resources = &pb.Resources{
-			Vcpus:    int32(req.VCPUs),
-			MemoryMb: int32(req.MemoryMB),
-		}
+	// Populate resources from tier (overrides request-level values)
+	protoReq.Resources = &pb.Resources{
+		Vcpus:    int32(tier.VCPUs),
+		MemoryMb: int32(tier.MemoryMB),
+	}
+	// Allow explicit request-level overrides if set
+	if req.VCPUs > 0 {
+		protoReq.Resources.Vcpus = int32(req.VCPUs)
+	}
+	if req.MemoryMB > 0 {
+		protoReq.Resources.MemoryMb = int32(req.MemoryMB)
 	}
 	if startCmd != nil {
 		protoReq.StartCommand = &pb.StartCommand{
@@ -161,11 +200,21 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// Call host agent to allocate runner
 	resp, err := client.AllocateRunner(ctx, protoReq)
 	if err != nil {
+		// Roll back optimistic reservation
+		s.hostRegistry.mu.Lock()
+		host.UsedCPUMillicores -= effectiveCPU
+		host.UsedMemoryMB -= tier.MemoryMB
+		s.hostRegistry.mu.Unlock()
 		s.logger.WithError(err).WithField("host", host.InstanceName).Error("gRPC AllocateRunner failed")
 		return nil, fmt.Errorf("host agent AllocateRunner failed: %w", err)
 	}
 
 	if resp.Error != "" {
+		// Roll back optimistic reservation
+		s.hostRegistry.mu.Lock()
+		host.UsedCPUMillicores -= effectiveCPU
+		host.UsedMemoryMB -= tier.MemoryMB
+		s.hostRegistry.mu.Unlock()
 		return &AllocateRunnerResponse{
 			HostID:      host.ID,
 			HostAddress: host.GRPCAddress,
@@ -242,28 +291,34 @@ func (s *Scheduler) scoreHostForWorkloadKey(h *Host, workloadKey string) float64
 	return score
 }
 
-// scoreHost calculates a base score for a host
+// canFitWorkload checks whether a host has enough resources to run a workload
+// of the given tier.
+func canFitWorkload(h *Host, t tiers.Tier) bool {
+	if h.TotalCPUMillicores == 0 {
+		return false
+	}
+	effectiveCPU := tiers.EffectiveCPUMillicores(t)
+	return (h.TotalCPUMillicores-h.UsedCPUMillicores) >= effectiveCPU &&
+		(h.TotalMemoryMB-h.UsedMemoryMB) >= t.MemoryMB
+}
+
+// scoreHost calculates a base score for a host using resource-based metrics.
 func (s *Scheduler) scoreHost(h *Host) float64 {
 	var score float64
 
-	// Prefer hosts with idle runners (faster allocation)
+	// Prefer hosts with idle runners (cache warmth)
 	score += float64(h.IdleRunners) * 10
 
-	// Prefer hosts with more available capacity
-	availableSlots := h.TotalSlots - h.UsedSlots
-	score += float64(availableSlots) * 5
+	if h.TotalCPUMillicores > 0 {
+		cpuFree := float64(h.TotalCPUMillicores-h.UsedCPUMillicores) / float64(h.TotalCPUMillicores)
+		memFree := float64(h.TotalMemoryMB-h.UsedMemoryMB) / float64(h.TotalMemoryMB)
+		score += cpuFree * 20
+		score += memFree * 15
+	}
 
 	// Prefer hosts with recent heartbeats
 	if time.Since(h.LastHeartbeat) < 30*time.Second {
 		score += 20
-	}
-
-	// Penalize hosts with high utilization
-	if h.TotalSlots > 0 {
-		utilization := float64(h.UsedSlots) / float64(h.TotalSlots)
-		if utilization > 0.8 {
-			score -= 30
-		}
 	}
 
 	return score
@@ -403,30 +458,36 @@ func (s *Scheduler) GetQueueDepth() int {
 func (s *Scheduler) GetStats() SchedulerStats {
 	hosts := s.hostRegistry.GetAllHosts()
 
-	var totalSlots, usedSlots, idleRunners, busyRunners int
+	var totalCPU, usedCPU, totalMem, usedMem, idleRunners, busyRunners int
 	for _, h := range hosts {
-		totalSlots += h.TotalSlots
-		usedSlots += h.UsedSlots
+		totalCPU += h.TotalCPUMillicores
+		usedCPU += h.UsedCPUMillicores
+		totalMem += h.TotalMemoryMB
+		usedMem += h.UsedMemoryMB
 		idleRunners += h.IdleRunners
 		busyRunners += h.BusyRunners
 	}
 
 	return SchedulerStats{
-		TotalHosts:  len(hosts),
-		TotalSlots:  totalSlots,
-		UsedSlots:   usedSlots,
-		IdleRunners: idleRunners,
-		BusyRunners: busyRunners,
-		QueueDepth:  s.GetQueueDepth(),
+		TotalHosts:         len(hosts),
+		TotalCPUMillicores: totalCPU,
+		UsedCPUMillicores:  usedCPU,
+		TotalMemoryMB:      totalMem,
+		UsedMemoryMB:       usedMem,
+		IdleRunners:        idleRunners,
+		BusyRunners:        busyRunners,
+		QueueDepth:         s.GetQueueDepth(),
 	}
 }
 
 // SchedulerStats holds scheduler statistics
 type SchedulerStats struct {
-	TotalHosts  int
-	TotalSlots  int
-	UsedSlots   int
-	IdleRunners int
-	BusyRunners int
-	QueueDepth  int
+	TotalHosts         int
+	TotalCPUMillicores int
+	UsedCPUMillicores  int
+	TotalMemoryMB      int
+	UsedMemoryMB       int
+	IdleRunners        int
+	BusyRunners        int
+	QueueDepth         int
 }

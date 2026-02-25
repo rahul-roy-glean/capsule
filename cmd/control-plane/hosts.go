@@ -16,8 +16,6 @@ type Host struct {
 	InstanceName     string
 	Zone             string
 	Status           string
-	TotalSlots       int
-	UsedSlots        int
 	IdleRunners      int
 	BusyRunners      int
 	SnapshotVersion  string
@@ -30,6 +28,11 @@ type Host struct {
 	LoadedManifests map[string]string
 	// DiskUsage is the reported disk usage percentage (0.0-1.0)
 	DiskUsage float64
+	// Resource tracking for bin-packing scheduler
+	TotalCPUMillicores int
+	UsedCPUMillicores  int
+	TotalMemoryMB      int
+	UsedMemoryMB       int
 }
 
 // Runner represents a runner instance
@@ -75,7 +78,6 @@ func (hr *HostRegistry) RegisterHost(ctx context.Context, instanceName, zone str
 	hr.logger.WithFields(logrus.Fields{
 		"instance_name": instanceName,
 		"zone":          zone,
-		"total_slots":   totalSlots,
 	}).Info("Registering host")
 
 	var hostID string
@@ -100,7 +102,6 @@ func (hr *HostRegistry) RegisterHost(ctx context.Context, instanceName, zone str
 		InstanceName:  instanceName,
 		Zone:          zone,
 		Status:        "ready",
-		TotalSlots:    totalSlots,
 		GRPCAddress:   grpcAddress,
 		LastHeartbeat: time.Now(),
 		CreatedAt:     time.Now(),
@@ -111,47 +112,19 @@ func (hr *HostRegistry) RegisterHost(ctx context.Context, instanceName, zone str
 	return host, nil
 }
 
-// UpdateHeartbeat updates a host's heartbeat
-func (hr *HostRegistry) UpdateHeartbeat(ctx context.Context, hostID string, status HostStatus) error {
-	hr.mu.Lock()
-	defer hr.mu.Unlock()
-
-	_, err := hr.db.ExecContext(ctx, `
-		UPDATE hosts SET
-			used_slots = $2,
-			idle_runners = $3,
-			busy_runners = $4,
-			snapshot_version = $5,
-			last_heartbeat = NOW()
-		WHERE id = $1
-	`, hostID, status.UsedSlots, status.IdleRunners, status.BusyRunners, status.SnapshotVersion)
-
-	if err != nil {
-		return err
-	}
-
-	if host, ok := hr.hosts[hostID]; ok {
-		host.UsedSlots = status.UsedSlots
-		host.IdleRunners = status.IdleRunners
-		host.BusyRunners = status.BusyRunners
-		host.SnapshotVersion = status.SnapshotVersion
-		host.LastHeartbeat = time.Now()
-	}
-
-	return nil
-}
-
 type HostHeartbeat struct {
-	InstanceName    string
-	Zone            string
-	GRPCAddress     string
-	HTTPAddress     string
-	TotalSlots      int
-	UsedSlots       int
-	IdleRunners     int
-	BusyRunners     int
-	SnapshotVersion string
-	LoadedManifests map[string]string
+	InstanceName       string
+	Zone               string
+	GRPCAddress        string
+	HTTPAddress        string
+	IdleRunners        int
+	BusyRunners        int
+	SnapshotVersion    string
+	LoadedManifests    map[string]string
+	TotalCPUMillicores int
+	UsedCPUMillicores  int
+	TotalMemoryMB      int
+	UsedMemoryMB       int
 }
 
 // UpsertHeartbeat upserts the host record and updates heartbeat fields. It preserves
@@ -169,26 +142,30 @@ func (hr *HostRegistry) UpsertHeartbeat(ctx context.Context, hb HostHeartbeat) (
 	var status string
 	err := hr.db.QueryRowContext(ctx, `
 		INSERT INTO hosts (
-			instance_name, zone, status, total_slots, used_slots, idle_runners, busy_runners,
-			snapshot_version, grpc_address, http_address, last_heartbeat
+			instance_name, zone, status, idle_runners, busy_runners,
+			snapshot_version, grpc_address, http_address, last_heartbeat,
+			total_cpu_millicores, used_cpu_millicores, total_memory_mb, used_memory_mb
 		)
-		VALUES ($1, $2, 'ready', $3, $4, $5, $6, $7, $8, $9, NOW())
+		VALUES ($1, $2, 'ready', $3, $4, $5, $6, $7, NOW(), $8, $9, $10, $11)
 		ON CONFLICT (instance_name) DO UPDATE SET
 			zone = EXCLUDED.zone,
-			total_slots = EXCLUDED.total_slots,
-			used_slots = EXCLUDED.used_slots,
 			idle_runners = EXCLUDED.idle_runners,
 			busy_runners = EXCLUDED.busy_runners,
 			snapshot_version = EXCLUDED.snapshot_version,
 			grpc_address = EXCLUDED.grpc_address,
 			http_address = EXCLUDED.http_address,
 			last_heartbeat = NOW(),
+			total_cpu_millicores = EXCLUDED.total_cpu_millicores,
+			used_cpu_millicores = EXCLUDED.used_cpu_millicores,
+			total_memory_mb = EXCLUDED.total_memory_mb,
+			used_memory_mb = EXCLUDED.used_memory_mb,
 			status = CASE
 				WHEN hosts.status IN ('draining','terminating') THEN hosts.status
 				ELSE 'ready'
 			END
 		RETURNING id, status
-	`, hb.InstanceName, hb.Zone, hb.TotalSlots, hb.UsedSlots, hb.IdleRunners, hb.BusyRunners, hb.SnapshotVersion, hb.GRPCAddress, hb.HTTPAddress).Scan(&hostID, &status)
+	`, hb.InstanceName, hb.Zone, hb.IdleRunners, hb.BusyRunners, hb.SnapshotVersion, hb.GRPCAddress, hb.HTTPAddress,
+		hb.TotalCPUMillicores, hb.UsedCPUMillicores, hb.TotalMemoryMB, hb.UsedMemoryMB).Scan(&hostID, &status)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to upsert host heartbeat: %w", err)
 	}
@@ -202,14 +179,16 @@ func (hr *HostRegistry) UpsertHeartbeat(ctx context.Context, hb HostHeartbeat) (
 	host.InstanceName = hb.InstanceName
 	host.Zone = hb.Zone
 	host.Status = status
-	host.TotalSlots = hb.TotalSlots
-	host.UsedSlots = hb.UsedSlots
 	host.IdleRunners = hb.IdleRunners
 	host.BusyRunners = hb.BusyRunners
 	host.SnapshotVersion = hb.SnapshotVersion
 	host.GRPCAddress = hb.GRPCAddress
 	host.HTTPAddress = hb.HTTPAddress
 	host.LastHeartbeat = time.Now()
+	host.TotalCPUMillicores = hb.TotalCPUMillicores
+	host.UsedCPUMillicores = hb.UsedCPUMillicores
+	host.TotalMemoryMB = hb.TotalMemoryMB
+	host.UsedMemoryMB = hb.UsedMemoryMB
 	if hb.LoadedManifests != nil {
 		host.LoadedManifests = hb.LoadedManifests
 	}
@@ -246,14 +225,6 @@ func (hr *HostRegistry) SetHostStatusByInstanceName(ctx context.Context, instanc
 	return nil
 }
 
-// HostStatus for heartbeat updates
-type HostStatus struct {
-	UsedSlots       int
-	IdleRunners     int
-	BusyRunners     int
-	SnapshotVersion string
-}
-
 // GetHost returns a host by ID
 func (hr *HostRegistry) GetHost(hostID string) (*Host, error) {
 	hr.mu.RLock()
@@ -278,18 +249,25 @@ func (hr *HostRegistry) GetAllHosts() []*Host {
 	return hosts
 }
 
-// GetAvailableHosts returns hosts that can accept new runners
+// GetAvailableHosts returns hosts that can accept new runners.
+// A host is considered available if it has a fresh heartbeat, is ready,
+// and has resource capacity remaining.
 func (hr *HostRegistry) GetAvailableHosts() []*Host {
 	hr.mu.RLock()
 	defer hr.mu.RUnlock()
 
 	var available []*Host
 	for _, h := range hr.hosts {
-		if h.Status == "ready" && h.UsedSlots < h.TotalSlots {
-			// Check heartbeat freshness
-			if time.Since(h.LastHeartbeat) < 60*time.Second {
-				available = append(available, h)
-			}
+		if h.Status != "ready" {
+			continue
+		}
+		if time.Since(h.LastHeartbeat) >= 60*time.Second {
+			continue
+		}
+		if h.TotalCPUMillicores > 0 &&
+			(h.TotalCPUMillicores-h.UsedCPUMillicores) > 0 &&
+			(h.TotalMemoryMB-h.UsedMemoryMB) > 0 {
+			available = append(available, h)
 		}
 	}
 	return available
@@ -383,8 +361,9 @@ func (hr *HostRegistry) LoadFromDB(ctx context.Context) error {
 
 	// Load hosts
 	rows, err := hr.db.QueryContext(ctx, `
-		SELECT id, instance_name, zone, status, total_slots, used_slots, idle_runners, busy_runners,
-		       snapshot_version, last_heartbeat, grpc_address, http_address, created_at
+		SELECT id, instance_name, zone, status, idle_runners, busy_runners,
+		       snapshot_version, last_heartbeat, grpc_address, http_address, created_at,
+		       total_cpu_millicores, used_cpu_millicores, total_memory_mb, used_memory_mb
 		FROM hosts
 	`)
 	if err != nil {
@@ -398,8 +377,9 @@ func (hr *HostRegistry) LoadFromDB(ctx context.Context) error {
 		var lastHeartbeat sql.NullTime
 
 		err := rows.Scan(&h.ID, &h.InstanceName, &h.Zone, &h.Status,
-			&h.TotalSlots, &h.UsedSlots, &h.IdleRunners, &h.BusyRunners,
-			&snapshotVersion, &lastHeartbeat, &grpcAddress, &httpAddress, &h.CreatedAt)
+			&h.IdleRunners, &h.BusyRunners,
+			&snapshotVersion, &lastHeartbeat, &grpcAddress, &httpAddress, &h.CreatedAt,
+			&h.TotalCPUMillicores, &h.UsedCPUMillicores, &h.TotalMemoryMB, &h.UsedMemoryMB)
 		if err != nil {
 			return err
 		}

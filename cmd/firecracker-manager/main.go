@@ -42,8 +42,6 @@ var (
 	httpPort             = flag.Int("http-port", 8080, "HTTP server port (health/metrics)")
 	maxRunners           = flag.Int("max-runners", 16, "Maximum runners per host")
 	idleTarget           = flag.Int("idle-target", 2, "Target number of idle runners")
-	vcpusPerRunner       = flag.Int("vcpus-per-runner", 4, "vCPUs per runner")
-	memoryPerRunner      = flag.Int("memory-per-runner", 8192, "Memory MB per runner")
 	firecrackerBin       = flag.String("firecracker-bin", "/usr/local/bin/firecracker", "Path to firecracker binary")
 	socketDir            = flag.String("socket-dir", "/var/run/firecracker", "Directory for VM sockets")
 	workspaceDir         = flag.String("workspace-dir", "/mnt/data/workspaces", "Directory for workspaces")
@@ -228,8 +226,6 @@ func main() {
 		Zone:                      zone,
 		MaxRunners:                *maxRunners,
 		IdleTarget:                *idleTarget,
-		VCPUsPerRunner:            *vcpusPerRunner,
-		MemoryMBPerRunner:         *memoryPerRunner,
 		FirecrackerBin:            *firecrackerBin,
 		SocketDir:                 *socketDir,
 		WorkspaceDir:              *workspaceDir,
@@ -271,6 +267,9 @@ func main() {
 		PoolMaxRunnerDiskGB:    *poolMaxRunnerDiskGB,
 		PoolRecycleTimeoutSecs: *poolRecycleTimeout,
 	}
+
+	// Detect host resources for bin-packing scheduler
+	cfg.TotalCPUMillicores, cfg.TotalMemoryMB = detectHostResources(log)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -516,8 +515,8 @@ func readyHandler(mgr *runner.Manager) http.HandlerFunc {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "Ready: %d/%d runners, snapshot: %s",
-			status.UsedSlots, status.TotalSlots, status.SnapshotVersion)
+		fmt.Fprintf(w, "Ready: %d runners, snapshot: %s",
+			status.ActiveRunners, status.SnapshotVersion)
 	}
 }
 
@@ -582,7 +581,7 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				// Chunked mode: no local pre-allocation; control plane drives it.
 			} else if mgr.DiskUsage() > 0.85 {
 				log.Warn("Disk usage exceeds 85%, skipping runner allocation")
-			} else if !mgr.IsDraining() && status.IdleRunners < idleTarget && mgr.CanAddRunner() {
+			} else if !mgr.IsDraining() && status.IdleRunners < idleTarget && mgr.CanAddRunner(0, 0) {
 				log.Debug("Adding runner to maintain idle pool")
 				allocTimer := telemetry.NewStopwatch()
 				_, err := mgr.AllocateRunner(ctx, runner.AllocateRequest{})
@@ -607,10 +606,12 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				}
 			}
 
-			// Update Prometheus metrics (legacy)
+			// Update Prometheus metrics
 			metrics.UpdateHostMetrics(
-				status.TotalSlots,
-				status.UsedSlots,
+				status.TotalCPUMillicores,
+				status.UsedCPUMillicores,
+				status.TotalMemoryMB,
+				status.UsedMemoryMB,
 				status.IdleRunners,
 				status.BusyRunners,
 			)
@@ -618,10 +619,12 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			// Record GCP Cloud Monitoring metrics
 			if metricsClient != nil {
 				metricsClient.RecordHostMetrics(ctx, telemetry.HostMetrics{
-					TotalSlots:  status.TotalSlots,
-					UsedSlots:   status.UsedSlots,
-					IdleRunners: status.IdleRunners,
-					BusyRunners: status.BusyRunners,
+					TotalCPUMillicores: status.TotalCPUMillicores,
+					UsedCPUMillicores:  status.UsedCPUMillicores,
+					TotalMemoryMB:      status.TotalMemoryMB,
+					UsedMemoryMB:       status.UsedMemoryMB,
+					IdleRunners:        status.IdleRunners,
+					BusyRunners:        status.BusyRunners,
 				})
 
 				// Record chunked snapshot metrics
@@ -662,18 +665,20 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 }
 
 type hostHeartbeatRequest struct {
-	InstanceName    string            `json:"instance_name"`
-	Zone            string            `json:"zone"`
-	GRPCAddress     string            `json:"grpc_address"`
-	HTTPAddress     string            `json:"http_address"`
-	TotalSlots      int               `json:"total_slots"`
-	UsedSlots       int               `json:"used_slots"`
-	IdleRunners     int               `json:"idle_runners"`
-	BusyRunners     int               `json:"busy_runners"`
-	SnapshotVersion string            `json:"snapshot_version"`
-	Draining        bool              `json:"draining"`
-	DiskUsage       float64           `json:"disk_usage"`
-	LoadedManifests map[string]string `json:"loaded_manifests,omitempty"`
+	InstanceName       string            `json:"instance_name"`
+	Zone               string            `json:"zone"`
+	GRPCAddress        string            `json:"grpc_address"`
+	HTTPAddress        string            `json:"http_address"`
+	IdleRunners        int               `json:"idle_runners"`
+	BusyRunners        int               `json:"busy_runners"`
+	SnapshotVersion    string            `json:"snapshot_version"`
+	Draining           bool              `json:"draining"`
+	DiskUsage          float64           `json:"disk_usage"`
+	TotalCPUMillicores int               `json:"total_cpu_millicores"`
+	UsedCPUMillicores  int               `json:"used_cpu_millicores"`
+	TotalMemoryMB      int               `json:"total_memory_mb"`
+	UsedMemoryMB       int               `json:"used_memory_mb"`
+	LoadedManifests    map[string]string `json:"loaded_manifests,omitempty"`
 }
 
 type hostHeartbeatResponse struct {
@@ -713,17 +718,19 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			hbTimer := telemetry.NewStopwatch()
 			status := mgr.GetStatus()
 			reqBody := hostHeartbeatRequest{
-				InstanceName:    instanceName,
-				Zone:            zone,
-				GRPCAddress:     fmt.Sprintf("%s:%d", internalIP, grpcPort),
-				HTTPAddress:     fmt.Sprintf("%s:%d", internalIP, httpPort),
-				TotalSlots:      status.TotalSlots,
-				UsedSlots:       status.UsedSlots,
-				IdleRunners:     status.IdleRunners,
-				BusyRunners:     status.BusyRunners,
-				SnapshotVersion: status.SnapshotVersion,
-				Draining:        status.Draining,
-				DiskUsage:       mgr.DiskUsage(),
+				InstanceName:       instanceName,
+				Zone:               zone,
+				GRPCAddress:        fmt.Sprintf("%s:%d", internalIP, grpcPort),
+				HTTPAddress:        fmt.Sprintf("%s:%d", internalIP, httpPort),
+				IdleRunners:        status.IdleRunners,
+				BusyRunners:        status.BusyRunners,
+				SnapshotVersion:    status.SnapshotVersion,
+				Draining:           status.Draining,
+				DiskUsage:          mgr.DiskUsage(),
+				TotalCPUMillicores: status.TotalCPUMillicores,
+				UsedCPUMillicores:  status.UsedCPUMillicores,
+				TotalMemoryMB:      status.TotalMemoryMB,
+				UsedMemoryMB:       status.UsedMemoryMB,
 			}
 			if chunkedMgr != nil {
 				reqBody.LoadedManifests = chunkedMgr.GetLoadedManifests()
@@ -972,6 +979,54 @@ func getLocalIPFallback() string {
 		}
 	}
 	return ""
+}
+
+// detectHostResources detects the total CPU and memory available on this host.
+// It reads from /proc/cpuinfo and /proc/meminfo on Linux. Returns (cpuMillicores, memoryMB).
+func detectHostResources(log *logrus.Entry) (int, int) {
+	var cpuMillicores, memoryMB int
+
+	// Detect CPU count from /proc/cpuinfo
+	cpuData, err := os.ReadFile("/proc/cpuinfo")
+	if err == nil {
+		cpuCount := 0
+		for _, line := range strings.Split(string(cpuData), "\n") {
+			if strings.HasPrefix(line, "processor") {
+				cpuCount++
+			}
+		}
+		if cpuCount > 0 {
+			cpuMillicores = cpuCount * 1000
+		}
+	}
+
+	// Detect total memory from /proc/meminfo
+	memData, err := os.ReadFile("/proc/meminfo")
+	if err == nil {
+		for _, line := range strings.Split(string(memData), "\n") {
+			if strings.HasPrefix(line, "MemTotal:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					if kb, err := fmt.Sscanf(fields[1], "%d", &memoryMB); err == nil && kb == 1 {
+						memoryMB = memoryMB / 1024 // kB -> MB
+					}
+				}
+				break
+			}
+		}
+	}
+
+	// Fallback: try GCE machine-type metadata
+	if cpuMillicores == 0 || memoryMB == 0 {
+		log.Debug("Could not detect resources from /proc, will report 0 (slot-based fallback)")
+	} else {
+		log.WithFields(logrus.Fields{
+			"cpu_millicores": cpuMillicores,
+			"memory_mb":      memoryMB,
+		}).Info("Detected host resources")
+	}
+
+	return cpuMillicores, memoryMB
 }
 
 func gcpTokenHandler(w http.ResponseWriter, r *http.Request, logger *logrus.Logger) {
