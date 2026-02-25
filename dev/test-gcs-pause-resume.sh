@@ -99,18 +99,75 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-header "4. Execute: write marker file in VM"
+header "4. Create state inside VM (memory + disk + process)"
 # ---------------------------------------------------------------------------
-EXEC_OUT=$(curl -s --no-buffer -X POST "$MGR/api/v1/runners/$RUNNER_ID/exec" \
-  -H 'Content-Type: application/json' \
-  -d '{"command":["sh","-c","echo gcs-cross-host-marker > /tmp/gcs-test.txt && cat /tmp/gcs-test.txt"],"timeout_seconds":10}')
-echo "  $EXEC_OUT"
 
-if echo "$EXEC_OUT" | grep -q 'gcs-cross-host-marker'; then
-  pass "Marker file created in VM"
+# Helper to run a command inside the VM and capture output
+vm_exec() {
+  local cmd="$1"
+  curl -s --no-buffer --max-time 30 -X POST "$MGR/api/v1/runners/$RUNNER_ID/exec" \
+    -H 'Content-Type: application/json' \
+    -d "{\"command\":[\"sh\",\"-c\",\"$cmd\"],\"timeout_seconds\":20}"
+}
+
+# 4a. Memory state: write marker to tmpfs (/tmp is memory-backed)
+echo "  --- 4a. Memory state (tmpfs) ---"
+OUT=$(vm_exec "echo gcs-mem-marker-12345 > /tmp/gcs-test.txt && cat /tmp/gcs-test.txt")
+echo "  $OUT"
+if echo "$OUT" | grep -q 'gcs-mem-marker-12345'; then
+  pass "tmpfs marker written"
 else
-  fail "Could not create marker file"
+  fail "tmpfs marker write failed"
 fi
+
+# 4b. Memory state: write ~2MB of data to tmpfs to span partial chunk
+echo "  --- 4b. Larger memory data (2MB in tmpfs) ---"
+OUT=$(vm_exec "dd if=/dev/urandom of=/tmp/gcs-bigfile.bin bs=1K count=2048 2>/dev/null && md5sum /tmp/gcs-bigfile.bin")
+echo "  $OUT"
+BIGFILE_MD5=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[a-f0-9]{32}' | head -1)
+echo "  MD5: $BIGFILE_MD5"
+if [ -n "$BIGFILE_MD5" ]; then
+  pass "2MB tmpfs file written (md5=$BIGFILE_MD5)"
+else
+  fail "2MB tmpfs file write failed"
+fi
+
+# 4c. Disk state: write to persistent filesystem (/home lives on rootfs)
+echo "  --- 4c. Disk state (rootfs) ---"
+OUT=$(vm_exec "echo gcs-disk-marker-67890 > /home/gcs-disk-test.txt && cat /home/gcs-disk-test.txt")
+echo "  $OUT"
+if echo "$OUT" | grep -q 'gcs-disk-marker-67890'; then
+  pass "rootfs marker written"
+else
+  fail "rootfs marker write failed"
+fi
+
+# 4d. Process state: start a background counter that writes to a file
+echo "  --- 4d. Background process ---"
+OUT=$(vm_exec "nohup sh -c 'i=0; while true; do echo \\\$i > /tmp/counter.txt; i=\\\$((i+1)); sleep 1; done' >/dev/null 2>&1 & echo bg_started")
+echo "  $OUT"
+if echo "$OUT" | grep -q 'bg_started'; then
+  pass "Background counter started"
+else
+  fail "Background counter start failed"
+fi
+
+# Wait a few seconds so the counter advances
+sleep 3
+OUT=$(vm_exec "cat /tmp/counter.txt")
+PRE_PAUSE_COUNT=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '\d+' | head -1)
+echo "  Counter before pause: $PRE_PAUSE_COUNT"
+if [ -n "$PRE_PAUSE_COUNT" ] && [ "$PRE_PAUSE_COUNT" -gt 0 ] 2>/dev/null; then
+  pass "Counter is running (value=$PRE_PAUSE_COUNT)"
+else
+  fail "Counter not running"
+fi
+
+# 4e. Environment / kernel state: record uptime and PID list
+echo "  --- 4e. Kernel state ---"
+OUT=$(vm_exec "cat /proc/uptime | awk '{print \\\$1}'")
+PRE_PAUSE_UPTIME=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[0-9.]+' | head -1)
+echo "  Uptime before pause: ${PRE_PAUSE_UPTIME}s"
 
 # ---------------------------------------------------------------------------
 header "5. Pause runner (should upload to GCS)"
@@ -226,17 +283,83 @@ fi
 pass "Resumed runner is ready"
 
 # ---------------------------------------------------------------------------
-header "9. Verify state preserved: read marker file"
+header "9. Verify ALL state preserved after GCS resume"
 # ---------------------------------------------------------------------------
-VERIFY_OUT=$(curl -s --no-buffer -X POST "$MGR/api/v1/runners/$RESUME_RUNNER_ID/exec" \
-  -H 'Content-Type: application/json' \
-  -d '{"command":["cat","/tmp/gcs-test.txt"],"timeout_seconds":10}' 2>&1 || echo "EXEC_FAILED")
-echo "  $VERIFY_OUT"
 
-if echo "$VERIFY_OUT" | grep -q 'gcs-cross-host-marker'; then
-  pass "Marker file preserved across GCS-backed pause/resume!"
+# Helper to run a command inside the resumed VM
+vm_exec_resumed() {
+  local cmd="$1"
+  curl -s --no-buffer --max-time 30 -X POST "$MGR/api/v1/runners/$RESUME_RUNNER_ID/exec" \
+    -H 'Content-Type: application/json' \
+    -d "{\"command\":[\"sh\",\"-c\",\"$cmd\"],\"timeout_seconds\":20}"
+}
+
+# 9a. Memory: tmpfs marker
+echo "  --- 9a. Memory state (tmpfs marker) ---"
+OUT=$(vm_exec_resumed "cat /tmp/gcs-test.txt")
+echo "  $OUT"
+if echo "$OUT" | grep -q 'gcs-mem-marker-12345'; then
+  pass "tmpfs marker preserved"
 else
-  fail "Marker file NOT found — memory state was lost"
+  fail "tmpfs marker LOST — memory state not restored"
+fi
+
+# 9b. Memory: 2MB file integrity
+echo "  --- 9b. Memory state (2MB file checksum) ---"
+OUT=$(vm_exec_resumed "md5sum /tmp/gcs-bigfile.bin")
+echo "  $OUT"
+RESUMED_MD5=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[a-f0-9]{32}' | head -1)
+echo "  MD5 before: $BIGFILE_MD5"
+echo "  MD5 after:  $RESUMED_MD5"
+if [ "$BIGFILE_MD5" = "$RESUMED_MD5" ] && [ -n "$RESUMED_MD5" ]; then
+  pass "2MB tmpfs file checksum matches — no corruption"
+else
+  fail "2MB tmpfs file checksum MISMATCH — data corrupted"
+fi
+
+# 9c. Disk: rootfs marker
+echo "  --- 9c. Disk state (rootfs marker) ---"
+OUT=$(vm_exec_resumed "cat /home/gcs-disk-test.txt")
+echo "  $OUT"
+if echo "$OUT" | grep -q 'gcs-disk-marker-67890'; then
+  pass "rootfs marker preserved"
+else
+  fail "rootfs marker LOST — disk state not restored"
+fi
+
+# 9d. Process: background counter should have continued
+echo "  --- 9d. Process state (background counter) ---"
+OUT=$(vm_exec_resumed "cat /tmp/counter.txt")
+POST_RESUME_COUNT=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '\d+' | head -1)
+echo "  Counter before pause: $PRE_PAUSE_COUNT"
+echo "  Counter after resume: $POST_RESUME_COUNT"
+if [ -n "$POST_RESUME_COUNT" ] && [ "$POST_RESUME_COUNT" -ge "$PRE_PAUSE_COUNT" ] 2>/dev/null; then
+  pass "Background counter survived (${PRE_PAUSE_COUNT} → ${POST_RESUME_COUNT})"
+else
+  fail "Background counter lost or reset"
+fi
+
+# 9e. Kernel: uptime should be >= pre-pause (kernel continues from snapshot)
+echo "  --- 9e. Kernel state (uptime) ---"
+OUT=$(vm_exec_resumed "cat /proc/uptime | awk '{print \\\$1}'")
+POST_RESUME_UPTIME=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[0-9.]+' | head -1)
+echo "  Uptime before pause: ${PRE_PAUSE_UPTIME}s"
+echo "  Uptime after resume: ${POST_RESUME_UPTIME}s"
+# Uptime comparison: kernel's monotonic clock continues from the snapshot point
+if [ -n "$POST_RESUME_UPTIME" ]; then
+  pass "Kernel alive (uptime=${POST_RESUME_UPTIME}s)"
+else
+  fail "Could not read kernel uptime"
+fi
+
+# 9f. Exec works: basic command
+echo "  --- 9f. Exec sanity check ---"
+OUT=$(vm_exec_resumed "whoami && hostname")
+echo "  $OUT"
+if echo "$OUT" | grep -q '"type":"exit"'; then
+  pass "Exec works on resumed VM"
+else
+  fail "Exec broken on resumed VM"
 fi
 
 # ---------------------------------------------------------------------------
