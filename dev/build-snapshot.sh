@@ -6,11 +6,10 @@
 #
 # Once a snapshot exists, the manager uses snapshot restore (fast) instead of cold boot.
 #
-# Run inside the Lima VM: lima bash dev/build-snapshot.sh
+# Usage: make dev-snapshot
 #
 # Prerequisites:
-#   - lima make build                     (builds all binaries including snapshot-builder)
-#   - lima bash dev/build-dev-rootfs.sh   (builds rootfs.img + kernel.bin)
+#   - make dev-build   (builds all binaries + rootfs.img + kernel.bin)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,7 +24,7 @@ echo "=== Building Firecracker Snapshot (local) ==="
 
 # --- Prerequisites ---
 if [ ! -f "$REPO_ROOT/bin/snapshot-builder" ]; then
-  echo "FAIL: bin/snapshot-builder not found. Run 'lima make build' first."
+  echo "FAIL: bin/snapshot-builder not found. Run 'make dev-build' first."
   exit 1
 fi
 

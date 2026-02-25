@@ -1,6 +1,6 @@
 #!/bin/bash
 # Start the control-plane + firecracker-manager stack.
-# Run inside the Lima VM: lima bash dev/run-stack.sh
+# Usage: make dev-stack
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -21,7 +21,7 @@ if [ ! -e /dev/kvm ]; then
 fi
 
 if ! systemctl is-active --quiet postgresql; then
-  echo "FAIL: PostgreSQL is not running. Start the Lima VM with 'make dev-up'."
+  echo "FAIL: PostgreSQL is not running. Run 'sudo systemctl start postgresql'."
   exit 1
 fi
 
@@ -31,12 +31,12 @@ if [ ! -f "$SNAPSHOT_DIR/kernel.bin" ]; then
 fi
 
 if [ ! -f "$REPO_ROOT/bin/control-plane" ]; then
-  echo "FAIL: bin/control-plane not found. Run 'lima make build' first."
+  echo "FAIL: bin/control-plane not found. Run 'make dev-build' first."
   exit 1
 fi
 
 if [ ! -f "$REPO_ROOT/bin/firecracker-manager" ]; then
-  echo "FAIL: bin/firecracker-manager not found. Run 'lima make build' first."
+  echo "FAIL: bin/firecracker-manager not found. Run 'make dev-build' first."
   exit 1
 fi
 

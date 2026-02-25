@@ -1,6 +1,6 @@
 #!/bin/bash
 # Stop the dev stack: kill processes, clean up VMs, sockets, and network.
-# Run inside the Lima VM: lima bash dev/stop-stack.sh
+# Usage: make dev-stop
 set -euo pipefail
 
 PID_DIR="/tmp/fc-dev/pids"
@@ -45,19 +45,25 @@ if pgrep -f "firecracker --id" > /dev/null 2>&1; then
   sudo pkill -9 -f "firecracker --id" 2>/dev/null || true
 fi
 
-# 4. Clean up network namespaces (fc-dev related)
+# 4. Clean up TAP devices (snapshot-builder and manager create tap-slot-*)
+for tap in $(ip -o link show 2>/dev/null | grep -oP 'tap-slot-\d+' || true); do
+  echo "Removing TAP device: $tap"
+  sudo ip link delete "$tap" 2>/dev/null || true
+done
+
+# 5. Clean up network namespaces (fc-dev related)
 for ns in $(ip netns list 2>/dev/null | awk '{print $1}' | grep -E '^fc-' || true); do
   echo "Removing network namespace: $ns"
   sudo ip netns delete "$ns" 2>/dev/null || true
 done
 
-# 5. Clean up Firecracker sockets
+# 6. Clean up Firecracker sockets
 if ls /tmp/fc-dev/sockets/*.sock 2>/dev/null; then
   echo "Removing Firecracker sockets..."
   rm -f /tmp/fc-dev/sockets/*.sock
 fi
 
-# 6. Remove remaining PID files
+# 7. Remove remaining PID files
 rm -f "$PID_DIR"/*.pid
 
 echo ""

@@ -1,6 +1,6 @@
 #!/bin/bash
 # E2E test: allocate(session) → exec → pause → allocate(same session) → exec → verify state → release
-# Run inside the Lima VM: lima bash dev/test-pause-resume.sh
+# Usage: make dev-test-pause-resume
 #
 # Prerequisites:
 #   - Stack running: make dev-stack (or dev-stack-local)
