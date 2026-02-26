@@ -800,6 +800,22 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 		`, resp.SessionId, req.RunnerID, host.ID, resp.Layer+1)
 	}
 
+	// Roll back optimistic resource reservation — a paused runner no longer
+	// consumes host resources. Without this, UsedCPU/Memory accumulates
+	// until the next heartbeat.
+	if runner.ReservedCPU > 0 || runner.ReservedMemoryMB > 0 {
+		s.hostRegistry.mu.Lock()
+		host.UsedCPUMillicores -= runner.ReservedCPU
+		host.UsedMemoryMB -= runner.ReservedMemoryMB
+		if host.UsedCPUMillicores < 0 {
+			host.UsedCPUMillicores = 0
+		}
+		if host.UsedMemoryMB < 0 {
+			host.UsedMemoryMB = 0
+		}
+		s.hostRegistry.mu.Unlock()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":             resp.Success,

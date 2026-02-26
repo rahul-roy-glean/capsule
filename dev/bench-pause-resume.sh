@@ -82,8 +82,9 @@ vm_exec() {
 
 pause_runner() {
   local runner_id=$1
-  curl -s -X POST "$MGR/api/v1/runners/$runner_id/pause" \
-    -H 'Content-Type: application/json'
+  curl -s -X POST "$CP/api/v1/runners/pause" \
+    -H 'Content-Type: application/json' \
+    -d "{\"runner_id\":\"$runner_id\"}"
 }
 
 release_runner() {

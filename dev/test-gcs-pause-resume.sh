@@ -162,8 +162,9 @@ echo "  Uptime before pause: ${PRE_PAUSE_UPTIME}s"
 # ---------------------------------------------------------------------------
 header "5. Pause runner (should upload to GCS)"
 # ---------------------------------------------------------------------------
-PAUSE_RESP=$(curl -s -X POST "$MGR/api/v1/runners/$RUNNER_ID/pause" \
-  -H 'Content-Type: application/json')
+PAUSE_RESP=$(curl -s -X POST "$CP/api/v1/runners/pause" \
+  -H 'Content-Type: application/json' \
+  -d "{\"runner_id\":\"$RUNNER_ID\"}")
 echo "  Response: $PAUSE_RESP"
 
 PAUSE_SESSION=$(echo "$PAUSE_RESP" | jq -r '.session_id // empty')
