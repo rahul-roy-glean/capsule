@@ -74,6 +74,15 @@ type Runner struct {
 	SessionLayers int       `json:"session_layers,omitempty"`
 }
 
+// RunnerHeartbeatInfo is a lightweight per-runner status included in host
+// heartbeats so the control plane can enforce TTLs centrally.
+type RunnerHeartbeatInfo struct {
+	RunnerID    string `json:"runner_id"`
+	State       State  `json:"state"`
+	WorkloadKey string `json:"workload_key"`
+	IdleSince   string `json:"idle_since,omitempty"` // RFC3339; set when idle and LastExecAt is non-zero
+}
+
 // Resources represents the resources allocated to a runner
 type Resources struct {
 	VCPUs    int

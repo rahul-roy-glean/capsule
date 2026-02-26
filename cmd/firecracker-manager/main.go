@@ -460,16 +460,13 @@ func main() {
 	httpMux.HandleFunc("/health", healthHandler(mgr))
 	httpMux.HandleFunc("/ready", readyHandler(mgr))
 	httpMux.Handle("/metrics", promhttp.Handler())
-	httpMux.HandleFunc("/api/v1/runners/quarantine", quarantineRunnerHandler(mgr, logger))
-	httpMux.HandleFunc("/api/v1/runners/unquarantine", unquarantineRunnerHandler(mgr, logger))
+	httpMux.HandleFunc("/api/v1/runners/quarantine", drainingGuard(mgr, quarantineRunnerHandler(mgr, logger)))
+	httpMux.HandleFunc("/api/v1/runners/unquarantine", drainingGuard(mgr, unquarantineRunnerHandler(mgr, logger)))
 	httpMux.HandleFunc("/snapshot/sync", snapshotSyncHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/gc", gcHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/pool/flush", poolFlushHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/pool/stats", poolStatsHandler(mgr, logger))
-	httpMux.HandleFunc("/api/v1/runners/", runnerProxyHandler(mgr, logger))
-
-	// Start TTL enforcement loop for session auto-pause
-	mgr.StartTTLEnforcement(ctx)
+	httpMux.HandleFunc("/api/v1/runners/", drainingGuard(mgr, runnerProxyHandler(mgr, logger)))
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *httpPort),
@@ -498,6 +495,25 @@ func main() {
 
 	log.Info("Shutting down...")
 
+	// Mark host as draining so local middleware rejects new requests.
+	mgr.SetDraining(true)
+
+	// Send a drain heartbeat to the control plane so it stops allocating to this host.
+	if *controlPlane != "" {
+		sendDrainHeartbeat(mgr, chunkedMgr, *controlPlane, instanceName, zone, *grpcPort, *httpPort, logger)
+	}
+
+	// Pause all session-bound runners so their state is saved to GCS and they
+	// can be resumed on another host.
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 25*time.Second)
+	paused, pauseErr := mgr.PauseSessionRunners(drainCtx)
+	drainCancel()
+	if pauseErr != nil {
+		log.WithError(pauseErr).WithField("paused", paused).Warn("Some session runners failed to pause during drain")
+	} else if paused > 0 {
+		log.WithField("paused", paused).Info("Paused session runners during drain")
+	}
+
 	// Graceful shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
@@ -507,6 +523,24 @@ func main() {
 	httpServer.Shutdown(shutdownCtx)
 
 	log.Info("Shutdown complete")
+}
+
+// drainingGuard wraps an HTTP handler and returns 503 with Retry-After if the
+// host is draining. Health and readiness endpoints are NOT wrapped so GCE
+// health checks continue to work.
+func drainingGuard(mgr *runner.Manager, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if mgr.IsDraining() {
+			w.Header().Set("Retry-After", "5")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "host is draining, retry via control plane",
+			})
+			return
+		}
+		next(w, r)
+	}
 }
 
 func healthHandler(mgr *runner.Manager) http.HandlerFunc {
@@ -675,20 +709,21 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 }
 
 type hostHeartbeatRequest struct {
-	InstanceName       string            `json:"instance_name"`
-	Zone               string            `json:"zone"`
-	GRPCAddress        string            `json:"grpc_address"`
-	HTTPAddress        string            `json:"http_address"`
-	IdleRunners        int               `json:"idle_runners"`
-	BusyRunners        int               `json:"busy_runners"`
-	SnapshotVersion    string            `json:"snapshot_version"`
-	Draining           bool              `json:"draining"`
-	DiskUsage          float64           `json:"disk_usage"`
-	TotalCPUMillicores int               `json:"total_cpu_millicores"`
-	UsedCPUMillicores  int               `json:"used_cpu_millicores"`
-	TotalMemoryMB      int               `json:"total_memory_mb"`
-	UsedMemoryMB       int               `json:"used_memory_mb"`
-	LoadedManifests    map[string]string `json:"loaded_manifests,omitempty"`
+	InstanceName       string                       `json:"instance_name"`
+	Zone               string                       `json:"zone"`
+	GRPCAddress        string                       `json:"grpc_address"`
+	HTTPAddress        string                       `json:"http_address"`
+	IdleRunners        int                          `json:"idle_runners"`
+	BusyRunners        int                          `json:"busy_runners"`
+	SnapshotVersion    string                       `json:"snapshot_version"`
+	Draining           bool                         `json:"draining"`
+	DiskUsage          float64                      `json:"disk_usage"`
+	TotalCPUMillicores int                          `json:"total_cpu_millicores"`
+	UsedCPUMillicores  int                          `json:"used_cpu_millicores"`
+	TotalMemoryMB      int                          `json:"total_memory_mb"`
+	UsedMemoryMB       int                          `json:"used_memory_mb"`
+	LoadedManifests    map[string]string            `json:"loaded_manifests,omitempty"`
+	Runners            []runner.RunnerHeartbeatInfo `json:"runners,omitempty"`
 }
 
 type hostHeartbeatResponse struct {
@@ -745,6 +780,7 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			if chunkedMgr != nil {
 				reqBody.LoadedManifests = chunkedMgr.GetLoadedManifests()
 			}
+			reqBody.Runners = mgr.GetRunnerHeartbeatInfo()
 
 			b, _ := json.Marshal(reqBody)
 			req, err := http.NewRequestWithContext(ctx, http.MethodPost, heartbeatURL, bytes.NewReader(b))
@@ -804,6 +840,14 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 					} else {
 						log.WithField("drained_idle_runners", drained).Info("Host entered draining mode")
 					}
+
+					// Pause session-bound runners so they can resume on another host
+					paused, pauseErr := mgr.PauseSessionRunners(ctx)
+					if pauseErr != nil {
+						log.WithError(pauseErr).WithField("paused", paused).Warn("Failed to pause some session runners during drain")
+					} else if paused > 0 {
+						log.WithField("paused", paused).Info("Paused session runners during drain")
+					}
 				} else {
 					wasDraining = false
 					log.Info("Host exited draining mode")
@@ -812,6 +856,7 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				wasDraining = true
 				_, _ = mgr.RemoveRunnerLabels(ctx)
 				_, _ = mgr.DrainIdleRunners(ctx)
+				_, _ = mgr.PauseSessionRunners(ctx)
 			}
 
 			// Handle snapshot sync directive from control plane
@@ -845,6 +890,64 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			}
 		}
 	}
+}
+
+// sendDrainHeartbeat sends a single heartbeat with Draining=true so the control
+// plane marks this host as draining before the process exits.
+func sendDrainHeartbeat(mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, controlPlane, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger) {
+	log := logger.WithField("component", "drain-heartbeat")
+
+	cp := strings.TrimSpace(controlPlane)
+	if !strings.HasPrefix(cp, "http://") && !strings.HasPrefix(cp, "https://") {
+		cp = "http://" + cp
+	}
+	heartbeatURL := strings.TrimRight(cp, "/") + "/api/v1/hosts/heartbeat"
+
+	internalIP := getMetadataValue("instance/network-interfaces/0/ip")
+	if internalIP == "" {
+		internalIP = getLocalIPFallback()
+	}
+
+	status := mgr.GetStatus()
+	reqBody := hostHeartbeatRequest{
+		InstanceName:       instanceName,
+		Zone:               zone,
+		GRPCAddress:        fmt.Sprintf("%s:%d", internalIP, grpcPort),
+		HTTPAddress:        fmt.Sprintf("%s:%d", internalIP, httpPort),
+		IdleRunners:        status.IdleRunners,
+		BusyRunners:        status.BusyRunners,
+		SnapshotVersion:    status.SnapshotVersion,
+		Draining:           true,
+		DiskUsage:          mgr.DiskUsage(),
+		TotalCPUMillicores: status.TotalCPUMillicores,
+		UsedCPUMillicores:  status.UsedCPUMillicores,
+		TotalMemoryMB:      status.TotalMemoryMB,
+		UsedMemoryMB:       status.UsedMemoryMB,
+	}
+	if chunkedMgr != nil {
+		reqBody.LoadedManifests = chunkedMgr.GetLoadedManifests()
+	}
+	reqBody.Runners = mgr.GetRunnerHeartbeatInfo()
+
+	b, _ := json.Marshal(reqBody)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, heartbeatURL, bytes.NewReader(b))
+	if err != nil {
+		log.WithError(err).Warn("Failed to create drain heartbeat request")
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.WithError(err).Warn("Failed to send drain heartbeat")
+		return
+	}
+	resp.Body.Close()
+	log.WithField("status", resp.StatusCode).Info("Drain heartbeat sent to control plane")
 }
 
 func loggingInterceptor(logger *logrus.Logger) grpc.UnaryServerInterceptor {

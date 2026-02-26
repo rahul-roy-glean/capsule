@@ -104,6 +104,9 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 	runner.State = StatePausing
 	sessionID := runner.SessionID
 	layerN := runner.SessionLayers
+	// Snapshot the golden metadata under lock — it's written by SetGoldenChunkedMeta
+	// from a different goroutine (SyncManifest/heartbeat loop).
+	goldenMeta := m.goldenChunkedMeta
 	m.mu.Unlock()
 
 	m.logger.WithFields(logrus.Fields{
@@ -143,6 +146,17 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 
 	// Write metadata.json
 	sessionDir := filepath.Join(m.sessionBaseDir(), sessionID)
+
+	// Load the previous metadata if it exists — we need GCSMemIndexObject
+	// from a prior pause to use as the base for multi-pause chain dedup.
+	var prevGCSMemIndex string
+	if prevData, readErr := os.ReadFile(filepath.Join(sessionDir, "metadata.json")); readErr == nil {
+		var prev SessionMetadata
+		if json.Unmarshal(prevData, &prev) == nil {
+			prevGCSMemIndex = prev.GCSMemIndexObject
+		}
+	}
+
 	metadata := SessionMetadata{
 		SessionID:          sessionID,
 		WorkloadKey:        runner.WorkloadKey,
@@ -172,18 +186,18 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 		//   2. Golden CI snapshot metadata converted to ChunkIndex
 		//   3. Empty base (all dirty pages treated as new)
 		var baseMemIndex *snapshot.ChunkIndex
-		if metadata.GCSMemIndexObject != "" {
+		if prevGCSMemIndex != "" {
 			// We have a previous session index — download it as the base so
 			// non-dirty chunks carry forward without re-upload.
-			prevIdx, dlErr := uploader.DownloadChunkIndex(ctx, metadata.GCSMemIndexObject)
+			prevIdx, dlErr := uploader.DownloadChunkIndex(ctx, prevGCSMemIndex)
 			if dlErr != nil {
 				m.logger.WithError(dlErr).Warn("Failed to download previous session ChunkIndex; falling back to golden base")
 			} else {
 				baseMemIndex = prevIdx
 			}
 		}
-		if baseMemIndex == nil && m.goldenChunkedMeta != nil {
-			baseMemIndex = snapshot.ChunkIndexFromMeta(m.goldenChunkedMeta)
+		if baseMemIndex == nil && goldenMeta != nil {
+			baseMemIndex = snapshot.ChunkIndexFromMeta(goldenMeta)
 		}
 		if baseMemIndex == nil {
 			// Fallback: empty base — all dirty pages treated as new.
@@ -212,10 +226,10 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 			} else {
 				// Upload dirty FUSE disk chunks if available.
 				var newDiskIndex *snapshot.ChunkIndex
-				if m.getDirtyDiskChunks != nil && m.sessionDiskStore != nil && m.goldenChunkedMeta != nil {
+				if m.getDirtyDiskChunks != nil && m.sessionDiskStore != nil && goldenMeta != nil {
 					dirtyDisk := m.getDirtyDiskChunks(runnerID)
 					if len(dirtyDisk) > 0 {
-						baseDiskIndex := buildBaseDiskIndex(m.goldenChunkedMeta)
+						baseDiskIndex := buildBaseDiskIndex(goldenMeta)
 						diskIdx, diskErr := uploader.MergeAndUploadDisk(ctx, dirtyDisk, baseDiskIndex)
 						if diskErr != nil {
 							m.logger.WithError(diskErr).Warn("GCS disk chunk upload failed; disk not included in session")
@@ -636,6 +650,12 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		return nil, fmt.Errorf("failed to restore from session snapshot: %w", restoreErr)
 	}
 
+	// Clean up downloaded state file — Firecracker holds the fd open,
+	// so removing the directory entry is safe and avoids accumulation.
+	if latestStateFile != "" {
+		os.Remove(latestStateFile)
+	}
+
 	// Set up port forwarding for netns
 	if useNetNS && m.netnsNetwork != nil {
 		if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentHealthPort); err != nil {
@@ -777,70 +797,6 @@ func (m *Manager) ResetTTL(runnerID string) {
 		runner.LastExecAt = time.Now()
 	}
 	m.mu.Unlock()
-}
-
-// StartTTLEnforcement starts a background goroutine that auto-pauses or destroys
-// idle runners whose TTL has expired.
-func (m *Manager) StartTTLEnforcement(ctx context.Context) {
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				m.enforceTTLs(ctx)
-			}
-		}
-	}()
-}
-
-// enforceTTLs checks all runners for TTL expiry and pauses/destroys as needed.
-func (m *Manager) enforceTTLs(ctx context.Context) {
-	m.mu.RLock()
-	var candidates []struct {
-		id        string
-		autoPause bool
-	}
-	for _, r := range m.runners {
-		if r.TTLSeconds <= 0 {
-			continue
-		}
-		if r.State != StateIdle {
-			continue
-		}
-		if atomic.LoadInt32(&r.ActiveExecs) > 0 {
-			continue
-		}
-		// Skip if LastExecAt was never set (runner never executed anything)
-		if r.LastExecAt.IsZero() {
-			continue
-		}
-		if time.Since(r.LastExecAt) < time.Duration(r.TTLSeconds)*time.Second {
-			continue
-		}
-		candidates = append(candidates, struct {
-			id        string
-			autoPause bool
-		}{id: r.ID, autoPause: r.AutoPause})
-	}
-	m.mu.RUnlock()
-
-	for _, c := range candidates {
-		if c.autoPause {
-			m.logger.WithField("runner_id", c.id).Info("TTL expired, auto-pausing runner")
-			if _, err := m.PauseRunner(ctx, c.id); err != nil {
-				m.logger.WithError(err).WithField("runner_id", c.id).Warn("Failed to auto-pause runner on TTL")
-			}
-		} else {
-			m.logger.WithField("runner_id", c.id).Info("TTL expired, destroying runner")
-			if err := m.ReleaseRunner(c.id, true); err != nil {
-				m.logger.WithError(err).WithField("runner_id", c.id).Warn("Failed to destroy runner on TTL")
-			}
-		}
-	}
 }
 
 // SessionExists checks if a session snapshot exists on disk.
