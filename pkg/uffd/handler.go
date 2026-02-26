@@ -71,6 +71,10 @@ const (
 
 	// Page size (4KB on x86_64)
 	PageSize = 4096
+
+	// uffdMsgSize is the size of a uffd_msg struct (32 bytes on x86_64).
+	// Pre-computed to avoid unsafe.Sizeof in the hot loop.
+	uffdMsgSize = 32
 )
 
 // zeroPage is a shared zero-filled page used for zero chunk reads.
@@ -82,24 +86,17 @@ const (
 	numChunksToEagerFetch = 32
 )
 
-// uffdMsg is the message structure received from userfaultfd
-type uffdMsg struct {
-	Event uint8
-	_     [7]uint8
-	Arg   uffdMsgArg
-}
-
-// uffdMsgArg is the union in uffd_msg
-type uffdMsgArg struct {
-	Pagefault uffdMsgPagefault
-}
-
-// uffdMsgPagefault is the pagefault event data
-type uffdMsgPagefault struct {
-	Flags   uint64
-	Address uint64
-	Feat    uint64
-}
+// uffd_msg layout (32 bytes on x86_64):
+//
+//	Offset  Size  Field
+//	0       1     event (uint8)
+//	1       7     padding
+//	8       8     pagefault.flags (uint64)
+//	16      8     pagefault.address (uint64)
+//	24      8     pagefault.feat (uint64)
+//
+// We parse this directly from a [uffdMsgSize]byte buffer to avoid
+// struct allocation in the hot page-fault loop.
 
 // ufffdioCopy is the UFFDIO_COPY ioctl structure
 type uffdioCopy struct {
@@ -402,6 +399,10 @@ func (h *Handler) handlePageFaults(uffdFd int) {
 		{Fd: int32(uffdFd), Events: unix.POLLIN},
 	}
 
+	// Pre-allocate message buffer outside the hot loop to avoid
+	// per-fault heap allocation. uffd_msg is 32 bytes on x86_64.
+	var msgBuf [uffdMsgSize]byte
+
 	for {
 		select {
 		case <-h.ctx.Done():
@@ -423,11 +424,8 @@ func (h *Handler) handlePageFaults(uffdFd int) {
 			continue // Timeout, check for cancellation
 		}
 
-		// Read the fault message
-		var msg uffdMsg
-		msgBytes := make([]byte, unsafe.Sizeof(msg))
-
-		_, err = unix.Read(uffdFd, msgBytes)
+		// Read the fault message into stack-allocated buffer
+		_, err = unix.Read(uffdFd, msgBuf[:])
 		if err != nil {
 			if err == unix.EAGAIN {
 				continue
@@ -436,21 +434,19 @@ func (h *Handler) handlePageFaults(uffdFd int) {
 			return
 		}
 
-		// Parse message
-		msg.Event = msgBytes[0]
-		msg.Arg.Pagefault.Flags = binary.LittleEndian.Uint64(msgBytes[8:16])
-		msg.Arg.Pagefault.Address = binary.LittleEndian.Uint64(msgBytes[16:24])
-
-		if msg.Event != UFFD_EVENT_PAGEFAULT {
-			h.logger.WithField("event", msg.Event).Debug("Non-pagefault event")
+		// Parse message from stack buffer
+		event := msgBuf[0]
+		if event != UFFD_EVENT_PAGEFAULT {
+			h.logger.WithField("event", event).Debug("Non-pagefault event")
 			continue
 		}
 
+		address := binary.LittleEndian.Uint64(msgBuf[16:24])
 		atomic.AddUint64(&h.pageFaults, 1)
 
 		// Handle the page fault
-		if err := h.handleSingleFault(uffdFd, msg.Arg.Pagefault.Address); err != nil {
-			h.logger.WithError(err).WithField("address", fmt.Sprintf("0x%x", msg.Arg.Pagefault.Address)).Error("Failed to handle page fault")
+		if err := h.handleSingleFault(uffdFd, address); err != nil {
+			h.logger.WithError(err).WithField("address", fmt.Sprintf("0x%x", address)).Error("Failed to handle page fault")
 		}
 	}
 }
@@ -533,8 +529,8 @@ func (h *Handler) queueEagerFetch(currentOffset uint64) {
 		return
 	}
 
-	// Find current chunk and queue the next N chunks (skip zero chunks)
-	var hashes []string
+	// Pre-allocate with expected capacity to avoid repeated slice growth
+	hashes := make([]string, 0, numChunksToEagerFetch)
 	for i := 1; i <= numChunksToEagerFetch; i++ {
 		nextOffset := currentOffset + uint64(i)*chunkSize
 		if chunk := h.findChunk(nextOffset); chunk != nil && !chunk.IsZeroChunk() {

@@ -289,6 +289,10 @@ func (h *LayeredHandler) handlePageFaults(uffdFd int) {
 		{Fd: int32(uffdFd), Events: unix.POLLIN},
 	}
 
+	// Pre-allocate message buffer outside the hot loop to avoid
+	// per-fault heap allocation. uffd_msg is 32 bytes on x86_64.
+	var msgBuf [uffdMsgSize]byte
+
 	for {
 		select {
 		case <-h.ctx.Done():
@@ -309,10 +313,8 @@ func (h *LayeredHandler) handlePageFaults(uffdFd int) {
 			continue
 		}
 
-		var msg uffdMsg
-		msgBytes := make([]byte, unsafe.Sizeof(msg))
-
-		_, err = unix.Read(uffdFd, msgBytes)
+		// Read the fault message into stack-allocated buffer
+		_, err = unix.Read(uffdFd, msgBuf[:])
 		if err != nil {
 			if err == unix.EAGAIN {
 				continue
@@ -321,18 +323,17 @@ func (h *LayeredHandler) handlePageFaults(uffdFd int) {
 			return
 		}
 
-		msg.Event = msgBytes[0]
-		msg.Arg.Pagefault.Flags = binary.LittleEndian.Uint64(msgBytes[8:16])
-		msg.Arg.Pagefault.Address = binary.LittleEndian.Uint64(msgBytes[16:24])
-
-		if msg.Event != UFFD_EVENT_PAGEFAULT {
+		// Parse message from stack buffer
+		event := msgBuf[0]
+		if event != UFFD_EVENT_PAGEFAULT {
 			continue
 		}
 
+		address := binary.LittleEndian.Uint64(msgBuf[16:24])
 		atomic.AddUint64(&h.pageFaults, 1)
 
-		if err := h.handleSingleFault(uffdFd, msg.Arg.Pagefault.Address); err != nil {
-			h.logger.WithError(err).WithField("address", fmt.Sprintf("0x%x", msg.Arg.Pagefault.Address)).Error("Failed to handle page fault")
+		if err := h.handleSingleFault(uffdFd, address); err != nil {
+			h.logger.WithError(err).WithField("address", fmt.Sprintf("0x%x", address)).Error("Failed to handle page fault")
 		}
 	}
 }
