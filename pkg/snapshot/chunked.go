@@ -176,28 +176,31 @@ func NewChunkStore(ctx context.Context, cfg ChunkStoreConfig) (*ChunkStore, erro
 	}, nil
 }
 
-// StoreChunk stores a chunk and returns its hash
+// StoreChunk stores a chunk and returns its hash.
+// Deduplication is handled via the in-memory LRU cache: if the chunk is
+// already cached we skip the upload entirely. Otherwise we upload
+// unconditionally — CAS writes are idempotent so re-uploading an existing
+// chunk is harmless and saves the two GCS round-trips (Attrs + getChunkSize)
+// that a pre-upload existence check would require.
 func (cs *ChunkStore) StoreChunk(ctx context.Context, data []byte) (string, int64, error) {
 	// Compute hash of uncompressed data
 	hash := sha256.Sum256(data)
 	hashStr := hex.EncodeToString(hash[:])
 
-	// Check if chunk already exists (deduplication)
-	exists, err := cs.chunkExists(ctx, hashStr)
-	if err != nil {
-		cs.logger.WithError(err).WithField("hash", hashStr[:12]).Warn("Failed to check chunk existence")
-	} else if exists {
-		// Chunk already exists, skip upload
-		cs.logger.WithField("hash", hashStr[:12]).Debug("Chunk already exists, skipping upload")
-		// Get the compressed size from existing chunk
-		compressedSize, _ := cs.getChunkSize(ctx, hashStr)
-		return hashStr, compressedSize, nil
+	// Fast dedup: if the chunk is in our in-memory LRU, we already have it
+	// in GCS (since we only cache after a successful upload or download).
+	if _, ok := cs.chunkCache.Get(hashStr); ok {
+		// Return estimated compressed size from what we'd produce.
+		// The exact stored size doesn't matter for chunk refs since we
+		// recompute it from GCS attrs when needed.
+		compressed := cs.encoder.EncodeAll(data, make([]byte, 0, len(data)/2))
+		return hashStr, int64(len(compressed)), nil
 	}
 
 	// Compress data
 	compressed := cs.encoder.EncodeAll(data, make([]byte, 0, len(data)/2))
 
-	// Store in GCS
+	// Store in GCS (idempotent for same hash)
 	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
 	objPath := cs.chunkPath(hashStr)
 	obj := bucket.Object(objPath)
@@ -220,6 +223,10 @@ func (cs *ChunkStore) StoreChunk(ctx context.Context, data []byte) (string, int6
 			cs.logger.WithError(err).WithField("hash", hashStr[:12]).Warn("Failed to write chunk to local cache")
 		}
 	}
+
+	// Add to in-memory cache so subsequent StoreChunk calls for the same
+	// data skip the upload entirely.
+	cs.chunkCache.Put(hashStr, data)
 
 	cs.logger.WithFields(logrus.Fields{
 		"hash":            hashStr[:12],
@@ -474,31 +481,6 @@ func (cs *ChunkStore) chunkPath(hash string) string {
 		raw = fmt.Sprintf("%s/%s/%s", ChunksPrefix, hash[:2], hash)
 	}
 	return cs.gcsPath(raw)
-}
-
-// chunkExists checks if a chunk already exists in GCS
-func (cs *ChunkStore) chunkExists(ctx context.Context, hash string) (bool, error) {
-	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
-	objPath := cs.chunkPath(hash)
-	_, err := bucket.Object(objPath).Attrs(ctx)
-	if err == storage.ErrObjectNotExist {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-// getChunkSize returns the compressed size of a chunk in GCS
-func (cs *ChunkStore) getChunkSize(ctx context.Context, hash string) (int64, error) {
-	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
-	objPath := cs.chunkPath(hash)
-	attrs, err := bucket.Object(objPath).Attrs(ctx)
-	if err != nil {
-		return 0, err
-	}
-	return attrs.Size, nil
 }
 
 // UploadRawFile compresses a local file with zstd and uploads it to GCS as a
