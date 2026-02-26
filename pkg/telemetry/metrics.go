@@ -96,6 +96,14 @@ const (
 	MetricPoolMemoryUsed   = "pool/memory_used_bytes"
 	MetricPoolMemoryMax    = "pool/memory_max_bytes"
 	MetricPoolHitRatio     = "pool/hit_ratio"
+
+	// Session pause/resume metrics
+	MetricSessionPauseDuration  = "session/pause_duration_seconds"
+	MetricSessionPauseTotal     = "session/pause_total"
+	MetricSessionPauseChunks    = "session/pause_chunks_uploaded"
+	MetricSessionResumeDuration = "session/resume_duration_seconds"
+	MetricSessionResumeTotal    = "session/resume_total"
+	MetricSessionResumeRouting  = "session/resume_routing_total"
 )
 
 // Well-known label keys for consistency.
@@ -114,6 +122,7 @@ const (
 	LabelJobID       = "job_id"
 	LabelHostID      = "host_id"
 	LabelWorkloadKey = "workload_key"
+	LabelRouting     = "routing"
 )
 
 // E2E canary metrics
@@ -141,6 +150,12 @@ const (
 	PhaseMounts           = "mounts"
 	PhaseGitHubRegister   = "github_register"
 	PhaseReady            = "ready"
+
+	// Session resume routing labels
+	RoutingSameHost  = "same_host"
+	RoutingCrossHost = "cross_host"
+	RoutingLocal     = "local" // local LayeredHandler, no GCS
+	RoutingGCS       = "gcs"   // GCS-backed UFFD resume
 )
 
 // Labels is a convenience type for metric labels.

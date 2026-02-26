@@ -1,6 +1,6 @@
 #!/bin/bash
 # E2E test: allocate → poll → exec → release
-# Run inside the Lima VM: lima bash dev/test-exec.sh
+# Usage: make dev-test-exec
 set -euo pipefail
 
 CP=http://localhost:8080

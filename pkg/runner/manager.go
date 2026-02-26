@@ -64,6 +64,27 @@ type Manager struct {
 
 	// Runner pool for VM reuse (nil if pooling disabled)
 	pool *Pool
+
+	// sessionMemStore and sessionDiskStore are chunk stores for GCS-backed
+	// session pause/resume (nil when SessionChunkBucket is not configured).
+	// When non-nil, PauseRunner uploads dirty diff chunks to GCS and
+	// ResumeFromSession fetches chunks lazily via UFFD from any host.
+	sessionMemStore  *snapshot.ChunkStore
+	sessionDiskStore *snapshot.ChunkStore
+
+	// goldenChunkedMeta holds the base snapshot metadata used as the reference
+	// for session pause uploads. Only populated when sessionMemStore is non-nil.
+	goldenChunkedMeta *snapshot.ChunkedSnapshotMetadata
+
+	// getDirtyDiskChunks is a callback set by ChunkedManager that returns
+	// the dirty FUSE disk chunks for a runner. Nil when FUSE disks are not in use.
+	getDirtyDiskChunks func(runnerID string) map[int][]byte
+
+	// setupFUSEDisk is a callback set by ChunkedManager that creates and mounts
+	// a FUSE-backed disk from chunk refs. Returns the disk image path.
+	// Used by ResumeFromSession for GCS-backed cross-host resume where the
+	// local rootfs overlay doesn't exist.
+	setupFUSEDisk func(runnerID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (diskImagePath string, err error)
 }
 
 type QuarantineOptions struct {
@@ -191,6 +212,25 @@ func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logge
 	}()
 
 	return m, nil
+}
+
+// SetSessionStores configures the Manager for GCS-backed session pause/resume.
+// Called by ChunkedManager after its chunk stores are created so that sessions
+// reuse the same GCS bucket and chunk stores as the CI snapshot pipeline —
+// no separate SessionChunkBucket needed.
+// goldenMeta is used as the base for memory diff merging on pause.
+func (m *Manager) SetSessionStores(memStore, diskStore *snapshot.ChunkStore, goldenMeta *snapshot.ChunkedSnapshotMetadata) {
+	m.sessionMemStore = memStore
+	m.sessionDiskStore = diskStore
+	m.goldenChunkedMeta = goldenMeta
+}
+
+// SetGoldenChunkedMeta updates the golden metadata used as the base for
+// session pause uploads. Called after SyncManifest loads a new version.
+func (m *Manager) SetGoldenChunkedMeta(meta *snapshot.ChunkedSnapshotMetadata) {
+	m.mu.Lock()
+	m.goldenChunkedMeta = meta
+	m.mu.Unlock()
 }
 
 // cleanupRecentRequests removes expired idempotency entries (>5 min old).
@@ -1587,6 +1627,9 @@ func (m *Manager) Close() error {
 
 	// Close snapshot cache
 	m.snapshotCache.Close()
+
+	// Note: sessionMemStore and sessionDiskStore are NOT closed here — they are
+	// owned by ChunkedManager which has its own Close() that shuts them down.
 
 	return nil
 }

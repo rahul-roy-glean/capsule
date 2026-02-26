@@ -257,6 +257,16 @@ type HostConfig struct {
 	// (baked into the snapshot rootfs). Defaults to /workspace if not set.
 	GitCachePreClonedPath string
 
+	// SessionChunkBucket enables cloud-backed session pause/resume.
+	// When set, PauseRunner uploads dirty memory diff chunks and VM state to GCS
+	// under this bucket, producing a self-contained SnapshotManifest.
+	// ResumeFromSession fetches chunks lazily via UFFD from this bucket on any host.
+	// When empty, sessions remain host-local (existing behaviour unchanged).
+	SessionChunkBucket string
+	// GCSPrefix is the top-level prefix for all GCS paths used by session chunk stores
+	// (e.g. "v1"). Matches the GCSPrefix used by ChunkedManagerConfig.
+	GCSPrefix string
+
 	// GitHub Runner Registration (Option C: pre-register at boot)
 	// GitHubRunnerEnabled enables automatic runner registration at VM boot
 	GitHubRunnerEnabled bool

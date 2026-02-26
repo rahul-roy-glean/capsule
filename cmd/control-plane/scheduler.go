@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -14,6 +15,7 @@ import (
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/tiers"
 )
 
@@ -22,7 +24,13 @@ type Scheduler struct {
 	hostRegistry    *HostRegistry
 	db              *sql.DB
 	snapshotManager *SnapshotManager
+	metricsClient   *telemetry.Client
 	logger          *logrus.Entry
+
+	// connPool caches gRPC connections to host agents, keyed by address.
+	// gRPC connections are multiplexed and designed to be long-lived, so
+	// reusing them avoids TCP+TLS handshake latency on every RPC.
+	connPool sync.Map // map[string]*grpc.ClientConn
 }
 
 // NewScheduler creates a new scheduler
@@ -33,6 +41,44 @@ func NewScheduler(hr *HostRegistry, db *sql.DB, sm *SnapshotManager, logger *log
 		snapshotManager: sm,
 		logger:          logger.WithField("component", "scheduler"),
 	}
+}
+
+// SetMetricsClient attaches a telemetry client for GCP Cloud Monitoring.
+func (s *Scheduler) SetMetricsClient(c *telemetry.Client) {
+	s.metricsClient = c
+}
+
+// getHostConn returns a cached gRPC connection to the given address, creating
+// one if needed. Connections are long-lived and multiplexed.
+func (s *Scheduler) getHostConn(address string) (*grpc.ClientConn, error) {
+	if v, ok := s.connPool.Load(address); ok {
+		return v.(*grpc.ClientConn), nil
+	}
+
+	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to host %s: %w", address, err)
+	}
+
+	// Store-or-load to handle concurrent creation for the same address.
+	if actual, loaded := s.connPool.LoadOrStore(address, conn); loaded {
+		// Another goroutine won the race; close our duplicate.
+		conn.Close()
+		return actual.(*grpc.ClientConn), nil
+	}
+
+	return conn, nil
+}
+
+// Close closes all cached gRPC connections.
+func (s *Scheduler) Close() {
+	s.connPool.Range(func(key, value any) bool {
+		if conn, ok := value.(*grpc.ClientConn); ok {
+			conn.Close()
+		}
+		s.connPool.Delete(key)
+		return true
+	})
 }
 
 // AllocateRunnerRequest represents a request to allocate a runner
@@ -125,8 +171,51 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		eligible = hosts
 	}
 
-	// Score and select best host (with workload-key cache affinity)
-	host := s.selectBestHostForWorkloadKey(eligible, workloadKey)
+	// Session stickiness: if this is a session resume, prefer the host where
+	// the session was paused. This keeps the LRU chunk cache warm and avoids
+	// cold GCS fetches on resume.
+	var host *Host
+	if req.SessionID != "" && s.db != nil {
+		var sessionHostID string
+		var status string
+		err := s.db.QueryRowContext(ctx,
+			`SELECT host_id, status FROM session_snapshots WHERE session_id = $1`,
+			req.SessionID).Scan(&sessionHostID, &status)
+		if err == nil && status == "suspended" && sessionHostID != "" {
+			for _, h := range eligible {
+				if h.ID == sessionHostID {
+					host = h
+					s.logger.WithFields(logrus.Fields{
+						"session_id": req.SessionID,
+						"host_id":    sessionHostID,
+					}).Info("Session sticky routing: using original host")
+					if s.metricsClient != nil {
+						s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionResumeRouting, telemetry.Labels{
+							telemetry.LabelRouting: telemetry.RoutingSameHost,
+						})
+					}
+					break
+				}
+			}
+			if host == nil {
+				s.logger.WithFields(logrus.Fields{
+					"session_id":      req.SessionID,
+					"original_host":   sessionHostID,
+					"available_hosts": len(eligible),
+				}).Warn("Session sticky host not available, falling back to best-fit")
+				if s.metricsClient != nil {
+					s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionResumeRouting, telemetry.Labels{
+						telemetry.LabelRouting: telemetry.RoutingCrossHost,
+					})
+				}
+			}
+		}
+	}
+
+	// Fall back to workload-key cache affinity scoring
+	if host == nil {
+		host = s.selectBestHostForWorkloadKey(eligible, workloadKey)
+	}
 	if host == nil {
 		return nil, fmt.Errorf("no suitable host found")
 	}
@@ -145,12 +234,11 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		"grpc_address":  host.GRPCAddress,
 	}).Debug("Selected host")
 
-	// Connect to host agent
-	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// Connect to host agent (pooled connection)
+	conn, err := s.getHostConn(host.GRPCAddress)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to host %s: %w", host.GRPCAddress, err)
+		return nil, err
 	}
-	defer conn.Close()
 
 	// Create host agent client
 	client := pb.NewHostAgentClient(conn)
@@ -343,11 +431,10 @@ func (s *Scheduler) ReleaseRunner(ctx context.Context, runnerID string, destroy 
 	}
 
 	// Connect to host and release
-	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := s.getHostConn(host.GRPCAddress)
 	if err != nil {
-		return fmt.Errorf("failed to connect to host: %w", err)
+		return err
 	}
-	defer conn.Close()
 
 	client := pb.NewHostAgentClient(conn)
 	resp, err := client.ReleaseRunner(ctx, &pb.ReleaseRunnerRequest{
@@ -382,11 +469,10 @@ func (s *Scheduler) QuarantineRunner(ctx context.Context, runnerID, reason strin
 		return "", err
 	}
 
-	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := s.getHostConn(host.GRPCAddress)
 	if err != nil {
-		return "", fmt.Errorf("failed to connect to host: %w", err)
+		return "", err
 	}
-	defer conn.Close()
 
 	client := pb.NewHostAgentClient(conn)
 	resp, err := client.QuarantineRunner(ctx, &pb.QuarantineRunnerRequest{
@@ -421,11 +507,10 @@ func (s *Scheduler) UnquarantineRunner(ctx context.Context, runnerID string, unb
 		return err
 	}
 
-	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := s.getHostConn(host.GRPCAddress)
 	if err != nil {
-		return fmt.Errorf("failed to connect to host: %w", err)
+		return err
 	}
-	defer conn.Close()
 
 	client := pb.NewHostAgentClient(conn)
 	resp, err := client.UnquarantineRunner(ctx, &pb.UnquarantineRunnerRequest{

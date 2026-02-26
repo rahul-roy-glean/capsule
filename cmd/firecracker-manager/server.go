@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
@@ -11,14 +12,16 @@ import (
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
 )
 
 // HostAgentServer implements the HostAgent gRPC service
 type HostAgentServer struct {
 	pb.UnimplementedHostAgentServer
-	manager    *runner.Manager
-	chunkedMgr *runner.ChunkedManager // Optional, for chunked snapshot support
-	logger     *logrus.Entry
+	manager       *runner.Manager
+	chunkedMgr    *runner.ChunkedManager // Optional, for chunked snapshot support
+	metricsClient *telemetry.Client      // Optional, for GCP Cloud Monitoring
+	logger        *logrus.Entry
 }
 
 // NewHostAgentServer creates a new HostAgentServer
@@ -36,6 +39,11 @@ func NewHostAgentServerWithChunked(mgr *runner.Manager, chunkedMgr *runner.Chunk
 		chunkedMgr: chunkedMgr,
 		logger:     logger.WithField("service", "host-agent"),
 	}
+}
+
+// SetMetricsClient attaches a telemetry client for GCP Cloud Monitoring.
+func (s *HostAgentServer) SetMetricsClient(c *telemetry.Client) {
+	s.metricsClient = c
 }
 
 // AllocateRunner allocates a new runner
@@ -97,11 +105,36 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 
 		// Try to resume from session snapshot
 		if s.manager.SessionExists(allocReq.SessionID) {
+			resumeStart := time.Now()
 			r, err = s.manager.ResumeFromSession(ctx, allocReq.SessionID, allocReq.WorkloadKey)
+			resumeDuration := time.Since(resumeStart)
+
 			if err == nil {
 				resumed = true
+
+				// Determine routing type: GCS-backed or local
+				meta, _ := s.manager.GetSessionMetadata(allocReq.SessionID)
+				routing := telemetry.RoutingLocal
+				if meta != nil && meta.GCSManifestPath != "" {
+					routing = telemetry.RoutingGCS
+				}
+
+				if s.metricsClient != nil {
+					s.metricsClient.RecordDuration(ctx, telemetry.MetricSessionResumeDuration, resumeDuration, telemetry.Labels{
+						telemetry.LabelRouting: routing,
+					})
+					s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionResumeTotal, telemetry.Labels{
+						telemetry.LabelResult:  telemetry.ResultSuccess,
+						telemetry.LabelRouting: routing,
+					})
+				}
 			} else {
 				s.logger.WithError(err).Warn("Failed to resume from session, falling back to fresh allocation")
+				if s.metricsClient != nil {
+					s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionResumeTotal, telemetry.Labels{
+						telemetry.LabelResult: telemetry.ResultFailure,
+					})
+				}
 				err = nil // Reset error for fresh allocation
 			}
 		}
@@ -325,13 +358,28 @@ func (s *HostAgentServer) UnquarantineRunner(ctx context.Context, req *pb.Unquar
 func (s *HostAgentServer) PauseRunner(ctx context.Context, req *pb.PauseRunnerRequest) (*pb.PauseRunnerResponse, error) {
 	s.logger.WithField("runner_id", req.RunnerId).Info("PauseRunner request")
 
+	start := time.Now()
 	result, err := s.manager.PauseRunner(ctx, req.RunnerId)
+	duration := time.Since(start)
+
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to pause runner")
+		if s.metricsClient != nil {
+			s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionPauseTotal, telemetry.Labels{
+				telemetry.LabelResult: telemetry.ResultFailure,
+			})
+		}
 		return &pb.PauseRunnerResponse{
 			Success: false,
 			Error:   err.Error(),
 		}, nil
+	}
+
+	if s.metricsClient != nil {
+		s.metricsClient.RecordDuration(ctx, telemetry.MetricSessionPauseDuration, duration, nil)
+		s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionPauseTotal, telemetry.Labels{
+			telemetry.LabelResult: telemetry.ResultSuccess,
+		})
 	}
 
 	return &pb.PauseRunnerResponse{

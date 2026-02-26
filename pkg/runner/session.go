@@ -9,10 +9,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/uffd"
 )
 
@@ -59,6 +61,13 @@ type SessionMetadata struct {
 	// TTL config preserved across pause/resume
 	TTLSeconds int  `json:"ttl_seconds,omitempty"`
 	AutoPause  bool `json:"auto_pause,omitempty"`
+
+	// GCS-backed session fields (populated when SessionChunkBucket is configured).
+	// When GCSManifestPath is non-empty, ResumeFromSession uses UFFD-backed
+	// GCS chunk loading instead of the host-local LayeredHandler.
+	GCSManifestPath    string `json:"gcs_manifest_path,omitempty"`
+	GCSMemIndexObject  string `json:"gcs_mem_index_object,omitempty"`
+	GCSDiskIndexObject string `json:"gcs_disk_index_object,omitempty"`
 }
 
 // PauseRunner creates a diff snapshot of the runner's VM, saves session state,
@@ -148,6 +157,108 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 		MemoryMB:           runner.Resources.MemoryMB,
 		TTLSeconds:         runner.TTLSeconds,
 		AutoPause:          runner.AutoPause,
+	}
+
+	// GCS-backed upload: when sessionMemStore is configured, upload dirty mem
+	// diff chunks and VM state to GCS, producing a self-contained SnapshotManifest.
+	if m.sessionMemStore != nil {
+		gcsBase := fmt.Sprintf("%s/runner_state/%s", runner.WorkloadKey, runnerID)
+
+		uploader := snapshot.NewSessionChunkUploader(m.sessionMemStore, m.sessionDiskStore, m.logger.Logger)
+
+		// Load the base ChunkIndex for memory.
+		// Priority:
+		//   1. Previous session's GCS ChunkIndex (multi-pause chain)
+		//   2. Golden CI snapshot metadata converted to ChunkIndex
+		//   3. Empty base (all dirty pages treated as new)
+		var baseMemIndex *snapshot.ChunkIndex
+		if metadata.GCSMemIndexObject != "" {
+			// We have a previous session index — download it as the base so
+			// non-dirty chunks carry forward without re-upload.
+			prevIdx, dlErr := uploader.DownloadChunkIndex(ctx, metadata.GCSMemIndexObject)
+			if dlErr != nil {
+				m.logger.WithError(dlErr).Warn("Failed to download previous session ChunkIndex; falling back to golden base")
+			} else {
+				baseMemIndex = prevIdx
+			}
+		}
+		if baseMemIndex == nil && m.goldenChunkedMeta != nil {
+			baseMemIndex = snapshot.ChunkIndexFromMeta(m.goldenChunkedMeta)
+		}
+		if baseMemIndex == nil {
+			// Fallback: empty base — all dirty pages treated as new.
+			baseMemIndex = &snapshot.ChunkIndex{
+				Version:        "1",
+				CreatedAt:      time.Now(),
+				ChunkSizeBytes: snapshot.DefaultChunkSize,
+			}
+			baseMemIndex.CAS.Algo = "sha256"
+			baseMemIndex.CAS.Layout = "chunks/mem/{p0}/{hash}"
+			baseMemIndex.CAS.Kind = "mem"
+			baseMemIndex.Region.Name = "vm_memory"
+			baseMemIndex.Region.LogicalSizeBytes = int64(runner.Resources.MemoryMB) * 1024 * 1024
+			baseMemIndex.Region.Coverage = "sparse"
+			baseMemIndex.Region.DefaultFill = "zero"
+		}
+
+		newMemIndex, err := uploader.MergeAndUploadMem(ctx, memDiffFile, baseMemIndex)
+		if err != nil {
+			m.logger.WithError(err).Warn("GCS mem chunk upload failed; falling back to local-only session")
+		} else {
+			vmStateGCSPath := uploader.FullGCSPath(gcsBase + "/snapshot.state")
+
+			if uploadErr := uploader.UploadVMState(ctx, stateFile, vmStateGCSPath); uploadErr != nil {
+				m.logger.WithError(uploadErr).Warn("GCS vmstate upload failed; falling back to local-only session")
+			} else {
+				// Upload dirty FUSE disk chunks if available.
+				var newDiskIndex *snapshot.ChunkIndex
+				if m.getDirtyDiskChunks != nil && m.sessionDiskStore != nil && m.goldenChunkedMeta != nil {
+					dirtyDisk := m.getDirtyDiskChunks(runnerID)
+					if len(dirtyDisk) > 0 {
+						baseDiskIndex := buildBaseDiskIndex(m.goldenChunkedMeta)
+						diskIdx, diskErr := uploader.MergeAndUploadDisk(ctx, dirtyDisk, baseDiskIndex)
+						if diskErr != nil {
+							m.logger.WithError(diskErr).Warn("GCS disk chunk upload failed; disk not included in session")
+						} else {
+							newDiskIndex = diskIdx
+						}
+					}
+				}
+
+				snapshotID := uuid.New().String()
+				man := &snapshot.SnapshotManifest{
+					Version:     "1",
+					SnapshotID:  snapshotID,
+					CreatedAt:   time.Now(),
+					WorkloadKey: runner.WorkloadKey,
+				}
+				man.Firecracker.VMStateObject = vmStateGCSPath
+				man.Memory.Mode = "chunked"
+				man.Memory.TotalSizeBytes = baseMemIndex.Region.LogicalSizeBytes
+				man.Memory.ChunkIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
+				man.Integrity.Algo = "sha256"
+
+				if newDiskIndex != nil {
+					man.Disk.Mode = "chunked"
+					man.Disk.TotalSizeBytes = newDiskIndex.Region.LogicalSizeBytes
+					man.Disk.ChunkIndexObject = uploader.FullGCSPath(gcsBase + "/disk-chunked-metadata.json")
+				}
+
+				if writeErr := uploader.WriteManifest(ctx, gcsBase, man, newMemIndex, newDiskIndex); writeErr != nil {
+					m.logger.WithError(writeErr).Warn("GCS manifest write failed; falling back to local-only session")
+				} else {
+					metadata.GCSManifestPath = uploader.FullGCSPath(gcsBase + "/snapshot_manifest.json")
+					metadata.GCSMemIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
+					if newDiskIndex != nil {
+						metadata.GCSDiskIndexObject = uploader.FullGCSPath(gcsBase + "/disk-chunked-metadata.json")
+					}
+					m.logger.WithFields(logrus.Fields{
+						"runner_id":    runnerID,
+						"gcs_manifest": metadata.GCSManifestPath,
+					}).Info("Session uploaded to GCS successfully")
+				}
+			}
+		}
 	}
 	metadataBytes, _ := json.MarshalIndent(metadata, "", "  ")
 	if err := os.WriteFile(filepath.Join(sessionDir, "metadata.json"), metadataBytes, 0644); err != nil {
@@ -311,39 +422,136 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	overlayPath := metadata.RootfsPath
 	repoCacheUpperPath := metadata.RepoCacheUpperPath
 
-	// Build diff layer paths (oldest first)
-	var diffLayers []string
-	for i := 0; i < metadata.Layers; i++ {
-		layerPath := filepath.Join(sessionDir, fmt.Sprintf("layer_%d", i), "mem_diff.sparse")
-		if _, err := os.Stat(layerPath); err == nil {
-			diffLayers = append(diffLayers, layerPath)
-		}
-	}
-
-	// Latest layer's state file
-	latestStateFile := filepath.Join(sessionDir, fmt.Sprintf("layer_%d", metadata.Layers-1), "snapshot.state")
-
-	// Start layered UFFD handler
+	// Build the UFFD handler and state file path, using GCS-backed chunks when
+	// available (metadata.GCSManifestPath is set) or falling back to the local
+	// LayeredHandler (requires golden snapshot.mem on this host).
 	uffdSocketPath := filepath.Join(m.config.SocketDir, runnerID+"-uffd.sock")
-	uffdHandler, err := uffd.NewLayeredHandler(uffd.LayeredHandlerConfig{
-		SocketPath:    uffdSocketPath,
-		GoldenMemPath: snapshotPaths.Mem,
-		DiffLayers:    diffLayers,
-		Logger:        m.logger.Logger,
-	})
-	if err != nil {
-		m.mu.Lock()
-		m.cleanupNetworkOnly(runnerID, tap.Name)
-		m.mu.Unlock()
-		return nil, fmt.Errorf("failed to create layered UFFD handler: %w", err)
-	}
+	var uffdHandler uffdStopper
+	var latestStateFile string
 
-	if err := uffdHandler.Start(); err != nil {
-		uffdHandler.Stop()
-		m.mu.Lock()
-		m.cleanupNetworkOnly(runnerID, tap.Name)
-		m.mu.Unlock()
-		return nil, fmt.Errorf("failed to start UFFD handler: %w", err)
+	if metadata.GCSManifestPath != "" && m.sessionMemStore != nil {
+		// GCS-backed resume: download ChunkIndex, convert to ChunkedSnapshotMetadata,
+		// create a Handler that fetches pages lazily from GCS.
+		uploader := snapshot.NewSessionChunkUploader(m.sessionMemStore, m.sessionDiskStore, m.logger.Logger)
+
+		man, dlErr := uploader.DownloadManifest(ctx, metadata.GCSManifestPath)
+		if dlErr != nil {
+			m.mu.Lock()
+			m.cleanupNetworkOnly(runnerID, tap.Name)
+			m.mu.Unlock()
+			return nil, fmt.Errorf("failed to download session manifest: %w", dlErr)
+		}
+
+		memIdx, dlErr := uploader.DownloadChunkIndex(ctx, man.Memory.ChunkIndexObject)
+		if dlErr != nil {
+			m.mu.Lock()
+			m.cleanupNetworkOnly(runnerID, tap.Name)
+			m.mu.Unlock()
+			return nil, fmt.Errorf("failed to download mem chunk index: %w", dlErr)
+		}
+
+		chunkedMeta := snapshot.ChunkIndexToMetadata(memIdx)
+		gcsHandler, handlerErr := uffd.NewHandler(uffd.HandlerConfig{
+			SocketPath: uffdSocketPath,
+			ChunkStore: m.sessionMemStore,
+			Metadata:   chunkedMeta,
+			Logger:     m.logger.Logger,
+		})
+		if handlerErr != nil {
+			m.mu.Lock()
+			m.cleanupNetworkOnly(runnerID, tap.Name)
+			m.mu.Unlock()
+			return nil, fmt.Errorf("failed to create GCS UFFD handler: %w", handlerErr)
+		}
+		if startErr := gcsHandler.Start(); startErr != nil {
+			gcsHandler.Stop()
+			m.mu.Lock()
+			m.cleanupNetworkOnly(runnerID, tap.Name)
+			m.mu.Unlock()
+			return nil, fmt.Errorf("failed to start GCS UFFD handler: %w", startErr)
+		}
+		uffdHandler = gcsHandler
+
+		// Download the VM state file locally (Firecracker requires a local path).
+		localStateDir := filepath.Join(m.config.SocketDir, "session-state")
+		if mkdirErr := os.MkdirAll(localStateDir, 0755); mkdirErr != nil {
+			gcsHandler.Stop()
+			m.mu.Lock()
+			m.cleanupNetworkOnly(runnerID, tap.Name)
+			m.mu.Unlock()
+			return nil, fmt.Errorf("failed to create local state dir: %w", mkdirErr)
+		}
+		latestStateFile = filepath.Join(localStateDir, runnerID+".state")
+		if dlErr := uploader.DownloadVMState(ctx, man.Firecracker.VMStateObject, latestStateFile); dlErr != nil {
+			gcsHandler.Stop()
+			m.mu.Lock()
+			m.cleanupNetworkOnly(runnerID, tap.Name)
+			m.mu.Unlock()
+			return nil, fmt.Errorf("failed to download VM state from GCS: %w", dlErr)
+		}
+
+		// Set up FUSE disk for rootfs if the manifest includes a disk ChunkIndex.
+		if man.Disk.Mode == "chunked" && man.Disk.ChunkIndexObject != "" && m.setupFUSEDisk != nil {
+			diskIdx, diskDlErr := uploader.DownloadChunkIndex(ctx, man.Disk.ChunkIndexObject)
+			if diskDlErr != nil {
+				gcsHandler.Stop()
+				m.mu.Lock()
+				m.cleanupNetworkOnly(runnerID, tap.Name)
+				m.mu.Unlock()
+				return nil, fmt.Errorf("failed to download disk chunk index: %w", diskDlErr)
+			}
+
+			// Convert ChunkIndex extents to dense ChunkRef slice for FUSE.
+			diskRefs := snapshot.ChunkIndexToRefs(diskIdx)
+			fusePath, fuseErr := m.setupFUSEDisk(runnerID, diskRefs, diskIdx.Region.LogicalSizeBytes, diskIdx.ChunkSizeBytes)
+			if fuseErr != nil {
+				gcsHandler.Stop()
+				m.mu.Lock()
+				m.cleanupNetworkOnly(runnerID, tap.Name)
+				m.mu.Unlock()
+				return nil, fmt.Errorf("failed to setup FUSE disk for session resume: %w", fuseErr)
+			}
+			overlayPath = fusePath
+		}
+
+		m.logger.WithFields(logrus.Fields{
+			"session_id":  sessionID,
+			"gcs_vmstate": man.Firecracker.VMStateObject,
+			"rootfs":      overlayPath,
+		}).Info("Resuming from GCS-backed session (UFFD chunked)")
+	} else {
+		// Local fallback: LayeredHandler uses golden snapshot.mem on this host.
+		// Build diff layer paths (oldest first).
+		var diffLayers []string
+		for i := 0; i < metadata.Layers; i++ {
+			layerPath := filepath.Join(sessionDir, fmt.Sprintf("layer_%d", i), "mem_diff.sparse")
+			if _, err := os.Stat(layerPath); err == nil {
+				diffLayers = append(diffLayers, layerPath)
+			}
+		}
+
+		latestStateFile = filepath.Join(sessionDir, fmt.Sprintf("layer_%d", metadata.Layers-1), "snapshot.state")
+
+		layeredHandler, handlerErr := uffd.NewLayeredHandler(uffd.LayeredHandlerConfig{
+			SocketPath:    uffdSocketPath,
+			GoldenMemPath: snapshotPaths.Mem,
+			DiffLayers:    diffLayers,
+			Logger:        m.logger.Logger,
+		})
+		if handlerErr != nil {
+			m.mu.Lock()
+			m.cleanupNetworkOnly(runnerID, tap.Name)
+			m.mu.Unlock()
+			return nil, fmt.Errorf("failed to create layered UFFD handler: %w", handlerErr)
+		}
+		if startErr := layeredHandler.Start(); startErr != nil {
+			layeredHandler.Stop()
+			m.mu.Lock()
+			m.cleanupNetworkOnly(runnerID, tap.Name)
+			m.mu.Unlock()
+			return nil, fmt.Errorf("failed to start UFFD handler: %w", startErr)
+		}
+		uffdHandler = layeredHandler
 	}
 
 	// Set up network config
@@ -430,11 +638,11 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 
 	// Set up port forwarding for netns
 	if useNetNS && m.netnsNetwork != nil {
-		if err := m.netnsNetwork.ForwardPort(runnerID, 8080); err != nil {
-			m.logger.WithError(err).Warn("Failed to forward port 8080")
+		if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentHealthPort); err != nil {
+			m.logger.WithError(err).Warn("Failed to forward thaw-agent health port")
 		}
-		if err := m.netnsNetwork.ForwardPort(runnerID, 8081); err != nil {
-			m.logger.WithError(err).Warn("Failed to forward port 8081")
+		if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentDebugPort); err != nil {
+			m.logger.WithError(err).Warn("Failed to forward thaw-agent debug port")
 		}
 	}
 
@@ -507,6 +715,33 @@ func (m *Manager) cleanupNetworkOnly(runnerID, _ string) {
 		m.network.ReleaseTap(runnerID)
 	}
 	os.Remove(filepath.Join(m.config.SocketDir, runnerID+".sock"))
+}
+
+// buildBaseDiskIndex constructs a ChunkIndex for disk from golden CI metadata.
+func buildBaseDiskIndex(meta *snapshot.ChunkedSnapshotMetadata) *snapshot.ChunkIndex {
+	idx := &snapshot.ChunkIndex{
+		Version:        "1",
+		ChunkSizeBytes: meta.ChunkSize,
+	}
+	idx.CAS.Algo = "sha256"
+	idx.CAS.Layout = "chunks/disk/{p0}/{hash}"
+	idx.CAS.Kind = "disk"
+	idx.Region.Name = "vm_disk"
+	idx.Region.LogicalSizeBytes = meta.TotalDiskSize
+	idx.Region.Coverage = "sparse"
+	idx.Region.DefaultFill = "zero"
+	for _, ref := range meta.RootfsChunks {
+		if ref.Hash == snapshot.ZeroChunkHash {
+			continue
+		}
+		idx.Region.Extents = append(idx.Region.Extents, snapshot.ManifestChunkRef{
+			Offset:       ref.Offset,
+			Length:       ref.Size,
+			Hash:         ref.Hash,
+			StoredLength: ref.CompressedSize,
+		})
+	}
+	return idx
 }
 
 // IncrementActiveExecs atomically increments the active exec count for a runner.

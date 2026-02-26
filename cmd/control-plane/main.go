@@ -157,6 +157,9 @@ func main() {
 	hostRegistry := NewHostRegistry(db, logger)
 	snapshotManager := NewSnapshotManager(ctx, db, *gcsBucket, *gcsPrefix, gcpProjectVal, gcpZoneVal, logger)
 	scheduler := NewScheduler(hostRegistry, db, snapshotManager, logger)
+	if metricsClient != nil {
+		scheduler.SetMetricsClient(metricsClient)
+	}
 	jobQueue := NewJobQueue(db, scheduler, hostRegistry, logger)
 	snapshotConfigRegistry := NewSnapshotConfigRegistry(db, snapshotManager, logger)
 

@@ -2,8 +2,8 @@
 # Install prerequisites for local Firecracker development on a Linux host.
 # Run as root: sudo bash dev/setup-linux.sh
 #
-# This is the equivalent of lima.yaml's provision script, for use on
-# GCE instances or any Ubuntu/Debian Linux host with KVM.
+# Installs Go, Firecracker, Docker, Postgres, and configures KVM on
+# Ubuntu/Debian Linux hosts.
 set -eux
 
 export DEBIAN_FRONTEND=noninteractive
