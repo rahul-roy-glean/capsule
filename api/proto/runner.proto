@@ -178,9 +178,10 @@ message AllocateRunnerRequest {
   string github_runner_token = 7;
   string ci_runner_token = 8;     // Generic CI runner registration token
   string ci_system = 9;           // CI system identifier (e.g., "github-actions", "none")
-  string chunk_key = 10;          // Hash of snapshot commands; identifies which snapshot to boot
+  string workload_key = 10;       // Hash of snapshot commands; identifies which snapshot to boot
   StartCommand start_command = 11; // Optional: user service to start inside the VM
   string session_id = 12;         // optional: bind to session for pause/resume
+  string snapshot_version = 13;   // Explicit version to use; skips current-pointer.json lookup
 }
 
 // AllocateRunnerResponse
@@ -330,7 +331,7 @@ message PauseRunnerResponse {
 
 message ResumeRunnerRequest {
   string session_id = 1;
-  string chunk_key = 2;
+  string workload_key = 2;
 }
 
 message ResumeRunnerResponse {
