@@ -430,6 +430,9 @@ func main() {
 		hostAgentServer = NewHostAgentServer(mgr, logger)
 	}
 	pb.RegisterHostAgentServer(grpcServer, hostAgentServer)
+	if metricsClient != nil {
+		hostAgentServer.SetMetricsClient(metricsClient)
+	}
 
 	// Register health service
 	healthServer := health.NewServer()

@@ -14,6 +14,7 @@ import (
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
 )
 
 // Scheduler handles runner allocation across hosts
@@ -21,6 +22,7 @@ type Scheduler struct {
 	hostRegistry    *HostRegistry
 	db              *sql.DB
 	snapshotManager *SnapshotManager
+	metricsClient   *telemetry.Client
 	logger          *logrus.Entry
 }
 
@@ -32,6 +34,11 @@ func NewScheduler(hr *HostRegistry, db *sql.DB, sm *SnapshotManager, logger *log
 		snapshotManager: sm,
 		logger:          logger.WithField("component", "scheduler"),
 	}
+}
+
+// SetMetricsClient attaches a telemetry client for GCP Cloud Monitoring.
+func (s *Scheduler) SetMetricsClient(c *telemetry.Client) {
+	s.metricsClient = c
 }
 
 // AllocateRunnerRequest represents a request to allocate a runner
@@ -100,8 +107,51 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		return nil, fmt.Errorf("no available hosts")
 	}
 
-	// Score and select best host (with workload-key cache affinity)
-	host := s.selectBestHostForWorkloadKey(hosts, workloadKey)
+	// Session stickiness: if this is a session resume, prefer the host where
+	// the session was paused. This keeps the LRU chunk cache warm and avoids
+	// cold GCS fetches on resume.
+	var host *Host
+	if req.SessionID != "" && s.db != nil {
+		var sessionHostID string
+		var status string
+		err := s.db.QueryRowContext(ctx,
+			`SELECT host_id, status FROM session_snapshots WHERE session_id = $1`,
+			req.SessionID).Scan(&sessionHostID, &status)
+		if err == nil && status == "suspended" && sessionHostID != "" {
+			for _, h := range hosts {
+				if h.ID == sessionHostID {
+					host = h
+					s.logger.WithFields(logrus.Fields{
+						"session_id": req.SessionID,
+						"host_id":    sessionHostID,
+					}).Info("Session sticky routing: using original host")
+					if s.metricsClient != nil {
+						s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionResumeRouting, telemetry.Labels{
+							telemetry.LabelRouting: telemetry.RoutingSameHost,
+						})
+					}
+					break
+				}
+			}
+			if host == nil {
+				s.logger.WithFields(logrus.Fields{
+					"session_id":      req.SessionID,
+					"original_host":   sessionHostID,
+					"available_hosts": len(hosts),
+				}).Warn("Session sticky host not available, falling back to best-fit")
+				if s.metricsClient != nil {
+					s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionResumeRouting, telemetry.Labels{
+						telemetry.LabelRouting: telemetry.RoutingCrossHost,
+					})
+				}
+			}
+		}
+	}
+
+	// Fall back to workload-key cache affinity scoring
+	if host == nil {
+		host = s.selectBestHostForWorkloadKey(hosts, workloadKey)
+	}
 	if host == nil {
 		return nil, fmt.Errorf("no suitable host found")
 	}
