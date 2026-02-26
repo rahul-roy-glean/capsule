@@ -196,7 +196,7 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 			baseMemIndex.CAS.Layout = "chunks/mem/{p0}/{hash}"
 			baseMemIndex.CAS.Kind = "mem"
 			baseMemIndex.Region.Name = "vm_memory"
-			baseMemIndex.Region.LogicalSizeBytes = int64(m.config.MemoryMBPerRunner) * 1024 * 1024
+			baseMemIndex.Region.LogicalSizeBytes = int64(runner.Resources.MemoryMB) * 1024 * 1024
 			baseMemIndex.Region.Coverage = "sparse"
 			baseMemIndex.Region.DefaultFill = "zero"
 		}

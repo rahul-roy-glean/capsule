@@ -195,8 +195,8 @@ func BenchmarkParseUffdMsg_HeapBuffer(b *testing.B) {
 func BenchmarkFindMapping_3Regions(b *testing.B) {
 	h := &Handler{
 		mappings: []GuestRegionUFFDMapping{
-			{BaseHostVirtAddr: 0x100000, Size: 0x80000000, Offset: 0},             // 2GB
-			{BaseHostVirtAddr: 0x80100000, Size: 0x80000000, Offset: 0x80000000},  // 2GB
+			{BaseHostVirtAddr: 0x100000, Size: 0x80000000, Offset: 0},              // 2GB
+			{BaseHostVirtAddr: 0x80100000, Size: 0x80000000, Offset: 0x80000000},   // 2GB
 			{BaseHostVirtAddr: 0x100100000, Size: 0x80000000, Offset: 0x100000000}, // 2GB
 		},
 	}

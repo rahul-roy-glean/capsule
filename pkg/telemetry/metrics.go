@@ -154,8 +154,8 @@ const (
 	// Session resume routing labels
 	RoutingSameHost  = "same_host"
 	RoutingCrossHost = "cross_host"
-	RoutingLocal     = "local"  // local LayeredHandler, no GCS
-	RoutingGCS       = "gcs"    // GCS-backed UFFD resume
+	RoutingLocal     = "local" // local LayeredHandler, no GCS
+	RoutingGCS       = "gcs"   // GCS-backed UFFD resume
 )
 
 // Labels is a convenience type for metric labels.

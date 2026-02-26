@@ -31,9 +31,9 @@ type SnapshotManifest struct {
 // It is self-contained: only dirty/non-zero extents are listed; holes are implicit zeros.
 // Lives at {gcsBase}/chunked-metadata.json (mem) or {gcsBase}/disk-chunked-metadata.json (disk).
 type ChunkIndex struct {
-	Version        string    `json:"version"`
-	CreatedAt      time.Time `json:"created_at"`
-	CAS            struct {
+	Version   string    `json:"version"`
+	CreatedAt time.Time `json:"created_at"`
+	CAS       struct {
 		Algo   string `json:"algo"`
 		Layout string `json:"layout"` // e.g. "chunks/mem/{p0}/{hash}"
 		Kind   string `json:"kind"`   // "mem" or "disk"
