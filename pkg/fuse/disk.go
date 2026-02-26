@@ -26,6 +26,7 @@ import (
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
@@ -33,7 +34,15 @@ import (
 const (
 	// Eager prefetching constants
 	numChunksToEagerFetch = 64
+
+	// saveDirtyChunksConcurrency controls parallel uploads in SaveDirtyChunks.
+	saveDirtyChunksConcurrency = 16
 )
+
+// zeroChunkBuf is a shared read-only zero-filled buffer used for zero-chunk
+// reads. Avoids allocating a new 4MB buffer on every read of an unwritten chunk.
+// Safe to share because FUSE Read only copies from this buffer.
+var zeroChunkBuf = make([]byte, snapshot.DefaultChunkSize)
 
 // ChunkedDisk implements a FUSE filesystem backed by chunked snapshots
 type ChunkedDisk struct {
@@ -346,15 +355,15 @@ func (d *ChunkedDisk) getChunkData(chunkIdx int) ([]byte, error) {
 
 	// Fetch from chunk store
 	if chunkIdx >= len(d.chunks) {
-		// Beyond stored chunks, return zeros
-		return make([]byte, d.chunkSize), nil
+		// Beyond stored chunks, return shared zero buffer (read-only)
+		return zeroChunkBuf[:d.chunkSize], nil
 	}
 
 	chunk := &d.chunks[chunkIdx]
 
-	// Zero chunk (skipped during build) — return zeros without a network fetch
+	// Zero chunk (skipped during build) — return shared zero buffer without a network fetch
 	if chunk.IsZeroChunk() {
-		return make([]byte, chunk.Size), nil
+		return zeroChunkBuf[:chunk.Size], nil
 	}
 
 	atomic.AddUint64(&d.chunkReads, 1)
@@ -409,19 +418,15 @@ func (d *ChunkedDisk) getOrCreateDirtyChunk(chunkIdx int) ([]byte, error) {
 	return dirty, nil
 }
 
-// GetDirtyChunks returns all dirty chunks for incremental snapshot upload
+// GetDirtyChunks returns all dirty chunks for incremental snapshot upload.
+// This atomically swaps out the dirty map, so the caller owns the returned
+// data exclusively. This is safe because GetDirtyChunks is called during
+// pause when the VM is already stopped and no FUSE writes are in flight.
 func (d *ChunkedDisk) GetDirtyChunks() map[int][]byte {
-	d.dirtyChunksMu.RLock()
-	defer d.dirtyChunksMu.RUnlock()
-
-	// Return a copy to avoid concurrent modification issues
-	result := make(map[int][]byte, len(d.dirtyChunks))
-	for idx, data := range d.dirtyChunks {
-		dataCopy := make([]byte, len(data))
-		copy(dataCopy, data)
-		result[idx] = dataCopy
-	}
-
+	d.dirtyChunksMu.Lock()
+	result := d.dirtyChunks
+	d.dirtyChunks = make(map[int][]byte)
+	d.dirtyChunksMu.Unlock()
 	return result
 }
 
@@ -495,7 +500,8 @@ func (d *ChunkedDisk) PrefetchHead(ctx context.Context, n int) error {
 	return nil
 }
 
-// SaveDirtyChunks uploads dirty chunks to the chunk store and returns updated chunk refs
+// SaveDirtyChunks uploads dirty chunks to the chunk store in parallel and
+// returns updated chunk refs.
 func (d *ChunkedDisk) SaveDirtyChunks(ctx context.Context) ([]snapshot.ChunkRef, error) {
 	d.dirtyChunksMu.RLock()
 	defer d.dirtyChunksMu.RUnlock()
@@ -517,20 +523,38 @@ func (d *ChunkedDisk) SaveDirtyChunks(ctx context.Context) ([]snapshot.ChunkRef,
 		}
 	}
 
-	// Upload dirty chunks and update refs
+	// Upload dirty chunks in parallel
+	type result struct {
+		idx            int
+		hash           string
+		compressedSize int64
+	}
+	results := make(chan result, len(d.dirtyChunks))
+
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(saveDirtyChunksConcurrency)
+
 	for idx, data := range d.dirtyChunks {
-		hash, compressedSize, err := d.chunkStore.StoreChunk(ctx, data)
-		if err != nil {
-			return nil, fmt.Errorf("failed to store dirty chunk %d: %w", idx, err)
-		}
+		i := idx
+		chunkData := data
+		g.Go(func() error {
+			hash, compressedSize, err := d.chunkStore.StoreChunk(gCtx, chunkData)
+			if err != nil {
+				return fmt.Errorf("failed to store dirty chunk %d: %w", i, err)
+			}
+			results <- result{idx: i, hash: hash, compressedSize: compressedSize}
+			return nil
+		})
+	}
 
-		newChunks[idx].Hash = hash
-		newChunks[idx].CompressedSize = compressedSize
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	close(results)
 
-		d.logger.WithFields(logrus.Fields{
-			"chunk_idx": idx,
-			"hash":      hash[:12],
-		}).Debug("Uploaded dirty chunk")
+	for r := range results {
+		newChunks[r.idx].Hash = r.hash
+		newChunks[r.idx].CompressedSize = r.compressedSize
 	}
 
 	return newChunks, nil
