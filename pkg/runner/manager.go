@@ -145,12 +145,12 @@ func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logge
 
 	// Check if git-cache image exists (created by startup script)
 	gitCacheImg := ""
-	if cfg.GitCacheEnabled && cfg.GitCacheImagePath != "" {
-		if _, err := os.Stat(cfg.GitCacheImagePath); err == nil {
-			gitCacheImg = cfg.GitCacheImagePath
+	if cfg.Bazel.GitCacheEnabled && cfg.Bazel.GitCacheImagePath != "" {
+		if _, err := os.Stat(cfg.Bazel.GitCacheImagePath); err == nil {
+			gitCacheImg = cfg.Bazel.GitCacheImagePath
 			logger.WithField("git_cache_image", gitCacheImg).Info("Git-cache image found")
 		} else {
-			logger.WithField("git_cache_image", cfg.GitCacheImagePath).Warn("Git-cache enabled but image not found")
+			logger.WithField("git_cache_image", cfg.Bazel.GitCacheImagePath).Warn("Git-cache enabled but image not found")
 		}
 	}
 
@@ -437,7 +437,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		m.cleanupRunner(runnerID, tap.Name, overlayPath, "")
 		return nil, fmt.Errorf("failed to create repo-cache-upper directory: %w", err)
 	}
-	if err := createExt4Image(repoCacheUpperPath, m.config.RepoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
+	if err := createExt4Image(repoCacheUpperPath, m.config.Bazel.RepoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
 		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
 		return nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
 	}
@@ -663,7 +663,7 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 	data.Latest.Meta.Environment = m.config.Environment
 	data.Latest.Meta.JobID = req.RequestID
 	data.Latest.Meta.CurrentTime = time.Now().UTC().Format(time.RFC3339)
-	data.Latest.Buildbarn.CertsMountPath = m.config.BuildbarnCertsMountPath
+	data.Latest.Buildbarn.CertsMountPath = m.config.Bazel.BuildbarnCertsMountPath
 	data.Latest.Network.IP = netCfg.IP
 	data.Latest.Network.Gateway = netCfg.Gateway
 	data.Latest.Network.Netmask = netCfg.Netmask
@@ -688,9 +688,9 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 			if runnerURL != "" {
 				data.Latest.Job.Repo = runnerURL
 			}
-			if len(m.config.GitHubRunnerLabels) > 0 {
+			if len(m.config.CI.GitHubRunnerLabels) > 0 {
 				labels := make(map[string]string)
-				for _, label := range m.config.GitHubRunnerLabels {
+				for _, label := range m.config.CI.GitHubRunnerLabels {
 					labels[label] = "true"
 				}
 				data.Latest.Job.Labels = labels
@@ -700,32 +700,32 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 	}
 
 	// Git cache configuration
-	if m.config.GitCacheEnabled && m.gitCacheImage != "" {
+	if m.config.Bazel.GitCacheEnabled && m.gitCacheImage != "" {
 		data.Latest.GitCache.Enabled = true
-		data.Latest.GitCache.MountPath = m.config.GitCacheMountPath
-		data.Latest.GitCache.RepoMappings = m.config.GitCacheRepoMappings
+		data.Latest.GitCache.MountPath = m.config.Bazel.GitCacheMountPath
+		data.Latest.GitCache.RepoMappings = m.config.Bazel.GitCacheRepoMappings
 
 		// Ensure Job.Repo is set for git-cache workspace setup
 		// This is needed even if GitHub runner registration fails
-		if data.Latest.Job.Repo == "" && m.config.GitHubRepo != "" {
-			data.Latest.Job.Repo = m.config.GitHubRepo
+		if data.Latest.Job.Repo == "" && m.config.CI.GitHubRepo != "" {
+			data.Latest.Job.Repo = m.config.CI.GitHubRepo
 		}
 
 		// Set pre-cloned path (where repo was cloned during warmup, baked into snapshot)
 		// This allows thaw-agent to create symlinks from workspace to pre-cloned repo
-		if m.config.GitCachePreClonedPath != "" {
-			data.Latest.GitCache.PreClonedPath = m.config.GitCachePreClonedPath
+		if m.config.Bazel.GitCachePreClonedPath != "" {
+			data.Latest.GitCache.PreClonedPath = m.config.Bazel.GitCachePreClonedPath
 		}
 		// Note: if PreClonedPath is not set, thaw-agent will derive it from job.repo
 	}
 
 	// Always set WorkspaceDir - needed for pre-cloned repo symlink even without git-cache
-	if m.config.GitCacheWorkspaceDir != "" {
-		data.Latest.GitCache.WorkspaceDir = m.config.GitCacheWorkspaceDir
+	if m.config.Bazel.GitCacheWorkspaceDir != "" {
+		data.Latest.GitCache.WorkspaceDir = m.config.Bazel.GitCacheWorkspaceDir
 	}
 
 	// Runner configuration
-	data.Latest.Runner.Ephemeral = m.config.GitHubRunnerEphemeral
+	data.Latest.Runner.Ephemeral = m.config.CI.GitHubRunnerEphemeral
 	if m.ciAdapter != nil {
 		data.Latest.Runner.CISystem = m.ciAdapter.Name()
 	}
@@ -1329,12 +1329,12 @@ func ensureCredentialsImage(cfg HostConfig, log *logrus.Entry) (string, error) {
 	}
 
 	imgPath := filepath.Join(sharedDir, "credentials.img")
-	sizeMB := cfg.BuildbarnCertsImageSizeMB
+	sizeMB := cfg.Bazel.BuildbarnCertsImageSizeMB
 	if sizeMB <= 0 {
 		sizeMB = 32
 	}
 
-	seedDir := cfg.BuildbarnCertsDir
+	seedDir := cfg.Bazel.BuildbarnCertsDir
 	if seedDir == "" {
 		if _, err := os.Stat(imgPath); err == nil {
 			return imgPath, nil
@@ -1727,7 +1727,7 @@ func (m *Manager) getRunnerVMStats(ctx context.Context, runnerID string) (*VMSta
 	memoryUsage := int64(runner.Resources.MemoryMB) * 1024 * 1024
 
 	// Disk usage would be the overlay size, but for now just estimate
-	diskUsage := int64(m.config.RepoCacheUpperSizeGB) * 1024 * 1024 * 1024
+	diskUsage := int64(m.config.Bazel.RepoCacheUpperSizeGB) * 1024 * 1024 * 1024
 
 	return &VMStats{
 		MemoryUsageBytes: memoryUsage,

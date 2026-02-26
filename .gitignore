@@ -1,4 +1,4 @@
-# Binaries
+# Pre-built binaries (use `make build` instead)
 bin/
 *.exe
 *.dll
@@ -16,7 +16,7 @@ bin/
 /snapshot-converter
 /thaw-agent
 
-# Build outputs
+# Build outputs (use `make build-rootfs`)
 images/microvm/output/
 *.img
 *.bin
@@ -94,4 +94,7 @@ __pycache__/
 
 /deploy/terraform/tfplan
 
-.claude/settings.local.json
+.claude/
+
+# Terraform provider cache (non-glob match for root terraform dir)
+deploy/terraform/.terraform/

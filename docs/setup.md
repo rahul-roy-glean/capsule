@@ -1,4 +1,6 @@
-Deploy bazel-firecracker on scio-ci
+NOTE: Replace placeholder values (YOUR_*, your-*) with your actual configuration.
+
+Deploy bazel-firecracker on your-project-id
 
 Phase 1: Local prerequisites
 
@@ -13,10 +15,10 @@ helm version
 # Auth
 gcloud auth login
 gcloud auth application-default login
-gcloud config set project scio-ci
+gcloud config set project your-project-id
 
 # Pull latest code (with all our fixes)
-cd /Users/blr/work/bazel-firecracker
+cd $PROJECT_ROOT
 git pull origin main
 
 # Verify everything builds
@@ -24,14 +26,14 @@ make build
 
 Phase 2: Terraform state bucket
 
-gcloud storage buckets create gs://bazel-firecracker-tfstate-scio-ci \
---project=scio-ci --location=us-central1 --uniform-bucket-level-access
+gcloud storage buckets create gs://your-bucket-name-tfstate \
+--project=your-project-id --location=us-central1 --uniform-bucket-level-access
 
 Phase 3: Store GitHub App private key
 
 # Upload your existing GitHub App private key
 gcloud secrets create github-app-key \
---project=scio-ci \
+--project=your-project-id \
 --data-file=/path/to/your-github-app-private-key.pem
 
 Phase 4: Terraform
@@ -42,20 +44,20 @@ echo "SAVE THIS: $DB_PASSWORD"
 cd deploy/terraform
 
 terraform init \
--backend-config="bucket=bazel-firecracker-tfstate-scio-ci" \
+-backend-config="bucket=your-bucket-name-tfstate" \
 -backend-config="prefix=firecracker-bazel-runner"
 
 terraform plan \
--var="project_id=scio-ci" \
+-var="project_id=your-project-id" \
 -var="db_password=$DB_PASSWORD" \
 -var="github_runner_enabled=true" \
--var="github_repo=askscio/scio" \
--var="github_org=askscio" \
--var="github_app_id=YOUR_APP_ID" \
--var="github_app_secret=projects/scio-ci/secrets/github-app-key/versions/latest" \
+-var="github_repo=your-org/your-repo" \
+-var="github_org=your-org" \
+-var="github_app_id=YOUR_GITHUB_APP_ID" \
+-var="github_app_secret=projects/your-project-id/secrets/github-app-key/versions/latest" \
 -var="github_runner_labels=self-hosted,firecracker,Linux,X64,bazel" \
 -var="git_cache_enabled=true" \
--var='git_cache_repos={"github.com/askscio/scio":"scio"}' \
+-var='git_cache_repos={"github.com/your-org/your-repo":"your-repo"}' \
 -out=tfplan
 
 terraform apply tfplan
@@ -71,7 +73,7 @@ SQL_INSTANCE=$(terraform output -raw sql_instance_name)
 SQL_IP=$(terraform output -raw sql_private_ip)
 
 # Option A: Cloud SQL Auth Proxy (from your local machine)
-cloud-sql-proxy "scio-ci:us-central1:${SQL_INSTANCE}" &
+cloud-sql-proxy "your-project-id:us-central1:${SQL_INSTANCE}" &
 psql "host=127.0.0.1 port=5432 user=postgres password=$DB_PASSWORD dbname=postgres" \
 -f ../database/schema.sql
 
@@ -82,32 +84,32 @@ psql "host=127.0.0.1 port=5432 user=postgres password=$DB_PASSWORD dbname=postgr
 
 Phase 6: Build and push control plane container
 
-cd /Users/blr/work/bazel-firecracker
+cd $PROJECT_ROOT
 
 # Configure Docker for Artifact Registry
 gcloud auth configure-docker us-central1-docker.pkg.dev
 
 # Build (--platform linux/amd64 is already in the Makefile)
-make docker-build PROJECT_ID=scio-ci
-make docker-push PROJECT_ID=scio-ci
+make docker-build PROJECT_ID=your-project-id
+make docker-push PROJECT_ID=your-project-id
 
 Phase 7: Deploy control plane to GKE
 
 # Get GKE credentials
 GKE_CLUSTER=$(terraform -chdir=deploy/terraform output -raw gke_cluster_name)
 gcloud container clusters get-credentials "$GKE_CLUSTER" \
---region=us-central1 --project=scio-ci
+--region=us-central1 --project=your-project-id
 
-# Deploy via Helm (override the hardcoded scio-ci values explicitly)
+# Deploy via Helm (override the hardcoded your-project-id values explicitly)
 SQL_IP=$(terraform -chdir=deploy/terraform output -raw sql_private_ip)
 
 helm upgrade --install control-plane deploy/helm/firecracker-runner/ \
---set image.repository=us-central1-docker.pkg.dev/scio-ci/firecracker/control-plane \
+--set image.repository=us-central1-docker.pkg.dev/your-project-id/firecracker/control-plane \
 --set image.tag=latest \
 --set config.dbHost="$SQL_IP" \
 --set config.dbPassword="$DB_PASSWORD" \
---set config.gcsBucket=scio-ci-firecracker-snapshots \
---set config.gcpProject=scio-ci
+--set config.gcsBucket=your-bucket-name \
+--set config.gcpProject=your-project-id
 
 # Verify
 kubectl get pods
@@ -115,7 +117,7 @@ kubectl logs -l app=control-plane --tail=20
 
 Phase 8: Build microVM rootfs
 
-cd /Users/blr/work/bazel-firecracker
+cd $PROJECT_ROOT
 
 # This uses Docker, works on macOS
 make rootfs
@@ -127,10 +129,10 @@ ls -lh images/microvm/output/
 Phase 9: Build Packer host image
 
 # Cross-compiles firecracker-manager for linux/amd64, then runs Packer
-make release-host-image PROJECT_ID=scio-ci
+make release-host-image PROJECT_ID=your-project-id
 
 # Verify image was created
-gcloud compute images list --project=scio-ci \
+gcloud compute images list --project=your-project-id \
 --filter="family:firecracker-host" --format="table(name,creationTimestamp)"
 
 Phase 10: Create initial Firecracker snapshot
@@ -139,7 +141,7 @@ This must run on a Linux VM with KVM (nested virtualization).
 
 # Create a temporary builder VM
 gcloud compute instances create snapshot-builder-vm \
---project=scio-ci \
+--project=your-project-id \
 --zone=us-central1-a \
 --machine-type=n2-standard-8 \
 --image-family=ubuntu-2204-lts \
@@ -151,7 +153,7 @@ gcloud compute instances create snapshot-builder-vm \
 --subnet=$(terraform -chdir=deploy/terraform output -raw hosts_subnet_name)
 
 # SSH in
-gcloud compute ssh snapshot-builder-vm --zone=us-central1-a --project=scio-ci
+gcloud compute ssh snapshot-builder-vm --zone=us-central1-a --project=your-project-id
 
 On the VM:
 # Install Go
@@ -161,7 +163,7 @@ sudo tar -C /usr/local -xzf go1.24.0.linux-amd64.tar.gz
 export PATH=$PATH:/usr/local/go/bin
 
 # Clone repo and build
-git clone https://github.com/rahul-roy-glean/bazel-firecracker.git
+git clone https://github.com/your-org/bazel-firecracker.git
 cd bazel-firecracker
 go build -o snapshot-builder ./cmd/snapshot-builder
 
@@ -185,23 +187,23 @@ sudo iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -j MASQUERADE
 
 # Run snapshot builder
 sudo ./snapshot-builder \
---repo-url=https://github.com/askscio/scio \
+--repo-url=https://github.com/your-org/your-repo \
 --repo-branch=main \
 --kernel-path=/opt/firecracker/kernel.bin \
 --rootfs-path=/opt/firecracker/rootfs.img \
---gcs-bucket=scio-ci-firecracker-snapshots \
---github-app-id=YOUR_APP_ID \
---github-app-secret=projects/scio-ci/secrets/github-app-key/versions/latest
+--gcs-bucket=your-bucket-name \
+--github-app-id=YOUR_GITHUB_APP_ID \
+--github-app-secret=projects/your-project-id/secrets/github-app-key/versions/latest
 
 # Verify upload
-gsutil ls gs://scio-ci-firecracker-snapshots/current/
+gsutil ls gs://your-bucket-name/current/
 
 Exit the VM:
 exit
 
 # Clean up builder VM
 gcloud compute instances delete snapshot-builder-vm \
---zone=us-central1-a --project=scio-ci --quiet
+--zone=us-central1-a --project=your-project-id --quiet
 
 Phase 11: (Optional) Build data snapshot for fast host boot
 
@@ -209,20 +211,20 @@ Skip this for initial deployment. Without it, hosts download from GCS on first b
 
 Phase 12: Start hosts via MIG rolling update
 
-make mig-rolling-update PROJECT_ID=scio-ci
+make mig-rolling-update PROJECT_ID=your-project-id
 
 # Watch hosts come up
 watch -n5 gcloud compute instance-groups managed list-instances \
-fc-runner-dev-hosts --region=us-central1 --project=scio-ci
+fc-runner-dev-hosts --region=us-central1 --project=your-project-id
 
 Phase 13: Verify hosts
 
 # Wait for instances to show RUNNING, then SSH to one
 INSTANCE=$(gcloud compute instance-groups managed list-instances \
-fc-runner-dev-hosts --region=us-central1 --project=scio-ci \
+fc-runner-dev-hosts --region=us-central1 --project=your-project-id \
 --format="value(instance)" --limit=1)
 
-gcloud compute ssh "$INSTANCE" --zone=us-central1-a --project=scio-ci
+gcloud compute ssh "$INSTANCE" --zone=us-central1-a --project=your-project-id
 
 # On the host:
 sudo journalctl -u firecracker-manager --no-pager -n 50
@@ -237,7 +239,7 @@ Phase 14: Configure GitHub webhook
 CP_IP=$(kubectl get svc control-plane -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 echo "Webhook URL: http://${CP_IP}:8080/webhook/github"
 
-In GitHub (askscio/scio):
+In GitHub (your-org/your-repo):
 1. Settings -> Webhooks -> Add webhook
 2. Payload URL: http://<CP_IP>:8080/webhook/github
 3. Content type: application/json
@@ -245,7 +247,7 @@ In GitHub (askscio/scio):
 
 Phase 15: End-to-end test
 
-Create a test workflow in askscio/scio:
+Create a test workflow in your-org/your-repo:
 
 # .github/workflows/firecracker-test.yaml
 name: Firecracker Test
@@ -282,7 +284,7 @@ If things go wrong, check in this order:
 ├─────────────────────────┼───────────────────────────────────────────────────────────────────┤
 │ Manager won't start     │ journalctl -u firecracker-manager -- look for snapshot/KVM errors │
 ├─────────────────────────┼───────────────────────────────────────────────────────────────────┤
-│ No snapshots available  │ gsutil ls gs://scio-ci-firecracker-snapshots/current/             │
+│ No snapshots available  │ gsutil ls gs://your-bucket-name/current/                          │
 ├─────────────────────────┼───────────────────────────────────────────────────────────────────┤
 │ VM boots but no network │ SSH to host, check ip addr show fcbr0 and iptables -t nat -L      │
 ├─────────────────────────┼───────────────────────────────────────────────────────────────────┤
