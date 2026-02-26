@@ -28,6 +28,11 @@ type Config struct {
 	// InstanceName is the VM instance name (for host metrics)
 	InstanceName string
 
+	// InstanceID is the numeric GCE instance ID. Required for gce_instance
+	// monitored resource labels; if empty, InstanceName is used as a fallback
+	// (works for dev but may cause "resource not found" errors in prod).
+	InstanceID string
+
 	// Zone is the GCP zone
 	Zone string
 

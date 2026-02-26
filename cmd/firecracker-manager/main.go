@@ -427,6 +427,7 @@ func main() {
 		Component:    "firecracker-manager",
 		Environment:  *environment,
 		InstanceName: instanceName,
+		InstanceID:   hostID, // numeric GCE instance ID from instance/id metadata
 		Zone:         zone,
 	}
 	// Override from metadata if set

@@ -595,12 +595,26 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		"chunk_key":  req.ChunkKey,
 	}).Info("Manual runner allocation request")
 
+	allocStart := time.Now()
+
 	resp, err := s.scheduler.AllocateRunner(r.Context(), AllocateRunnerRequest{
 		RequestID: req.RequestID,
 		ChunkKey:  req.ChunkKey,
 		Labels:    req.Labels,
 		SessionID: req.SessionID,
 	})
+	if s.metricsClient != nil {
+		result := telemetry.ResultSuccess
+		if err != nil {
+			result = telemetry.ResultFailure
+		}
+		s.metricsClient.RecordDuration(r.Context(), telemetry.MetricCPAllocationLatency, time.Since(allocStart), telemetry.Labels{
+			telemetry.LabelResult: result,
+		})
+		s.metricsClient.IncrementCounter(r.Context(), telemetry.MetricCPAllocations, telemetry.Labels{
+			telemetry.LabelResult: result,
+		})
+	}
 	if err != nil {
 		s.logger.WithError(err).Error("Manual allocation failed")
 		w.Header().Set("Content-Type", "application/json")
@@ -940,8 +954,13 @@ func (s *ControlPlaneServer) HandleGetSnapshots(w http.ResponseWriter, r *http.R
 }
 
 func (s *ControlPlaneServer) HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	handler := NewGitHubWebhookHandler(s.scheduler, s.hostRegistry, s.jobQueue, s.logger.Logger)
 	handler.HandleWebhook(w, r)
+	if s.metricsClient != nil {
+		s.metricsClient.RecordDuration(r.Context(), telemetry.MetricCPWebhookLatency, time.Since(start), nil)
+		s.metricsClient.IncrementCounter(r.Context(), telemetry.MetricCPWebhookRequests, nil)
+	}
 }
 
 // HandleGetDesiredVersions returns the desired snapshot versions for a host.
