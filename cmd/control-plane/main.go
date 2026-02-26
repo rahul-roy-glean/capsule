@@ -381,11 +381,11 @@ func initSchema(db *sql.DB) error {
 			auto_rollout           BOOLEAN DEFAULT true,
 			created_at             TIMESTAMP DEFAULT NOW()
 		)`,
-		// Rename chunk_key -> workload_key in existing tables (idempotent: no-op if column doesn't exist)
-		`DO $$ BEGIN ALTER TABLE snapshot_configs RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; END $$`,
-		`DO $$ BEGIN ALTER TABLE snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; END $$`,
-		`DO $$ BEGIN ALTER TABLE version_assignments RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; END $$`,
-		`DO $$ BEGIN ALTER TABLE session_snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; END $$`,
+		// Rename chunk_key -> workload_key in existing tables (idempotent: no-op if column doesn't exist or target already exists)
+		`DO $$ BEGIN ALTER TABLE snapshot_configs RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
+		`DO $$ BEGIN ALTER TABLE snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
+		`DO $$ BEGIN ALTER TABLE version_assignments RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
+		`DO $$ BEGIN ALTER TABLE session_snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
 		// Add workload_key column to snapshots (for fresh installs without chunk_key)
 		`ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshots_workload_key ON snapshots(workload_key)`,
@@ -437,6 +437,15 @@ func initSchema(db *sql.DB) error {
 		// Add workload_key column to runners
 		`ALTER TABLE runners ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_runners_workload_key ON runners(workload_key)`,
+		// Incremental commands for snapshot configs
+		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS incremental_commands JSONB DEFAULT '[]'`,
+		// Tier-based resource sizing
+		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS tier VARCHAR(8) DEFAULT 'm'`,
+		// Host resource tracking for bin-packing scheduler
+		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS total_cpu_millicores INT DEFAULT 0`,
+		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS used_cpu_millicores INT DEFAULT 0`,
+		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS total_memory_mb INT DEFAULT 0`,
+		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS used_memory_mb INT DEFAULT 0`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil {
@@ -473,10 +482,9 @@ func (s *ControlPlaneServer) RegisterHost(ctx context.Context, req *pb.RegisterH
 	s.logger.WithFields(logrus.Fields{
 		"instance_name": req.InstanceName,
 		"zone":          req.Zone,
-		"total_slots":   req.TotalSlots,
 	}).Info("RegisterHost request")
 
-	host, err := s.hostRegistry.RegisterHost(ctx, req.InstanceName, req.Zone, int(req.TotalSlots), "")
+	host, err := s.hostRegistry.RegisterHost(ctx, req.InstanceName, req.Zone, 0, "")
 	if err != nil {
 		return nil, err
 	}
@@ -489,22 +497,13 @@ func (s *ControlPlaneServer) RegisterHost(ctx context.Context, req *pb.RegisterH
 	}, nil
 }
 
-// Heartbeat implements the gRPC Heartbeat method
+// Heartbeat implements the gRPC Heartbeat method.
+// The HTTP heartbeat endpoint (UpsertHeartbeat) is the primary path;
+// this gRPC method is kept for proto interface compatibility.
 func (s *ControlPlaneServer) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
 	if req.Status == nil {
 		return &pb.HeartbeatResponse{Acknowledged: false}, nil
 	}
-
-	err := s.hostRegistry.UpdateHeartbeat(ctx, req.HostId, HostStatus{
-		UsedSlots:       int(req.Status.UsedSlots),
-		IdleRunners:     int(req.Status.IdleRunners),
-		BusyRunners:     int(req.Status.BusyRunners),
-		SnapshotVersion: req.Status.SnapshotVersion,
-	})
-	if err != nil {
-		s.logger.WithError(err).Warn("Failed to update heartbeat")
-	}
-
 	return &pb.HeartbeatResponse{
 		Acknowledged: true,
 	}, nil
@@ -907,17 +906,19 @@ func (s *ControlPlaneServer) HandleGetHosts(w http.ResponseWriter, r *http.Reque
 
 	for _, h := range hosts {
 		hostList = append(hostList, map[string]interface{}{
-			"id":               h.ID,
-			"instance_name":    h.InstanceName,
-			"zone":             h.Zone,
-			"status":           h.Status,
-			"total_slots":      h.TotalSlots,
-			"used_slots":       h.UsedSlots,
-			"idle_runners":     h.IdleRunners,
-			"busy_runners":     h.BusyRunners,
-			"snapshot_version": h.SnapshotVersion,
-			"last_heartbeat":   h.LastHeartbeat,
-			"grpc_address":     h.GRPCAddress,
+			"id":                   h.ID,
+			"instance_name":        h.InstanceName,
+			"zone":                 h.Zone,
+			"status":               h.Status,
+			"idle_runners":         h.IdleRunners,
+			"busy_runners":         h.BusyRunners,
+			"snapshot_version":     h.SnapshotVersion,
+			"last_heartbeat":       h.LastHeartbeat,
+			"grpc_address":         h.GRPCAddress,
+			"total_cpu_millicores": h.TotalCPUMillicores,
+			"used_cpu_millicores":  h.UsedCPUMillicores,
+			"total_memory_mb":      h.TotalMemoryMB,
+			"used_memory_mb":       h.UsedMemoryMB,
 		})
 	}
 
@@ -1053,8 +1054,10 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 			totalRunners := int64(0)
 			totalIdle := int64(0)
 			totalBusy := int64(0)
-			fleetSlotsTotal := int64(0)
-			fleetSlotsUsed := int64(0)
+			fleetCPUTotal := int64(0)
+			fleetCPUUsed := int64(0)
+			fleetMemTotal := int64(0)
+			fleetMemUsed := int64(0)
 			activeHosts := int64(0)
 
 			for _, h := range hosts {
@@ -1063,12 +1066,13 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 				totalIdle += int64(h.IdleRunners)
 				totalBusy += int64(h.BusyRunners)
 				if h.Status == "ready" {
-					fleetSlotsTotal += int64(h.TotalSlots)
-					fleetSlotsUsed += int64(h.UsedSlots)
+					fleetCPUTotal += int64(h.TotalCPUMillicores)
+					fleetCPUUsed += int64(h.UsedCPUMillicores)
+					fleetMemTotal += int64(h.TotalMemoryMB)
+					fleetMemUsed += int64(h.UsedMemoryMB)
 					activeHosts++
 				}
 			}
-			fleetSlotsFree := fleetSlotsTotal - fleetSlotsUsed
 
 			// Record host counts by status
 			for status, count := range statusCounts {
@@ -1088,17 +1092,13 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 				telemetry.LabelStatus: "busy",
 			})
 
-			// Record fleet slot metrics — primary autoscaler signal.
-			mc.RecordInt(ctx, telemetry.MetricCPFleetSlotsTotal, fleetSlotsTotal, nil)
-			mc.RecordInt(ctx, telemetry.MetricCPFleetSlotsUsed, fleetSlotsUsed, nil)
-			mc.RecordInt(ctx, telemetry.MetricCPFleetSlotsFree, fleetSlotsFree, nil)
-			// free_slots_per_host: GCP autoscaler scales out when this drops below target.
-			// Use 0 when there are no active hosts (signals immediate scale-out need).
-			freeSlotsPer := int64(0)
-			if activeHosts > 0 {
-				freeSlotsPer = fleetSlotsFree / activeHosts
-			}
-			mc.RecordInt(ctx, telemetry.MetricCPFleetFreeSlotsPer, freeSlotsPer, nil)
+			// Record fleet resource metrics
+			mc.RecordInt(ctx, telemetry.MetricCPFleetCPUTotal, fleetCPUTotal, nil)
+			mc.RecordInt(ctx, telemetry.MetricCPFleetCPUUsed, fleetCPUUsed, nil)
+			mc.RecordInt(ctx, telemetry.MetricCPFleetCPUFree, fleetCPUTotal-fleetCPUUsed, nil)
+			mc.RecordInt(ctx, telemetry.MetricCPFleetMemTotal, fleetMemTotal, nil)
+			mc.RecordInt(ctx, telemetry.MetricCPFleetMemUsed, fleetMemUsed, nil)
+			mc.RecordInt(ctx, telemetry.MetricCPFleetMemFree, fleetMemTotal-fleetMemUsed, nil)
 
 			// Record queue depth
 			mc.RecordInt(ctx, telemetry.MetricCPQueueDepth, int64(sched.GetQueueDepth()), nil)

@@ -19,6 +19,7 @@ import (
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/tiers"
 )
 
 // Snapshot represents a snapshot version
@@ -501,7 +502,7 @@ shutdown -h now
 // launchSnapshotBuilderVMForKey creates a GCE instance to build a snapshot from commands JSON.
 // When incremental is true, the builder passes --incremental to the snapshot-builder binary
 // and runs on a spot (preemptible) instance. Full builds use on-demand instances.
-func (sm *SnapshotManager) launchSnapshotBuilderVMForKey(ctx context.Context, instanceName, workloadKey, commandsJSON, version, githubAppID, githubAppSecret string, incremental bool) error {
+func (sm *SnapshotManager) launchSnapshotBuilderVMForKey(ctx context.Context, instanceName, workloadKey, commandsJSON, version, githubAppID, githubAppSecret string, incremental bool, incrementalCommandsJSON string, snapshotVCPUs, snapshotMemoryMB int) error {
 	if sm.gcpProject == "" {
 		sm.logger.Warn("GCP project not configured, skipping VM launch")
 		return nil
@@ -529,6 +530,10 @@ func (sm *SnapshotManager) launchSnapshotBuilderVMForKey(ctx context.Context, in
 	incrementalFlag := ""
 	if incremental {
 		incrementalFlag = "--incremental"
+	}
+	incrementalCommandsFlag := ""
+	if incrementalCommandsJSON != "" {
+		incrementalCommandsFlag = fmt.Sprintf("--incremental-commands='%s'", incrementalCommandsJSON)
 	}
 
 	startupScript := fmt.Sprintf(`#!/bin/bash
@@ -573,14 +578,21 @@ fi
     --gcs-prefix="%s" \
     --output-dir=/tmp/snapshot \
     --log-level=info \
-	--vcpus=2 \
-	--memory-mb=3072 \
-    %s %s
+	--vcpus=%d \
+	--memory-mb=%d \
+    --version="%s" \
+    %s %s %s
 echo "Snapshot build complete, shutting down..."
 shutdown -h now
-`, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, workloadKey, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, commandsJSON, sm.gcsBucket, sm.gcsPrefix, githubFlags, incrementalFlag)
+`, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, workloadKey, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, commandsJSON, sm.gcsBucket, sm.gcsPrefix, snapshotVCPUs, snapshotMemoryMB, version, githubFlags, incrementalFlag, incrementalCommandsFlag)
 
-	machineType := fmt.Sprintf("zones/%s/machineTypes/n2-standard-8", sm.gcpZone)
+	// Size the builder VM to fit the snapshot build: give it at least 8 vCPUs
+	// or the snapshot's vCPUs + 2 headroom, whichever is larger.
+	builderVCPUs := 8
+	if snapshotVCPUs+2 > builderVCPUs {
+		builderVCPUs = snapshotVCPUs + 2
+	}
+	machineType := fmt.Sprintf("zones/%s/machineTypes/n2-standard-%d", sm.gcpZone, builderVCPUs)
 	sourceImage := fmt.Sprintf("projects/%s/global/images/family/%s", sm.gcpProject, "firecracker-host")
 	if sm.builderImage != "" {
 		sourceImage = sm.builderImage
@@ -1206,7 +1218,7 @@ func (sm *SnapshotManager) SetActiveSnapshotForKey(ctx context.Context, workload
 // When incremental is true, the builder restores from the previous snapshot and
 // the VM runs on a spot (preemptible) instance to save costs. Full builds use
 // on-demand instances since they are long-running and expensive to retry.
-func (sm *SnapshotManager) TriggerSnapshotBuildForKey(ctx context.Context, workloadKey string, commands []snapshot.SnapshotCommand, githubAppID, githubAppSecret string, incremental bool) (string, error) {
+func (sm *SnapshotManager) TriggerSnapshotBuildForKey(ctx context.Context, workloadKey string, commands []snapshot.SnapshotCommand, incrementalCommands []snapshot.SnapshotCommand, githubAppID, githubAppSecret string, incremental bool) (string, error) {
 	version := fmt.Sprintf("v%s-%s", time.Now().Format("20060102-150405"), workloadKey)
 
 	sm.logger.WithFields(logrus.Fields{
@@ -1228,9 +1240,29 @@ func (sm *SnapshotManager) TriggerSnapshotBuildForKey(ctx context.Context, workl
 		return "", err
 	}
 
+	// Pass incremental commands to the VM when doing an incremental build
+	var incrementalCommandsJSON string
+	if incremental && len(incrementalCommands) > 0 {
+		b, _ := json.Marshal(incrementalCommands)
+		incrementalCommandsJSON = string(b)
+	}
+
+	// Look up tier for this workload key to determine snapshot vCPUs/memory
+	snapshotVCPUs := 4 // default "m" tier
+	snapshotMemoryMB := 4096
+	if sm.db != nil {
+		var tierName sql.NullString
+		if err := sm.db.QueryRowContext(ctx, `SELECT tier FROM snapshot_configs WHERE workload_key = $1`, workloadKey).Scan(&tierName); err == nil && tierName.Valid && tierName.String != "" {
+			if t, err := tiers.Lookup(tierName.String); err == nil {
+				snapshotVCPUs = t.VCPUs
+				snapshotMemoryMB = t.MemoryMB
+			}
+		}
+	}
+
 	// Launch snapshot builder VM
 	instanceName := fmt.Sprintf("snapshot-builder-%s", version)
-	if err := sm.launchSnapshotBuilderVMForKey(ctx, instanceName, workloadKey, string(commandsJSON), version, githubAppID, githubAppSecret, incremental); err != nil {
+	if err := sm.launchSnapshotBuilderVMForKey(ctx, instanceName, workloadKey, string(commandsJSON), version, githubAppID, githubAppSecret, incremental, incrementalCommandsJSON, snapshotVCPUs, snapshotMemoryMB); err != nil {
 		sm.UpdateSnapshotStatus(ctx, version, "failed")
 		return "", fmt.Errorf("failed to launch snapshot builder: %w", err)
 	}

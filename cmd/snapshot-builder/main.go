@@ -23,6 +23,7 @@ import (
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/fuse"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/github"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/uffd"
 )
 
 var (
@@ -44,10 +45,12 @@ var (
 	memBackend           = flag.String("mem-backend", "chunked", "Memory backend for chunked snapshots: 'chunked' (UFFD lazy loading via MemChunks, default) or 'file' (upload snapshot.mem as single blob)")
 	gcsPrefix            = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
 
-	incremental = flag.Bool("incremental", false, "Restore from previous snapshot for incremental rebuild")
+	incremental     = flag.Bool("incremental", false, "Restore from previous snapshot for incremental rebuild")
+	versionOverride = flag.String("version", "", "Snapshot version string (if empty, auto-generated from timestamp + workload key)")
 
 	// Snapshot commands (replaces --repo-slug/--repo-url/--repo-branch/--bazel-version)
-	snapshotCommands = flag.String("snapshot-commands", "", "JSON array of SnapshotCommand describing what to bake into the snapshot (required)")
+	snapshotCommands       = flag.String("snapshot-commands", "", "JSON array of SnapshotCommand describing what to bake into the snapshot (required)")
+	incrementalCommandsStr = flag.String("incremental-commands", "", "JSON commands to use for incremental builds (overrides --snapshot-commands when --incremental is set)")
 
 	// GitHub App authentication for private repos (used when git-cache is not available)
 	githubAppID     = flag.String("github-app-id", "", "GitHub App ID for private repo access")
@@ -145,11 +148,22 @@ func main() {
 	if len(commands) == 0 {
 		log.Fatal("--snapshot-commands must be non-empty")
 	}
+	// Parse incremental commands if provided
+	var incrCommands []snapshot.SnapshotCommand
+	if *incrementalCommandsStr != "" {
+		if err := json.Unmarshal([]byte(*incrementalCommandsStr), &incrCommands); err != nil {
+			log.WithError(err).Warn("invalid --incremental-commands, ignoring")
+		}
+	}
+
 	workloadKey := snapshot.ComputeWorkloadKey(commands)
 	log.WithField("workload_key", workloadKey).Info("Computed workload key from snapshot commands")
 
-	// Generate version string
-	version := fmt.Sprintf("v%s-%s", time.Now().Format("20060102-150405"), workloadKey)
+	// Generate version string (use override from control plane if provided)
+	version := *versionOverride
+	if version == "" {
+		version = fmt.Sprintf("v%s-%s", time.Now().Format("20060102-150405"), workloadKey)
+	}
 	log.WithField("version", version).Info("Building snapshot")
 
 	// Create output directory
@@ -178,6 +192,7 @@ func main() {
 	var vm *firecracker.VM
 	var fuseDisk *fuse.ChunkedDisk
 	var fuseSeedDisk *fuse.ChunkedDisk
+	var incrUffdHandler *uffd.Handler
 
 	// Paths used by both paths and for final snapshot creation
 	workingRootfs := filepath.Join(*outputDir, "rootfs.img")
@@ -191,10 +206,14 @@ func main() {
 	if *incremental {
 		log.Info("Attempting incremental restore from previous snapshot...")
 		var incrementalErr error
-		vm, fuseDisk, fuseSeedDisk, incrementalErr = restoreFromPreviousSnapshot(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken, commands)
+		vm, fuseDisk, fuseSeedDisk, incrUffdHandler, incrementalErr = restoreFromPreviousSnapshot(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken, commands, incrCommands)
 		if incrementalErr != nil {
 			log.WithError(incrementalErr).Warn("Incremental restore failed, falling back to cold boot")
 			vm = nil
+			if incrUffdHandler != nil {
+				incrUffdHandler.Stop()
+				incrUffdHandler = nil
+			}
 			if fuseDisk != nil {
 				fuseDisk.Unmount()
 				fuseDisk = nil
@@ -358,6 +377,12 @@ func main() {
 
 	// Stop VM
 	vm.Stop()
+
+	// Stop UFFD handler (if used for incremental restore)
+	if incrUffdHandler != nil {
+		incrUffdHandler.Stop()
+		incrUffdHandler = nil
+	}
 
 	// If we used FUSE-backed rootfs (incremental), save dirty chunks to the chunk store.
 	// This uploads only the changed chunks. We store the updated chunk refs for use
@@ -1022,12 +1047,13 @@ func restoreFromPreviousSnapshot(
 	vmID, tapName, guestMAC, bootArgs string,
 	gitToken, gcpAccessToken string,
 	commands []snapshot.SnapshotCommand,
-) (*firecracker.VM, *fuse.ChunkedDisk, *fuse.ChunkedDisk, error) {
+	incrementalCommands []snapshot.SnapshotCommand,
+) (*firecracker.VM, *fuse.ChunkedDisk, *fuse.ChunkedDisk, *uffd.Handler, error) {
 	// Use a subdirectory for incremental working files to avoid colliding
 	// with the symlinks in /tmp/snapshot/ that Firecracker expects.
 	incrDir := filepath.Join(*outputDir, "incremental")
 	if err := os.MkdirAll(incrDir, 0755); err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create incremental dir: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to create incremental dir: %w", err)
 	}
 
 	// 1. Create chunk store and load previous chunked metadata
@@ -1039,7 +1065,7 @@ func restoreFromPreviousSnapshot(
 		Logger:         logger,
 	})
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create chunk store: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to create chunk store: %w", err)
 	}
 
 	// Resolve the current version via pointer file, then load its metadata.
@@ -1047,12 +1073,12 @@ func restoreFromPreviousSnapshot(
 	currentVersion, err := chunkStore.ReadCurrentVersion(ctx, wk)
 	if err != nil {
 		chunkStore.Close()
-		return nil, nil, nil, fmt.Errorf("failed to resolve current version for workload key %q: %w", wk, err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to resolve current version for workload key %q: %w", wk, err)
 	}
 	chunkedMeta, err := chunkStore.LoadChunkedMetadata(ctx, wk, currentVersion)
 	if err != nil {
 		chunkStore.Close()
-		return nil, nil, nil, fmt.Errorf("no previous chunked snapshot found for version %s: %w", currentVersion, err)
+		return nil, nil, nil, nil, fmt.Errorf("no previous chunked snapshot found for version %s: %w", currentVersion, err)
 	}
 	log.WithFields(logrus.Fields{
 		"version":       chunkedMeta.Version,
@@ -1067,7 +1093,7 @@ func restoreFromPreviousSnapshot(
 		currentHash, err := hashFile(*rootfsPath)
 		if err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, fmt.Errorf("failed to hash current rootfs: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("failed to hash current rootfs: %w", err)
 		}
 		if currentHash != chunkedMeta.RootfsSourceHash {
 			chunkStore.Close()
@@ -1075,25 +1101,30 @@ func restoreFromPreviousSnapshot(
 				"previous": chunkedMeta.RootfsSourceHash[:12],
 				"current":  currentHash[:12],
 			}).Warn("Base rootfs has changed, incremental restore would use stale image")
-			return nil, nil, nil, fmt.Errorf("rootfs changed (previous=%s current=%s)", chunkedMeta.RootfsSourceHash[:12], currentHash[:12])
+			return nil, nil, nil, nil, fmt.Errorf("rootfs changed (previous=%s current=%s)", chunkedMeta.RootfsSourceHash[:12], currentHash[:12])
 		}
 		log.WithField("hash", currentHash[:12]).Info("Base rootfs unchanged, safe to restore incrementally")
 	} else {
 		chunkStore.Close()
-		return nil, nil, nil, fmt.Errorf("previous snapshot has no rootfs source hash, cannot verify rootfs unchanged — forcing cold boot")
+		return nil, nil, nil, nil, fmt.Errorf("previous snapshot has no rootfs source hash, cannot verify rootfs unchanged — forcing cold boot")
 	}
 
-	// 2. Download snapshot.mem (raw file)
+	// 2. Prepare memory restore: prefer MemFilePath (file-backed), fall back to
+	//    UFFD lazy loading from MemChunks.
 	localMemPath := filepath.Join(incrDir, "snapshot.mem")
+	useUFFD := false
 	if chunkedMeta.MemFilePath != "" {
 		log.Info("Downloading previous snapshot memory file...")
 		if err := chunkStore.DownloadRawFile(ctx, chunkedMeta.MemFilePath, localMemPath); err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, fmt.Errorf("failed to download memory file: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("failed to download memory file: %w", err)
 		}
+	} else if len(chunkedMeta.MemChunks) > 0 {
+		log.Info("No mem_file_path, will use UFFD lazy loading from memory chunks")
+		useUFFD = true
 	} else {
 		chunkStore.Close()
-		return nil, nil, nil, fmt.Errorf("previous snapshot has no mem_file_path (UFFD-only snapshots not supported for incremental)")
+		return nil, nil, nil, nil, fmt.Errorf("previous snapshot has no mem_file_path and no mem_chunks")
 	}
 
 	// 3. Fetch state chunk and write to local file
@@ -1102,11 +1133,11 @@ func restoreFromPreviousSnapshot(
 		stateData, err := chunkStore.GetChunk(ctx, chunkedMeta.StateHash)
 		if err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, fmt.Errorf("failed to fetch vmstate chunk: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("failed to fetch vmstate chunk: %w", err)
 		}
 		if err := os.WriteFile(localStatePath, stateData, 0644); err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, fmt.Errorf("failed to write vmstate: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("failed to write vmstate: %w", err)
 		}
 		log.WithField("state_size", len(stateData)).Info("Fetched previous vmstate")
 	}
@@ -1117,18 +1148,18 @@ func restoreFromPreviousSnapshot(
 		kernelData, err := chunkStore.GetChunk(ctx, chunkedMeta.KernelHash)
 		if err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, fmt.Errorf("failed to fetch kernel chunk: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("failed to fetch kernel chunk: %w", err)
 		}
 		if err := os.WriteFile(localKernelPath, kernelData, 0644); err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, fmt.Errorf("failed to write kernel: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("failed to write kernel: %w", err)
 		}
 		log.WithField("kernel_size", len(kernelData)).Info("Fetched kernel from chunk store")
 	} else {
 		// Fall back to local kernel
 		if err := copyFile(*kernelPath, localKernelPath); err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, fmt.Errorf("failed to copy kernel: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("failed to copy kernel: %w", err)
 		}
 	}
 
@@ -1144,11 +1175,11 @@ func restoreFromPreviousSnapshot(
 	})
 	if err != nil {
 		chunkStore.Close()
-		return nil, nil, nil, fmt.Errorf("failed to create FUSE rootfs disk: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to create FUSE rootfs disk: %w", err)
 	}
 	if err := fuseDisk.Mount(); err != nil {
 		chunkStore.Close()
-		return nil, nil, nil, fmt.Errorf("failed to mount FUSE rootfs: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to mount FUSE rootfs: %w", err)
 	}
 	log.Info("Mounted FUSE-backed rootfs from previous snapshot")
 
@@ -1176,12 +1207,12 @@ func restoreFromPreviousSnapshot(
 		if err != nil {
 			fuseDisk.Unmount()
 			chunkStore.Close()
-			return nil, nil, nil, fmt.Errorf("failed to create FUSE seed disk: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("failed to create FUSE seed disk: %w", err)
 		}
 		if err := fuseSeedDisk.Mount(); err != nil {
 			fuseDisk.Unmount()
 			chunkStore.Close()
-			return nil, nil, nil, fmt.Errorf("failed to mount FUSE seed disk: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("failed to mount FUSE seed disk: %w", err)
 		}
 		repoCacheSeedPath = fuseSeedDisk.DiskImagePath()
 		log.Info("Mounted FUSE-backed repo-cache-seed from previous snapshot")
@@ -1191,7 +1222,7 @@ func restoreFromPreviousSnapshot(
 		if err := createExt4Image(repoCacheSeedPath, *repoCacheSeedSizeGB, "BAZEL_REPO_SEED"); err != nil {
 			fuseDisk.Unmount()
 			chunkStore.Close()
-			return nil, nil, nil, fmt.Errorf("failed to create repo-cache-seed image: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("failed to create repo-cache-seed image: %w", err)
 		}
 	}
 
@@ -1203,7 +1234,7 @@ func restoreFromPreviousSnapshot(
 			fuseSeedDisk.Unmount()
 		}
 		chunkStore.Close()
-		return nil, nil, nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
 	}
 
 	credentialsPath := filepath.Join(incrDir, "credentials.img")
@@ -1213,7 +1244,7 @@ func restoreFromPreviousSnapshot(
 			fuseSeedDisk.Unmount()
 		}
 		chunkStore.Close()
-		return nil, nil, nil, fmt.Errorf("failed to create credentials image: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to create credentials image: %w", err)
 	}
 
 	gitCachePath := filepath.Join(incrDir, "git-cache.img")
@@ -1223,7 +1254,7 @@ func restoreFromPreviousSnapshot(
 			fuseSeedDisk.Unmount()
 		}
 		chunkStore.Close()
-		return nil, nil, nil, fmt.Errorf("failed to create git-cache image: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to create git-cache image: %w", err)
 	}
 
 	// 8. Create symlinks in /tmp/snapshot/ so Firecracker can find drives at baked-in paths
@@ -1233,7 +1264,7 @@ func restoreFromPreviousSnapshot(
 			fuseSeedDisk.Unmount()
 		}
 		chunkStore.Close()
-		return nil, nil, nil, fmt.Errorf("failed to create snapshot symlink dir: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to create snapshot symlink dir: %w", err)
 	}
 
 	symlinks := []struct {
@@ -1259,7 +1290,7 @@ func restoreFromPreviousSnapshot(
 				fuseSeedDisk.Unmount()
 			}
 			chunkStore.Close()
-			return nil, nil, nil, fmt.Errorf("symlink %s -> %s: %w", linkPath, s.target, err)
+			return nil, nil, nil, nil, fmt.Errorf("symlink %s -> %s: %w", linkPath, s.target, err)
 		}
 		createdSymlinks = append(createdSymlinks, linkPath)
 		log.WithFields(logrus.Fields{
@@ -1299,21 +1330,96 @@ func restoreFromPreviousSnapshot(
 			fuseSeedDisk.Unmount()
 		}
 		chunkStore.Close()
-		return nil, nil, nil, fmt.Errorf("failed to create VM: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
-	log.Info("Restoring VM from previous snapshot...")
-	if err := vm.RestoreFromSnapshot(ctx, localStatePath, localMemPath, false); err != nil {
-		for _, c := range createdSymlinks {
-			os.Remove(c)
+	// Restore VM: use UFFD lazy memory if no MemFilePath, otherwise file-backed.
+	var uffdHandler *uffd.Handler
+	if useUFFD {
+		// Create a dedicated memory chunk store for UFFD.
+		memChunkStore, err := snapshot.NewChunkStore(ctx, snapshot.ChunkStoreConfig{
+			GCSBucket:      *gcsBucket,
+			GCSPrefix:      *gcsPrefix,
+			LocalCachePath: filepath.Join(incrDir, "chunk-cache"),
+			ChunkSubdir:    "mem",
+			Logger:         logger,
+		})
+		if err != nil {
+			for _, c := range createdSymlinks {
+				os.Remove(c)
+			}
+			vm.Stop()
+			fuseDisk.Unmount()
+			if fuseSeedDisk != nil {
+				fuseSeedDisk.Unmount()
+			}
+			chunkStore.Close()
+			return nil, nil, nil, nil, fmt.Errorf("failed to create mem chunk store: %w", err)
 		}
-		vm.Stop()
-		fuseDisk.Unmount()
-		if fuseSeedDisk != nil {
-			fuseSeedDisk.Unmount()
+
+		uffdSocketPath := filepath.Join(incrDir, "uffd.sock")
+		uffdHandler, err = uffd.NewHandler(uffd.HandlerConfig{
+			SocketPath: uffdSocketPath,
+			ChunkStore: memChunkStore,
+			Metadata:   chunkedMeta,
+			Logger:     logger,
+		})
+		if err != nil {
+			memChunkStore.Close()
+			for _, c := range createdSymlinks {
+				os.Remove(c)
+			}
+			vm.Stop()
+			fuseDisk.Unmount()
+			if fuseSeedDisk != nil {
+				fuseSeedDisk.Unmount()
+			}
+			chunkStore.Close()
+			return nil, nil, nil, nil, fmt.Errorf("failed to create UFFD handler: %w", err)
 		}
-		chunkStore.Close()
-		return nil, nil, nil, fmt.Errorf("failed to restore from snapshot: %w", err)
+		if err := uffdHandler.Start(); err != nil {
+			memChunkStore.Close()
+			for _, c := range createdSymlinks {
+				os.Remove(c)
+			}
+			vm.Stop()
+			fuseDisk.Unmount()
+			if fuseSeedDisk != nil {
+				fuseSeedDisk.Unmount()
+			}
+			chunkStore.Close()
+			return nil, nil, nil, nil, fmt.Errorf("failed to start UFFD handler: %w", err)
+		}
+
+		log.Info("Restoring VM from previous snapshot with UFFD...")
+		if err := vm.RestoreFromSnapshotWithUFFD(ctx, localStatePath, uffdSocketPath, false); err != nil {
+			uffdHandler.Stop()
+			memChunkStore.Close()
+			for _, c := range createdSymlinks {
+				os.Remove(c)
+			}
+			vm.Stop()
+			fuseDisk.Unmount()
+			if fuseSeedDisk != nil {
+				fuseSeedDisk.Unmount()
+			}
+			chunkStore.Close()
+			return nil, nil, nil, nil, fmt.Errorf("failed to restore from snapshot with UFFD: %w", err)
+		}
+	} else {
+		log.Info("Restoring VM from previous snapshot (file-backed memory)...")
+		if err := vm.RestoreFromSnapshot(ctx, localStatePath, localMemPath, false); err != nil {
+			for _, c := range createdSymlinks {
+				os.Remove(c)
+			}
+			vm.Stop()
+			fuseDisk.Unmount()
+			if fuseSeedDisk != nil {
+				fuseSeedDisk.Unmount()
+			}
+			chunkStore.Close()
+			return nil, nil, nil, nil, fmt.Errorf("failed to restore from snapshot: %w", err)
+		}
 	}
 
 	// 10. Clean up symlinks (Firecracker holds fds after LoadSnapshot)
@@ -1324,7 +1430,13 @@ func restoreFromPreviousSnapshot(
 	// 11. Set MMDS with mode=warmup and new runner_id
 	newRunnerID := fmt.Sprintf("snapshot-builder-incr-%s", uuid.New().String()[:8])
 	gitCacheEnabled := false
-	mmdsData := buildWarmupMMDS(commands, gitToken, gcpAccessToken, gitCacheEnabled)
+	// Use incremental commands for MMDS if provided, otherwise fall back to full commands
+	mmdsCommands := commands
+	if len(incrementalCommands) > 0 {
+		mmdsCommands = incrementalCommands
+		log.WithField("incremental_commands_count", len(incrementalCommands)).Info("Using incremental commands for MMDS")
+	}
+	mmdsData := buildWarmupMMDS(mmdsCommands, gitToken, gcpAccessToken, gitCacheEnabled)
 	// Override runner_id so thaw-agent detects the change and re-runs warmup
 	mmdsData["latest"].(map[string]interface{})["meta"].(map[string]interface{})["runner_id"] = newRunnerID
 
@@ -1335,7 +1447,7 @@ func restoreFromPreviousSnapshot(
 			fuseSeedDisk.Unmount()
 		}
 		chunkStore.Close()
-		return nil, nil, nil, fmt.Errorf("failed to set MMDS data: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to set MMDS data: %w", err)
 	}
 
 	// 12. Resume VM — thaw-agent wakes up, detects runner_id change, re-runs warmup
@@ -1347,11 +1459,11 @@ func restoreFromPreviousSnapshot(
 			fuseSeedDisk.Unmount()
 		}
 		chunkStore.Close()
-		return nil, nil, nil, fmt.Errorf("failed to resume VM: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to resume VM: %w", err)
 	}
 
 	log.Info("VM restored and resumed for incremental warmup")
-	return vm, fuseDisk, fuseSeedDisk, nil
+	return vm, fuseDisk, fuseSeedDisk, uffdHandler, nil
 }
 
 // buildWarmupMMDS creates the MMDS data for warmup mode.

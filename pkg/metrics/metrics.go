@@ -7,14 +7,24 @@ import (
 
 var (
 	// Host metrics
-	hostTotalSlots = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "firecracker_host_total_slots",
-		Help: "Total runner slots on this host",
+	hostCPUTotal = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "firecracker_host_cpu_millicores_total",
+		Help: "Total CPU millicores on this host",
 	})
 
-	hostUsedSlots = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "firecracker_host_used_slots",
-		Help: "Used runner slots on this host",
+	hostCPUUsed = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "firecracker_host_cpu_millicores_used",
+		Help: "Used CPU millicores on this host",
+	})
+
+	hostMemTotal = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "firecracker_host_memory_mb_total",
+		Help: "Total memory MB on this host",
+	})
+
+	hostMemUsed = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "firecracker_host_memory_mb_used",
+		Help: "Used memory MB on this host",
 	})
 
 	hostIdleRunners = promauto.NewGauge(prometheus.GaugeOpts{
@@ -34,9 +44,11 @@ func RegisterHostMetrics() {
 }
 
 // UpdateHostMetrics updates the host-level metrics
-func UpdateHostMetrics(total, used, idle, busy int) {
-	hostTotalSlots.Set(float64(total))
-	hostUsedSlots.Set(float64(used))
+func UpdateHostMetrics(cpuTotal, cpuUsed, memTotal, memUsed, idle, busy int) {
+	hostCPUTotal.Set(float64(cpuTotal))
+	hostCPUUsed.Set(float64(cpuUsed))
+	hostMemTotal.Set(float64(memTotal))
+	hostMemUsed.Set(float64(memUsed))
 	hostIdleRunners.Set(float64(idle))
 	hostBusyRunners.Set(float64(busy))
 }

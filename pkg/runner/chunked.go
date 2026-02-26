@@ -528,14 +528,11 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		MAC:             tap.MAC,
 		SnapshotVersion: meta.Version,
 		WorkloadKey:     workloadKey,
-		Resources: Resources{
-			VCPUs:    cm.config.VCPUsPerRunner,
-			MemoryMB: cm.config.MemoryMBPerRunner,
-		},
-		CreatedAt:   time.Now(),
-		SocketPath:  filepath.Join(cm.config.SocketDir, runnerID+".sock"),
-		LogPath:     filepath.Join(cm.config.LogDir, runnerID+".log"),
-		MetricsPath: filepath.Join(cm.config.LogDir, runnerID+".metrics"),
+		Resources:       req.Resources,
+		CreatedAt:       time.Now(),
+		SocketPath:      filepath.Join(cm.config.SocketDir, runnerID+".sock"),
+		LogPath:         filepath.Join(cm.config.LogDir, runnerID+".log"),
+		MetricsPath:     filepath.Join(cm.config.LogDir, runnerID+".metrics"),
 		// FUSE disk provides the rootfs via lazy loading
 		RootfsOverlay: fuseDisk.DiskImagePath(),
 	}

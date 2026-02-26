@@ -7,16 +7,18 @@ import (
 )
 
 type hostHeartbeatRequest struct {
-	InstanceName    string `json:"instance_name"`
-	Zone            string `json:"zone"`
-	GRPCAddress     string `json:"grpc_address"`
-	HTTPAddress     string `json:"http_address"`
-	TotalSlots      int    `json:"total_slots"`
-	UsedSlots       int    `json:"used_slots"`
-	IdleRunners     int    `json:"idle_runners"`
-	BusyRunners     int    `json:"busy_runners"`
-	SnapshotVersion string `json:"snapshot_version"`
-	Draining        bool   `json:"draining"`
+	InstanceName       string `json:"instance_name"`
+	Zone               string `json:"zone"`
+	GRPCAddress        string `json:"grpc_address"`
+	HTTPAddress        string `json:"http_address"`
+	IdleRunners        int    `json:"idle_runners"`
+	BusyRunners        int    `json:"busy_runners"`
+	SnapshotVersion    string `json:"snapshot_version"`
+	Draining           bool   `json:"draining"`
+	TotalCPUMillicores int    `json:"total_cpu_millicores"`
+	UsedCPUMillicores  int    `json:"used_cpu_millicores"`
+	TotalMemoryMB      int    `json:"total_memory_mb"`
+	UsedMemoryMB       int    `json:"used_memory_mb"`
 	// LoadedManifests reports which chunk manifests are already loaded on this host
 	// (workload_key → version). Used by the control plane for cache-affinity scheduling.
 	LoadedManifests map[string]string `json:"loaded_manifests,omitempty"`
@@ -55,16 +57,18 @@ func (s *ControlPlaneServer) HandleHostHeartbeat(w http.ResponseWriter, r *http.
 	}
 
 	host, shouldDrain, err := s.hostRegistry.UpsertHeartbeat(r.Context(), HostHeartbeat{
-		InstanceName:    req.InstanceName,
-		Zone:            req.Zone,
-		GRPCAddress:     req.GRPCAddress,
-		HTTPAddress:     req.HTTPAddress,
-		TotalSlots:      req.TotalSlots,
-		UsedSlots:       req.UsedSlots,
-		IdleRunners:     req.IdleRunners,
-		BusyRunners:     req.BusyRunners,
-		SnapshotVersion: req.SnapshotVersion,
-		LoadedManifests: req.LoadedManifests,
+		InstanceName:       req.InstanceName,
+		Zone:               req.Zone,
+		GRPCAddress:        req.GRPCAddress,
+		HTTPAddress:        req.HTTPAddress,
+		IdleRunners:        req.IdleRunners,
+		BusyRunners:        req.BusyRunners,
+		SnapshotVersion:    req.SnapshotVersion,
+		LoadedManifests:    req.LoadedManifests,
+		TotalCPUMillicores: req.TotalCPUMillicores,
+		UsedCPUMillicores:  req.UsedCPUMillicores,
+		TotalMemoryMB:      req.TotalMemoryMB,
+		UsedMemoryMB:       req.UsedMemoryMB,
 	})
 	if err != nil {
 		writeJSON(w, http.StatusOK, hostHeartbeatResponse{

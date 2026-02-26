@@ -188,8 +188,6 @@ type HostConfig struct {
 	Zone              string
 	MaxRunners        int
 	IdleTarget        int
-	VCPUsPerRunner    int
-	MemoryMBPerRunner int
 	FirecrackerBin    string
 	SocketDir         string
 	WorkspaceDir      string
@@ -229,6 +227,10 @@ type HostConfig struct {
 	WorkloadKey      string
 	Environment      string
 	ControlPlaneAddr string
+
+	// Host resource capacity for bin-packing scheduler
+	TotalCPUMillicores int
+	TotalMemoryMB      int
 
 	// Runner Pool Configuration
 	PoolEnabled            bool `json:"pool_enabled"`

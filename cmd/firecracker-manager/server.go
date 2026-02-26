@@ -222,8 +222,6 @@ func (s *HostAgentServer) GetHostStatus(ctx context.Context, req *pb.GetHostStat
 	st := s.manager.GetStatus()
 
 	resp := &pb.HostStatus{
-		TotalSlots:      int32(st.TotalSlots),
-		UsedSlots:       int32(st.UsedSlots),
 		IdleRunners:     int32(st.IdleRunners),
 		BusyRunners:     int32(st.BusyRunners),
 		SnapshotVersion: st.SnapshotVersion,

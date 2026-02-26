@@ -212,6 +212,18 @@ variable "use_chunked_snapshots" {
   default     = true
 }
 
+variable "chunk_cache_size_gb" {
+  description = "Size in GB of the on-disk LRU chunk cache for FUSE-backed disks. Larger values improve cache hit ratio and reduce GCS fetches."
+  type        = number
+  default     = 2
+}
+
+variable "mem_cache_size_gb" {
+  description = "Size in GB of the in-memory LRU chunk cache for UFFD page fault handling. Larger values reduce GCS fetches for memory pages."
+  type        = number
+  default     = 2
+}
+
 variable "use_netns" {
   description = "Use per-VM network namespaces instead of a shared bridge. Provides VM-to-VM isolation by construction — each VM gets its own namespace with point-to-point veth routing."
   type        = bool
