@@ -1,0 +1,62 @@
+platform:
+  gcp_project: "my-project"
+  region: "us-central1"
+  zone: "us-central1-a"
+
+repository:
+  url: "https://github.com/myorg/myrepo"
+  branch: "main"
+
+microvm:
+  vcpus: 4
+  memory_mb: 8192
+  max_per_host: 16
+  # Dev environments are session-bound; no anonymous idle pool needed.
+  idle_target: 0
+
+hosts:
+  machine_type: "n2-standard-64"
+  min_count: 2
+  max_count: 10
+  data_disk_gb: 500
+
+ci:
+  system: "none"
+
+workload:
+  # Snapshot warmup: clone the repo, install the toolchain, start LSP servers.
+  snapshot_commands:
+    - type: "git-clone"
+      args: ["https://github.com/myorg/myrepo", "main"]
+    - type: "shell"
+      args: ["bash", "/setup/install-toolchain.sh"]
+      run_as_root: true
+    - type: "shell"
+      # Pre-warm the language server so it's already indexed at restore time.
+      args: ["bash", "/setup/warm-lsp.sh"]
+      run_as_root: false
+
+  # VS Code Server (code-server) as the IDE.
+  # Users connect via browser at https://<host-ip>:8443
+  start_command:
+    command: ["/usr/bin/code-server", "--auth=none", "--bind-addr=0.0.0.0:8443", "/workspace"]
+    port: 8443
+    health_path: "/healthz"
+
+# Session persistence is the key feature for dev environments:
+# - On browser close / idle timeout, the VM is paused to GCS (cheap, fast).
+# - On reconnect, the scheduler resumes the session on any available host (~300ms).
+# - The developer's in-VM state (open files, running terminals, LSP index) is preserved.
+session:
+  enabled: true
+  ttl_seconds: 3600     # Auto-pause after 1h idle
+  auto_pause: true      # Pause to GCS (preserves state); false = destroy
+
+credentials:
+  # Developer SSH keys or auth tokens needed inside the VM.
+  secrets: []
+  #   - name: "developer-ssh-key"
+  #     secret_name: "projects/my-project/secrets/dev-ssh-key/versions/latest"
+  #     target: "ssh/id_rsa"
+  host_dirs: []
+  env: {}

@@ -231,6 +231,29 @@ func (u *IncrementalUploader) UpdateSnapshotPointer(ctx context.Context, meta *C
 	return nil
 }
 
+// GCConfig holds configuration for garbage collection.
+type GCConfig struct {
+	// MinChunkAge is the minimum age a chunk must have before it can be
+	// deleted by GC. Chunks younger than this are always protected.
+	// Default: 24h. This is the primary safety mechanism.
+	MinChunkAge time.Duration
+}
+
+// DefaultGCConfig returns a GCConfig with sensible defaults.
+func DefaultGCConfig() GCConfig {
+	return GCConfig{MinChunkAge: 24 * time.Hour}
+}
+
+// CollectSessionRoots returns chunk hashes referenced by active session
+// snapshots. This queries the session_snapshots table for sessions that
+// are not expired or deleted, and collects all chunk hashes from their
+// chunk indices. Returns nil if no DB is configured.
+//
+// TODO: implement when session_snapshots DB table is available.
+func CollectSessionRoots(ctx context.Context) (map[string]bool, error) {
+	return nil, nil
+}
+
 // GarbageCollect removes chunks that are not referenced by any of the keepVersions.
 // It loads all chunk manifests for the versions to keep, builds a set of referenced
 // hashes, lists all chunks in GCS, and deletes unreferenced ones.
@@ -240,7 +263,7 @@ func (u *IncrementalUploader) UpdateSnapshotPointer(ctx context.Context, meta *C
 // referenced by repo B must not be deleted just because repo A deprecated its
 // snapshot. The caller is responsible for collecting versions across all repos.
 // Use GarbageCollectAllRepos for the safe multi-repo variant.
-func (u *IncrementalUploader) GarbageCollect(ctx context.Context, workloadKey string, keepVersions []string) error {
+func (u *IncrementalUploader) GarbageCollect(ctx context.Context, workloadKey string, keepVersions []string, gcCfg GCConfig) error {
 	u.logger.WithField("keep_versions", keepVersions).Info("Starting garbage collection")
 
 	if len(keepVersions) == 0 {
@@ -265,14 +288,14 @@ func (u *IncrementalUploader) GarbageCollect(ctx context.Context, workloadKey st
 		}).Debug("Loaded chunk references for version")
 	}
 
-	return u.deleteUnreferencedChunks(ctx, referencedHashes)
+	return u.deleteUnreferencedChunks(ctx, referencedHashes, gcCfg)
 }
 
 // GarbageCollectAllRepos is the safe multi-repo variant of GarbageCollect.
 // It accepts a map of workload_key → []version_paths (GCS metadata paths) and
 // builds the referenced set across ALL repos before deleting anything.
 // This prevents repo A's GC from deleting chunks still referenced by repo B.
-func (u *IncrementalUploader) GarbageCollectAllRepos(ctx context.Context, repoVersions map[string][]string) error {
+func (u *IncrementalUploader) GarbageCollectAllRepos(ctx context.Context, repoVersions map[string][]string, gcCfg GCConfig) error {
 	u.logger.WithField("repos", len(repoVersions)).Info("Starting multi-repo garbage collection")
 
 	referencedHashes := make(map[string]bool)
@@ -300,7 +323,7 @@ func (u *IncrementalUploader) GarbageCollectAllRepos(ctx context.Context, repoVe
 		"total_referenced": len(referencedHashes),
 	}).Info("Built referenced chunk set across all repos")
 
-	return u.deleteUnreferencedChunks(ctx, referencedHashes)
+	return u.deleteUnreferencedChunks(ctx, referencedHashes, gcCfg)
 }
 
 // collectReferencedHashes adds all chunk hashes from a metadata to the set.
@@ -329,8 +352,9 @@ func collectReferencedHashes(meta *ChunkedSnapshotMetadata, hashes map[string]bo
 }
 
 // deleteUnreferencedChunks lists all chunks in storage and deletes those
-// not in the referenced set.
-func (u *IncrementalUploader) deleteUnreferencedChunks(ctx context.Context, referencedHashes map[string]bool) error {
+// not in the referenced set. Chunks younger than gcCfg.MinChunkAge are
+// always protected regardless of reference status.
+func (u *IncrementalUploader) deleteUnreferencedChunks(ctx context.Context, referencedHashes map[string]bool, gcCfg GCConfig) error {
 	u.logger.WithField("total_referenced", len(referencedHashes)).Info("Built referenced chunk set")
 
 	allChunks, err := u.store.ListChunks(ctx)
@@ -359,17 +383,38 @@ func (u *IncrementalUploader) deleteUnreferencedChunks(ctx context.Context, refe
 	}).Info("Deleting unreferenced chunks")
 
 	deleted := 0
+	skippedAge := 0
 	for _, hash := range toDelete {
+		// Check chunk age before deleting — young chunks are protected.
+		if gcCfg.MinChunkAge > 0 {
+			created, err := u.store.GetChunkCreationTime(ctx, hash)
+			if err != nil {
+				u.logger.WithError(err).WithField("hash", hash[:12]).Warn("Failed to get chunk attrs, skipping deletion")
+				skippedAge++
+				continue
+			}
+			age := time.Since(created)
+			if age < gcCfg.MinChunkAge {
+				u.logger.WithFields(logrus.Fields{
+					"hash": hash[:12],
+					"age":  age,
+				}).Debug("Skipping young chunk (below MinChunkAge)")
+				skippedAge++
+				continue
+			}
+		}
+
 		if err := u.store.DeleteChunk(ctx, hash); err != nil {
-			u.logger.WithError(err).WithField("hash", hash).Warn("Failed to delete chunk")
+			u.logger.WithError(err).WithField("hash", hash[:12]).Warn("Failed to delete chunk")
 			continue
 		}
 		deleted++
 	}
 
 	u.logger.WithFields(logrus.Fields{
-		"deleted": deleted,
-		"failed":  len(toDelete) - deleted,
+		"deleted":     deleted,
+		"skipped_age": skippedAge,
+		"failed":      len(toDelete) - deleted - skippedAge,
 	}).Info("Garbage collection complete")
 
 	return nil

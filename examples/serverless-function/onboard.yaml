@@ -1,0 +1,54 @@
+platform:
+  gcp_project: "my-project"
+  region: "us-central1"
+  zone: "us-central1-a"
+
+repository:
+  url: "https://github.com/myorg/my-functions"
+  branch: "main"
+
+microvm:
+  vcpus: 2
+  memory_mb: 1024           # Small footprint per function instance
+  max_per_host: 64          # High density on each host
+  idle_target: 10           # Large warm pool for low cold-start latency
+
+hosts:
+  machine_type: "n2-standard-64"
+  min_count: 2
+  max_count: 20
+  data_disk_gb: 200
+
+ci:
+  system: "none"
+
+workload:
+  # Snapshot warmup: install the runtime and dependencies.
+  # The snapshot freezes the VM with the runtime process already initialized.
+  snapshot_commands:
+    - type: "shell"
+      args: ["npm", "install", "--prefix", "/app"]
+      run_as_root: false
+    - type: "shell"
+      # Start the runtime once so module loading is baked into the snapshot.
+      # The warm-up script starts the server, runs a health check, and exits.
+      args: ["bash", "/app/scripts/warm-runtime.sh"]
+      run_as_root: false
+
+  # The function runtime that handles incoming invocations.
+  start_command:
+    command: ["/app/function-runtime", "--handler=handler.main", "--port=3000"]
+    port: 3000
+    health_path: "/ready"
+
+# No session persistence for stateless functions: after the function returns,
+# TryRecycle pauses the VM back into the local pool (~50ms) for the next
+# invocation. Cross-host GCS sessions are not needed unless you need
+# long-lived function state (uncommon).
+# session:
+#   enabled: false
+
+credentials:
+  secrets: []
+  host_dirs: []
+  env: {}

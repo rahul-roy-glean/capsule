@@ -226,3 +226,56 @@ func TestGenerateTFVars_DefaultDir(t *testing.T) {
 		t.Errorf("expected filename terraform.auto.tfvars, got %q", filepath.Base(path))
 	}
 }
+
+func TestGenerateTFVars_BazelAddon(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &Config{
+		Platform: PlatformConfig{GCPProject: "test-project", Region: "us-central1", Zone: "us-central1-a"},
+		Hosts:    HostsConfig{MachineType: "n2-standard-64", MinCount: 2, MaxCount: 20, DataDiskGB: 500},
+		MicroVM:  MicroVMConfig{MaxPerHost: 16, IdleTarget: 2, VCPUs: 4, MemoryMB: 8192},
+		CI: CIConfig{
+			System: "github-actions",
+			GitHub: GitHubConfig{Repo: "org/repo", Ephemeral: true},
+		},
+		Bazel: BazelConfig{
+			WarmupTargets:        "//src/...",
+			RepoCacheUpperSizeGB: 20,
+			GitCache: GitCacheConfig{
+				Enabled:      true,
+				Repos:        map[string]string{"github.com/org/repo": "org-repo"},
+				WorkspaceDir: "/mnt/ephemeral/workspace",
+			},
+			Buildbarn: BuildbarnConfig{
+				CertsDir: "/etc/glean/ci/certs/buildbarn",
+			},
+		},
+	}
+
+	path, err := generateTFVars(cfg, false, dir)
+	if err != nil {
+		t.Fatalf("generateTFVars() error = %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	content := string(data)
+
+	checks := []struct {
+		label    string
+		contains string
+	}{
+		{"repo_cache_upper_size_gb", `repo_cache_upper_size_gb = 20`},
+		{"git_cache_enabled", `git_cache_enabled = true`},
+		{"git_cache_repos key", `"github.com/org/repo"`},
+		{"git_cache_repos val", `"org-repo"`},
+		{"git_cache_workspace_dir", `git_cache_workspace_dir = "/mnt/ephemeral/workspace"`},
+		{"buildbarn_certs_dir", `buildbarn_certs_dir = "/etc/glean/ci/certs/buildbarn"`},
+	}
+	for _, c := range checks {
+		if !strings.Contains(content, c.contains) {
+			t.Errorf("bazel addon tfvars missing %s: expected to contain %q\ncontent:\n%s", c.label, c.contains, content)
+		}
+	}
+}

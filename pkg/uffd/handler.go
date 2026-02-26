@@ -28,6 +28,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/metrics"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
@@ -133,6 +134,13 @@ type Handler struct {
 	wg        sync.WaitGroup
 	connected chan struct{} // closed when Firecracker connects
 
+	// Fault policy
+	consecutiveFailures    uint64 // atomic
+	killOnce               sync.Once
+	onFatal                func(error)
+	faultTimeout           time.Duration
+	maxConsecutiveFailures int
+
 	logger *logrus.Entry
 }
 
@@ -142,6 +150,17 @@ type HandlerConfig struct {
 	ChunkStore *snapshot.ChunkStore
 	Metadata   *snapshot.ChunkedSnapshotMetadata
 	Logger     *logrus.Logger
+
+	// FaultTimeout is the per-fault timeout for fetching page data.
+	// Zero means 5s default.
+	FaultTimeout time.Duration
+	// MaxConsecutiveFailures is the number of consecutive fault failures
+	// before invoking OnFatal. Zero means 3 default.
+	MaxConsecutiveFailures int
+	// OnFatal is called (at most once) when consecutive failures reach
+	// the threshold. The caller should cancel the handler's context to
+	// stop the fault loop.
+	OnFatal func(error)
 }
 
 // NewHandler creates a new UFFD handler
@@ -150,16 +169,28 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 		cfg.Logger = logrus.New()
 	}
 
+	faultTimeout := cfg.FaultTimeout
+	if faultTimeout == 0 {
+		faultTimeout = 5 * time.Second
+	}
+	maxConsecutiveFailures := cfg.MaxConsecutiveFailures
+	if maxConsecutiveFailures == 0 {
+		maxConsecutiveFailures = 3
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	h := &Handler{
-		chunkStore: cfg.ChunkStore,
-		metadata:   cfg.Metadata,
-		socketPath: cfg.SocketPath,
-		ctx:        ctx,
-		cancel:     cancel,
-		connected:  make(chan struct{}),
-		logger:     cfg.Logger.WithField("component", "uffd-handler"),
+		chunkStore:             cfg.ChunkStore,
+		metadata:               cfg.Metadata,
+		socketPath:             cfg.SocketPath,
+		ctx:                    ctx,
+		cancel:                 cancel,
+		connected:              make(chan struct{}),
+		onFatal:                cfg.OnFatal,
+		faultTimeout:           faultTimeout,
+		maxConsecutiveFailures: maxConsecutiveFailures,
+		logger:                 cfg.Logger.WithField("component", "uffd-handler"),
 	}
 
 	// Chunk lookup is built after receiving memory mappings from Firecracker
@@ -431,6 +462,8 @@ func (h *Handler) handlePageFaults(uffdFd int) {
 
 // handleSingleFault handles a single page fault
 func (h *Handler) handleSingleFault(uffdFd int, address uint64) error {
+	faultStart := time.Now()
+
 	// Align to page boundary
 	pageAddr := address & ^uint64(PageSize-1)
 
@@ -454,11 +487,26 @@ func (h *Handler) handleSingleFault(uffdFd int, address uint64) error {
 		return h.zeroFault(uffdFd, pageAddr)
 	}
 
-	// Get page data from chunk store
-	pageData, err := h.getPageData(offset)
+	// Get page data from chunk store with per-fault timeout
+	faultCtx, cancel := context.WithTimeout(h.ctx, h.faultTimeout)
+	defer cancel()
+
+	pageData, err := h.getPageData(faultCtx, offset)
 	if err != nil {
+		failures := atomic.AddUint64(&h.consecutiveFailures, 1)
+		h.logger.WithError(err).WithFields(logrus.Fields{
+			"hash":                 chunk.Hash[:12],
+			"offset":               offset,
+			"consecutive_failures": failures,
+		}).Error("Fault failure")
+		if int(failures) >= h.maxConsecutiveFailures && h.onFatal != nil {
+			h.killOnce.Do(func() { h.onFatal(err) })
+		}
 		return fmt.Errorf("failed to get page data: %w", err)
 	}
+
+	// Reset consecutive failures on success
+	atomic.StoreUint64(&h.consecutiveFailures, 0)
 
 	// Copy data to faulting address using UFFDIO_COPY
 	cp := uffdioCopy{
@@ -473,6 +521,7 @@ func (h *Handler) handleSingleFault(uffdFd int, address uint64) error {
 		return fmt.Errorf("UFFDIO_COPY failed: %w", errno)
 	}
 
+	metrics.UFFDFaultServiceSeconds.Observe(time.Since(faultStart).Seconds())
 	return nil
 }
 
@@ -525,7 +574,7 @@ func (h *Handler) queueEagerFetch(currentOffset uint64) {
 // ChunkStore (which has its own sharded LRU cache) and indexing directly into
 // the chunk buffer. This avoids the 1024 separate 4KB allocations that the
 // previous page-level LRU approach required per chunk fetch.
-func (h *Handler) getPageData(offset uint64) ([]byte, error) {
+func (h *Handler) getPageData(ctx context.Context, offset uint64) ([]byte, error) {
 	// Find the chunk containing this offset
 	chunk := h.findChunk(offset)
 	if chunk == nil || chunk.IsZeroChunk() {
@@ -536,7 +585,7 @@ func (h *Handler) getPageData(offset uint64) ([]byte, error) {
 
 	// Fetch the chunk (hits ChunkStore's in-memory LRU on repeat access)
 	atomic.AddUint64(&h.chunkFetches, 1)
-	chunkData, err := h.chunkStore.GetChunk(h.ctx, chunk.Hash)
+	chunkData, err := h.chunkStore.GetChunk(ctx, chunk.Hash)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch chunk %s: %w", chunk.Hash[:12], err)
 	}

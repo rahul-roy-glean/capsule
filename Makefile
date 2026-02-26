@@ -4,8 +4,8 @@
 .PHONY: firecracker-manager control-plane snapshot-builder thaw-agent
 .PHONY: git-cache-builder git-cache-freshness data-snapshot-builder snapshot-converter
 .PHONY: test-unit test-race test-cover test-integration test-all check
-.PHONY: dev-up dev-build dev-snapshot dev-stack dev-test-exec dev-test-pause-resume dev-stop dev-down dev-clean
-.PHONY: dev-setup dev-provision dev-build-local dev-snapshot-local dev-stack-local dev-test-exec-local dev-test-pause-resume-local dev-stop-local
+.PHONY: dev-up dev-build dev-snapshot dev-stack dev-test-exec dev-test-pause-resume dev-stop
+.PHONY: dev-setup dev-provision
 
 # Variables
 PROJECT_ID ?= your-project-id
@@ -18,7 +18,7 @@ VERSION ?= $(shell git describe --tags --always --dirty)
 
 # Go build settings
 GO := go
-GOFLAGS := -ldflags "-X main.version=$(VERSION)"
+GOFLAGS := -trimpath -ldflags "-X main.version=$(VERSION)"
 GOARCH_TARGET ?= amd64
 export PATH := /usr/local/go/bin:$(PATH)
 
@@ -334,15 +334,23 @@ help:
 	@echo "  ENV                - Environment name (default: dev)"
 	@echo "  GIT_CACHE_REPOS    - Repos for git-cache (e.g., github.com/org/repo:name)"
 	@echo ""
-	@echo "Local Development (Linux host with KVM):"
-	@echo "  dev-provision        - Install prerequisites (run once, needs sudo)"
-	@echo "  dev-build            - Build binaries + minimal rootfs"
-	@echo "  dev-snapshot         - Build full snapshot for restore testing"
+	@echo "Local Development (macOS + Lima):"
+	@echo "  dev-up               - Start Lima VM with KVM, Firecracker, Postgres"
+	@echo "  dev-build            - Build binaries + minimal rootfs inside Lima VM"
+	@echo "  dev-snapshot         - Build full snapshot (mem+state) for restore testing"
 	@echo "  dev-stack            - Start control-plane + firecracker-manager"
 	@echo "  dev-test-exec        - Run E2E exec test (allocate->exec->release)"
-	@echo "  dev-test-pause-resume - Run E2E pause/resume test"
-	@echo "  dev-test-gcs-pause-resume - Run E2E GCS-backed pause/resume test (needs SESSION_CHUNK_BUCKET)"
-	@echo "  dev-stop             - Stop the stack"
+	@echo "  dev-stop             - Stop the stack (keeps VM and rootfs)"
+	@echo "  dev-down             - Stop Lima VM (fast resume with dev-up)"
+	@echo "  dev-clean            - Delete VM + all artifacts"
+	@echo ""
+	@echo "Local Development (Linux / GCE — no Lima):"
+	@echo "  dev-provision        - Install prerequisites (run once, needs sudo)"
+	@echo "  dev-build-local      - Build binaries + minimal rootfs"
+	@echo "  dev-snapshot-local   - Build full snapshot for restore testing"
+	@echo "  dev-stack-local      - Start control-plane + firecracker-manager"
+	@echo "  dev-test-exec-local  - Run E2E exec test"
+	@echo "  dev-stop-local       - Stop the stack"
 	@echo ""
 	@echo "Example workflow (disk snapshots):"
 	@echo "  1. make packer-build PROJECT_ID=my-project"
@@ -351,45 +359,83 @@ help:
 	@echo "  4. terraform apply -var='use_data_snapshot=true' -var='data_snapshot_name=runner-data-YYYYMMDD-HHMMSS'"
 	@echo "  5. make mig-rolling-update PROJECT_ID=my-project"
 
-# === Local Development (Linux host with KVM) ===
-#
-# Workflow: make dev-provision → make dev-build → make dev-snapshot → make dev-stack → make dev-test-exec
+# === Local Development ===
+# Two modes:
+#   macOS + Lima: make dev-up → make dev-build → make dev-stack → make dev-test-exec
+#   Linux (GCE): make dev-setup → make dev-build-local → make dev-stack-local → make dev-test-exec-local
+DEV_VM    := fc-dev
+LIMA      := limactl
+LIMA_EXEC := $(LIMA) shell $(DEV_VM) --
+
+# --- macOS + Lima targets ---
+
+# Start Lima VM (one-time, ~3 min)
+dev-up:
+	$(LIMA) start ./dev/lima.yaml --name=$(DEV_VM) --tty=false
+	@echo "Lima VM '$(DEV_VM)' is running."
+
+# Build binaries + dev rootfs inside Lima VM (~2 min)
+dev-build:
+	$(LIMA_EXEC) bash -c 'GOARCH_TARGET=$$(uname -m | sed "s/x86_64/amd64/;s/aarch64/arm64/") make build'
+	$(LIMA_EXEC) bash dev/build-dev-rootfs.sh
+
+# Build a full snapshot inside Lima VM
+dev-snapshot:
+	$(LIMA_EXEC) bash dev/build-snapshot.sh
+
+# Start the full stack inside Lima VM
+dev-stack:
+	$(LIMA_EXEC) bash dev/run-stack.sh
+
+# Run E2E exec test via Lima VM
+dev-test-exec:
+	$(LIMA_EXEC) bash dev/test-exec.sh
+
+# Run E2E pause/resume test via Lima VM
+dev-test-pause-resume:
+	$(LIMA_EXEC) bash dev/test-pause-resume.sh
+
+# Stop the stack inside Lima VM
+dev-stop:
+	$(LIMA_EXEC) bash dev/stop-stack.sh
+
+# Stop Lima VM (preserves disk — fast restart with `dev-up`)
+dev-down:
+	-$(LIMA) stop $(DEV_VM)
+
+# Full cleanup: stop VM, remove disk, remove all dev artifacts
+dev-clean:
+	-$(LIMA) stop $(DEV_VM) 2>/dev/null
+	-$(LIMA) delete $(DEV_VM) 2>/dev/null
+	@echo "Lima VM deleted. Run 'make dev-up' to recreate."
+
+# --- Linux (GCE) targets — run directly, no Lima ---
 
 # Install prerequisites on a fresh Linux host (Ubuntu/Debian)
 dev-provision:
 	sudo bash dev/setup-linux.sh
 
-# Build binaries + dev rootfs
-dev-build:
+# Build binaries + dev rootfs directly on Linux
+dev-build-local:
 	make build
 	bash dev/build-dev-rootfs.sh
 
-# Build a full snapshot
-dev-snapshot:
+# Build a full snapshot directly on Linux
+dev-snapshot-local:
 	bash dev/build-snapshot.sh
 
-# Start the full stack
-dev-stack:
+# Start the full stack directly on Linux
+dev-stack-local:
 	bash dev/run-stack.sh
 
-# Run E2E exec test
-dev-test-exec:
+# Run E2E exec test directly on Linux
+dev-test-exec-local:
 	bash dev/test-exec.sh
 
-# Run E2E pause/resume test
-dev-test-pause-resume:
+# Run E2E pause/resume test directly on Linux
+dev-test-pause-resume-local:
 	bash dev/test-pause-resume.sh
 
-# Run E2E GCS-backed pause/resume test (cross-host simulation)
-# Requires: SESSION_CHUNK_BUCKET=<bucket> (same bucket used for dev-snapshot and dev-stack)
-dev-test-gcs-pause-resume:
-	bash dev/test-gcs-pause-resume.sh
-
-# Run pause/resume performance benchmark
-# Requires: SESSION_CHUNK_BUCKET=<bucket> (same bucket used for dev-snapshot and dev-stack)
-dev-bench-pause-resume:
-	bash dev/bench-pause-resume.sh
-
-# Stop the stack
-dev-stop:
+# Stop the stack directly on Linux
+dev-stop-local:
 	bash dev/stop-stack.sh
