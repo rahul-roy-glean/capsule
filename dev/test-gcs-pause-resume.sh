@@ -57,6 +57,22 @@ else
   exit 1
 fi
 
+# Wait for at least one host agent to register with the control plane.
+echo -n "  Waiting for host agent registration..."
+for i in $(seq 1 30); do
+  HOST_COUNT=$(curl -s "$CP/api/v1/hosts" 2>/dev/null | jq 'length' 2>/dev/null || echo "0")
+  if [ "$HOST_COUNT" -gt 0 ] 2>/dev/null; then
+    echo " registered (${i}s, $HOST_COUNT host(s))"
+    break
+  fi
+  if [ "$i" = "30" ]; then
+    fail "No hosts registered after 30s"
+    exit 1
+  fi
+  echo -n "."
+  sleep 1
+done
+
 # ---------------------------------------------------------------------------
 header "2. Allocate runner with session_id"
 # ---------------------------------------------------------------------------

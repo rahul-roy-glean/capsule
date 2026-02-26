@@ -105,6 +105,25 @@ WORKLOAD_KEY=$(register_config)
 echo "Workload key: $WORKLOAD_KEY"
 echo ""
 
+# Wait for at least one host agent to register with the control plane.
+# The firecracker-manager sends its first heartbeat on a timer after startup;
+# if we allocate before it arrives the CP returns "no available hosts".
+echo -n "Waiting for host agent registration..."
+for i in $(seq 1 30); do
+  HOST_COUNT=$(curl -s "$CP/api/v1/hosts" 2>/dev/null | jq 'length' 2>/dev/null || echo "0")
+  if [ "$HOST_COUNT" -gt 0 ] 2>/dev/null; then
+    echo " registered (${i}s, $HOST_COUNT host(s))"
+    break
+  fi
+  if [ "$i" = "30" ]; then
+    echo " FAIL: no hosts registered after 30s"
+    exit 1
+  fi
+  echo -n "."
+  sleep 1
+done
+echo ""
+
 # --- Results table ---
 printf "%-12s %10s %10s %10s %10s %10s %10s %12s\n" \
   "DIRTY_MB" "ALLOC_ms" "EXEC_ms" "PAUSE_ms" "RESUME_ms" "VERIFY_ms" "TOTAL_ms" "CHUNKS_UP"
