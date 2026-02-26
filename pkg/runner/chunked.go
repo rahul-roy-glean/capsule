@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -44,6 +45,9 @@ type ChunkedManager struct {
 	// "chunked" forces UFFD, "file" forces file-backed, "" uses metadata.
 	memBackend string
 
+	// readyTimeout is the max wait time for thaw-agent health check
+	readyTimeout time.Duration
+
 	chunkedLogger *logrus.Entry
 }
 
@@ -72,6 +76,12 @@ type ChunkedManagerConfig struct {
 	// snapshot metadata says, allowing rollback without rebuilding snapshots.
 	MemBackend string
 
+	// ReadyTimeout is the maximum time to wait for the thaw-agent health
+	// endpoint to return HTTP 200 after VM restore. If the agent doesn't
+	// become healthy within this window the VM is killed and the allocation
+	// fails (default 10s).
+	ReadyTimeout time.Duration
+
 	// GCSPrefix is the top-level prefix for all GCS paths (e.g. "v1").
 	GCSPrefix string
 }
@@ -96,6 +106,7 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 		fuseSeedDisks: make(map[string]*fuse.ChunkedDisk),
 		useNetNS:      cfg.UseNetNS,
 		memBackend:    cfg.MemBackend,
+		readyTimeout:  cfg.ReadyTimeout,
 		chunkedLogger: logger.WithField("component", "chunked-manager"),
 	}
 
@@ -707,7 +718,20 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		}
 	}
 
-	runner.State = StateInitializing
+	// Ready-gate: poll thaw-agent health endpoint before marking runner as ready.
+	// Only transition to StateIdle once the VM is confirmed functional.
+	readyTimeout := cm.readyTimeout
+	if readyTimeout <= 0 {
+		readyTimeout = 10 * time.Second
+	}
+	if err := cm.waitForThawAgent(ctx, runner.InternalIP.String(), readyTimeout); err != nil {
+		cm.chunkedLogger.WithError(err).WithField("runner_id", runnerID).Error("Thaw-agent failed ready check, killing VM")
+		vm.Stop()
+		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+		return nil, fmt.Errorf("thaw-agent not ready after %v: %w", readyTimeout, err)
+	}
+
+	runner.State = StateIdle
 	runner.StartedAt = time.Now()
 
 	cm.runners[runnerID] = runner
@@ -1002,6 +1026,40 @@ func (cm *ChunkedManager) Close() error {
 
 	// Close base manager
 	return cm.Manager.Close()
+}
+
+// waitForThawAgent polls the thaw-agent /alive endpoint until it returns
+// HTTP 200 or the timeout expires. This ensures the VM is functional after
+// snapshot restore before we expose it to the scheduler.
+func (cm *ChunkedManager) waitForThawAgent(ctx context.Context, ip string, timeout time.Duration) error {
+	aliveURL := fmt.Sprintf("http://%s:%d/alive", ip, snapshot.ThawAgentDebugPort)
+	deadline := time.Now().Add(timeout)
+	pollInterval := 200 * time.Millisecond
+
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		resp, err := client.Get(aliveURL)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				cm.chunkedLogger.WithField("url", aliveURL).Debug("Thaw-agent ready")
+				return nil
+			}
+		}
+
+		select {
+		case <-time.After(pollInterval):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	return fmt.Errorf("thaw-agent at %s did not become ready within %v", aliveURL, timeout)
 }
 
 // GetChunkedMetadata returns the loaded chunked snapshot metadata (may be nil).
