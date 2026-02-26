@@ -25,7 +25,6 @@ import (
 	"time"
 	"unsafe"
 
-	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
@@ -120,14 +119,8 @@ type Handler struct {
 	// Pre-computed for fast lookups (built after mappings are received)
 	chunkLookup []snapshot.ChunkRef
 
-	// LRU page cache for recently accessed pages
-	// Key is page offset (in snapshot file space), value is page data (4KB)
-	pageCache     *lru.Cache[uint64, []byte]
-	pageCacheSize int
-
 	// Stats
 	pageFaults   uint64
-	cacheHits    uint64
 	chunkFetches uint64
 
 	// Unix socket path for receiving UFFD from Firecracker
@@ -145,11 +138,10 @@ type Handler struct {
 
 // HandlerConfig holds configuration for the UFFD handler
 type HandlerConfig struct {
-	SocketPath    string
-	ChunkStore    *snapshot.ChunkStore
-	Metadata      *snapshot.ChunkedSnapshotMetadata
-	PageCacheSize int // Max pages to cache (default 50000 = ~200MB)
-	Logger        *logrus.Logger
+	SocketPath string
+	ChunkStore *snapshot.ChunkStore
+	Metadata   *snapshot.ChunkedSnapshotMetadata
+	Logger     *logrus.Logger
 }
 
 // NewHandler creates a new UFFD handler
@@ -158,30 +150,16 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 		cfg.Logger = logrus.New()
 	}
 
-	// Default page cache size: 50000 pages = ~200MB
-	pageCacheSize := cfg.PageCacheSize
-	if pageCacheSize == 0 {
-		pageCacheSize = 50000
-	}
-
-	// Create LRU cache for pages
-	pageCache, err := lru.New[uint64, []byte](pageCacheSize)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create page cache: %w", err)
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 
 	h := &Handler{
-		chunkStore:    cfg.ChunkStore,
-		metadata:      cfg.Metadata,
-		pageCache:     pageCache,
-		pageCacheSize: pageCacheSize,
-		socketPath:    cfg.SocketPath,
-		ctx:           ctx,
-		cancel:        cancel,
-		connected:     make(chan struct{}),
-		logger:        cfg.Logger.WithField("component", "uffd-handler"),
+		chunkStore: cfg.ChunkStore,
+		metadata:   cfg.Metadata,
+		socketPath: cfg.SocketPath,
+		ctx:        ctx,
+		cancel:     cancel,
+		connected:  make(chan struct{}),
+		logger:     cfg.Logger.WithField("component", "uffd-handler"),
 	}
 
 	// Chunk lookup is built after receiving memory mappings from Firecracker
@@ -543,14 +521,11 @@ func (h *Handler) queueEagerFetch(currentOffset uint64) {
 	}
 }
 
-// getPageData retrieves page data from cache or fetches from chunk store
+// getPageData retrieves page data by fetching the containing chunk from the
+// ChunkStore (which has its own sharded LRU cache) and indexing directly into
+// the chunk buffer. This avoids the 1024 separate 4KB allocations that the
+// previous page-level LRU approach required per chunk fetch.
 func (h *Handler) getPageData(offset uint64) ([]byte, error) {
-	// Check LRU page cache first
-	if data, ok := h.pageCache.Get(offset); ok {
-		atomic.AddUint64(&h.cacheHits, 1)
-		return data, nil
-	}
-
 	// Find the chunk containing this offset
 	chunk := h.findChunk(offset)
 	if chunk == nil || chunk.IsZeroChunk() {
@@ -559,17 +534,14 @@ func (h *Handler) getPageData(offset uint64) ([]byte, error) {
 		return zeroPage, nil
 	}
 
-	// Fetch the chunk
+	// Fetch the chunk (hits ChunkStore's in-memory LRU on repeat access)
 	atomic.AddUint64(&h.chunkFetches, 1)
 	chunkData, err := h.chunkStore.GetChunk(h.ctx, chunk.Hash)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch chunk %s: %w", chunk.Hash[:12], err)
 	}
 
-	// Cache pages from this chunk
-	h.cacheChunkPages(uint64(chunk.Offset), chunkData)
-
-	// Return the requested page
+	// Index directly into the chunk buffer for the requested page
 	pageOffset := offset - uint64(chunk.Offset)
 	if pageOffset+PageSize > uint64(len(chunkData)) {
 		// Partial page at end of chunk - pad with zeros
@@ -579,26 +551,6 @@ func (h *Handler) getPageData(offset uint64) ([]byte, error) {
 	}
 
 	return chunkData[pageOffset : pageOffset+PageSize], nil
-}
-
-// cacheChunkPages caches all pages from a fetched chunk
-// LRU eviction happens automatically when cache is full
-func (h *Handler) cacheChunkPages(chunkOffset uint64, data []byte) {
-	// Cache each page in the chunk
-	for off := uint64(0); off < uint64(len(data)); off += PageSize {
-		pageAddr := chunkOffset + off
-		endOff := off + PageSize
-		if endOff > uint64(len(data)) {
-			endOff = uint64(len(data))
-		}
-
-		// Make a copy for the cache
-		page := make([]byte, PageSize)
-		copy(page, data[off:endOff])
-		h.pageCache.Add(pageAddr, page) // LRU eviction is automatic
-	}
-
-	// TODO: Implement LRU eviction when cache gets too large
 }
 
 // Stop stops the UFFD handler
@@ -614,15 +566,17 @@ func (h *Handler) Stop() {
 func (h *Handler) Stats() HandlerStats {
 	return HandlerStats{
 		PageFaults:   atomic.LoadUint64(&h.pageFaults),
-		CacheHits:    atomic.LoadUint64(&h.cacheHits),
 		ChunkFetches: atomic.LoadUint64(&h.chunkFetches),
+		// CacheHits is always 0 for the chunked Handler: page-level caching
+		// was removed in favor of the ChunkStore's chunk-level LRU, which
+		// tracks its own hit rate via ChunkStore.CacheStats().
 	}
 }
 
 // HandlerStats holds UFFD handler statistics
 type HandlerStats struct {
 	PageFaults   uint64
-	CacheHits    uint64
+	CacheHits    uint64 // Always 0 for Handler; retained for API compatibility with LayeredHandler
 	ChunkFetches uint64
 }
 
