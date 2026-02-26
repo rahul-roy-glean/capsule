@@ -1,20 +1,11 @@
 # Onboard configuration for bazel-firecracker platform
 # Fill in your project-specific values and run: make onboard CONFIG=onboard.yaml
+# See examples/ for complete configurations for each use case.
 
 platform:
   gcp_project: "my-project"
   region: "us-central1"
   zone: "us-central1-a"
-
-repository:
-  url: "github.com/myorg/myrepo"
-  branch: "main"
-  # GitHub App authentication for private repos (optional)
-  github_app_id: ""
-  github_app_secret_name: ""  # GCP Secret Manager reference
-
-bazel:
-  warmup_targets: "//..."     # Targets to warm up during snapshot build
 
 microvm:
   vcpus: 4
@@ -28,37 +19,59 @@ hosts:
   max_count: 20
   data_disk_gb: 500
 
+# workload: required when ci.system is "none" (AI sandbox, dev env, serverless).
+# Ignored when ci.system is "github-actions".
+# workload:
+#   # snapshot_commands lists warmup steps baked into the golden snapshot.
+#   # Types: "shell" | "git-clone" | "gcp-auth" (see examples/README.md for args)
+#   snapshot_commands:
+#     - type: "shell"
+#       args: ["pip3", "install", "-r", "/app/requirements.txt"]
+#       run_as_root: true
+#   # start_command: the service the VM runs after restore.
+#   # thaw-agent starts command, waits for GET health_path on port to return 2xx.
+#   start_command:
+#     command: ["python3", "/app/server.py"]
+#     port: 8080
+#     health_path: "/health"
+
+# session: optional, for workloads that persist state across requests.
+# session:
+#   enabled: true
+#   ttl_seconds: 3600   # auto-pause after 1h idle
+#   auto_pause: true    # pause to GCS (true) vs destroy (false)
+
+# ci: add-on for CI system integration. Default: "none" (generic VM host).
 ci:
-  system: "github-actions"    # "github-actions" | "none"
-  github:                     # Only used when system == "github-actions"
-    repo: "myorg/myrepo"
-    org: "myorg"              # For org-level runner registration (optional)
-    labels:
-      - "self-hosted"
-      - "firecracker"
-      - "bazel"
-    ephemeral: true
+  system: "none"        # "github-actions" | "none"
+  # github:             # only used when system == "github-actions"
+  #   repo: "myorg/myrepo"
+  #   org: "myorg"      # org-level runner registration (optional; overrides repo)
+  #   labels:
+  #     - "self-hosted"
+  #     - "firecracker"
+  #     - "bazel"
+  #   ephemeral: true
+
+# bazel: add-on for Bazel-specific snapshot warmup (ci.system: github-actions).
+# bazel:
+#   warmup_targets: "//..."
+#   repo_cache_upper_size_gb: 10
+#   git_cache:
+#     enabled: false
+#     repos: {}          # {"github.com/myorg/myrepo": "myrepo"}
+#     workspace_dir: ""  # defaults to /mnt/ephemeral/workspace
+#   buildbarn:
+#     certs_dir: ""      # host path to Buildbarn mTLS certs
+
+# repository: required when snapshot uses git-clone, or when ci.system is github-actions.
+# repository:
+#   url: "https://github.com/myorg/myrepo"
+#   branch: "main"
+#   github_app_id: ""
+#   github_app_secret_name: ""  # GCP Secret Manager reference
 
 credentials:
-  # Secrets fetched from GCP Secret Manager and injected into microVMs
   secrets: []
-  # Example:
-  #   - name: "artifactory-netrc"
-  #     secret_name: "projects/my-proj/secrets/artifactory-netrc/versions/latest"
-  #     target: "netrc"
-  #   - name: "gcp-sa-key"
-  #     secret_name: "projects/my-proj/secrets/ci-sa-key/versions/latest"
-  #     target: "gcp-service-account.json"
-  # Host-local directories to include in credentials drive
   host_dirs: []
-  # Example:
-  #   - name: "buildbarn-certs"
-  #     host_path: "/etc/glean/ci/certs/buildbarn"
-  #     target: "certs/buildbarn"
-  # Environment variables for build tools
   env: {}
-  # Example:
-  #   GOOGLE_APPLICATION_CREDENTIALS: "/mnt/credentials/gcp-service-account.json"
-
-buildbarn:
-  certs_dir: ""               # Host path to Buildbarn certs (legacy, use credentials.host_dirs instead)
