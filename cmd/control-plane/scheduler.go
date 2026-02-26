@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -24,6 +25,11 @@ type Scheduler struct {
 	snapshotManager *SnapshotManager
 	metricsClient   *telemetry.Client
 	logger          *logrus.Entry
+
+	// connPool caches gRPC connections to host agents, keyed by address.
+	// gRPC connections are multiplexed and designed to be long-lived, so
+	// reusing them avoids TCP+TLS handshake latency on every RPC.
+	connPool sync.Map // map[string]*grpc.ClientConn
 }
 
 // NewScheduler creates a new scheduler
@@ -39,6 +45,39 @@ func NewScheduler(hr *HostRegistry, db *sql.DB, sm *SnapshotManager, logger *log
 // SetMetricsClient attaches a telemetry client for GCP Cloud Monitoring.
 func (s *Scheduler) SetMetricsClient(c *telemetry.Client) {
 	s.metricsClient = c
+}
+
+// getHostConn returns a cached gRPC connection to the given address, creating
+// one if needed. Connections are long-lived and multiplexed.
+func (s *Scheduler) getHostConn(address string) (*grpc.ClientConn, error) {
+	if v, ok := s.connPool.Load(address); ok {
+		return v.(*grpc.ClientConn), nil
+	}
+
+	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to host %s: %w", address, err)
+	}
+
+	// Store-or-load to handle concurrent creation for the same address.
+	if actual, loaded := s.connPool.LoadOrStore(address, conn); loaded {
+		// Another goroutine won the race; close our duplicate.
+		conn.Close()
+		return actual.(*grpc.ClientConn), nil
+	}
+
+	return conn, nil
+}
+
+// Close closes all cached gRPC connections.
+func (s *Scheduler) Close() {
+	s.connPool.Range(func(key, value any) bool {
+		if conn, ok := value.(*grpc.ClientConn); ok {
+			conn.Close()
+		}
+		s.connPool.Delete(key)
+		return true
+	})
 }
 
 // AllocateRunnerRequest represents a request to allocate a runner
@@ -162,12 +201,11 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		"grpc_address":  host.GRPCAddress,
 	}).Debug("Selected host")
 
-	// Connect to host agent
-	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// Connect to host agent (pooled connection)
+	conn, err := s.getHostConn(host.GRPCAddress)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to host %s: %w", host.GRPCAddress, err)
+		return nil, err
 	}
-	defer conn.Close()
 
 	// Create host agent client
 	client := pb.NewHostAgentClient(conn)
@@ -338,11 +376,10 @@ func (s *Scheduler) ReleaseRunner(ctx context.Context, runnerID string, destroy 
 	}
 
 	// Connect to host and release
-	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := s.getHostConn(host.GRPCAddress)
 	if err != nil {
-		return fmt.Errorf("failed to connect to host: %w", err)
+		return err
 	}
-	defer conn.Close()
 
 	client := pb.NewHostAgentClient(conn)
 	resp, err := client.ReleaseRunner(ctx, &pb.ReleaseRunnerRequest{
@@ -377,11 +414,10 @@ func (s *Scheduler) QuarantineRunner(ctx context.Context, runnerID, reason strin
 		return "", err
 	}
 
-	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := s.getHostConn(host.GRPCAddress)
 	if err != nil {
-		return "", fmt.Errorf("failed to connect to host: %w", err)
+		return "", err
 	}
-	defer conn.Close()
 
 	client := pb.NewHostAgentClient(conn)
 	resp, err := client.QuarantineRunner(ctx, &pb.QuarantineRunnerRequest{
@@ -416,11 +452,10 @@ func (s *Scheduler) UnquarantineRunner(ctx context.Context, runnerID string, unb
 		return err
 	}
 
-	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := s.getHostConn(host.GRPCAddress)
 	if err != nil {
-		return fmt.Errorf("failed to connect to host: %w", err)
+		return err
 	}
-	defer conn.Close()
 
 	client := pb.NewHostAgentClient(conn)
 	resp, err := client.UnquarantineRunner(ctx, &pb.UnquarantineRunnerRequest{
