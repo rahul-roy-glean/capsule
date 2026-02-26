@@ -43,8 +43,6 @@ type Runner struct {
 	InternalIP     string
 	GitHubRunnerID string
 	JobID          string
-	Repo           string
-	Branch         string
 	WorkloadKey    string
 	CreatedAt      time.Time
 	StartedAt      time.Time
@@ -284,13 +282,13 @@ func (hr *HostRegistry) AddRunner(ctx context.Context, runner *Runner) error {
 	defer hr.mu.Unlock()
 
 	_, err := hr.db.ExecContext(ctx, `
-		INSERT INTO runners (id, host_id, status, internal_ip, job_id, repo, branch, workload_key)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		INSERT INTO runners (id, host_id, status, internal_ip, job_id, workload_key)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (id) DO UPDATE SET
 			host_id = EXCLUDED.host_id,
 			status = EXCLUDED.status,
 			internal_ip = EXCLUDED.internal_ip
-	`, runner.ID, runner.HostID, runner.Status, runner.InternalIP, runner.JobID, runner.Repo, runner.Branch, runner.WorkloadKey)
+	`, runner.ID, runner.HostID, runner.Status, runner.InternalIP, runner.JobID, runner.WorkloadKey)
 
 	if err != nil {
 		return err
@@ -411,8 +409,7 @@ func (hr *HostRegistry) LoadFromDB(ctx context.Context) error {
 
 	// Load runners
 	rows, err = hr.db.QueryContext(ctx, `
-		SELECT id, host_id, status, internal_ip, github_runner_id, job_id,
-		       repo, branch, created_at
+		SELECT id, host_id, status, internal_ip, github_runner_id, job_id, created_at
 		FROM runners
 	`)
 	if err != nil {
@@ -422,10 +419,10 @@ func (hr *HostRegistry) LoadFromDB(ctx context.Context) error {
 
 	for rows.Next() {
 		var r Runner
-		var internalIP, githubRunnerID, jobID, repo, branch sql.NullString
+		var internalIP, githubRunnerID, jobID sql.NullString
 
 		err := rows.Scan(&r.ID, &r.HostID, &r.Status, &internalIP,
-			&githubRunnerID, &jobID, &repo, &branch, &r.CreatedAt)
+			&githubRunnerID, &jobID, &r.CreatedAt)
 		if err != nil {
 			return err
 		}
@@ -438,12 +435,6 @@ func (hr *HostRegistry) LoadFromDB(ctx context.Context) error {
 		}
 		if jobID.Valid {
 			r.JobID = jobID.String
-		}
-		if repo.Valid {
-			r.Repo = repo.String
-		}
-		if branch.Valid {
-			r.Branch = branch.String
 		}
 
 		hr.runners[r.ID] = &r

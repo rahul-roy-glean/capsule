@@ -289,8 +289,6 @@ func initSchema(db *sql.DB) error {
 		internal_ip VARCHAR(15),
 		github_runner_id VARCHAR(255),
 		job_id VARCHAR(255),
-		repo VARCHAR(255),
-		branch VARCHAR(255),
 		created_at TIMESTAMP DEFAULT NOW(),
 		started_at TIMESTAMP,
 		completed_at TIMESTAMP
@@ -422,8 +420,8 @@ func initSchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_session_runner ON session_snapshots(runner_id)`,
 		// Expiry cleanup: scan suspended sessions past their TTL
 		`CREATE INDEX IF NOT EXISTS idx_session_expires ON session_snapshots(status, expires_at) WHERE status = 'suspended'`,
-		// runners: per-repo fairness check (scheduler.go: COUNT(*) WHERE repo=$1 AND status IN (...))
-		`CREATE INDEX IF NOT EXISTS idx_runners_repo_status ON runners(repo, status)`,
+		// Drop legacy repo index and columns (workload_key replaced repo-based routing)
+		`DROP INDEX IF EXISTS idx_runners_repo_status`,
 		// jobs: queue drain (WHERE status='queued' ORDER BY queued_at)
 		`CREATE INDEX IF NOT EXISTS idx_jobs_queued ON jobs(status, queued_at) WHERE status = 'queued'`,
 		// jobs: completion by github_job_id
@@ -444,9 +442,11 @@ func initSchema(db *sql.DB) error {
 		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS used_cpu_millicores INT DEFAULT 0`,
 		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS total_memory_mb INT DEFAULT 0`,
 		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS used_memory_mb INT DEFAULT 0`,
-		// Drop legacy slot columns (replaced by resource-based bin-packing)
 		`ALTER TABLE hosts DROP COLUMN IF EXISTS total_slots`,
 		`ALTER TABLE hosts DROP COLUMN IF EXISTS used_slots`,
+		// Drop unused repo/branch columns from runners
+		`ALTER TABLE runners DROP COLUMN IF EXISTS repo`,
+		`ALTER TABLE runners DROP COLUMN IF EXISTS branch`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil {
