@@ -33,6 +33,17 @@ type Host struct {
 	UsedCPUMillicores  int
 	TotalMemoryMB      int
 	UsedMemoryMB       int
+	// RunnerInfos is per-runner status from the latest heartbeat, used for
+	// centralized TTL enforcement.
+	RunnerInfos []HostRunnerInfo
+}
+
+// HostRunnerInfo is per-runner status reported by a host heartbeat.
+type HostRunnerInfo struct {
+	RunnerID    string
+	State       string
+	WorkloadKey string
+	IdleSince   time.Time // zero if not idle or never executed
 }
 
 // Runner represents a runner instance

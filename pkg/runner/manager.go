@@ -1484,6 +1484,26 @@ func (m *Manager) GetStatus() ManagerStatus {
 	}
 }
 
+// GetRunnerHeartbeatInfo returns per-runner status summaries for the heartbeat.
+func (m *Manager) GetRunnerHeartbeatInfo() []RunnerHeartbeatInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	infos := make([]RunnerHeartbeatInfo, 0, len(m.runners))
+	for _, r := range m.runners {
+		info := RunnerHeartbeatInfo{
+			RunnerID:    r.ID,
+			State:       r.State,
+			WorkloadKey: r.WorkloadKey,
+		}
+		if r.State == StateIdle && !r.LastExecAt.IsZero() {
+			info.IdleSince = r.LastExecAt.Format(time.RFC3339)
+		}
+		infos = append(infos, info)
+	}
+	return infos
+}
+
 // ManagerStatus represents the status of the runner manager
 type ManagerStatus struct {
 	ActiveRunners      int
@@ -1563,6 +1583,39 @@ func (m *Manager) DrainIdleRunners(ctx context.Context) (int, error) {
 		return stopped, joinErrors(errs)
 	}
 	return stopped, nil
+}
+
+// PauseSessionRunners pauses all session-bound runners (idle or busy) so their
+// state is uploaded to GCS before the host shuts down. This is called during
+// graceful drain to ensure sessions can be resumed on another host.
+func (m *Manager) PauseSessionRunners(ctx context.Context) (int, error) {
+	m.mu.RLock()
+	var targets []string
+	for _, r := range m.runners {
+		if r.SessionID != "" && (r.State == StateIdle || r.State == StateBusy) {
+			targets = append(targets, r.ID)
+		}
+	}
+	m.mu.RUnlock()
+
+	if len(targets) == 0 {
+		return 0, nil
+	}
+
+	var errs []error
+	paused := 0
+	for _, id := range targets {
+		if _, err := m.PauseRunner(ctx, id); err != nil {
+			m.logger.WithError(err).WithField("runner_id", id).Warn("Failed to pause session runner during drain")
+			errs = append(errs, err)
+			continue
+		}
+		paused++
+	}
+	if len(errs) > 0 {
+		return paused, joinErrors(errs)
+	}
+	return paused, nil
 }
 
 // RemoveRunnerLabels removes custom labels from all runners on this host.

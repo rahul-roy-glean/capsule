@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"time"
 )
 
 type hostHeartbeatRequest struct {
@@ -21,7 +22,16 @@ type hostHeartbeatRequest struct {
 	UsedMemoryMB       int    `json:"used_memory_mb"`
 	// LoadedManifests reports which chunk manifests are already loaded on this host
 	// (workload_key → version). Used by the control plane for cache-affinity scheduling.
-	LoadedManifests map[string]string `json:"loaded_manifests,omitempty"`
+	LoadedManifests map[string]string     `json:"loaded_manifests,omitempty"`
+	Runners         []heartbeatRunnerInfo `json:"runners,omitempty"`
+}
+
+// heartbeatRunnerInfo mirrors runner.RunnerHeartbeatInfo for JSON deserialization.
+type heartbeatRunnerInfo struct {
+	RunnerID    string `json:"runner_id"`
+	State       string `json:"state"`
+	WorkloadKey string `json:"workload_key"`
+	IdleSince   string `json:"idle_since,omitempty"` // RFC3339
 }
 
 type hostHeartbeatResponse struct {
@@ -76,6 +86,39 @@ func (s *ControlPlaneServer) HandleHostHeartbeat(w http.ResponseWriter, r *http.
 			Error:        err.Error(),
 		})
 		return
+	}
+
+	// If the host reported itself as draining (e.g. SIGTERM received), mark it
+	// in the registry so the scheduler stops allocating to it.
+	if req.Draining {
+		if err := s.hostRegistry.SetHostStatusByInstanceName(r.Context(), req.InstanceName, "draining"); err != nil {
+			s.logger.WithError(err).WithField("instance_name", req.InstanceName).Warn("Failed to mark host as draining from heartbeat")
+		}
+	}
+
+	// Store per-runner info on the in-memory host for TTL enforcement.
+	if len(req.Runners) > 0 {
+		infos := make([]HostRunnerInfo, 0, len(req.Runners))
+		for _, ri := range req.Runners {
+			info := HostRunnerInfo{
+				RunnerID:    ri.RunnerID,
+				State:       ri.State,
+				WorkloadKey: ri.WorkloadKey,
+			}
+			if ri.IdleSince != "" {
+				if t, err := time.Parse(time.RFC3339, ri.IdleSince); err == nil {
+					info.IdleSince = t
+				}
+			}
+			infos = append(infos, info)
+		}
+		s.hostRegistry.mu.Lock()
+		host.RunnerInfos = infos
+		s.hostRegistry.mu.Unlock()
+	} else {
+		s.hostRegistry.mu.Lock()
+		host.RunnerInfos = nil
+		s.hostRegistry.mu.Unlock()
 	}
 
 	// Compute per-workload-key sync directives: only send workload keys whose

@@ -244,6 +244,7 @@ func main() {
 	go snapshotFreshnessLoop(ctx, snapshotManager, snapshotConfigRegistry, logger)
 	go startDownscaler(ctx, db, hostRegistry, logger)
 	go jobQueue.jobRetryLoop(ctx)
+	go controlPlaneServer.startTTLEnforcement(ctx)
 	if metricsClient != nil {
 		go controlPlaneMetricsLoop(ctx, hostRegistry, scheduler, snapshotManager, metricsClient, logger)
 	}
@@ -767,6 +768,17 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// If host is draining/terminating, session runners are already being
+	// proactively paused by the host agent — return 503 so the client retries
+	// via /connect which will resume on a new host.
+	if host.Status == "draining" || host.Status == "terminating" {
+		w.Header().Set("Retry-After", "5")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "host is draining"})
+		return
+	}
+
 	// Forward to host agent gRPC
 	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -859,13 +871,29 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 			return
 		}
 
-		// Resume from session via host
-		host, err := s.hostRegistry.GetHost(hostID)
-		if err != nil {
-			http.Error(w, "host not found for suspended session", http.StatusInternalServerError)
+		// Pick the host to resume on. Prefer the original host unless it's
+		// draining/terminating or unreachable — in that case, fall back to
+		// another available host using cache-affinity scheduling.
+		var resumeHost *Host
+		origHost, origErr := s.hostRegistry.GetHost(hostID)
+		if origErr == nil && origHost.Status != "draining" && origHost.Status != "terminating" {
+			resumeHost = origHost
+		} else {
+			// Look up workload_key for affinity scheduling
+			var workloadKey string
+			_ = s.scheduler.db.QueryRowContext(r.Context(),
+				`SELECT workload_key FROM session_snapshots WHERE session_id = $1`, sessionID).Scan(&workloadKey)
+			resumeHost = s.scheduler.selectBestHostForWorkloadKey(s.hostRegistry.GetAvailableHosts(), workloadKey)
+		}
+		if resumeHost == nil {
+			w.Header().Set("Retry-After", "5")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": "no available host for session resume"})
 			return
 		}
-		conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+
+		conn, err := grpc.NewClient(resumeHost.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			http.Error(w, "failed to connect to host", http.StatusInternalServerError)
 			return
@@ -885,15 +913,17 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 			return
 		}
 
-		// Update session status
+		// Update session status and host assignment
 		_, _ = s.scheduler.db.ExecContext(r.Context(),
-			`UPDATE session_snapshots SET status = 'active' WHERE session_id = $1`, sessionID)
+			`UPDATE session_snapshots SET status = 'active', host_id = $1 WHERE session_id = $2`,
+			resumeHost.ID, sessionID)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(map[string]string{
-			"status":    "resumed",
-			"runner_id": resp.Runner.GetId(),
+			"status":       "resumed",
+			"runner_id":    resp.Runner.GetId(),
+			"host_address": resumeHost.HTTPAddress,
 		})
 		return
 	}
@@ -902,6 +932,15 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 	host, err := s.hostRegistry.GetHost(runner.HostID)
 	if err != nil {
 		http.Error(w, "host not found", http.StatusInternalServerError)
+		return
+	}
+
+	// If the host is draining, the runner will soon be gone — tell the client to retry.
+	if host.Status == "draining" || host.Status == "terminating" {
+		w.Header().Set("Retry-After", "5")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "host is draining, retry shortly"})
 		return
 	}
 
