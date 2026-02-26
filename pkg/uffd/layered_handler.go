@@ -37,6 +37,12 @@ type LayeredHandler struct {
 	layerFDs   []int   // file descriptors for diff layers (oldest first)
 	layerSizes []int64 // sizes of diff layer files
 
+	// layerBitmaps holds one bitmap per diff layer (same order as layerFDs).
+	// Each bitmap has one bit per page: bit N is set if page N contains data
+	// (not a sparse hole). Built at startup via SEEK_DATA/SEEK_HOLE to
+	// replace per-fault lseek syscalls with O(1) bitmap lookups.
+	layerBitmaps [][]uint64
+
 	// Guest memory region mappings received from Firecracker
 	mappings []GuestRegionUFFDMapping
 
@@ -114,7 +120,7 @@ func NewLayeredHandler(cfg LayeredHandlerConfig) (*LayeredHandler, error) {
 	}
 	h.goldenMem = goldenMem
 
-	// Open diff layer files (oldest first)
+	// Open diff layer files (oldest first) and build extent bitmaps
 	for _, layerPath := range cfg.DiffLayers {
 		fd, err := unix.Open(layerPath, unix.O_RDONLY, 0)
 		if err != nil {
@@ -129,6 +135,11 @@ func NewLayeredHandler(cfg LayeredHandlerConfig) (*LayeredHandler, error) {
 		}
 		h.layerFDs = append(h.layerFDs, fd)
 		h.layerSizes = append(h.layerSizes, stat.Size)
+
+		// Build a page-level bitmap of data extents using SEEK_DATA/SEEK_HOLE.
+		// This replaces per-fault lseek syscalls with O(1) bitmap lookups.
+		bitmap := buildExtentBitmap(fd, stat.Size)
+		h.layerBitmaps = append(h.layerBitmaps, bitmap)
 	}
 
 	h.logger.WithFields(logrus.Fields{
@@ -137,6 +148,47 @@ func NewLayeredHandler(cfg LayeredHandlerConfig) (*LayeredHandler, error) {
 	}).Info("Layered UFFD handler initialized")
 
 	return h, nil
+}
+
+// buildExtentBitmap walks a sparse file with SEEK_DATA/SEEK_HOLE and returns
+// a bitmap with one bit per page. Bit N is set if page N has data.
+func buildExtentBitmap(fd int, fileSize int64) []uint64 {
+	numPages := (fileSize + PageSize - 1) / PageSize
+	numWords := (numPages + 63) / 64
+	bitmap := make([]uint64, numWords)
+
+	for offset := int64(0); ; {
+		dataStart, err := unix.Seek(fd, offset, unix.SEEK_DATA)
+		if err != nil {
+			break // ENXIO = no more data segments
+		}
+		holeStart, err := unix.Seek(fd, dataStart, unix.SEEK_HOLE)
+		if err != nil {
+			holeStart = fileSize
+		}
+
+		// Set bits for all pages in [dataStart, holeStart)
+		firstPage := dataStart / PageSize
+		lastPage := (holeStart - 1) / PageSize
+		for p := firstPage; p <= lastPage; p++ {
+			bitmap[p/64] |= 1 << (p % 64)
+		}
+
+		offset = holeStart
+	}
+
+	return bitmap
+}
+
+// bitmapHasPage returns true if the bitmap indicates page at the given offset
+// has data (is not a sparse hole).
+func bitmapHasPage(bitmap []uint64, offset uint64) bool {
+	page := offset / PageSize
+	word := page / 64
+	if word >= uint64(len(bitmap)) {
+		return false
+	}
+	return bitmap[word]&(1<<(page%64)) != 0
 }
 
 // cleanup releases resources
@@ -357,35 +409,28 @@ func (h *LayeredHandler) handleSingleFault(uffdFd int, address uint64) error {
 	}
 
 	// Check diff layers in reverse order (newest first)
+	// Uses pre-built bitmaps for O(1) data-presence checks instead of
+	// per-fault SEEK_DATA syscalls.
 	for i := len(h.layerFDs) - 1; i >= 0; i-- {
-		fd := h.layerFDs[i]
-		layerSize := h.layerSizes[i]
-
-		if int64(offset) >= layerSize {
+		if int64(offset) >= h.layerSizes[i] {
 			continue
 		}
 
-		// Use lseek SEEK_DATA to check if this offset has data (not a sparse hole)
-		dataOffset, err := unix.Seek(fd, int64(offset), unix.SEEK_DATA)
-		if err != nil {
-			// ENXIO means no data at or after offset (all holes) - try next layer
+		// O(1) bitmap lookup replaces lseek(SEEK_DATA) syscall
+		if !bitmapHasPage(h.layerBitmaps[i], offset) {
 			continue
 		}
 
-		// Check if the data region starts at or before our page offset
-		// and we're within a data region (not past it into a hole)
-		if dataOffset <= int64(offset) {
-			// Read the page from this layer
-			page := make([]byte, PageSize)
-			n, err := unix.Pread(fd, page, int64(offset))
-			if err != nil || n == 0 {
-				continue
-			}
-
-			atomic.AddUint64(&h.layerReads, 1)
-			h.pageCache.Add(offset, page)
-			return h.copyPage(uffdFd, pageAddr, page)
+		// Read the page from this layer
+		page := make([]byte, PageSize)
+		n, err := unix.Pread(h.layerFDs[i], page, int64(offset))
+		if err != nil || n == 0 {
+			continue
 		}
+
+		atomic.AddUint64(&h.layerReads, 1)
+		h.pageCache.Add(offset, page)
+		return h.copyPage(uffdFd, pageAddr, page)
 	}
 
 	// Fall back to golden base memory
