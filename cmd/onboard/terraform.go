@@ -122,11 +122,11 @@ func generateTFVars(cfg *Config, finalize bool, targetDir ...string) (string, er
 	// --- MicroVMs ---
 	addInt("max_runners_per_host", cfg.MicroVM.MaxPerHost)
 	addInt("idle_runners_target", cfg.MicroVM.IdleTarget)
-	addInt("vcpus_per_runner", cfg.MicroVM.VCPUs)
-	addInt("memory_per_runner_mb", cfg.MicroVM.MemoryMB)
 
-	// --- CI add-on ---
+	// CI system
 	addStr("ci_system", cfg.CI.System)
+
+	// GitHub config
 	if cfg.CI.System == "github-actions" {
 		addBool("github_runner_enabled", true)
 		if cfg.CI.GitHub.Repo != "" {

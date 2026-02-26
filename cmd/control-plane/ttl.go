@@ -62,6 +62,7 @@ func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
 		runnerID    string
 		hostID      string
 		grpcAddress string
+		workloadKey string
 	}
 	var candidates []pauseCandidate
 
@@ -87,6 +88,7 @@ func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
 					runnerID:    ri.RunnerID,
 					hostID:      h.ID,
 					grpcAddress: h.GRPCAddress,
+					workloadKey: ri.WorkloadKey,
 				})
 			}
 		}
@@ -130,7 +132,7 @@ func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
 					status = 'suspended',
 					layer_count = EXCLUDED.layer_count,
 					paused_at = NOW()
-			`, resp.SessionId, c.runnerID, "", c.hostID, resp.Layer+1)
+			`, resp.SessionId, c.runnerID, c.workloadKey, c.hostID, resp.Layer+1)
 		}
 
 		// Roll back optimistic resource reservation.
