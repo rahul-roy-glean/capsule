@@ -194,18 +194,6 @@ variable "idle_runners_target" {
   default     = 2
 }
 
-variable "vcpus_per_runner" {
-  description = "Number of vCPUs allocated to each microVM"
-  type        = number
-  default     = 12
-}
-
-variable "memory_per_runner_mb" {
-  description = "Memory in MB allocated to each microVM"
-  type        = number
-  default     = 49152
-}
-
 variable "use_chunked_snapshots" {
   description = "Enable chunked snapshot restore with UFFD (lazy memory) and FUSE (lazy disk). Requires chunked metadata in the snapshot bucket."
   type        = bool

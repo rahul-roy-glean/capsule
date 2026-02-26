@@ -444,8 +444,21 @@ func initSchema(db *sql.DB) error {
 		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS used_cpu_millicores INT DEFAULT 0`,
 		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS total_memory_mb INT DEFAULT 0`,
 		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS used_memory_mb INT DEFAULT 0`,
+		// Drop host_summary view that depends on total_slots/used_slots before dropping the columns
+		`DROP VIEW IF EXISTS host_summary`,
 		`ALTER TABLE hosts DROP COLUMN IF EXISTS total_slots`,
 		`ALTER TABLE hosts DROP COLUMN IF EXISTS used_slots`,
+		// Recreate host_summary view without slot columns
+		`CREATE OR REPLACE VIEW host_summary AS
+		 SELECT
+		     COUNT(*) as total_hosts,
+		     COUNT(*) FILTER (WHERE status = 'ready') as ready_hosts,
+		     COUNT(*) FILTER (WHERE status = 'draining') as draining_hosts,
+		     COUNT(*) FILTER (WHERE status = 'unhealthy') as unhealthy_hosts,
+		     SUM(idle_runners) as idle_runners,
+		     SUM(busy_runners) as busy_runners
+		 FROM hosts
+		 WHERE last_heartbeat > NOW() - INTERVAL '2 minutes'`,
 		// Drop unused repo/branch columns from runners
 		`ALTER TABLE runners DROP COLUMN IF EXISTS repo`,
 		`ALTER TABLE runners DROP COLUMN IF EXISTS branch`,
@@ -805,12 +818,12 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 	if resp.SessionId != "" {
 		_, _ = s.scheduler.db.ExecContext(r.Context(), `
 			INSERT INTO session_snapshots (session_id, runner_id, workload_key, host_id, status, layer_count, paused_at)
-			VALUES ($1, $2, '', $3, 'suspended', $4, NOW())
+			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW())
 			ON CONFLICT (session_id) DO UPDATE SET
 				status = 'suspended',
 				layer_count = EXCLUDED.layer_count,
 				paused_at = NOW()
-		`, resp.SessionId, req.RunnerID, host.ID, resp.Layer+1)
+		`, resp.SessionId, req.RunnerID, runner.WorkloadKey, host.ID, resp.Layer+1)
 	}
 
 	// Roll back optimistic resource reservation — a paused runner no longer

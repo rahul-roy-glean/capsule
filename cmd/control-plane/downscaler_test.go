@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -318,4 +320,399 @@ func newTestLogger() *logrus.Logger {
 	l := logrus.New()
 	l.SetLevel(logrus.WarnLevel)
 	return l
+}
+
+type mockMIGClient struct {
+	targetSize       int64
+	instances        map[string]string // name → URL
+	deletedInstances []string          // URLs passed to DeleteInstances
+	resizedTo        int64             // last Resize target (0 means not called)
+	deleteErr        error
+	resizeErr        error
+}
+
+func (m *mockMIGClient) GetTargetSize(_ context.Context) (int64, error) {
+	return m.targetSize, nil
+}
+
+func (m *mockMIGClient) ListInstances(_ context.Context) (map[string]string, error) {
+	cp := make(map[string]string, len(m.instances))
+	for k, v := range m.instances {
+		cp[k] = v
+	}
+	return cp, nil
+}
+
+func (m *mockMIGClient) DeleteInstances(_ context.Context, urls []string) error {
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
+	m.deletedInstances = append(m.deletedInstances, urls...)
+	return nil
+}
+
+func (m *mockMIGClient) Resize(_ context.Context, newSize int64) error {
+	if m.resizeErr != nil {
+		return m.resizeErr
+	}
+	m.resizedTo = newSize
+	return nil
+}
+
+type mockHostStore struct {
+	hosts         []*Host
+	statusUpdates map[string]string // instanceName → last status set
+	removedHosts  []string          // host IDs removed
+	cleanedUp     []string          // host IDs cleaned up
+}
+
+func newMockHostStore(hosts []*Host) *mockHostStore {
+	return &mockHostStore{
+		hosts:         hosts,
+		statusUpdates: map[string]string{},
+	}
+}
+
+func (m *mockHostStore) GetAllHosts() []*Host {
+	return m.hosts
+}
+
+func (m *mockHostStore) SetHostStatusByInstanceName(_ context.Context, instanceName, status string) error {
+	m.statusUpdates[instanceName] = status
+	return nil
+}
+
+func (m *mockHostStore) CleanupHostRunners(_ context.Context, hostID string) error {
+	m.cleanedUp = append(m.cleanedUp, hostID)
+	return nil
+}
+
+func (m *mockHostStore) RemoveHost(hostID string) {
+	m.removedHosts = append(m.removedHosts, hostID)
+}
+
+type mockQueueDepth struct {
+	depth int
+}
+
+func (m *mockQueueDepth) GetQueueDepth() int {
+	return m.depth
+}
+
+func defaultTestConfig() downscalerConfig {
+	return downscalerConfig{
+		MaxDeletesPerCycle:   5,
+		MaxDrainsPerCycle:    5,
+		HeartbeatStaleWindow: 90 * time.Second,
+		ScaleUpThreshold:     0.9,
+		ScaleDownThreshold:   0.5,
+		Cooldown:             5 * time.Minute,
+	}
+}
+
+
+func TestRunDownscaleOnce_ScaleUpResizesMIG(t *testing.T) {
+	now := time.Now()
+	hosts := []*Host{
+		{ID: "1", InstanceName: "h1", Status: "ready", TotalCPUMillicores: 1000, UsedCPUMillicores: 950, CreatedAt: now.Add(-2 * time.Hour), LastHeartbeat: now},
+		{ID: "2", InstanceName: "h2", Status: "ready", TotalCPUMillicores: 1000, UsedCPUMillicores: 920, CreatedAt: now.Add(-1 * time.Hour), LastHeartbeat: now},
+	}
+
+	mc := &mockMIGClient{targetSize: 2, instances: map[string]string{"h1": "url/h1", "h2": "url/h2"}}
+	hs := newMockHostStore(hosts)
+	qds := &mockQueueDepth{depth: 0}
+	log := newTestLogger().WithField("test", true)
+
+	acted, err := runDownscaleOnce(context.Background(), defaultTestConfig(), mc, hs, qds, time.Time{}, log)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !acted {
+		t.Fatal("expected action taken")
+	}
+	if mc.resizedTo != 3 {
+		t.Fatalf("expected MIG resized to 3, got %d", mc.resizedTo)
+	}
+}
+
+func TestRunDownscaleOnce_ScaleUpNoReadyHostsWithQueue(t *testing.T) {
+	mc := &mockMIGClient{targetSize: 0, instances: map[string]string{}}
+	hs := newMockHostStore(nil)
+	qds := &mockQueueDepth{depth: 5}
+	log := newTestLogger().WithField("test", true)
+
+	acted, err := runDownscaleOnce(context.Background(), defaultTestConfig(), mc, hs, qds, time.Time{}, log)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !acted {
+		t.Fatal("expected action taken")
+	}
+	if mc.resizedTo != 1 {
+		t.Fatalf("expected MIG resized to 1, got %d", mc.resizedTo)
+	}
+}
+
+func TestRunDownscaleOnce_ScaleDownDrainsVictim(t *testing.T) {
+	now := time.Now()
+	hosts := []*Host{
+		{ID: "1", InstanceName: "h-old", Status: "ready", TotalCPUMillicores: 1000, UsedCPUMillicores: 300, CreatedAt: now.Add(-2 * time.Hour), LastHeartbeat: now},
+		{ID: "2", InstanceName: "h-new", Status: "ready", TotalCPUMillicores: 1000, UsedCPUMillicores: 200, CreatedAt: now.Add(-1 * time.Hour), LastHeartbeat: now},
+	}
+
+	mc := &mockMIGClient{targetSize: 2, instances: map[string]string{"h-old": "url/h-old", "h-new": "url/h-new"}}
+	hs := newMockHostStore(hosts)
+	qds := &mockQueueDepth{depth: 0}
+	log := newTestLogger().WithField("test", true)
+
+	acted, err := runDownscaleOnce(context.Background(), defaultTestConfig(), mc, hs, qds, time.Time{}, log)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !acted {
+		t.Fatal("expected action taken")
+	}
+	// Verify victim was marked as draining in host store.
+	status, ok := hs.statusUpdates["h-new"]
+	if !ok {
+		t.Fatal("expected h-new status to be updated")
+	}
+	if status != "draining" {
+		t.Fatalf("expected h-new status 'draining', got '%s'", status)
+	}
+	// MIG should NOT have been resized (scale-down only drains, doesn't resize).
+	if mc.resizedTo != 0 {
+		t.Fatalf("expected no MIG resize on scale-down, got resize to %d", mc.resizedTo)
+	}
+}
+
+func TestRunDownscaleOnce_Phase1DeletesDrainingIdleHosts(t *testing.T) {
+	now := time.Now()
+	hosts := []*Host{
+		{ID: "1", InstanceName: "h-draining", Status: "draining", BusyRunners: 0, TotalCPUMillicores: 1000, UsedCPUMillicores: 0, CreatedAt: now.Add(-2 * time.Hour), LastHeartbeat: now},
+		{ID: "2", InstanceName: "h-ready", Status: "ready", TotalCPUMillicores: 1000, UsedCPUMillicores: 700, CreatedAt: now.Add(-1 * time.Hour), LastHeartbeat: now},
+	}
+
+	mc := &mockMIGClient{targetSize: 2, instances: map[string]string{"h-draining": "url/h-draining", "h-ready": "url/h-ready"}}
+	hs := newMockHostStore(hosts)
+	qds := &mockQueueDepth{depth: 0}
+	log := newTestLogger().WithField("test", true)
+
+	_, err := runDownscaleOnce(context.Background(), defaultTestConfig(), mc, hs, qds, time.Time{}, log)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Verify draining host was deleted via MIG.
+	if len(mc.deletedInstances) != 1 || mc.deletedInstances[0] != "url/h-draining" {
+		t.Fatalf("expected h-draining deleted, got %v", mc.deletedInstances)
+	}
+	// Verify status updated to terminating.
+	if hs.statusUpdates["h-draining"] != "terminating" {
+		t.Fatalf("expected h-draining status 'terminating', got '%s'", hs.statusUpdates["h-draining"])
+	}
+}
+
+func TestRunDownscaleOnce_Phase1SkipsBusyDrainingHosts(t *testing.T) {
+	now := time.Now()
+	hosts := []*Host{
+		{ID: "1", InstanceName: "h-busy", Status: "draining", BusyRunners: 3, TotalCPUMillicores: 1000, UsedCPUMillicores: 500, CreatedAt: now.Add(-2 * time.Hour), LastHeartbeat: now},
+		{ID: "2", InstanceName: "h-ready", Status: "ready", TotalCPUMillicores: 1000, UsedCPUMillicores: 700, CreatedAt: now.Add(-1 * time.Hour), LastHeartbeat: now},
+	}
+
+	mc := &mockMIGClient{targetSize: 2, instances: map[string]string{"h-busy": "url/h-busy", "h-ready": "url/h-ready"}}
+	hs := newMockHostStore(hosts)
+	qds := &mockQueueDepth{depth: 0}
+	log := newTestLogger().WithField("test", true)
+
+	_, err := runDownscaleOnce(context.Background(), defaultTestConfig(), mc, hs, qds, time.Time{}, log)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(mc.deletedInstances) != 0 {
+		t.Fatalf("expected no deletions for busy draining host, got %v", mc.deletedInstances)
+	}
+}
+
+func TestRunDownscaleOnce_Phase0CleansUpUnhealthyHosts(t *testing.T) {
+	staleTime := time.Now().Add(-10 * time.Minute)
+	hosts := []*Host{
+		{ID: "unhealthy-1", InstanceName: "h-unhealthy", Status: "unhealthy", LastHeartbeat: staleTime, CreatedAt: staleTime},
+	}
+
+	mc := &mockMIGClient{targetSize: 1, instances: map[string]string{"h-unhealthy": "url/h-unhealthy"}}
+	hs := newMockHostStore(hosts)
+	qds := &mockQueueDepth{depth: 0}
+	log := newTestLogger().WithField("test", true)
+
+	_, err := runDownscaleOnce(context.Background(), defaultTestConfig(), mc, hs, qds, time.Time{}, log)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Verify the unhealthy host was deleted from MIG.
+	if len(mc.deletedInstances) != 1 || mc.deletedInstances[0] != "url/h-unhealthy" {
+		t.Fatalf("expected h-unhealthy deleted, got %v", mc.deletedInstances)
+	}
+	// Verify status set to terminated.
+	if hs.statusUpdates["h-unhealthy"] != "terminated" {
+		t.Fatalf("expected status 'terminated', got '%s'", hs.statusUpdates["h-unhealthy"])
+	}
+	// Verify runners cleaned up and host removed.
+	if len(hs.cleanedUp) != 1 || hs.cleanedUp[0] != "unhealthy-1" {
+		t.Fatalf("expected cleanup for unhealthy-1, got %v", hs.cleanedUp)
+	}
+	if len(hs.removedHosts) != 1 || hs.removedHosts[0] != "unhealthy-1" {
+		t.Fatalf("expected removal of unhealthy-1, got %v", hs.removedHosts)
+	}
+}
+
+func TestRunDownscaleOnce_Phase0CleansUpStaleTerminatingHosts(t *testing.T) {
+	staleTime := time.Now().Add(-10 * time.Minute)
+	hosts := []*Host{
+		{ID: "term-1", InstanceName: "h-terminating", Status: "terminating", LastHeartbeat: staleTime, CreatedAt: staleTime},
+	}
+
+	mc := &mockMIGClient{targetSize: 1, instances: map[string]string{}}
+	hs := newMockHostStore(hosts)
+	qds := &mockQueueDepth{depth: 0}
+	log := newTestLogger().WithField("test", true)
+
+	_, err := runDownscaleOnce(context.Background(), defaultTestConfig(), mc, hs, qds, time.Time{}, log)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// No MIG deletion (instance not in MIG).
+	if len(mc.deletedInstances) != 0 {
+		t.Fatalf("expected no MIG deletions for terminating host, got %v", mc.deletedInstances)
+	}
+	// Runners cleaned up and host removed from registry.
+	if len(hs.cleanedUp) != 1 || hs.cleanedUp[0] != "term-1" {
+		t.Fatalf("expected cleanup for term-1, got %v", hs.cleanedUp)
+	}
+	if len(hs.removedHosts) != 1 || hs.removedHosts[0] != "term-1" {
+		t.Fatalf("expected removal of term-1, got %v", hs.removedHosts)
+	}
+}
+
+func TestRunDownscaleOnce_CooldownSkipsPhase2(t *testing.T) {
+	now := time.Now()
+	hosts := []*Host{
+		{ID: "1", InstanceName: "h1", Status: "ready", TotalCPUMillicores: 1000, UsedCPUMillicores: 950, CreatedAt: now.Add(-2 * time.Hour), LastHeartbeat: now},
+	}
+
+	mc := &mockMIGClient{targetSize: 1, instances: map[string]string{"h1": "url/h1"}}
+	hs := newMockHostStore(hosts)
+	qds := &mockQueueDepth{depth: 0}
+	log := newTestLogger().WithField("test", true)
+
+	// Last action was 1 minute ago, cooldown is 5 minutes → should skip.
+	lastAction := now.Add(-1 * time.Minute)
+	acted, err := runDownscaleOnce(context.Background(), defaultTestConfig(), mc, hs, qds, lastAction, log)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if acted {
+		t.Fatal("expected no action during cooldown")
+	}
+	if mc.resizedTo != 0 {
+		t.Fatalf("expected no resize during cooldown, got %d", mc.resizedTo)
+	}
+}
+
+func TestRunDownscaleOnce_CooldownExpiredAllowsAction(t *testing.T) {
+	now := time.Now()
+	hosts := []*Host{
+		{ID: "1", InstanceName: "h1", Status: "ready", TotalCPUMillicores: 1000, UsedCPUMillicores: 950, CreatedAt: now.Add(-2 * time.Hour), LastHeartbeat: now},
+	}
+
+	mc := &mockMIGClient{targetSize: 1, instances: map[string]string{"h1": "url/h1"}}
+	hs := newMockHostStore(hosts)
+	qds := &mockQueueDepth{depth: 0}
+	log := newTestLogger().WithField("test", true)
+
+	// Last action was 10 minutes ago, cooldown is 5 minutes → should proceed.
+	lastAction := now.Add(-10 * time.Minute)
+	acted, err := runDownscaleOnce(context.Background(), defaultTestConfig(), mc, hs, qds, lastAction, log)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !acted {
+		t.Fatal("expected action after cooldown expired")
+	}
+	if mc.resizedTo != 2 {
+		t.Fatalf("expected resize to 2, got %d", mc.resizedTo)
+	}
+}
+
+func TestRunDownscaleOnce_NoActionMidUtilization(t *testing.T) {
+	now := time.Now()
+	hosts := []*Host{
+		{ID: "1", InstanceName: "h1", Status: "ready", TotalCPUMillicores: 1000, UsedCPUMillicores: 700, CreatedAt: now.Add(-2 * time.Hour), LastHeartbeat: now},
+		{ID: "2", InstanceName: "h2", Status: "ready", TotalCPUMillicores: 1000, UsedCPUMillicores: 600, CreatedAt: now.Add(-1 * time.Hour), LastHeartbeat: now},
+	}
+
+	mc := &mockMIGClient{targetSize: 2, instances: map[string]string{"h1": "url/h1", "h2": "url/h2"}}
+	hs := newMockHostStore(hosts)
+	qds := &mockQueueDepth{depth: 0}
+	log := newTestLogger().WithField("test", true)
+
+	acted, err := runDownscaleOnce(context.Background(), defaultTestConfig(), mc, hs, qds, time.Time{}, log)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if acted {
+		t.Fatal("expected no action for mid-utilization hosts")
+	}
+	if mc.resizedTo != 0 {
+		t.Fatal("expected no resize")
+	}
+	if len(hs.statusUpdates) != 0 {
+		t.Fatalf("expected no status updates, got %v", hs.statusUpdates)
+	}
+}
+
+func TestRunDownscaleOnce_StaleHeartbeatHostsExcludedFromReadyHosts(t *testing.T) {
+	now := time.Now()
+	hosts := []*Host{
+		{ID: "1", InstanceName: "h-stale", Status: "ready", TotalCPUMillicores: 1000, UsedCPUMillicores: 950, CreatedAt: now.Add(-2 * time.Hour), LastHeartbeat: now.Add(-5 * time.Minute)},
+		{ID: "2", InstanceName: "h-fresh", Status: "ready", TotalCPUMillicores: 1000, UsedCPUMillicores: 700, CreatedAt: now.Add(-1 * time.Hour), LastHeartbeat: now},
+	}
+
+	mc := &mockMIGClient{targetSize: 2, instances: map[string]string{"h-stale": "url/h-stale", "h-fresh": "url/h-fresh"}}
+	hs := newMockHostStore(hosts)
+	qds := &mockQueueDepth{depth: 0}
+	log := newTestLogger().WithField("test", true)
+
+	acted, err := runDownscaleOnce(context.Background(), defaultTestConfig(), mc, hs, qds, time.Time{}, log)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Only h-fresh (Xi=0.7) is ready. Single host → no scale down.
+	// Xi=0.7 < 0.9 → no scale up.
+	if acted {
+		t.Fatal("expected no action when stale host excluded leaves single ready host")
+	}
+}
+
+func TestRunDownscaleOnce_ResizeErrorReturnsError(t *testing.T) {
+	now := time.Now()
+	hosts := []*Host{
+		{ID: "1", InstanceName: "h1", Status: "ready", TotalCPUMillicores: 1000, UsedCPUMillicores: 950, CreatedAt: now, LastHeartbeat: now},
+	}
+
+	mc := &mockMIGClient{
+		targetSize: 1,
+		instances:  map[string]string{"h1": "url/h1"},
+		resizeErr:  fmt.Errorf("quota exceeded"),
+	}
+	hs := newMockHostStore(hosts)
+	qds := &mockQueueDepth{depth: 0}
+	log := newTestLogger().WithField("test", true)
+
+	acted, err := runDownscaleOnce(context.Background(), defaultTestConfig(), mc, hs, qds, time.Time{}, log)
+	if err == nil {
+		t.Fatal("expected error from resize failure")
+	}
+	if acted {
+		t.Fatal("expected no action on error")
+	}
 }

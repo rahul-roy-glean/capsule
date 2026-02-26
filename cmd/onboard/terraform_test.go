@@ -189,8 +189,6 @@ func TestGenerateTFVars_AllFields(t *testing.T) {
 		{"host_data_disk_size_gb", `host_data_disk_size_gb = 200`},
 		{"max_runners_per_host", `max_runners_per_host = 8`},
 		{"idle_runners_target", `idle_runners_target = 1`},
-		{"vcpus_per_runner", `vcpus_per_runner = 2`},
-		{"memory_per_runner_mb", `memory_per_runner_mb = 4096`},
 		{"github_org", `github_org = "myorg"`},
 		{"github_app_id", `github_app_id = "99999"`},
 		{"github_app_secret", `github_app_secret = "my-secret"`},

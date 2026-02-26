@@ -121,6 +121,13 @@ func startDownscaler(ctx context.Context, db *sql.DB, hr *HostRegistry, sched *S
 		return
 	}
 
+	mc := &gcpMIGClient{
+		svc:       svc,
+		projectID: cfg.ProjectID,
+		region:    cfg.Region,
+		migName:   cfg.MIGName,
+	}
+
 	log.WithFields(logrus.Fields{
 		"project":              cfg.ProjectID,
 		"region":               cfg.Region,
@@ -153,7 +160,7 @@ func startDownscaler(ctx context.Context, db *sql.DB, hr *HostRegistry, sched *S
 				continue
 			}
 
-			if acted, err := runDownscaleOnce(ctx, cfg, svc, hr, sched, lastScaleAction, log); err != nil {
+			if acted, err := runDownscaleOnce(ctx, cfg, mc, hr, sched, lastScaleAction, log); err != nil {
 				log.WithError(err).Warn("Downscale iteration failed")
 			} else if acted {
 				lastScaleAction = time.Now()
@@ -164,31 +171,86 @@ func startDownscaler(ctx context.Context, db *sql.DB, hr *HostRegistry, sched *S
 	}
 }
 
-// runDownscaleOnce returns (actionTaken, error). actionTaken is true when a
-// scale-up resize or scale-down drain was performed (used for cooldown tracking).
-func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, svc *compute.Service, hr *HostRegistry, sched *Scheduler, lastScaleAction time.Time, log *logrus.Entry) (bool, error) {
-	mig, err := svc.RegionInstanceGroupManagers.Get(cfg.ProjectID, cfg.Region, cfg.MIGName).Context(ctx).Do()
-	if err != nil {
-		return false, fmt.Errorf("get mig: %w", err)
-	}
-	currentTarget := mig.TargetSize
+// migClient abstracts GCP MIG operations for testability.
+type migClient interface {
+	GetTargetSize(ctx context.Context) (int64, error)
+	ListInstances(ctx context.Context) (map[string]string, error) // name → instanceURL
+	DeleteInstances(ctx context.Context, instanceURLs []string) error
+	Resize(ctx context.Context, newSize int64) error
+}
 
-	managed, err := svc.RegionInstanceGroupManagers.ListManagedInstances(cfg.ProjectID, cfg.Region, cfg.MIGName).Context(ctx).Do()
-	if err != nil {
-		return false, fmt.Errorf("list managed instances: %w", err)
-	}
+// hostStore abstracts host registry operations for testability.
+type hostStore interface {
+	GetAllHosts() []*Host
+	SetHostStatusByInstanceName(ctx context.Context, instanceName, status string) error
+	CleanupHostRunners(ctx context.Context, hostID string) error
+	RemoveHost(hostID string)
+}
 
-	instanceByName := map[string]string{}
+// queueDepthSource abstracts queue depth retrieval for testability.
+type queueDepthSource interface {
+	GetQueueDepth() int
+}
+
+// gcpMIGClient wraps a real GCP compute.Service for production use.
+type gcpMIGClient struct {
+	svc       *compute.Service
+	projectID string
+	region    string
+	migName   string
+}
+
+func (g *gcpMIGClient) GetTargetSize(ctx context.Context) (int64, error) {
+	mig, err := g.svc.RegionInstanceGroupManagers.Get(g.projectID, g.region, g.migName).Context(ctx).Do()
+	if err != nil {
+		return 0, fmt.Errorf("get mig: %w", err)
+	}
+	return mig.TargetSize, nil
+}
+
+func (g *gcpMIGClient) ListInstances(ctx context.Context) (map[string]string, error) {
+	managed, err := g.svc.RegionInstanceGroupManagers.ListManagedInstances(g.projectID, g.region, g.migName).Context(ctx).Do()
+	if err != nil {
+		return nil, fmt.Errorf("list managed instances: %w", err)
+	}
+	result := map[string]string{}
 	for _, mi := range managed.ManagedInstances {
 		name := instanceNameFromURL(mi.Instance)
-		if name == "" {
-			continue
+		if name != "" {
+			result[name] = mi.Instance
 		}
-		instanceByName[name] = mi.Instance
+	}
+	return result, nil
+}
+
+func (g *gcpMIGClient) DeleteInstances(ctx context.Context, instanceURLs []string) error {
+	req := &compute.RegionInstanceGroupManagersDeleteInstancesRequest{
+		Instances: instanceURLs,
+	}
+	_, err := g.svc.RegionInstanceGroupManagers.DeleteInstances(g.projectID, g.region, g.migName, req).Context(ctx).Do()
+	return err
+}
+
+func (g *gcpMIGClient) Resize(ctx context.Context, newSize int64) error {
+	_, err := g.svc.RegionInstanceGroupManagers.Resize(g.projectID, g.region, g.migName, newSize).Context(ctx).Do()
+	return err
+}
+
+// runDownscaleOnce returns (actionTaken, error). actionTaken is true when a
+// scale-up resize or scale-down drain was performed (used for cooldown tracking).
+func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, mc migClient, hs hostStore, qds queueDepthSource, lastScaleAction time.Time, log *logrus.Entry) (bool, error) {
+	currentTarget, err := mc.GetTargetSize(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	instanceByName, err := mc.ListInstances(ctx)
+	if err != nil {
+		return false, err
 	}
 
 	// Snapshot hosts map by instance name.
-	hosts := hr.GetAllHosts()
+	hosts := hs.GetAllHosts()
 	hostByName := map[string]*Host{}
 	for _, h := range hosts {
 		hostByName[h.InstanceName] = h
@@ -205,11 +267,7 @@ func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, svc *compute.Se
 		if h.Status == "unhealthy" && time.Since(h.LastHeartbeat) >= unhealthyGracePeriod {
 			// Delete GCE instance if it exists in the MIG.
 			if instanceURL, ok := instanceByName[h.InstanceName]; ok {
-				req := &compute.RegionInstanceGroupManagersDeleteInstancesRequest{
-					Instances: []string{instanceURL},
-				}
-				_, err := svc.RegionInstanceGroupManagers.DeleteInstances(cfg.ProjectID, cfg.Region, cfg.MIGName, req).Context(ctx).Do()
-				if err != nil {
+				if err := mc.DeleteInstances(ctx, []string{instanceURL}); err != nil {
 					log.WithError(err).WithField("instance", h.InstanceName).Warn("Failed to delete unhealthy host")
 					continue
 				}
@@ -217,13 +275,13 @@ func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, svc *compute.Se
 				phase0Deleted++
 			}
 			// Mark terminated in DB.
-			_ = hr.SetHostStatusByInstanceName(ctx, h.InstanceName, "terminated")
+			_ = hs.SetHostStatusByInstanceName(ctx, h.InstanceName, "terminated")
 			// Clean up orphaned runners.
-			if err := hr.CleanupHostRunners(ctx, h.ID); err != nil {
+			if err := hs.CleanupHostRunners(ctx, h.ID); err != nil {
 				log.WithError(err).WithField("host_id", h.ID).Warn("Failed to clean up runners for unhealthy host")
 			}
 			// Remove from in-memory map.
-			hr.RemoveHost(h.ID)
+			hs.RemoveHost(h.ID)
 			delete(hostByName, h.InstanceName)
 			log.WithFields(logrus.Fields{
 				"host_id":  h.ID,
@@ -233,10 +291,10 @@ func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, svc *compute.Se
 
 		if h.Status == "terminating" && time.Since(h.LastHeartbeat) >= unhealthyGracePeriod {
 			// GCE instance already deleted; just clean up in-memory state.
-			if err := hr.CleanupHostRunners(ctx, h.ID); err != nil {
+			if err := hs.CleanupHostRunners(ctx, h.ID); err != nil {
 				log.WithError(err).WithField("host_id", h.ID).Warn("Failed to clean up runners for terminating host")
 			}
-			hr.RemoveHost(h.ID)
+			hs.RemoveHost(h.ID)
 			delete(hostByName, h.InstanceName)
 			log.WithFields(logrus.Fields{
 				"host_id":  h.ID,
@@ -265,15 +323,11 @@ func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, svc *compute.Se
 			continue
 		}
 
-		req := &compute.RegionInstanceGroupManagersDeleteInstancesRequest{
-			Instances: []string{instanceURL},
-		}
-		_, err := svc.RegionInstanceGroupManagers.DeleteInstances(cfg.ProjectID, cfg.Region, cfg.MIGName, req).Context(ctx).Do()
-		if err != nil {
+		if err := mc.DeleteInstances(ctx, []string{instanceURL}); err != nil {
 			log.WithError(err).WithField("instance", instanceName).Warn("Failed to delete draining host")
 			continue
 		}
-		_ = hr.SetHostStatusByInstanceName(ctx, instanceName, "terminating")
+		_ = hs.SetHostStatusByInstanceName(ctx, instanceName, "terminating")
 		deleted++
 	}
 
@@ -302,13 +356,12 @@ func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, svc *compute.Se
 		readyHosts = append(readyHosts, h)
 	}
 
-	decision := computeAutoscaleDecision(readyHosts, sched.GetQueueDepth(), cfg.ScaleUpThreshold, cfg.ScaleDownThreshold)
+	decision := computeAutoscaleDecision(readyHosts, qds.GetQueueDepth(), cfg.ScaleUpThreshold, cfg.ScaleDownThreshold)
 
 	switch decision.action {
 	case scaleActionUp:
 		newTarget := currentTarget + 1
-		_, err := svc.RegionInstanceGroupManagers.Resize(cfg.ProjectID, cfg.Region, cfg.MIGName, newTarget).Context(ctx).Do()
-		if err != nil {
+		if err := mc.Resize(ctx, newTarget); err != nil {
 			return false, fmt.Errorf("scale-up resize to %d: %w", newTarget, err)
 		}
 		log.WithFields(logrus.Fields{
@@ -320,7 +373,7 @@ func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, svc *compute.Se
 
 	case scaleActionDown:
 		victim := decision.drainTarget
-		if err := hr.SetHostStatusByInstanceName(ctx, victim.InstanceName, "draining"); err != nil {
+		if err := hs.SetHostStatusByInstanceName(ctx, victim.InstanceName, "draining"); err != nil {
 			log.WithError(err).WithField("instance", victim.InstanceName).Warn("Failed to mark host draining for scale-down")
 			return false, nil
 		}

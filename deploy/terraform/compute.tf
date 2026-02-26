@@ -99,8 +99,6 @@ resource "google_compute_instance_template" "firecracker_host" {
     buildbarn-certs         = jsonencode(var.buildbarn_certs)
     max-runners             = var.max_runners_per_host
     idle-target           = var.idle_runners_target
-    vcpus-per-runner      = var.vcpus_per_runner
-    memory-per-runner     = var.memory_per_runner_mb
     runner-ephemeral      = var.runner_ephemeral ? "true" : "false"
     # Indicates whether data disk was created from snapshot (fast) or empty (needs GCS download)
     use-data-snapshot     = var.use_data_snapshot ? "true" : "false"
@@ -298,10 +296,6 @@ LOGROTATE
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/max-runners || echo "16")
     IDLE_TARGET=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/idle-target || echo "2")
-    VCPUS_PER_RUNNER=$(curl -sf -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/vcpus-per-runner || echo "4")
-    MEMORY_PER_RUNNER=$(curl -sf -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/memory-per-runner || echo "8192")
     RUNNER_LABELS=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/github-runner-labels || echo "self-hosted,firecracker,Linux,X64")
     RUNNER_EPHEMERAL=$(curl -sf -H "Metadata-Flavor: Google" \
@@ -360,8 +354,6 @@ LOGROTATE
     EXEC_START="/usr/local/bin/firecracker-manager"
     EXEC_START="$EXEC_START --max-runners=$MAX_RUNNERS"
     EXEC_START="$EXEC_START --idle-target=$IDLE_TARGET"
-    EXEC_START="$EXEC_START --vcpus-per-runner=$VCPUS_PER_RUNNER"
-    EXEC_START="$EXEC_START --memory-per-runner=$MEMORY_PER_RUNNER"
     EXEC_START="$EXEC_START --github-runner-labels=$RUNNER_LABELS"
     EXEC_START="$EXEC_START --runner-ephemeral=$RUNNER_EPHEMERAL"
     EXEC_START="$EXEC_START --snapshot-cache=/mnt/data/snapshots"
