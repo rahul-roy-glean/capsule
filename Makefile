@@ -4,8 +4,8 @@
 .PHONY: firecracker-manager control-plane snapshot-builder thaw-agent
 .PHONY: git-cache-builder git-cache-freshness data-snapshot-builder snapshot-converter
 .PHONY: test-unit test-race test-cover test-integration test-all check
-.PHONY: dev-up dev-build dev-snapshot dev-stack dev-test-exec dev-test-pause-resume dev-stop dev-down dev-clean
-.PHONY: dev-setup dev-provision dev-build-local dev-snapshot-local dev-stack-local dev-test-exec-local dev-test-pause-resume-local dev-stop-local
+.PHONY: dev-up dev-build dev-snapshot dev-stack dev-test-exec dev-test-pause-resume dev-stop
+.PHONY: dev-setup dev-provision
 
 # Variables
 PROJECT_ID ?= your-project-id
@@ -18,7 +18,7 @@ VERSION ?= $(shell git describe --tags --always --dirty)
 
 # Go build settings
 GO := go
-GOFLAGS := -ldflags "-X main.version=$(VERSION)"
+GOFLAGS := -trimpath -ldflags "-X main.version=$(VERSION)"
 GOARCH_TARGET ?= amd64
 export PATH := /usr/local/go/bin:$(PATH)
 

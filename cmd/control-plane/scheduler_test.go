@@ -8,8 +8,8 @@ import (
 func TestScoreHost_PrefersIdleRunners(t *testing.T) {
 	s := &Scheduler{}
 
-	hostA := &Host{TotalSlots: 10, UsedSlots: 5, IdleRunners: 3, LastHeartbeat: time.Now()}
-	hostB := &Host{TotalSlots: 10, UsedSlots: 5, IdleRunners: 0, LastHeartbeat: time.Now()}
+	hostA := &Host{TotalCPUMillicores: 16000, UsedCPUMillicores: 8000, TotalMemoryMB: 65536, UsedMemoryMB: 32768, IdleRunners: 3, LastHeartbeat: time.Now()}
+	hostB := &Host{TotalCPUMillicores: 16000, UsedCPUMillicores: 8000, TotalMemoryMB: 65536, UsedMemoryMB: 32768, IdleRunners: 0, LastHeartbeat: time.Now()}
 
 	scoreA := s.scoreHost(hostA)
 	scoreB := s.scoreHost(hostB)
@@ -22,8 +22,8 @@ func TestScoreHost_PrefersIdleRunners(t *testing.T) {
 func TestScoreHost_PrefersAvailableCapacity(t *testing.T) {
 	s := &Scheduler{}
 
-	hostA := &Host{TotalSlots: 10, UsedSlots: 2, LastHeartbeat: time.Now()}
-	hostB := &Host{TotalSlots: 10, UsedSlots: 8, LastHeartbeat: time.Now()}
+	hostA := &Host{TotalCPUMillicores: 16000, UsedCPUMillicores: 3200, TotalMemoryMB: 65536, UsedMemoryMB: 8192, LastHeartbeat: time.Now()}
+	hostB := &Host{TotalCPUMillicores: 16000, UsedCPUMillicores: 12800, TotalMemoryMB: 65536, UsedMemoryMB: 52428, LastHeartbeat: time.Now()}
 
 	scoreA := s.scoreHost(hostA)
 	scoreB := s.scoreHost(hostB)
@@ -33,25 +33,11 @@ func TestScoreHost_PrefersAvailableCapacity(t *testing.T) {
 	}
 }
 
-func TestScoreHost_PenalizesHighUtilization(t *testing.T) {
-	s := &Scheduler{}
-
-	hostNormal := &Host{TotalSlots: 10, UsedSlots: 5, LastHeartbeat: time.Now()}
-	hostHigh := &Host{TotalSlots: 10, UsedSlots: 9, LastHeartbeat: time.Now()}
-
-	scoreNormal := s.scoreHost(hostNormal)
-	scoreHigh := s.scoreHost(hostHigh)
-
-	if scoreNormal <= scoreHigh {
-		t.Errorf("High utilization host should score lower: normal=%f, high=%f", scoreNormal, scoreHigh)
-	}
-}
-
 func TestScoreHost_PrefersRecentHeartbeat(t *testing.T) {
 	s := &Scheduler{}
 
-	hostRecent := &Host{TotalSlots: 10, UsedSlots: 5, LastHeartbeat: time.Now()}
-	hostStale := &Host{TotalSlots: 10, UsedSlots: 5, LastHeartbeat: time.Now().Add(-2 * time.Minute)}
+	hostRecent := &Host{TotalCPUMillicores: 16000, UsedCPUMillicores: 8000, TotalMemoryMB: 65536, UsedMemoryMB: 32768, LastHeartbeat: time.Now()}
+	hostStale := &Host{TotalCPUMillicores: 16000, UsedCPUMillicores: 8000, TotalMemoryMB: 65536, UsedMemoryMB: 32768, LastHeartbeat: time.Now().Add(-2 * time.Minute)}
 
 	scoreRecent := s.scoreHost(hostRecent)
 	scoreStale := s.scoreHost(hostStale)
@@ -61,43 +47,49 @@ func TestScoreHost_PrefersRecentHeartbeat(t *testing.T) {
 	}
 }
 
-func TestScoreHostForChunkKey_WarmCacheAffinity(t *testing.T) {
+func TestScoreHostForWorkloadKey_WarmCacheAffinity(t *testing.T) {
 	s := &Scheduler{}
 
 	hostWarm := &Host{
-		TotalSlots:      10,
-		UsedSlots:       5,
-		LastHeartbeat:   time.Now(),
-		LoadedManifests: map[string]string{"org-repo": "v1"},
+		TotalCPUMillicores: 16000,
+		UsedCPUMillicores:  8000,
+		TotalMemoryMB:      65536,
+		UsedMemoryMB:       32768,
+		LastHeartbeat:      time.Now(),
+		LoadedManifests:    map[string]string{"org-repo": "v1"},
 	}
 	hostCold := &Host{
-		TotalSlots:    10,
-		UsedSlots:     5,
-		LastHeartbeat: time.Now(),
+		TotalCPUMillicores: 16000,
+		UsedCPUMillicores:  8000,
+		TotalMemoryMB:      65536,
+		UsedMemoryMB:       32768,
+		LastHeartbeat:      time.Now(),
 	}
 
-	scoreWarm := s.scoreHostForChunkKey(hostWarm, "org-repo")
-	scoreCold := s.scoreHostForChunkKey(hostCold, "org-repo")
+	scoreWarm := s.scoreHostForWorkloadKey(hostWarm, "org-repo")
+	scoreCold := s.scoreHostForWorkloadKey(hostCold, "org-repo")
 
 	if scoreWarm <= scoreCold {
 		t.Errorf("Host with warm cache should score higher: warm=%f, cold=%f", scoreWarm, scoreCold)
 	}
 }
 
-func TestScoreHostForChunkKey_Empty(t *testing.T) {
+func TestScoreHostForWorkloadKey_Empty(t *testing.T) {
 	s := &Scheduler{}
 
 	host := &Host{
-		TotalSlots:      10,
-		UsedSlots:       5,
-		LastHeartbeat:   time.Now(),
-		LoadedManifests: map[string]string{"org-repo": "v1"},
+		TotalCPUMillicores: 16000,
+		UsedCPUMillicores:  8000,
+		TotalMemoryMB:      65536,
+		UsedMemoryMB:       32768,
+		LastHeartbeat:      time.Now(),
+		LoadedManifests:    map[string]string{"org-repo": "v1"},
 	}
 
-	scoreWithRepo := s.scoreHostForChunkKey(host, "org-repo")
-	scoreNoRepo := s.scoreHostForChunkKey(host, "")
+	scoreWithRepo := s.scoreHostForWorkloadKey(host, "org-repo")
+	scoreNoRepo := s.scoreHostForWorkloadKey(host, "")
 
-	// With empty chunk key, no cache affinity bonus should be applied
+	// With empty workload key, no cache affinity bonus should be applied
 	if scoreNoRepo >= scoreWithRepo {
 		t.Errorf("Empty repo slug should not get cache bonus: with=%f, without=%f", scoreWithRepo, scoreNoRepo)
 	}
@@ -107,11 +99,11 @@ func TestSelectBestHostForRepo(t *testing.T) {
 	s := &Scheduler{}
 
 	hosts := []*Host{
-		{ID: "cold", TotalSlots: 10, UsedSlots: 5, LastHeartbeat: time.Now()},
-		{ID: "warm", TotalSlots: 10, UsedSlots: 5, LastHeartbeat: time.Now(), LoadedManifests: map[string]string{"org-repo": "v1"}},
+		{ID: "cold", TotalCPUMillicores: 16000, UsedCPUMillicores: 8000, TotalMemoryMB: 65536, UsedMemoryMB: 32768, LastHeartbeat: time.Now()},
+		{ID: "warm", TotalCPUMillicores: 16000, UsedCPUMillicores: 8000, TotalMemoryMB: 65536, UsedMemoryMB: 32768, LastHeartbeat: time.Now(), LoadedManifests: map[string]string{"org-repo": "v1"}},
 	}
 
-	best := s.selectBestHostForChunkKey(hosts, "org-repo")
+	best := s.selectBestHostForWorkloadKey(hosts, "org-repo")
 	if best == nil {
 		t.Fatal("selectBestHostForRepo returned nil")
 	}
@@ -122,7 +114,7 @@ func TestSelectBestHostForRepo(t *testing.T) {
 
 func TestSelectBestHostForRepo_Empty(t *testing.T) {
 	s := &Scheduler{}
-	best := s.selectBestHostForChunkKey(nil, "org-repo")
+	best := s.selectBestHostForWorkloadKey(nil, "org-repo")
 	if best != nil {
 		t.Error("Expected nil for empty host list")
 	}

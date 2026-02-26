@@ -6,8 +6,10 @@ const (
 	MetricHostBootDuration     = "host/boot_duration_seconds"
 	MetricHostGCSSyncDuration  = "host/gcs_sync_duration_seconds"
 	MetricHostGCSSyncBytes     = "host/gcs_sync_bytes"
-	MetricHostSlotsTotal       = "host/slots_total"
-	MetricHostSlotsUsed        = "host/slots_used"
+	MetricHostCPUTotal         = "host/cpu_millicores_total"
+	MetricHostCPUUsed          = "host/cpu_millicores_used"
+	MetricHostMemTotal         = "host/memory_mb_total"
+	MetricHostMemUsed          = "host/memory_mb_used"
 	MetricHostRunnersIdle      = "host/runners_idle"
 	MetricHostRunnersBusy      = "host/runners_busy"
 	MetricHostHeartbeatLatency = "host/heartbeat_latency_seconds"
@@ -33,13 +35,14 @@ const (
 	MetricCPRunnersTotal      = "control_plane/runners_total"
 	MetricCPDownscalerActions = "control_plane/downscaler_actions_total"
 
-	// Fleet slot metrics — used as the primary autoscaler signal.
-	// free_slots_per_host is the canonical scale-out metric: when it drops below
-	// a target (e.g. 2), the GCP autoscaler adds more host VMs.
-	MetricCPFleetSlotsTotal   = "control_plane/fleet_slots_total"
-	MetricCPFleetSlotsUsed    = "control_plane/fleet_slots_used"
-	MetricCPFleetSlotsFree    = "control_plane/fleet_slots_free"
-	MetricCPFleetFreeSlotsPer = "control_plane/fleet_free_slots_per_host"
+	// Fleet resource metrics — used as the primary autoscaler signal.
+	MetricCPFleetCPUTotal    = "control_plane/fleet_cpu_millicores_total"
+	MetricCPFleetCPUUsed     = "control_plane/fleet_cpu_millicores_used"
+	MetricCPFleetCPUFree     = "control_plane/fleet_cpu_millicores_free"
+	MetricCPFleetMemTotal    = "control_plane/fleet_memory_mb_total"
+	MetricCPFleetMemUsed     = "control_plane/fleet_memory_mb_used"
+	MetricCPFleetMemFree     = "control_plane/fleet_memory_mb_free"
+	MetricCPFleetUtilization = "control_plane/fleet_utilization"
 
 	// Snapshot metrics
 	MetricSnapshotBuildDuration  = "snapshot/build_duration_seconds"
@@ -66,10 +69,17 @@ const (
 	MetricNetworkBytesTx     = "network/bytes_tx_total"
 	MetricNetworkBytesRx     = "network/bytes_rx_total"
 
-	// Chunked snapshot metrics
-	MetricChunkCacheSize     = "chunked/cache_size_bytes"
-	MetricChunkCacheMaxSize  = "chunked/cache_max_size_bytes"
-	MetricChunkCacheItems    = "chunked/cache_items"
+	// Chunked snapshot metrics — disk cache (FUSE)
+	MetricDiskCacheSize    = "chunked/disk_cache_size_bytes"
+	MetricDiskCacheMaxSize = "chunked/disk_cache_max_size_bytes"
+	MetricDiskCacheItems   = "chunked/disk_cache_items"
+
+	// Chunked snapshot metrics — memory cache (UFFD)
+	MetricMemCacheSize    = "chunked/mem_cache_size_bytes"
+	MetricMemCacheMaxSize = "chunked/mem_cache_max_size_bytes"
+	MetricMemCacheItems   = "chunked/mem_cache_items"
+
+	// Chunked snapshot metrics — general
 	MetricChunkPageFaults    = "chunked/page_faults_total"
 	MetricChunkCacheHits     = "chunked/cache_hits_total"
 	MetricChunkFetches       = "chunked/chunk_fetches_total"
@@ -87,6 +97,14 @@ const (
 	MetricPoolMemoryUsed   = "pool/memory_used_bytes"
 	MetricPoolMemoryMax    = "pool/memory_max_bytes"
 	MetricPoolHitRatio     = "pool/hit_ratio"
+
+	// Session pause/resume metrics
+	MetricSessionPauseDuration  = "session/pause_duration_seconds"
+	MetricSessionPauseTotal     = "session/pause_total"
+	MetricSessionPauseChunks    = "session/pause_chunks_uploaded"
+	MetricSessionResumeDuration = "session/resume_duration_seconds"
+	MetricSessionResumeTotal    = "session/resume_total"
+	MetricSessionResumeRouting  = "session/resume_routing_total"
 )
 
 // Well-known label keys for consistency.
@@ -104,7 +122,8 @@ const (
 	LabelEvent       = "event"
 	LabelJobID       = "job_id"
 	LabelHostID      = "host_id"
-	LabelChunkKey    = "chunk_key"
+	LabelWorkloadKey = "workload_key"
+	LabelRouting     = "routing"
 )
 
 // E2E canary metrics
@@ -132,6 +151,12 @@ const (
 	PhaseMounts           = "mounts"
 	PhaseGitHubRegister   = "github_register"
 	PhaseReady            = "ready"
+
+	// Session resume routing labels
+	RoutingSameHost  = "same_host"
+	RoutingCrossHost = "cross_host"
+	RoutingLocal     = "local" // local LayeredHandler, no GCS
+	RoutingGCS       = "gcs"   // GCS-backed UFFD resume
 )
 
 // Labels is a convenience type for metric labels.

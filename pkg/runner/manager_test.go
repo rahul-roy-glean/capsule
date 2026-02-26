@@ -411,14 +411,14 @@ func TestCanAddRunner(t *testing.T) {
 	m := newTestManager()
 	m.config.MaxRunners = 2
 
-	if !m.CanAddRunner() {
+	if !m.CanAddRunner(0, 0) {
 		t.Error("CanAddRunner() should be true for empty manager")
 	}
 
 	m.runners["r1"] = &Runner{ID: "r1"}
 	m.runners["r2"] = &Runner{ID: "r2"}
 
-	if m.CanAddRunner() {
+	if m.CanAddRunner(0, 0) {
 		t.Error("CanAddRunner() should be false at capacity")
 	}
 }
@@ -427,7 +427,7 @@ func TestCanAddRunner_Draining(t *testing.T) {
 	m := newTestManager()
 	m.draining = true
 
-	if m.CanAddRunner() {
+	if m.CanAddRunner(0, 0) {
 		t.Error("CanAddRunner() should be false when draining")
 	}
 }
@@ -437,7 +437,7 @@ func TestCanAddRunner_DrainingEvenWithCapacity(t *testing.T) {
 	m.config.MaxRunners = 10
 	m.draining = true
 
-	if m.CanAddRunner() {
+	if m.CanAddRunner(0, 0) {
 		t.Error("CanAddRunner() should be false when draining, regardless of capacity")
 	}
 }
@@ -576,7 +576,7 @@ func TestDrainBlocksAllocation(t *testing.T) {
 	if !m.IsDraining() {
 		t.Error("Expected manager to be draining")
 	}
-	if m.CanAddRunner() {
+	if m.CanAddRunner(0, 0) {
 		t.Error("Draining manager should not accept new runners")
 	}
 }
@@ -588,7 +588,7 @@ func TestCanAddRunner_AtCapacity(t *testing.T) {
 		m.runners[fmt.Sprintf("runner-%d", i)] = &Runner{ID: fmt.Sprintf("runner-%d", i)}
 	}
 
-	if m.CanAddRunner() {
+	if m.CanAddRunner(0, 0) {
 		t.Error("Manager at capacity should not accept new runners")
 	}
 }

@@ -16,6 +16,7 @@ import (
 // Uploader handles uploading snapshots to GCS
 type Uploader struct {
 	gcsBucket string
+	gcsPrefix string // top-level prefix for all GCS paths (e.g. "v1")
 	gcsClient *storage.Client
 	logger    *logrus.Entry
 }
@@ -23,6 +24,7 @@ type Uploader struct {
 // UploaderConfig holds configuration for snapshot uploader
 type UploaderConfig struct {
 	GCSBucket string
+	GCSPrefix string // Top-level prefix for all GCS paths (e.g. "v1"); empty means no prefix
 	Logger    *logrus.Logger
 }
 
@@ -40,16 +42,25 @@ func NewUploader(ctx context.Context, cfg UploaderConfig) (*Uploader, error) {
 
 	return &Uploader{
 		gcsBucket: cfg.GCSBucket,
+		gcsPrefix: cfg.GCSPrefix,
 		gcsClient: client,
 		logger:    logger.WithField("component", "snapshot-uploader"),
 	}, nil
 }
 
+// gcsPath prepends the configured GCS prefix to a path.
+func (u *Uploader) gcsPath(path string) string {
+	if u.gcsPrefix != "" {
+		return u.gcsPrefix + "/" + path
+	}
+	return path
+}
+
 // UploadSnapshot uploads a snapshot to GCS using parallel gcloud storage cp calls.
-// Paths are namespaced under the chunk key from metadata.ChunkKey.
+// Paths are namespaced under the workload key from metadata.WorkloadKey.
 func (u *Uploader) UploadSnapshot(ctx context.Context, localDir string, metadata SnapshotMetadata) error {
 	version := metadata.Version
-	prefix := metadata.ChunkKey + "/" + version
+	prefix := u.gcsPath(metadata.WorkloadKey + "/snapshot_state/" + version)
 	u.logger.WithFields(logrus.Fields{
 		"version":    version,
 		"gcs_prefix": prefix,
@@ -161,11 +172,11 @@ func (u *Uploader) uploadFile(ctx context.Context, localPath, remotePath string)
 	return nil
 }
 
-// UpdateCurrentPointerForRepo updates the "current" pointer for a specific chunk key.
-func (u *Uploader) UpdateCurrentPointerForRepo(ctx context.Context, version, chunkKey string) error {
+// UpdateCurrentPointerForRepo updates the "current" pointer for a specific workload key.
+func (u *Uploader) UpdateCurrentPointerForRepo(ctx context.Context, version, workloadKey string) error {
 	u.logger.WithFields(logrus.Fields{
-		"version":   version,
-		"chunk_key": chunkKey,
+		"version":      version,
+		"workload_key": workloadKey,
 	}).Info("Updating current pointer")
 
 	pointer := struct {
@@ -177,7 +188,7 @@ func (u *Uploader) UpdateCurrentPointerForRepo(ctx context.Context, version, chu
 		return fmt.Errorf("failed to marshal pointer: %w", err)
 	}
 
-	pointerPath := chunkKey + "/current-pointer.json"
+	pointerPath := u.gcsPath(workloadKey + "/current-pointer.json")
 
 	bucket := u.gcsClient.Bucket(u.gcsBucket)
 	obj := bucket.Object(pointerPath)
@@ -202,7 +213,7 @@ func (u *Uploader) DeleteVersion(ctx context.Context, version string) error {
 	bucket := u.gcsClient.Bucket(u.gcsBucket)
 
 	// List and delete all objects with this prefix
-	it := bucket.Objects(ctx, &storage.Query{Prefix: version + "/"})
+	it := bucket.Objects(ctx, &storage.Query{Prefix: u.gcsPath(version) + "/"})
 	for {
 		attrs, err := it.Next()
 		if err != nil {

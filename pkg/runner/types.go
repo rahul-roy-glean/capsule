@@ -36,7 +36,7 @@ type Runner struct {
 	SnapshotVersion         string
 	GitHubRunnerID          string
 	GitHubRepo              string // Repository for pool key matching
-	ChunkKey                string // Chunk key for snapshot routing in multi-snapshot support
+	WorkloadKey             string // Workload key for snapshot routing in multi-snapshot support
 	CISystem                string // CI system used for this runner (e.g., "github-actions")
 	JobID                   string
 	Resources               Resources
@@ -74,6 +74,15 @@ type Runner struct {
 	SessionLayers int       `json:"session_layers,omitempty"`
 }
 
+// RunnerHeartbeatInfo is a lightweight per-runner status included in host
+// heartbeats so the control plane can enforce TTLs centrally.
+type RunnerHeartbeatInfo struct {
+	RunnerID    string `json:"runner_id"`
+	State       State  `json:"state"`
+	WorkloadKey string `json:"workload_key"`
+	IdleSince   string `json:"idle_since,omitempty"` // RFC3339; set when idle and LastExecAt is non-zero
+}
+
 // Resources represents the resources allocated to a runner
 type Resources struct {
 	VCPUs    int
@@ -87,7 +96,8 @@ type AllocateRequest struct {
 	Repo              string
 	Branch            string
 	Commit            string
-	ChunkKey          string // Chunk key identifying which snapshot to use for this runner
+	WorkloadKey       string // Workload key identifying which snapshot to use for this runner
+	SnapshotVersion   string // Explicit snapshot version; skips current-pointer.json lookup when set
 	Resources         Resources
 	Labels            map[string]string
 	GitHubRunnerToken string
@@ -180,43 +190,56 @@ type CredentialHostDir struct {
 	Target   string `json:"target"`    // Target path inside credentials drive
 }
 
-// HostConfig holds configuration for the host agent
+// CIConfig holds optional CI system integration settings.
+// When CISystem is empty or "none", the platform operates as a generic VM host.
+type CIConfig struct {
+	CISystem              string
+	GitHubRunnerEnabled   bool
+	GitHubRepo            string
+	GitHubOrg             string
+	GitHubRunnerLabels    []string
+	GitHubRunnerEphemeral bool
+	GitHubAppID           string
+	GitHubAppSecret       string
+}
+
+// BazelConfig holds optional Bazel-specific settings for CI workloads.
+type BazelConfig struct {
+	RepoCacheUpperSizeGB  int
+	BuildbarnCertsDir     string
+	BuildbarnCertsMountPath string
+	BuildbarnCertsImageSizeMB int
+	GitCacheEnabled       bool
+	GitCacheDir           string
+	GitCacheImagePath     string
+	GitCacheMountPath     string
+	GitCacheRepoMappings  map[string]string
+	GitCacheWorkspaceDir  string
+	GitCachePreClonedPath string
+}
+
+// HostConfig holds configuration for the host agent.
+// Core fields handle generic VM lifecycle. CI and Bazel-specific settings
+// are isolated in the CI and Bazel sub-structs respectively.
 type HostConfig struct {
 	HostID            string
 	InstanceName      string
 	Zone              string
 	MaxRunners        int
 	IdleTarget        int
-	VCPUsPerRunner    int
-	MemoryMBPerRunner int
 	FirecrackerBin    string
 	SocketDir         string
 	WorkspaceDir      string
 	LogDir            string
 	SnapshotBucket    string
 	SnapshotCachePath string
-	// RepoCacheUpperSizeGB controls the per-runner writable layer size for the
-	// Bazel repository cache overlay.
-	RepoCacheUpperSizeGB int
-	// BuildbarnCertsDir is a host directory containing Buildbarn certificates
-	// (e.g. ca.crt, client.crt, client.pem). If set, the host agent will package
-	// this directory into an ext4 image and attach it read-only to each microVM.
-	BuildbarnCertsDir string
-	// BuildbarnCertsMountPath is where the certs will be mounted inside the microVM.
-	BuildbarnCertsMountPath string
-	// BuildbarnCertsImageSizeMB controls the size of the generated ext4 image.
-	BuildbarnCertsImageSizeMB int
-	// Credentials configuration (generic replacement for buildbarn-specific certs)
-	// CredentialsSecrets lists secrets to fetch from GCP Secret Manager
-	CredentialsSecrets []CredentialSecret
-	// CredentialsHostDirs lists host directories to include in the credentials drive
+
+	// Credentials configuration
+	CredentialsSecrets  []CredentialSecret
 	CredentialsHostDirs []CredentialHostDir
-	// CredentialsEnv maps environment variable names to their values (from credentials drive)
-	CredentialsEnv map[string]string
-	// CredentialsImageSizeMB controls the size of the generated credentials ext4 image
+	CredentialsEnv      map[string]string
 	CredentialsImageSizeMB int
-	// QuarantineDir is where the host will write quarantine manifests and keep
-	// per-runner debug metadata when a runner is quarantined.
+
 	QuarantineDir string
 	// SessionDir is the base directory for session snapshot storage (pause/resume).
 	// Defaults to {SnapshotCachePath}/../sessions (e.g. /mnt/data/sessions).
@@ -224,10 +247,15 @@ type HostConfig struct {
 	MicroVMSubnet     string
 	ExternalInterface string
 	BridgeName        string
-	// ChunkKey identifies which snapshot this host should use (hash of snapshot commands).
-	ChunkKey         string
+	// WorkloadKey identifies which snapshot this host should use (hash of snapshot commands).
+	WorkloadKey      string
 	Environment      string
 	ControlPlaneAddr string
+	GCPProject       string
+
+	// Host resource capacity for bin-packing scheduler
+	TotalCPUMillicores int
+	TotalMemoryMB      int
 
 	// Runner Pool Configuration
 	PoolEnabled            bool `json:"pool_enabled"`
@@ -237,40 +265,15 @@ type HostConfig struct {
 	PoolMaxRunnerDiskGB    int  `json:"pool_max_runner_disk_gb"`
 	PoolRecycleTimeoutSecs int  `json:"pool_recycle_timeout_secs"`
 
-	// GitCacheEnabled enables git-cache reference cloning for faster repo setup
-	GitCacheEnabled bool
-	// GitCacheDir is the host directory containing git mirrors (e.g. /mnt/nvme/git-cache)
-	GitCacheDir string
-	// GitCacheImagePath is the path to the git-cache block device image
-	GitCacheImagePath string
-	// GitCacheMountPath is where the git-cache will be mounted inside microVMs
-	GitCacheMountPath string
-	// GitCacheRepoMappings maps repo identifiers to their cache directory names
-	// e.g. {"github.com/askscio/scio": "scio"} means cache is at GitCacheDir/scio
-	GitCacheRepoMappings map[string]string
-	// GitCacheWorkspaceDir is the target directory for cloned repos inside microVMs
-	GitCacheWorkspaceDir string
-	// GitCachePreClonedPath is the path where repos were pre-cloned during warmup
-	// (baked into the snapshot rootfs). Defaults to /workspace if not set.
-	GitCachePreClonedPath string
+	// SessionChunkBucket enables cloud-backed session pause/resume.
+	SessionChunkBucket string
+	// GCSPrefix is the top-level prefix for all GCS paths (e.g. "v1").
+	GCSPrefix string
 
-	// GitHub Runner Registration (Option C: pre-register at boot)
-	// GitHubRunnerEnabled enables automatic runner registration at VM boot
-	GitHubRunnerEnabled bool
-	// GitHubRepo is the repository runners will register to (e.g., "askscio/scio")
-	GitHubRepo string
-	// GitHubOrg is the GitHub organization for org-level runner registration
-	// If set, uses org-level API which requires "Organization self-hosted runners" permission
-	// If empty, uses repo-level API which requires "Administration" permission on the repo
-	GitHubOrg string
-	// GitHubRunnerLabels are labels applied to registered runners
-	GitHubRunnerLabels []string
-	// GitHubRunnerEphemeral controls whether runners exit after one job (true) or persist (false)
-	GitHubRunnerEphemeral bool
-	// GitHubAppID is the GitHub App ID for authentication
-	GitHubAppID string
-	// GitHubAppSecret is the Secret Manager secret name containing the private key
-	GitHubAppSecret string
-	// GCPProject is the GCP project for Secret Manager access
-	GCPProject string
+	// CI holds optional CI system integration settings.
+	// When CI.CISystem is empty or "none", the platform operates as a generic VM host.
+	CI CIConfig
+
+	// Bazel holds optional Bazel-specific settings for CI workloads.
+	Bazel BazelConfig
 }

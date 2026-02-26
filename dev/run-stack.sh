@@ -1,6 +1,6 @@
 #!/bin/bash
 # Start the control-plane + firecracker-manager stack.
-# Run inside the Lima VM: lima bash dev/run-stack.sh
+# Usage: make dev-stack
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -21,7 +21,7 @@ if [ ! -e /dev/kvm ]; then
 fi
 
 if ! systemctl is-active --quiet postgresql; then
-  echo "FAIL: PostgreSQL is not running. Start the Lima VM with 'make dev-up'."
+  echo "FAIL: PostgreSQL is not running. Run 'sudo systemctl start postgresql'."
   exit 1
 fi
 
@@ -31,12 +31,12 @@ if [ ! -f "$SNAPSHOT_DIR/kernel.bin" ]; then
 fi
 
 if [ ! -f "$REPO_ROOT/bin/control-plane" ]; then
-  echo "FAIL: bin/control-plane not found. Run 'lima make build' first."
+  echo "FAIL: bin/control-plane not found. Run 'make dev-build' first."
   exit 1
 fi
 
 if [ ! -f "$REPO_ROOT/bin/firecracker-manager" ]; then
-  echo "FAIL: bin/firecracker-manager not found. Run 'lima make build' first."
+  echo "FAIL: bin/firecracker-manager not found. Run 'make dev-build' first."
   exit 1
 fi
 
@@ -83,23 +83,35 @@ done
 # --- Start firecracker-manager ---
 echo ""
 echo "=== Starting firecracker-manager ==="
-sudo -b sh -c 'nohup '"$REPO_ROOT"'/bin/firecracker-manager \
+
+# Build the full command as an array, then pass to sudo.
+SESSION_CHUNK_BUCKET=${SESSION_CHUNK_BUCKET:-}
+SNAPSHOT_BUCKET=${SNAPSHOT_BUCKET:-local-dev}
+
+MGR_CMD="$REPO_ROOT/bin/firecracker-manager \
   --http-port=9080 \
   --grpc-port=50052 \
   --use-netns \
   --ci-system=none \
-  --snapshot-bucket=local-dev \
-  --snapshot-cache='"$SNAPSHOT_DIR"' \
+  --snapshot-cache=$SNAPSHOT_DIR \
   --socket-dir=/tmp/fc-dev/sockets \
   --workspace-dir=/tmp/fc-dev/workspaces \
-  --log-dir='"$LOG_DIR"' \
+  --log-dir=$LOG_DIR \
   --control-plane=http://localhost:8080 \
   --telemetry-enabled=false \
-  --max-runners=4 \
+  --max-runners=8 \
   --idle-target=0 \
-  --log-level=debug \
-  > '"$LOG_DIR"'/firecracker-manager.log 2>&1 &
-echo $! > /tmp/fc-dev/pids/firecracker-manager.pid'
+  --log-level=debug"
+
+if [ -n "$SESSION_CHUNK_BUCKET" ]; then
+  MGR_CMD="$MGR_CMD --use-chunked-snapshots --snapshot-bucket=$SESSION_CHUNK_BUCKET --enable-session-chunks"
+  echo "  GCS session chunks: enabled (bucket: $SESSION_CHUNK_BUCKET)"
+else
+  MGR_CMD="$MGR_CMD --snapshot-bucket=$SNAPSHOT_BUCKET"
+fi
+
+sudo bash -c "nohup $MGR_CMD > $LOG_DIR/firecracker-manager.log 2>&1 &
+echo \$! > /tmp/fc-dev/pids/firecracker-manager.pid"
 # Give sudo a moment to fork
 sleep 1
 MGR_PID=$(cat "$PID_DIR/firecracker-manager.pid" 2>/dev/null || echo "unknown")

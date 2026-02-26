@@ -39,9 +39,10 @@ var (
 	metadataBucket = flag.String("metadata-bucket", "", "GCS bucket for metadata upload (for freshness checker)")
 
 	// Operational flags
-	keepDisk = flag.Bool("keep-disk", false, "Don't delete the build disk after snapshot (for debugging)")
-	dryRun   = flag.Bool("dry-run", false, "Build disk but don't create snapshot")
-	logLevel = flag.String("log-level", "info", "Log level")
+	keepDisk  = flag.Bool("keep-disk", false, "Don't delete the build disk after snapshot (for debugging)")
+	dryRun    = flag.Bool("dry-run", false, "Build disk but don't create snapshot")
+	logLevel  = flag.String("log-level", "info", "Log level")
+	gcsPrefix = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
 )
 
 // SnapshotMetadata records what's in the snapshot
@@ -229,7 +230,12 @@ func main() {
 	// Step 9: Upload metadata to GCS (for freshness checker)
 	if *metadataBucket != "" {
 		log.Info("Uploading metadata to GCS for freshness checker...")
-		metadataGCS := fmt.Sprintf("gs://%s/data-snapshot/current/metadata.json", *metadataBucket)
+		prefix := *gcsPrefix
+		basePath := fmt.Sprintf("data-snapshot/%s/metadata.json", snapshotName)
+		if prefix != "" {
+			basePath = prefix + "/" + basePath
+		}
+		metadataGCS := fmt.Sprintf("gs://%s/%s", *metadataBucket, basePath)
 		if err := uploadMetadataToGCS(ctx, metadataBytes, metadataGCS); err != nil {
 			log.WithError(err).Warn("Failed to upload metadata to GCS")
 		} else {

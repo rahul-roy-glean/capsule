@@ -24,6 +24,7 @@ var (
 	githubToken = flag.String("github-token", "", "GitHub token for private repo access (or use GITHUB_TOKEN env)")
 	logLevel    = flag.String("log-level", "info", "Log level")
 	dryRun      = flag.Bool("dry-run", false, "Build locally but don't upload to GCS")
+	gcsPrefix   = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
 
 	// GitHub App authentication (alternative to --github-token for production)
 	githubAppID     = flag.String("github-app-id", "", "GitHub App ID for private repo access")
@@ -207,7 +208,7 @@ func main() {
 		if err := uploadToGCS(context.Background(), *gcsBucket, *outputDir, metadata.Version, log); err != nil {
 			log.WithError(err).Fatal("Failed to upload to GCS")
 		}
-		log.WithField("gcs_path", fmt.Sprintf("gs://%s/git-cache/", *gcsBucket)).Info("Upload complete")
+		log.WithField("gcs_path", fmt.Sprintf("gs://%s/%s/", *gcsBucket, gcsPath(*gcsPrefix, "git-cache"))).Info("Upload complete")
 	} else if *dryRun {
 		log.Info("Dry-run mode, skipping GCS upload")
 	}
@@ -371,26 +372,24 @@ func createGitCacheImage(imagePath, sourceDir string, sizeGB int, log *logrus.En
 	return nil
 }
 
+func gcsPath(prefix, path string) string {
+	if prefix == "" {
+		return path
+	}
+	return prefix + "/" + path
+}
+
 func uploadToGCS(ctx context.Context, bucket, sourceDir, version string, log *logrus.Entry) error {
 	// Upload image to versioned path
 	imagePath := filepath.Join(sourceDir, "git-cache.img")
 	metadataPath := filepath.Join(sourceDir, "git-cache-metadata.json")
 
 	// Upload to versioned location
-	versionedPath := fmt.Sprintf("gs://%s/git-cache/%s/", bucket, version)
+	versionedPath := fmt.Sprintf("gs://%s/%s/", bucket, gcsPath(*gcsPrefix, "git-cache/"+version))
 	if err := gsutilCopy(imagePath, versionedPath+"git-cache.img", log); err != nil {
 		return err
 	}
 	if err := gsutilCopy(metadataPath, versionedPath+"metadata.json", log); err != nil {
-		return err
-	}
-
-	// Update "current" pointer
-	currentPath := fmt.Sprintf("gs://%s/git-cache/current/", bucket)
-	if err := gsutilCopy(imagePath, currentPath+"git-cache.img", log); err != nil {
-		return err
-	}
-	if err := gsutilCopy(metadataPath, currentPath+"metadata.json", log); err != nil {
 		return err
 	}
 

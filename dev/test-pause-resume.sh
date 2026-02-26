@@ -1,6 +1,6 @@
 #!/bin/bash
 # E2E test: allocate(session) → exec → pause → allocate(same session) → exec → verify state → release
-# Run inside the Lima VM: lima bash dev/test-pause-resume.sh
+# Usage: make dev-test-pause-resume
 #
 # Prerequisites:
 #   - Stack running: make dev-stack (or dev-stack-local)
@@ -21,7 +21,7 @@ header() { echo ""; echo "=== $1 ==="; }
 header "1. Register snapshot config with TTL + auto_pause"
 # ---------------------------------------------------------------------------
 # Register a config with 15s TTL and auto_pause enabled.
-# In a real scenario this would be done once per chunk_key.
+# In a real scenario this would be done once per workload_key.
 CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/snapshot-configs" \
   -H 'Content-Type: application/json' \
   -d '{
@@ -31,11 +31,11 @@ CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/snapshot-configs" \
     "auto_pause": true,
     "session_max_age_seconds": 3600
   }')
-CHUNK_KEY=$(echo "$CONFIG_RESP" | jq -r '.chunk_key')
-echo "Registered config: chunk_key=$CHUNK_KEY"
+WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.workload_key')
+echo "Registered config: workload_key=$WORKLOAD_KEY"
 echo "  TTL: $(echo "$CONFIG_RESP" | jq '.runner_ttl_seconds')s, auto_pause: $(echo "$CONFIG_RESP" | jq '.auto_pause')"
 
-if [ -n "$CHUNK_KEY" ] && [ "$CHUNK_KEY" != "null" ]; then
+if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then
   pass "Snapshot config registered with TTL fields"
 else
   fail "Snapshot config registration failed"
@@ -169,14 +169,14 @@ header "7. Verify session files on disk"
 SESSION_DIR="/tmp/fc-dev/sessions/$SESSION_ID"
 if [ -f "$SESSION_DIR/metadata.json" ]; then
   pass "metadata.json exists"
-  echo "  $(cat "$SESSION_DIR/metadata.json" | jq -c '{layers,chunk_key,runner_id}')"
+  echo "  $(cat "$SESSION_DIR/metadata.json" | jq -c '{layers,workload_key,runner_id}')"
 else
   # Try derived path
   SNAP_PARENT=$(dirname /tmp/fc-dev/snapshots)
   SESSION_DIR="$SNAP_PARENT/sessions/$SESSION_ID"
   if [ -f "$SESSION_DIR/metadata.json" ]; then
     pass "metadata.json exists (at $SESSION_DIR)"
-    echo "  $(cat "$SESSION_DIR/metadata.json" | jq -c '{layers,chunk_key,runner_id}')"
+    echo "  $(cat "$SESSION_DIR/metadata.json" | jq -c '{layers,workload_key,runner_id}')"
   else
     fail "metadata.json not found at expected paths"
   fi

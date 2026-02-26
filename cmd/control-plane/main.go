@@ -26,6 +26,7 @@ import (
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/tiers"
 )
 
 var (
@@ -38,6 +39,7 @@ var (
 	dbName     = flag.String("db-name", "firecracker_runner", "Database name")
 	dbSSLMode  = flag.String("db-ssl-mode", "disable", "Database SSL mode")
 	gcsBucket  = flag.String("gcs-bucket", "", "GCS bucket for snapshots")
+	gcsPrefix  = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
 	logLevel   = flag.String("log-level", "info", "Log level")
 
 	// Telemetry
@@ -154,8 +156,11 @@ func main() {
 
 	// Create services
 	hostRegistry := NewHostRegistry(db, logger)
-	scheduler := NewScheduler(hostRegistry, db, logger)
-	snapshotManager := NewSnapshotManager(ctx, db, *gcsBucket, gcpProjectVal, gcpZoneVal, logger)
+	snapshotManager := NewSnapshotManager(ctx, db, *gcsBucket, *gcsPrefix, gcpProjectVal, gcpZoneVal, logger)
+	scheduler := NewScheduler(hostRegistry, db, snapshotManager, logger)
+	if metricsClient != nil {
+		scheduler.SetMetricsClient(metricsClient)
+	}
 	jobQueue := NewJobQueue(db, scheduler, hostRegistry, logger)
 	snapshotConfigRegistry := NewSnapshotConfigRegistry(db, snapshotManager, logger)
 
@@ -238,8 +243,9 @@ func main() {
 	// Start background workers
 	go hostRegistry.HealthCheckLoop(ctx)
 	go snapshotFreshnessLoop(ctx, snapshotManager, snapshotConfigRegistry, logger)
-	go startDownscaler(ctx, db, hostRegistry, logger)
+	go startDownscaler(ctx, db, hostRegistry, scheduler, logger)
 	go jobQueue.jobRetryLoop(ctx)
+	go controlPlaneServer.startTTLEnforcement(ctx)
 	if metricsClient != nil {
 		go controlPlaneMetricsLoop(ctx, hostRegistry, scheduler, snapshotManager, metricsClient, logger)
 	}
@@ -267,8 +273,6 @@ func initSchema(db *sql.DB) error {
 		instance_name VARCHAR(255) NOT NULL,
 		zone VARCHAR(50) NOT NULL,
 		status VARCHAR(20) NOT NULL DEFAULT 'starting',
-		total_slots INT NOT NULL,
-		used_slots INT NOT NULL DEFAULT 0,
 		idle_runners INT NOT NULL DEFAULT 0,
 		busy_runners INT NOT NULL DEFAULT 0,
 		snapshot_version VARCHAR(50),
@@ -287,8 +291,6 @@ func initSchema(db *sql.DB) error {
 		internal_ip VARCHAR(15),
 		github_runner_id VARCHAR(255),
 		job_id VARCHAR(255),
-		repo VARCHAR(255),
-		branch VARCHAR(255),
 		created_at TIMESTAMP DEFAULT NOW(),
 		started_at TIMESTAMP,
 		completed_at TIMESTAMP
@@ -366,9 +368,9 @@ func initSchema(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_version_assignments_repo ON version_assignments(repo_slug)`,
 		`CREATE INDEX IF NOT EXISTS idx_version_assignments_host ON version_assignments(host_id)`,
-		// chunk_key migration: add snapshot_configs table
+		// workload_key migration: add snapshot_configs table
 		`CREATE TABLE IF NOT EXISTS snapshot_configs (
-			chunk_key              VARCHAR(16) PRIMARY KEY,
+			workload_key              VARCHAR(16) PRIMARY KEY,
 			display_name           VARCHAR(255),
 			commands               TEXT NOT NULL DEFAULT '[]',
 			build_schedule         VARCHAR(64) DEFAULT '',
@@ -377,9 +379,14 @@ func initSchema(db *sql.DB) error {
 			auto_rollout           BOOLEAN DEFAULT true,
 			created_at             TIMESTAMP DEFAULT NOW()
 		)`,
-		// Add chunk_key column to snapshots (rename from repo_slug)
-		`ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS chunk_key VARCHAR(16) DEFAULT ''`,
-		`CREATE INDEX IF NOT EXISTS idx_snapshots_chunk_key ON snapshots(chunk_key)`,
+		// Rename chunk_key -> workload_key in existing tables (idempotent: no-op if column doesn't exist or target already exists)
+		`DO $$ BEGIN ALTER TABLE snapshot_configs RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
+		`DO $$ BEGIN ALTER TABLE snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
+		`DO $$ BEGIN ALTER TABLE version_assignments RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
+		`DO $$ BEGIN ALTER TABLE session_snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
+		// Add workload_key column to snapshots (for fresh installs without chunk_key)
+		`ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_snapshots_workload_key ON snapshots(workload_key)`,
 		// GitHub App credentials for snapshot configs
 		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS github_app_id VARCHAR(255) DEFAULT ''`,
 		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS github_app_secret VARCHAR(255) DEFAULT ''`,
@@ -387,9 +394,9 @@ func initSchema(db *sql.DB) error {
 		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS ci_system VARCHAR(64) DEFAULT ''`,
 		// Add start_command column to snapshot_configs (JSON-encoded StartCommand)
 		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS start_command TEXT DEFAULT ''`,
-		// Add chunk_key column to version_assignments
-		`ALTER TABLE version_assignments ADD COLUMN IF NOT EXISTS chunk_key VARCHAR(16) NOT NULL DEFAULT ''`,
-		`CREATE INDEX IF NOT EXISTS idx_version_assignments_chunk ON version_assignments(chunk_key)`,
+		// Add workload_key column to version_assignments
+		`ALTER TABLE version_assignments ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_version_assignments_workload ON version_assignments(workload_key)`,
 		// Session pause/resume: TTL and auto-pause config
 		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS runner_ttl_seconds INT DEFAULT 0`,
 		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS session_max_age_seconds INT DEFAULT 86400`,
@@ -398,7 +405,7 @@ func initSchema(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS session_snapshots (
 			session_id    TEXT PRIMARY KEY,
 			runner_id     TEXT NOT NULL,
-			chunk_key     VARCHAR(16) NOT NULL,
+			workload_key     VARCHAR(16) NOT NULL,
 			host_id       UUID REFERENCES hosts(id),
 			status        VARCHAR(20) NOT NULL DEFAULT 'active',
 			layer_count   INT DEFAULT 0,
@@ -408,26 +415,40 @@ func initSchema(db *sql.DB) error {
 			paused_at     TIMESTAMP,
 			expires_at    TIMESTAMP
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_session_chunk ON session_snapshots(chunk_key)`,
+		`CREATE INDEX IF NOT EXISTS idx_session_workload ON session_snapshots(workload_key)`,
 		`CREATE INDEX IF NOT EXISTS idx_session_host ON session_snapshots(host_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_session_status ON session_snapshots(status)`,
 		// runner_id lookups on session_snapshots (HandleRunnerStatus, HandleConnectRunner)
 		`CREATE INDEX IF NOT EXISTS idx_session_runner ON session_snapshots(runner_id)`,
 		// Expiry cleanup: scan suspended sessions past their TTL
 		`CREATE INDEX IF NOT EXISTS idx_session_expires ON session_snapshots(status, expires_at) WHERE status = 'suspended'`,
-		// runners: per-repo fairness check (scheduler.go: COUNT(*) WHERE repo=$1 AND status IN (...))
-		`CREATE INDEX IF NOT EXISTS idx_runners_repo_status ON runners(repo, status)`,
+		// Drop legacy repo index and columns (workload_key replaced repo-based routing)
+		`DROP INDEX IF EXISTS idx_runners_repo_status`,
 		// jobs: queue drain (WHERE status='queued' ORDER BY queued_at)
 		`CREATE INDEX IF NOT EXISTS idx_jobs_queued ON jobs(status, queued_at) WHERE status = 'queued'`,
 		// jobs: completion by github_job_id
 		`CREATE INDEX IF NOT EXISTS idx_jobs_github_job_id ON jobs(github_job_id)`,
-		// snapshots: chunk_key + status + created_at for version lookups
-		`CREATE INDEX IF NOT EXISTS idx_snapshots_chunk_status ON snapshots(chunk_key, status, created_at DESC)`,
+		// snapshots: workload_key + status + created_at for version lookups
+		`CREATE INDEX IF NOT EXISTS idx_snapshots_workload_status ON snapshots(workload_key, status, created_at DESC)`,
 		// version_assignments: compound for subquery in GetFleetConvergence
-		`CREATE INDEX IF NOT EXISTS idx_version_assignments_chunk_host ON version_assignments(chunk_key, host_id)`,
-		// Add chunk_key column to runners
-		`ALTER TABLE runners ADD COLUMN IF NOT EXISTS chunk_key VARCHAR(16) DEFAULT ''`,
-		`CREATE INDEX IF NOT EXISTS idx_runners_chunk_key ON runners(chunk_key)`,
+		`CREATE INDEX IF NOT EXISTS idx_version_assignments_workload_host ON version_assignments(workload_key, host_id)`,
+		// Add workload_key column to runners
+		`ALTER TABLE runners ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_runners_workload_key ON runners(workload_key)`,
+		// Incremental commands for snapshot configs
+		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS incremental_commands JSONB DEFAULT '[]'`,
+		// Tier-based resource sizing
+		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS tier VARCHAR(8) DEFAULT 'm'`,
+		// Host resource tracking for bin-packing scheduler
+		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS total_cpu_millicores INT DEFAULT 0`,
+		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS used_cpu_millicores INT DEFAULT 0`,
+		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS total_memory_mb INT DEFAULT 0`,
+		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS used_memory_mb INT DEFAULT 0`,
+		`ALTER TABLE hosts DROP COLUMN IF EXISTS total_slots`,
+		`ALTER TABLE hosts DROP COLUMN IF EXISTS used_slots`,
+		// Drop unused repo/branch columns from runners
+		`ALTER TABLE runners DROP COLUMN IF EXISTS repo`,
+		`ALTER TABLE runners DROP COLUMN IF EXISTS branch`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil {
@@ -464,10 +485,9 @@ func (s *ControlPlaneServer) RegisterHost(ctx context.Context, req *pb.RegisterH
 	s.logger.WithFields(logrus.Fields{
 		"instance_name": req.InstanceName,
 		"zone":          req.Zone,
-		"total_slots":   req.TotalSlots,
 	}).Info("RegisterHost request")
 
-	host, err := s.hostRegistry.RegisterHost(ctx, req.InstanceName, req.Zone, int(req.TotalSlots), "")
+	host, err := s.hostRegistry.RegisterHost(ctx, req.InstanceName, req.Zone, "")
 	if err != nil {
 		return nil, err
 	}
@@ -480,29 +500,15 @@ func (s *ControlPlaneServer) RegisterHost(ctx context.Context, req *pb.RegisterH
 	}, nil
 }
 
-// Heartbeat implements the gRPC Heartbeat method
+// Heartbeat implements the gRPC Heartbeat method.
+// The HTTP heartbeat endpoint (UpsertHeartbeat) is the primary path;
+// this gRPC method is kept for proto interface compatibility.
 func (s *ControlPlaneServer) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
 	if req.Status == nil {
 		return &pb.HeartbeatResponse{Acknowledged: false}, nil
 	}
-
-	err := s.hostRegistry.UpdateHeartbeat(ctx, req.HostId, HostStatus{
-		UsedSlots:       int(req.Status.UsedSlots),
-		IdleRunners:     int(req.Status.IdleRunners),
-		BusyRunners:     int(req.Status.BusyRunners),
-		SnapshotVersion: req.Status.SnapshotVersion,
-	})
-	if err != nil {
-		s.logger.WithError(err).Warn("Failed to update heartbeat")
-	}
-
-	currentSnapshot := s.snapshotManager.GetCurrentVersion()
-	shouldSync := currentSnapshot != "" && currentSnapshot != req.Status.SnapshotVersion
-
 	return &pb.HeartbeatResponse{
-		Acknowledged:       true,
-		SnapshotVersion:    currentSnapshot,
-		ShouldSyncSnapshot: shouldSync,
+		Acknowledged: true,
 	}, nil
 }
 
@@ -563,8 +569,8 @@ func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Req
 
 // HandleAllocateRunner handles manual runner allocation requests.
 // POST /api/v1/runners/allocate
-// Body: {"chunk_key": "abc123", "labels": {"firecracker": "true"}}
-// ci_system is resolved from the snapshot config registered for the chunk_key.
+// Body: {"workload_key": "abc123", "labels": {"firecracker": "true"}}
+// ci_system is resolved from the snapshot config registered for the workload_key.
 func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -572,18 +578,18 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 	}
 
 	var req struct {
-		RequestID string            `json:"request_id"`
-		ChunkKey  string            `json:"chunk_key"`
-		Labels    map[string]string `json:"labels"`
-		SessionID string            `json:"session_id"`
+		RequestID   string            `json:"request_id"`
+		WorkloadKey string            `json:"workload_key"`
+		Labels      map[string]string `json:"labels"`
+		SessionID   string            `json:"session_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if req.ChunkKey == "" {
-		http.Error(w, "chunk_key is required", http.StatusBadRequest)
+	if req.WorkloadKey == "" {
+		http.Error(w, "workload_key is required", http.StatusBadRequest)
 		return
 	}
 	if req.RequestID == "" {
@@ -591,15 +597,15 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 	}
 
 	s.logger.WithFields(logrus.Fields{
-		"request_id": req.RequestID,
-		"chunk_key":  req.ChunkKey,
+		"request_id":   req.RequestID,
+		"workload_key": req.WorkloadKey,
 	}).Info("Manual runner allocation request")
 
 	resp, err := s.scheduler.AllocateRunner(r.Context(), AllocateRunnerRequest{
-		RequestID: req.RequestID,
-		ChunkKey:  req.ChunkKey,
-		Labels:    req.Labels,
-		SessionID: req.SessionID,
+		RequestID:   req.RequestID,
+		WorkloadKey: req.WorkloadKey,
+		Labels:      req.Labels,
+		SessionID:   req.SessionID,
 	})
 	if err != nil {
 		s.logger.WithError(err).Error("Manual allocation failed")
@@ -763,6 +769,17 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// If host is draining/terminating, session runners are already being
+	// proactively paused by the host agent — return 503 so the client retries
+	// via /connect which will resume on a new host.
+	if host.Status == "draining" || host.Status == "terminating" {
+		w.Header().Set("Retry-After", "5")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "host is draining"})
+		return
+	}
+
 	// Forward to host agent gRPC
 	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -787,13 +804,29 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 	// Update session_snapshots table
 	if resp.SessionId != "" {
 		_, _ = s.scheduler.db.ExecContext(r.Context(), `
-			INSERT INTO session_snapshots (session_id, runner_id, chunk_key, host_id, status, layer_count, paused_at)
+			INSERT INTO session_snapshots (session_id, runner_id, workload_key, host_id, status, layer_count, paused_at)
 			VALUES ($1, $2, '', $3, 'suspended', $4, NOW())
 			ON CONFLICT (session_id) DO UPDATE SET
 				status = 'suspended',
 				layer_count = EXCLUDED.layer_count,
 				paused_at = NOW()
 		`, resp.SessionId, req.RunnerID, host.ID, resp.Layer+1)
+	}
+
+	// Roll back optimistic resource reservation — a paused runner no longer
+	// consumes host resources. Without this, UsedCPU/Memory accumulates
+	// until the next heartbeat.
+	if runner.ReservedCPU > 0 || runner.ReservedMemoryMB > 0 {
+		s.hostRegistry.mu.Lock()
+		host.UsedCPUMillicores -= runner.ReservedCPU
+		host.UsedMemoryMB -= runner.ReservedMemoryMB
+		if host.UsedCPUMillicores < 0 {
+			host.UsedCPUMillicores = 0
+		}
+		if host.UsedMemoryMB < 0 {
+			host.UsedMemoryMB = 0
+		}
+		s.hostRegistry.mu.Unlock()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -839,13 +872,29 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 			return
 		}
 
-		// Resume from session via host
-		host, err := s.hostRegistry.GetHost(hostID)
-		if err != nil {
-			http.Error(w, "host not found for suspended session", http.StatusInternalServerError)
+		// Pick the host to resume on. Prefer the original host unless it's
+		// draining/terminating or unreachable — in that case, fall back to
+		// another available host using cache-affinity scheduling.
+		var resumeHost *Host
+		origHost, origErr := s.hostRegistry.GetHost(hostID)
+		if origErr == nil && origHost.Status != "draining" && origHost.Status != "terminating" {
+			resumeHost = origHost
+		} else {
+			// Look up workload_key for affinity scheduling
+			var workloadKey string
+			_ = s.scheduler.db.QueryRowContext(r.Context(),
+				`SELECT workload_key FROM session_snapshots WHERE session_id = $1`, sessionID).Scan(&workloadKey)
+			resumeHost = s.scheduler.selectBestHostForWorkloadKey(s.hostRegistry.GetAvailableHosts(), workloadKey)
+		}
+		if resumeHost == nil {
+			w.Header().Set("Retry-After", "5")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": "no available host for session resume"})
 			return
 		}
-		conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+
+		conn, err := grpc.NewClient(resumeHost.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			http.Error(w, "failed to connect to host", http.StatusInternalServerError)
 			return
@@ -865,15 +914,17 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 			return
 		}
 
-		// Update session status
+		// Update session status and host assignment
 		_, _ = s.scheduler.db.ExecContext(r.Context(),
-			`UPDATE session_snapshots SET status = 'active' WHERE session_id = $1`, sessionID)
+			`UPDATE session_snapshots SET status = 'active', host_id = $1 WHERE session_id = $2`,
+			resumeHost.ID, sessionID)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(map[string]string{
-			"status":    "resumed",
-			"runner_id": resp.Runner.GetId(),
+			"status":       "resumed",
+			"runner_id":    resp.Runner.GetId(),
+			"host_address": resumeHost.HTTPAddress,
 		})
 		return
 	}
@@ -882,6 +933,15 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 	host, err := s.hostRegistry.GetHost(runner.HostID)
 	if err != nil {
 		http.Error(w, "host not found", http.StatusInternalServerError)
+		return
+	}
+
+	// If the host is draining, the runner will soon be gone — tell the client to retry.
+	if host.Status == "draining" || host.Status == "terminating" {
+		w.Header().Set("Retry-After", "5")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "host is draining, retry shortly"})
 		return
 	}
 
@@ -903,17 +963,19 @@ func (s *ControlPlaneServer) HandleGetHosts(w http.ResponseWriter, r *http.Reque
 
 	for _, h := range hosts {
 		hostList = append(hostList, map[string]interface{}{
-			"id":               h.ID,
-			"instance_name":    h.InstanceName,
-			"zone":             h.Zone,
-			"status":           h.Status,
-			"total_slots":      h.TotalSlots,
-			"used_slots":       h.UsedSlots,
-			"idle_runners":     h.IdleRunners,
-			"busy_runners":     h.BusyRunners,
-			"snapshot_version": h.SnapshotVersion,
-			"last_heartbeat":   h.LastHeartbeat,
-			"grpc_address":     h.GRPCAddress,
+			"id":                   h.ID,
+			"instance_name":        h.InstanceName,
+			"zone":                 h.Zone,
+			"status":               h.Status,
+			"idle_runners":         h.IdleRunners,
+			"busy_runners":         h.BusyRunners,
+			"snapshot_version":     h.SnapshotVersion,
+			"last_heartbeat":       h.LastHeartbeat,
+			"grpc_address":         h.GRPCAddress,
+			"total_cpu_millicores": h.TotalCPUMillicores,
+			"used_cpu_millicores":  h.UsedCPUMillicores,
+			"total_memory_mb":      h.TotalMemoryMB,
+			"used_memory_mb":       h.UsedMemoryMB,
 		})
 	}
 
@@ -974,15 +1036,15 @@ func (s *ControlPlaneServer) HandleGetDesiredVersions(w http.ResponseWriter, r *
 }
 
 // HandleGetFleetConvergence returns the fleet convergence state.
-// GET /api/v1/versions/fleet?chunk_key={key}
+// GET /api/v1/versions/fleet?workload_key={key}
 func (s *ControlPlaneServer) HandleGetFleetConvergence(w http.ResponseWriter, r *http.Request) {
-	chunkKey := r.URL.Query().Get("chunk_key")
-	if chunkKey == "" {
-		http.Error(w, "chunk_key is required", http.StatusBadRequest)
+	workloadKey := r.URL.Query().Get("workload_key")
+	if workloadKey == "" {
+		http.Error(w, "workload_key is required", http.StatusBadRequest)
 		return
 	}
 
-	statuses, err := s.snapshotManager.GetFleetConvergence(r.Context(), chunkKey)
+	statuses, err := s.snapshotManager.GetFleetConvergence(r.Context(), workloadKey)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -990,9 +1052,9 @@ func (s *ControlPlaneServer) HandleGetFleetConvergence(w http.ResponseWriter, r 
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"chunk_key": chunkKey,
-		"hosts":     statuses,
-		"count":     len(statuses),
+		"workload_key": workloadKey,
+		"hosts":        statuses,
+		"count":        len(statuses),
 	})
 }
 
@@ -1049,8 +1111,10 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 			totalRunners := int64(0)
 			totalIdle := int64(0)
 			totalBusy := int64(0)
-			fleetSlotsTotal := int64(0)
-			fleetSlotsUsed := int64(0)
+			fleetCPUTotal := int64(0)
+			fleetCPUUsed := int64(0)
+			fleetMemTotal := int64(0)
+			fleetMemUsed := int64(0)
 			activeHosts := int64(0)
 
 			for _, h := range hosts {
@@ -1059,12 +1123,13 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 				totalIdle += int64(h.IdleRunners)
 				totalBusy += int64(h.BusyRunners)
 				if h.Status == "ready" {
-					fleetSlotsTotal += int64(h.TotalSlots)
-					fleetSlotsUsed += int64(h.UsedSlots)
+					fleetCPUTotal += int64(h.TotalCPUMillicores)
+					fleetCPUUsed += int64(h.UsedCPUMillicores)
+					fleetMemTotal += int64(h.TotalMemoryMB)
+					fleetMemUsed += int64(h.UsedMemoryMB)
 					activeHosts++
 				}
 			}
-			fleetSlotsFree := fleetSlotsTotal - fleetSlotsUsed
 
 			// Record host counts by status
 			for status, count := range statusCounts {
@@ -1084,20 +1149,44 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 				telemetry.LabelStatus: "busy",
 			})
 
-			// Record fleet slot metrics — primary autoscaler signal.
-			mc.RecordInt(ctx, telemetry.MetricCPFleetSlotsTotal, fleetSlotsTotal, nil)
-			mc.RecordInt(ctx, telemetry.MetricCPFleetSlotsUsed, fleetSlotsUsed, nil)
-			mc.RecordInt(ctx, telemetry.MetricCPFleetSlotsFree, fleetSlotsFree, nil)
-			// free_slots_per_host: GCP autoscaler scales out when this drops below target.
-			// Use 0 when there are no active hosts (signals immediate scale-out need).
-			freeSlotsPer := int64(0)
-			if activeHosts > 0 {
-				freeSlotsPer = fleetSlotsFree / activeHosts
+			// Record fleet resource metrics
+			mc.RecordInt(ctx, telemetry.MetricCPFleetCPUTotal, fleetCPUTotal, nil)
+			mc.RecordInt(ctx, telemetry.MetricCPFleetCPUUsed, fleetCPUUsed, nil)
+			mc.RecordInt(ctx, telemetry.MetricCPFleetCPUFree, fleetCPUTotal-fleetCPUUsed, nil)
+			mc.RecordInt(ctx, telemetry.MetricCPFleetMemTotal, fleetMemTotal, nil)
+			mc.RecordInt(ctx, telemetry.MetricCPFleetMemUsed, fleetMemUsed, nil)
+			mc.RecordInt(ctx, telemetry.MetricCPFleetMemFree, fleetMemTotal-fleetMemUsed, nil)
+
+			// Record slot-based fleet utilization for autoscaler
+			defaultTier, _ := tiers.Lookup(tiers.DefaultTier)
+			defaultCPU := tiers.EffectiveCPUMillicores(defaultTier)
+			defaultMem := defaultTier.MemoryMB
+
+			totalSlots := 0
+			usedSlots := 0
+			for _, h := range hosts {
+				if h.Status != "ready" || h.TotalCPUMillicores == 0 {
+					continue
+				}
+				hostTotal := min(h.TotalCPUMillicores/defaultCPU, h.TotalMemoryMB/defaultMem)
+				freeCPU := max((h.TotalCPUMillicores-h.UsedCPUMillicores)/defaultCPU, 0)
+				freeMem := max((h.TotalMemoryMB-h.UsedMemoryMB)/defaultMem, 0)
+				hostFree := min(freeCPU, freeMem)
+				totalSlots += hostTotal
+				usedSlots += hostTotal - hostFree
 			}
-			mc.RecordInt(ctx, telemetry.MetricCPFleetFreeSlotsPer, freeSlotsPer, nil)
+
+			queueDepth := sched.GetQueueDepth()
+			var utilization float64
+			if totalSlots > 0 {
+				utilization = float64(usedSlots+queueDepth) / float64(totalSlots)
+			} else if queueDepth > 0 {
+				utilization = 10.0 // no capacity but demand exists — force scale-up
+			}
+			mc.RecordFloat(ctx, telemetry.MetricCPFleetUtilization, utilization, nil)
 
 			// Record queue depth
-			mc.RecordInt(ctx, telemetry.MetricCPQueueDepth, int64(sched.GetQueueDepth()), nil)
+			mc.RecordInt(ctx, telemetry.MetricCPQueueDepth, int64(queueDepth), nil)
 
 			// Record snapshot age
 			currentVersion := sm.GetCurrentVersion()

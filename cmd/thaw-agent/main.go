@@ -1834,6 +1834,8 @@ func dispatchCommand(cmd snapshot.SnapshotCommand, data *MMDSData) error {
 	switch cmd.Type {
 	case "git-clone":
 		return runGitCloneCommand(cmd.Args, data)
+	case "git-pull":
+		return runGitPullCommand(cmd.Args, data)
 	case "gcp-auth":
 		return runGCPAuthCommand(data)
 	case "shell":
@@ -2038,6 +2040,85 @@ func runGitCloneCommand(args []string, data *MMDSData) error {
 			os.Symlink(actualRepoDir, expectedRepoDir)
 		}
 	}
+	return nil
+}
+
+// runGitPullCommand implements the "git-pull" warmup step for incremental builds.
+// It fetches and resets to the latest commit instead of cloning from scratch.
+// args[0] = repo URL, args[1] = branch (optional)
+// If the repo doesn't exist yet, falls back to runGitCloneCommand.
+func runGitPullCommand(args []string, data *MMDSData) error {
+	if len(args) == 0 {
+		return fmt.Errorf("git-pull command requires a repo URL argument")
+	}
+	repoURL := args[0]
+	repoBranch := "main"
+	if len(args) > 1 && args[1] != "" {
+		repoBranch = args[1]
+	}
+
+	repoPath := extractRepoDir(repoURL)
+	repoDir := filepath.Join("/workspace", repoPath)
+
+	// If the repo doesn't exist, fall back to clone
+	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err != nil {
+		log.WithField("repo_dir", repoDir).Info("Repository not found, falling back to git-clone")
+		return runGitCloneCommand(args, data)
+	}
+
+	// Look up runner user
+	runnerUser, err := user.Lookup(*runnerUsername)
+	if err != nil {
+		return fmt.Errorf("runner user not found: %w", err)
+	}
+	rUID, _ := strconv.ParseUint(runnerUser.Uid, 10, 32)
+	rGID, _ := strconv.ParseUint(runnerUser.Gid, 10, 32)
+	runnerCred := &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
+	}
+	runnerHome := "HOME=" + runnerUser.HomeDir
+
+	// Build authenticated remote URL if token is available
+	fetchURL := repoURL
+	if data.Latest.Job.GitToken != "" {
+		repoPathStr := strings.TrimPrefix(repoURL, "https://github.com/")
+		repoPathStr = strings.TrimPrefix(repoPathStr, "github.com/")
+		fetchURL = fmt.Sprintf("https://x-access-token:%s@github.com/%s", data.Latest.Job.GitToken, repoPathStr)
+	} else if !strings.HasPrefix(fetchURL, "https://") && !strings.HasPrefix(fetchURL, "git@") {
+		fetchURL = "https://github.com/" + fetchURL
+	}
+
+	updateWarmupState("pulling", "Pulling latest changes...")
+	log.WithFields(logrus.Fields{
+		"repo_url": repoURL,
+		"branch":   repoBranch,
+		"repo_dir": repoDir,
+	}).Info("Fetching latest changes for incremental warmup")
+
+	// Set remote URL (may have changed token)
+	env := append(os.Environ(), runnerHome, "GIT_TERMINAL_PROMPT=0")
+	setURLCmd := exec.Command("git", "-C", repoDir, "remote", "set-url", "origin", fetchURL)
+	setURLCmd.SysProcAttr = runnerCred
+	setURLCmd.Env = env
+	setURLCmd.Run()
+
+	// Fetch the branch
+	globalWarmupLogs.Add(fmt.Sprintf("[git-pull] Fetching origin/%s", repoBranch))
+	if err := runStreamedCommand("", env, runnerCred,
+		"git", "-C", repoDir, "fetch", "origin", repoBranch); err != nil {
+		globalWarmupLogs.Add(fmt.Sprintf("[git-pull] fetch failed: %v", err))
+		return fmt.Errorf("git fetch failed: %w", err)
+	}
+
+	// Hard reset to origin/<branch> to handle force pushes
+	globalWarmupLogs.Add(fmt.Sprintf("[git-pull] Resetting to origin/%s", repoBranch))
+	if err := runStreamedCommand("", env, runnerCred,
+		"git", "-C", repoDir, "reset", "--hard", "origin/"+repoBranch); err != nil {
+		globalWarmupLogs.Add(fmt.Sprintf("[git-pull] reset failed: %v", err))
+		return fmt.Errorf("git reset failed: %w", err)
+	}
+
+	log.Info("Git pull completed successfully")
 	return nil
 }
 

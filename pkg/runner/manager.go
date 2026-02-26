@@ -64,6 +64,27 @@ type Manager struct {
 
 	// Runner pool for VM reuse (nil if pooling disabled)
 	pool *Pool
+
+	// sessionMemStore and sessionDiskStore are chunk stores for GCS-backed
+	// session pause/resume (nil when SessionChunkBucket is not configured).
+	// When non-nil, PauseRunner uploads dirty diff chunks to GCS and
+	// ResumeFromSession fetches chunks lazily via UFFD from any host.
+	sessionMemStore  *snapshot.ChunkStore
+	sessionDiskStore *snapshot.ChunkStore
+
+	// goldenChunkedMeta holds the base snapshot metadata used as the reference
+	// for session pause uploads. Only populated when sessionMemStore is non-nil.
+	goldenChunkedMeta *snapshot.ChunkedSnapshotMetadata
+
+	// getDirtyDiskChunks is a callback set by ChunkedManager that returns
+	// the dirty FUSE disk chunks for a runner. Nil when FUSE disks are not in use.
+	getDirtyDiskChunks func(runnerID string) map[int][]byte
+
+	// setupFUSEDisk is a callback set by ChunkedManager that creates and mounts
+	// a FUSE-backed disk from chunk refs. Returns the disk image path.
+	// Used by ResumeFromSession for GCS-backed cross-host resume where the
+	// local rootfs overlay doesn't exist.
+	setupFUSEDisk func(runnerID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (diskImagePath string, err error)
 }
 
 type QuarantineOptions struct {
@@ -85,10 +106,10 @@ func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logge
 
 	// Create snapshot cache
 	cache, err := snapshot.NewCache(ctx, snapshot.CacheConfig{
-		LocalPath: cfg.SnapshotCachePath,
-		GCSBucket: cfg.SnapshotBucket,
-		ChunkKey:  cfg.ChunkKey,
-		Logger:    logger,
+		LocalPath:   cfg.SnapshotCachePath,
+		GCSBucket:   cfg.SnapshotBucket,
+		WorkloadKey: cfg.WorkloadKey,
+		Logger:      logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create snapshot cache: %w", err)
@@ -124,12 +145,12 @@ func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logge
 
 	// Check if git-cache image exists (created by startup script)
 	gitCacheImg := ""
-	if cfg.GitCacheEnabled && cfg.GitCacheImagePath != "" {
-		if _, err := os.Stat(cfg.GitCacheImagePath); err == nil {
-			gitCacheImg = cfg.GitCacheImagePath
+	if cfg.Bazel.GitCacheEnabled && cfg.Bazel.GitCacheImagePath != "" {
+		if _, err := os.Stat(cfg.Bazel.GitCacheImagePath); err == nil {
+			gitCacheImg = cfg.Bazel.GitCacheImagePath
 			logger.WithField("git_cache_image", gitCacheImg).Info("Git-cache image found")
 		} else {
-			logger.WithField("git_cache_image", cfg.GitCacheImagePath).Warn("Git-cache enabled but image not found")
+			logger.WithField("git_cache_image", cfg.Bazel.GitCacheImagePath).Warn("Git-cache enabled but image not found")
 		}
 	}
 
@@ -191,6 +212,25 @@ func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logge
 	}()
 
 	return m, nil
+}
+
+// SetSessionStores configures the Manager for GCS-backed session pause/resume.
+// Called by ChunkedManager after its chunk stores are created so that sessions
+// reuse the same GCS bucket and chunk stores as the CI snapshot pipeline —
+// no separate SessionChunkBucket needed.
+// goldenMeta is used as the base for memory diff merging on pause.
+func (m *Manager) SetSessionStores(memStore, diskStore *snapshot.ChunkStore, goldenMeta *snapshot.ChunkedSnapshotMetadata) {
+	m.sessionMemStore = memStore
+	m.sessionDiskStore = diskStore
+	m.goldenChunkedMeta = goldenMeta
+}
+
+// SetGoldenChunkedMeta updates the golden metadata used as the base for
+// session pause uploads. Called after SyncManifest loads a new version.
+func (m *Manager) SetGoldenChunkedMeta(meta *snapshot.ChunkedSnapshotMetadata) {
+	m.mu.Lock()
+	m.goldenChunkedMeta = meta
+	m.mu.Unlock()
 }
 
 // cleanupRecentRequests removes expired idempotency entries (>5 min old).
@@ -397,7 +437,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		m.cleanupRunner(runnerID, tap.Name, overlayPath, "")
 		return nil, fmt.Errorf("failed to create repo-cache-upper directory: %w", err)
 	}
-	if err := createExt4Image(repoCacheUpperPath, m.config.RepoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
+	if err := createExt4Image(repoCacheUpperPath, m.config.Bazel.RepoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
 		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
 		return nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
 	}
@@ -420,16 +460,13 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		MAC:             tap.MAC,
 		SnapshotVersion: snapshotPaths.Version,
 		GitHubRepo:      req.Repo, // For pool key matching
-		Resources: Resources{
-			VCPUs:    m.config.VCPUsPerRunner,
-			MemoryMB: m.config.MemoryMBPerRunner,
-		},
-		CreatedAt:      time.Now(),
-		SocketPath:     filepath.Join(m.config.SocketDir, runnerID+".sock"),
-		LogPath:        filepath.Join(m.config.LogDir, runnerID+".log"),
-		MetricsPath:    filepath.Join(m.config.LogDir, runnerID+".metrics"),
-		RootfsOverlay:  overlayPath,
-		RepoCacheUpper: repoCacheUpperPath,
+		Resources:       req.Resources,
+		CreatedAt:       time.Now(),
+		SocketPath:      filepath.Join(m.config.SocketDir, runnerID+".sock"),
+		LogPath:         filepath.Join(m.config.LogDir, runnerID+".log"),
+		MetricsPath:     filepath.Join(m.config.LogDir, runnerID+".metrics"),
+		RootfsOverlay:   overlayPath,
+		RepoCacheUpper:  repoCacheUpperPath,
 	}
 	if req.StartCommand != nil {
 		runner.ServicePort = req.StartCommand.Port
@@ -626,7 +663,7 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 	data.Latest.Meta.Environment = m.config.Environment
 	data.Latest.Meta.JobID = req.RequestID
 	data.Latest.Meta.CurrentTime = time.Now().UTC().Format(time.RFC3339)
-	data.Latest.Buildbarn.CertsMountPath = m.config.BuildbarnCertsMountPath
+	data.Latest.Buildbarn.CertsMountPath = m.config.Bazel.BuildbarnCertsMountPath
 	data.Latest.Network.IP = netCfg.IP
 	data.Latest.Network.Gateway = netCfg.Gateway
 	data.Latest.Network.Netmask = netCfg.Netmask
@@ -651,9 +688,9 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 			if runnerURL != "" {
 				data.Latest.Job.Repo = runnerURL
 			}
-			if len(m.config.GitHubRunnerLabels) > 0 {
+			if len(m.config.CI.GitHubRunnerLabels) > 0 {
 				labels := make(map[string]string)
-				for _, label := range m.config.GitHubRunnerLabels {
+				for _, label := range m.config.CI.GitHubRunnerLabels {
 					labels[label] = "true"
 				}
 				data.Latest.Job.Labels = labels
@@ -663,32 +700,32 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 	}
 
 	// Git cache configuration
-	if m.config.GitCacheEnabled && m.gitCacheImage != "" {
+	if m.config.Bazel.GitCacheEnabled && m.gitCacheImage != "" {
 		data.Latest.GitCache.Enabled = true
-		data.Latest.GitCache.MountPath = m.config.GitCacheMountPath
-		data.Latest.GitCache.RepoMappings = m.config.GitCacheRepoMappings
+		data.Latest.GitCache.MountPath = m.config.Bazel.GitCacheMountPath
+		data.Latest.GitCache.RepoMappings = m.config.Bazel.GitCacheRepoMappings
 
 		// Ensure Job.Repo is set for git-cache workspace setup
 		// This is needed even if GitHub runner registration fails
-		if data.Latest.Job.Repo == "" && m.config.GitHubRepo != "" {
-			data.Latest.Job.Repo = m.config.GitHubRepo
+		if data.Latest.Job.Repo == "" && m.config.CI.GitHubRepo != "" {
+			data.Latest.Job.Repo = m.config.CI.GitHubRepo
 		}
 
 		// Set pre-cloned path (where repo was cloned during warmup, baked into snapshot)
 		// This allows thaw-agent to create symlinks from workspace to pre-cloned repo
-		if m.config.GitCachePreClonedPath != "" {
-			data.Latest.GitCache.PreClonedPath = m.config.GitCachePreClonedPath
+		if m.config.Bazel.GitCachePreClonedPath != "" {
+			data.Latest.GitCache.PreClonedPath = m.config.Bazel.GitCachePreClonedPath
 		}
 		// Note: if PreClonedPath is not set, thaw-agent will derive it from job.repo
 	}
 
 	// Always set WorkspaceDir - needed for pre-cloned repo symlink even without git-cache
-	if m.config.GitCacheWorkspaceDir != "" {
-		data.Latest.GitCache.WorkspaceDir = m.config.GitCacheWorkspaceDir
+	if m.config.Bazel.GitCacheWorkspaceDir != "" {
+		data.Latest.GitCache.WorkspaceDir = m.config.Bazel.GitCacheWorkspaceDir
 	}
 
 	// Runner configuration
-	data.Latest.Runner.Ephemeral = m.config.GitHubRunnerEphemeral
+	data.Latest.Runner.Ephemeral = m.config.CI.GitHubRunnerEphemeral
 	if m.ciAdapter != nil {
 		data.Latest.Runner.CISystem = m.ciAdapter.Name()
 	}
@@ -1292,12 +1329,12 @@ func ensureCredentialsImage(cfg HostConfig, log *logrus.Entry) (string, error) {
 	}
 
 	imgPath := filepath.Join(sharedDir, "credentials.img")
-	sizeMB := cfg.BuildbarnCertsImageSizeMB
+	sizeMB := cfg.Bazel.BuildbarnCertsImageSizeMB
 	if sizeMB <= 0 {
 		sizeMB = 32
 	}
 
-	seedDir := cfg.BuildbarnCertsDir
+	seedDir := cfg.Bazel.BuildbarnCertsDir
 	if seedDir == "" {
 		if _, err := os.Stat(imgPath); err == nil {
 			return imgPath, nil
@@ -1422,6 +1459,7 @@ func (m *Manager) GetStatus() ManagerStatus {
 	defer m.mu.RUnlock()
 
 	var idle, busy int
+	var usedCPU, usedMem int
 	for _, r := range m.runners {
 		switch r.State {
 		case StateIdle:
@@ -1429,26 +1467,54 @@ func (m *Manager) GetStatus() ManagerStatus {
 		case StateBusy:
 			busy++
 		}
+		usedCPU += r.Resources.VCPUs * 1000
+		usedMem += r.Resources.MemoryMB
 	}
 
 	return ManagerStatus{
-		TotalSlots:      m.config.MaxRunners,
-		UsedSlots:       len(m.runners),
-		IdleRunners:     idle,
-		BusyRunners:     busy,
-		SnapshotVersion: m.snapshotCache.CurrentVersion(),
-		Draining:        m.draining,
+		ActiveRunners:      len(m.runners),
+		IdleRunners:        idle,
+		BusyRunners:        busy,
+		SnapshotVersion:    m.snapshotCache.CurrentVersion(),
+		Draining:           m.draining,
+		TotalCPUMillicores: m.config.TotalCPUMillicores,
+		UsedCPUMillicores:  usedCPU,
+		TotalMemoryMB:      m.config.TotalMemoryMB,
+		UsedMemoryMB:       usedMem,
 	}
+}
+
+// GetRunnerHeartbeatInfo returns per-runner status summaries for the heartbeat.
+func (m *Manager) GetRunnerHeartbeatInfo() []RunnerHeartbeatInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	infos := make([]RunnerHeartbeatInfo, 0, len(m.runners))
+	for _, r := range m.runners {
+		info := RunnerHeartbeatInfo{
+			RunnerID:    r.ID,
+			State:       r.State,
+			WorkloadKey: r.WorkloadKey,
+		}
+		if r.State == StateIdle && !r.LastExecAt.IsZero() {
+			info.IdleSince = r.LastExecAt.Format(time.RFC3339)
+		}
+		infos = append(infos, info)
+	}
+	return infos
 }
 
 // ManagerStatus represents the status of the runner manager
 type ManagerStatus struct {
-	TotalSlots      int
-	UsedSlots       int
-	IdleRunners     int
-	BusyRunners     int
-	SnapshotVersion string
-	Draining        bool
+	ActiveRunners      int
+	IdleRunners        int
+	BusyRunners        int
+	SnapshotVersion    string
+	Draining           bool
+	TotalCPUMillicores int
+	UsedCPUMillicores  int
+	TotalMemoryMB      int
+	UsedMemoryMB       int
 }
 
 // SyncSnapshot syncs a new snapshot version from GCS
@@ -1457,11 +1523,29 @@ func (m *Manager) SyncSnapshot(ctx context.Context, version string) error {
 	return m.snapshotCache.SyncFromGCS(ctx, version)
 }
 
-// CanAddRunner checks if a new runner can be added
-func (m *Manager) CanAddRunner() bool {
+// CanAddRunner checks if a new runner with the given resources can be added.
+// It checks both the hard MaxRunners cap and actual host resource capacity.
+func (m *Manager) CanAddRunner(vcpus, memoryMB int) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return !m.draining && len(m.runners) < m.config.MaxRunners
+
+	if m.draining || len(m.runners) >= m.config.MaxRunners {
+		return false
+	}
+
+	// If host doesn't report total resources, fall back to slot check
+	if m.config.TotalCPUMillicores == 0 {
+		return true
+	}
+
+	var usedCPU, usedMem int
+	for _, r := range m.runners {
+		usedCPU += r.Resources.VCPUs * 1000
+		usedMem += r.Resources.MemoryMB
+	}
+
+	return (m.config.TotalCPUMillicores-usedCPU) >= vcpus*1000 &&
+		(m.config.TotalMemoryMB-usedMem) >= memoryMB
 }
 
 // IdleCount returns the number of idle runners
@@ -1499,6 +1583,39 @@ func (m *Manager) DrainIdleRunners(ctx context.Context) (int, error) {
 		return stopped, joinErrors(errs)
 	}
 	return stopped, nil
+}
+
+// PauseSessionRunners pauses all session-bound runners (idle or busy) so their
+// state is uploaded to GCS before the host shuts down. This is called during
+// graceful drain to ensure sessions can be resumed on another host.
+func (m *Manager) PauseSessionRunners(ctx context.Context) (int, error) {
+	m.mu.RLock()
+	var targets []string
+	for _, r := range m.runners {
+		if r.SessionID != "" && (r.State == StateIdle || r.State == StateBusy) {
+			targets = append(targets, r.ID)
+		}
+	}
+	m.mu.RUnlock()
+
+	if len(targets) == 0 {
+		return 0, nil
+	}
+
+	var errs []error
+	paused := 0
+	for _, id := range targets {
+		if _, err := m.PauseRunner(ctx, id); err != nil {
+			m.logger.WithError(err).WithField("runner_id", id).Warn("Failed to pause session runner during drain")
+			errs = append(errs, err)
+			continue
+		}
+		paused++
+	}
+	if len(errs) > 0 {
+		return paused, joinErrors(errs)
+	}
+	return paused, nil
 }
 
 // RemoveRunnerLabels removes custom labels from all runners on this host.
@@ -1563,6 +1680,9 @@ func (m *Manager) Close() error {
 
 	// Close snapshot cache
 	m.snapshotCache.Close()
+
+	// Note: sessionMemStore and sessionDiskStore are NOT closed here — they are
+	// owned by ChunkedManager which has its own Close() that shuts them down.
 
 	return nil
 }
@@ -1660,7 +1780,7 @@ func (m *Manager) getRunnerVMStats(ctx context.Context, runnerID string) (*VMSta
 	memoryUsage := int64(runner.Resources.MemoryMB) * 1024 * 1024
 
 	// Disk usage would be the overlay size, but for now just estimate
-	diskUsage := int64(m.config.RepoCacheUpperSizeGB) * 1024 * 1024 * 1024
+	diskUsage := int64(m.config.Bazel.RepoCacheUpperSizeGB) * 1024 * 1024 * 1024
 
 	return &VMStats{
 		MemoryUsageBytes: memoryUsage,

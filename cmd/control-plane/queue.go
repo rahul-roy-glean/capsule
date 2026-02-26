@@ -104,14 +104,14 @@ func (jq *JobQueue) processQueuedJobs(ctx context.Context) {
 			continue
 		}
 
-		// Look up chunk_key from snapshot_configs by matching a git-clone command for this repo
-		chunkKey := lookupChunkKeyForRepo(jq.db, repo)
+		// Look up workload_key from snapshot_configs by matching a git-clone command for this repo
+		workloadKey := lookupWorkloadKeyForRepo(jq.db, repo)
 
 		// Attempt allocation
 		req := AllocateRunnerRequest{
-			RequestID: fmt.Sprintf("gh-%d", githubJobID),
-			ChunkKey:  chunkKey,
-			Labels:    labelsToMap(parseLabels(labelsJSON)),
+			RequestID:   fmt.Sprintf("gh-%d", githubJobID),
+			WorkloadKey: workloadKey,
+			Labels:      labelsToMap(parseLabels(labelsJSON)),
 		}
 
 		resp, err := jq.scheduler.AllocateRunner(ctx, req)
@@ -183,26 +183,26 @@ func parseLabels(labelsJSON []byte) []string {
 	return labels
 }
 
-// lookupChunkKeyForRepo finds the chunk_key in snapshot_configs whose commands
+// lookupWorkloadKeyForRepo finds the workload_key in snapshot_configs whose commands
 // contain a git-clone arg matching the given repo name. Returns "" if not found.
-func lookupChunkKeyForRepo(db *sql.DB, repoFullName string) string {
+func lookupWorkloadKeyForRepo(db *sql.DB, repoFullName string) string {
 	if db == nil {
 		return ""
 	}
-	rows, err := db.Query(`SELECT chunk_key, commands FROM snapshot_configs`)
+	rows, err := db.Query(`SELECT workload_key, commands FROM snapshot_configs`)
 	if err != nil {
 		return ""
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var chunkKey, commandsJSON string
-		if err := rows.Scan(&chunkKey, &commandsJSON); err != nil {
+		var workloadKey, commandsJSON string
+		if err := rows.Scan(&workloadKey, &commandsJSON); err != nil {
 			continue
 		}
-		// If any command arg contains the repo name, use this chunk_key
+		// If any command arg contains the repo name, use this workload_key
 		if commandsJSON != "" && containsRepo(commandsJSON, repoFullName) {
-			return chunkKey
+			return workloadKey
 		}
 	}
 	return ""

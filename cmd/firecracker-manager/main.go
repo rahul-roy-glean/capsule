@@ -42,8 +42,6 @@ var (
 	httpPort             = flag.Int("http-port", 8080, "HTTP server port (health/metrics)")
 	maxRunners           = flag.Int("max-runners", 16, "Maximum runners per host")
 	idleTarget           = flag.Int("idle-target", 2, "Target number of idle runners")
-	vcpusPerRunner       = flag.Int("vcpus-per-runner", 4, "vCPUs per runner")
-	memoryPerRunner      = flag.Int("memory-per-runner", 8192, "Memory MB per runner")
 	firecrackerBin       = flag.String("firecracker-bin", "/usr/local/bin/firecracker", "Path to firecracker binary")
 	socketDir            = flag.String("socket-dir", "/var/run/firecracker", "Directory for VM sockets")
 	workspaceDir         = flag.String("workspace-dir", "/mnt/data/workspaces", "Directory for workspaces")
@@ -87,8 +85,11 @@ var (
 
 	// Chunked snapshot flags (BuildBuddy-style lazy loading)
 	useChunkedSnapshots = flag.Bool("use-chunked-snapshots", false, "Enable chunked snapshot restore with UFFD (lazy memory) and FUSE (lazy disk)")
-	chunkCacheSizeGB    = flag.Int("chunk-cache-size-gb", 2, "Size in GB of local LRU chunk cache")
-	memBackend          = flag.String("mem-backend", "file", "Memory restore backend: 'chunked' (UFFD lazy loading) or 'file' (download full snapshot.mem at startup, default). Overrides the backend recorded in snapshot metadata.")
+	chunkCacheSizeGB    = flag.Int("chunk-cache-size-gb", 2, "Size in GB of disk chunk LRU cache (FUSE)")
+	memCacheSizeGB      = flag.Int("mem-cache-size-gb", 2, "Size in GB of memory chunk LRU cache (UFFD)")
+	memBackend          = flag.String("mem-backend", "chunked", "Memory restore backend: 'chunked' (UFFD lazy loading, default) or 'file' (download full snapshot.mem at startup). Overrides the backend recorded in snapshot metadata.")
+	gcsPrefix           = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
+	enableSessionChunks = flag.Bool("enable-session-chunks", false, "Enable cloud-backed session pause/resume. Uses --snapshot-bucket for chunk storage. When enabled, PauseRunner uploads chunks to GCS and ResumeFromSession fetches lazily via UFFD+FUSE.")
 
 	// Network namespace mode (alternative to slot-based TAPs)
 	useNetNS = flag.Bool("use-netns", false, "Use network namespaces instead of slot-based TAP devices (simplifies snapshot restore)")
@@ -226,41 +227,19 @@ func main() {
 		Zone:                      zone,
 		MaxRunners:                *maxRunners,
 		IdleTarget:                *idleTarget,
-		VCPUsPerRunner:            *vcpusPerRunner,
-		MemoryMBPerRunner:         *memoryPerRunner,
 		FirecrackerBin:            *firecrackerBin,
 		SocketDir:                 *socketDir,
 		WorkspaceDir:              *workspaceDir,
 		LogDir:                    *logDir,
 		SnapshotBucket:            *snapshotBucket,
 		SnapshotCachePath:         *snapshotCache,
-		RepoCacheUpperSizeGB:      *repoCacheUpperSizeGB,
-		BuildbarnCertsDir:         *buildbarnCertsDir,
-		BuildbarnCertsMountPath:   *buildbarnCertsMount,
-		BuildbarnCertsImageSizeMB: *buildbarnCertsSizeMB,
 		QuarantineDir:             *quarantineDir,
 		MicroVMSubnet:             *microVMSubnet,
 		ExternalInterface:         *extInterface,
 		BridgeName:                *bridgeName,
 		Environment:               *environment,
 		ControlPlaneAddr:          *controlPlane,
-		// Git cache config
-		GitCacheEnabled:       gitCacheEnabledVal,
-		GitCacheDir:           *gitCacheDir,
-		GitCacheImagePath:     *gitCacheImagePath,
-		GitCacheMountPath:     *gitCacheMountPath,
-		GitCacheRepoMappings:  gitCacheRepoMappings,
-		GitCacheWorkspaceDir:  *gitCacheWorkspaceDir,
-		GitCachePreClonedPath: *gitCachePreClonedPath,
-		// GitHub runner auto-registration (Option C)
-		GitHubRunnerEnabled:   githubRunnerEnabledVal,
-		GitHubRepo:            githubRepoVal,
-		GitHubOrg:             githubOrgVal,
-		GitHubRunnerLabels:    githubRunnerLabelsVal,
-		GitHubRunnerEphemeral: runnerEphemeralVal,
-		GitHubAppID:           githubAppIDVal,
-		GitHubAppSecret:       githubAppSecretVal,
-		GCPProject:            gcpProjectVal,
+		GCPProject:                gcpProjectVal,
 		// Runner pooling configuration
 		PoolEnabled:            *poolEnabled,
 		PoolMaxRunners:         *poolMaxRunners,
@@ -268,7 +247,40 @@ func main() {
 		PoolMaxRunnerMemoryGB:  *poolMaxRunnerMemoryGB,
 		PoolMaxRunnerDiskGB:    *poolMaxRunnerDiskGB,
 		PoolRecycleTimeoutSecs: *poolRecycleTimeout,
+		// Bazel-specific settings
+		Bazel: runner.BazelConfig{
+			RepoCacheUpperSizeGB:      *repoCacheUpperSizeGB,
+			BuildbarnCertsDir:         *buildbarnCertsDir,
+			BuildbarnCertsMountPath:   *buildbarnCertsMount,
+			BuildbarnCertsImageSizeMB: *buildbarnCertsSizeMB,
+			GitCacheEnabled:           gitCacheEnabledVal,
+			GitCacheDir:               *gitCacheDir,
+			GitCacheImagePath:         *gitCacheImagePath,
+			GitCacheMountPath:         *gitCacheMountPath,
+			GitCacheRepoMappings:      gitCacheRepoMappings,
+			GitCacheWorkspaceDir:      *gitCacheWorkspaceDir,
+			GitCachePreClonedPath:     *gitCachePreClonedPath,
+		},
+		// CI system settings
+		CI: runner.CIConfig{
+			GitHubRunnerEnabled:   githubRunnerEnabledVal,
+			GitHubRepo:            githubRepoVal,
+			GitHubOrg:             githubOrgVal,
+			GitHubRunnerLabels:    githubRunnerLabelsVal,
+			GitHubRunnerEphemeral: runnerEphemeralVal,
+			GitHubAppID:           githubAppIDVal,
+			GitHubAppSecret:       githubAppSecretVal,
+		},
 	}
+
+	// Enable cloud-backed session chunks using the snapshot bucket.
+	if *enableSessionChunks {
+		cfg.SessionChunkBucket = *snapshotBucket
+	}
+	cfg.GCSPrefix = *gcsPrefix
+
+	// Detect host resources for bin-packing scheduler
+	cfg.TotalCPUMillicores, cfg.TotalMemoryMB = detectHostResources(log)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -319,7 +331,8 @@ func main() {
 		log.WithFields(logrus.Fields{
 			"chunked_snapshots": *useChunkedSnapshots,
 			"use_netns":         *useNetNS,
-			"chunk_cache_gb":    *chunkCacheSizeGB,
+			"disk_cache_gb":     *chunkCacheSizeGB,
+			"mem_cache_gb":      *memCacheSizeGB,
 		}).Info("Creating chunked manager with BuildBuddy-style optimizations")
 
 		chunkedCfg := runner.ChunkedManagerConfig{
@@ -328,7 +341,9 @@ func main() {
 			UseChunkedSnapshots: *useChunkedSnapshots,
 			UseNetNS:            *useNetNS,
 			ChunkCacheSizeBytes: int64(*chunkCacheSizeGB) * 1024 * 1024 * 1024,
+			MemCacheSizeBytes:   int64(*memCacheSizeGB) * 1024 * 1024 * 1024,
 			MemBackend:          *memBackend,
+			GCSPrefix:           *gcsPrefix,
 		}
 
 		var err error
@@ -339,54 +354,10 @@ func main() {
 		defer chunkedMgr.Close()
 		mgr = chunkedMgr.Manager // Use embedded manager for compatibility
 
-		// When using chunked snapshots, eagerly fetch just the kernel from
-		// the chunk store so it's available as a local file for Firecracker
-		// boot config. Everything else (rootfs, memory) is loaded lazily
-		// via FUSE and UFFD. This replaces the traditional SyncFromGCS
-		// which would download the entire snapshot.
-		if *useChunkedSnapshots {
-			if meta := chunkedMgr.GetChunkedMetadata(); meta != nil && meta.KernelHash != "" {
-				log.Info("Eagerly fetching kernel from chunk store...")
-				kernelData, err := chunkedMgr.GetChunkStore().GetChunk(ctx, meta.KernelHash)
-				if err != nil {
-					log.WithError(err).Fatal("Failed to fetch kernel chunk")
-				}
-				kernelPath := filepath.Join(*snapshotCache, "kernel.bin")
-				if err := os.WriteFile(kernelPath, kernelData, 0644); err != nil {
-					log.WithError(err).Fatal("Failed to write kernel to local cache")
-				}
-				log.WithFields(logrus.Fields{
-					"kernel_size": len(kernelData),
-					"path":        kernelPath,
-				}).Info("Kernel fetched from chunk store")
-
-				// When using file-backed memory, also download snapshot.mem now
-				// so AllocateRunnerChunked can find it at restore time.
-				// At 8GB this takes ~30s on a fresh host but is only done once;
-				// all 4 runners share the same file via read-only mmap.
-				if *memBackend == "file" && meta.MemFilePath != "" {
-					memPath := filepath.Join(*snapshotCache, "snapshot.mem")
-					if _, err := os.Stat(memPath); err != nil {
-						log.WithField("gcs_path", meta.MemFilePath).Info("Downloading snapshot.mem (file-backed memory mode)...")
-						if err := chunkedMgr.GetChunkStore().DownloadRawFile(ctx, meta.MemFilePath, memPath); err != nil {
-							log.WithError(err).Fatal("Failed to download snapshot.mem")
-						}
-						fi, _ := os.Stat(memPath)
-						log.WithFields(logrus.Fields{
-							"path":       memPath,
-							"size_bytes": fi.Size(),
-						}).Info("snapshot.mem downloaded")
-					} else {
-						log.WithField("path", memPath).Info("snapshot.mem already cached, skipping download")
-					}
-				}
-			} else {
-				log.Warn("No chunked metadata or kernel hash available, falling back to traditional sync")
-				if err := mgr.SyncSnapshot(ctx, "current"); err != nil {
-					log.WithError(err).Fatal("Failed to sync snapshot from GCS")
-				}
-			}
-		}
+		// In chunked mode, no downloads happen at startup. The kernel,
+		// snapshot.mem (file mode), and manifest are all fetched on demand
+		// when the first SyncManifest (heartbeat) or AllocateRunner arrives.
+		log.Info("Chunked mode: deferring all downloads until first manifest sync")
 	} else {
 		var err error
 		mgr, err = runner.NewManager(ctx, cfg, ciAdapter, logger)
@@ -426,6 +397,7 @@ func main() {
 		MetricPrefix: *telemetryPrefix,
 		Component:    "firecracker-manager",
 		Environment:  *environment,
+		InstanceID:   hostID,
 		InstanceName: instanceName,
 		Zone:         zone,
 	}
@@ -462,6 +434,9 @@ func main() {
 		hostAgentServer = NewHostAgentServer(mgr, logger)
 	}
 	pb.RegisterHostAgentServer(grpcServer, hostAgentServer)
+	if metricsClient != nil {
+		hostAgentServer.SetMetricsClient(metricsClient)
+	}
 
 	// Register health service
 	healthServer := health.NewServer()
@@ -489,16 +464,13 @@ func main() {
 	httpMux.HandleFunc("/health", healthHandler(mgr))
 	httpMux.HandleFunc("/ready", readyHandler(mgr))
 	httpMux.Handle("/metrics", promhttp.Handler())
-	httpMux.HandleFunc("/api/v1/runners/quarantine", quarantineRunnerHandler(mgr, logger))
-	httpMux.HandleFunc("/api/v1/runners/unquarantine", unquarantineRunnerHandler(mgr, logger))
+	httpMux.HandleFunc("/api/v1/runners/quarantine", drainingGuard(mgr, quarantineRunnerHandler(mgr, logger)))
+	httpMux.HandleFunc("/api/v1/runners/unquarantine", drainingGuard(mgr, unquarantineRunnerHandler(mgr, logger)))
 	httpMux.HandleFunc("/snapshot/sync", snapshotSyncHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/gc", gcHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/pool/flush", poolFlushHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/pool/stats", poolStatsHandler(mgr, logger))
-	httpMux.HandleFunc("/api/v1/runners/", runnerProxyHandler(mgr, logger))
-
-	// Start TTL enforcement loop for session auto-pause
-	mgr.StartTTLEnforcement(ctx)
+	httpMux.HandleFunc("/api/v1/runners/", drainingGuard(mgr, runnerProxyHandler(mgr, logger)))
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *httpPort),
@@ -527,6 +499,25 @@ func main() {
 
 	log.Info("Shutting down...")
 
+	// Mark host as draining so local middleware rejects new requests.
+	mgr.SetDraining(true)
+
+	// Send a drain heartbeat to the control plane so it stops allocating to this host.
+	if *controlPlane != "" {
+		sendDrainHeartbeat(mgr, chunkedMgr, *controlPlane, instanceName, zone, *grpcPort, *httpPort, logger)
+	}
+
+	// Pause all session-bound runners so their state is saved to GCS and they
+	// can be resumed on another host.
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 25*time.Second)
+	paused, pauseErr := mgr.PauseSessionRunners(drainCtx)
+	drainCancel()
+	if pauseErr != nil {
+		log.WithError(pauseErr).WithField("paused", paused).Warn("Some session runners failed to pause during drain")
+	} else if paused > 0 {
+		log.WithField("paused", paused).Info("Paused session runners during drain")
+	}
+
 	// Graceful shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
@@ -536,6 +527,24 @@ func main() {
 	httpServer.Shutdown(shutdownCtx)
 
 	log.Info("Shutdown complete")
+}
+
+// drainingGuard wraps an HTTP handler and returns 503 with Retry-After if the
+// host is draining. Health and readiness endpoints are NOT wrapped so GCE
+// health checks continue to work.
+func drainingGuard(mgr *runner.Manager, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if mgr.IsDraining() {
+			w.Header().Set("Retry-After", "5")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "host is draining, retry via control plane",
+			})
+			return
+		}
+		next(w, r)
+	}
 }
 
 func healthHandler(mgr *runner.Manager) http.HandlerFunc {
@@ -554,8 +563,8 @@ func readyHandler(mgr *runner.Manager) http.HandlerFunc {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "Ready: %d/%d runners, snapshot: %s",
-			status.UsedSlots, status.TotalSlots, status.SnapshotVersion)
+		fmt.Fprintf(w, "Ready: %d runners, snapshot: %s",
+			status.ActiveRunners, status.SnapshotVersion)
 	}
 }
 
@@ -572,9 +581,8 @@ func snapshotSyncHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handle
 		if version == "" {
 			version = r.URL.Query().Get("version")
 		}
-		if version == "" {
-			version = "current" // Default to "current" folder in GCS
-		}
+		// version is empty if not specified; SyncFromGCS will resolve via
+		// current-pointer.json.
 
 		log.WithField("version", version).Info("Snapshot sync requested")
 
@@ -611,17 +619,17 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			status := mgr.GetStatus()
 
 			// Maintain idle target.
-			// In chunked mode, skip pre-allocation: each chunk key needs a different
+			// In chunked mode, skip pre-allocation: each workload key needs a different
 			// snapshot, so generic warm VMs would load the wrong data and be
 			// useless when an actual job arrives. The control plane drives
 			// allocation on-demand via gRPC AllocateRunner with the correct
-			// ChunkKey. In single-snapshot (non-chunked) mode, warm pool is fine
+			// WorkloadKey. In single-snapshot (non-chunked) mode, warm pool is fine
 			// because there is only one snapshot.
 			if chunkedMgr != nil {
 				// Chunked mode: no local pre-allocation; control plane drives it.
 			} else if mgr.DiskUsage() > 0.85 {
 				log.Warn("Disk usage exceeds 85%, skipping runner allocation")
-			} else if !mgr.IsDraining() && status.IdleRunners < idleTarget && mgr.CanAddRunner() {
+			} else if !mgr.IsDraining() && status.IdleRunners < idleTarget && mgr.CanAddRunner(0, 0) {
 				log.Debug("Adding runner to maintain idle pool")
 				allocTimer := telemetry.NewStopwatch()
 				_, err := mgr.AllocateRunner(ctx, runner.AllocateRequest{})
@@ -646,10 +654,12 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				}
 			}
 
-			// Update Prometheus metrics (legacy)
+			// Update Prometheus metrics
 			metrics.UpdateHostMetrics(
-				status.TotalSlots,
-				status.UsedSlots,
+				status.TotalCPUMillicores,
+				status.UsedCPUMillicores,
+				status.TotalMemoryMB,
+				status.UsedMemoryMB,
 				status.IdleRunners,
 				status.BusyRunners,
 			)
@@ -657,25 +667,30 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			// Record GCP Cloud Monitoring metrics
 			if metricsClient != nil {
 				metricsClient.RecordHostMetrics(ctx, telemetry.HostMetrics{
-					TotalSlots:  status.TotalSlots,
-					UsedSlots:   status.UsedSlots,
-					IdleRunners: status.IdleRunners,
-					BusyRunners: status.BusyRunners,
+					TotalCPUMillicores: status.TotalCPUMillicores,
+					UsedCPUMillicores:  status.UsedCPUMillicores,
+					TotalMemoryMB:      status.TotalMemoryMB,
+					UsedMemoryMB:       status.UsedMemoryMB,
+					IdleRunners:        status.IdleRunners,
+					BusyRunners:        status.BusyRunners,
 				})
 
 				// Record chunked snapshot metrics
 				if chunkedMgr != nil {
 					cs := chunkedMgr.GetChunkedStats()
 					metricsClient.RecordChunkedMetrics(ctx, telemetry.ChunkedMetrics{
-						CacheSize:    cs.CacheSize,
-						CacheMaxSize: cs.CacheMaxSize,
-						CacheItems:   cs.CacheItems,
-						PageFaults:   cs.TotalPageFaults,
-						CacheHits:    cs.TotalCacheHits,
-						ChunkFetches: cs.TotalChunkFetches,
-						DiskReads:    cs.TotalDiskReads,
-						DiskWrites:   cs.TotalDiskWrites,
-						DirtyChunks:  cs.TotalDirtyChunks,
+						DiskCacheSize:    cs.DiskCacheSize,
+						DiskCacheMaxSize: cs.DiskCacheMaxSize,
+						DiskCacheItems:   cs.DiskCacheItems,
+						MemCacheSize:     cs.MemCacheSize,
+						MemCacheMaxSize:  cs.MemCacheMaxSize,
+						MemCacheItems:    cs.MemCacheItems,
+						PageFaults:       cs.TotalPageFaults,
+						CacheHits:        cs.TotalCacheHits,
+						ChunkFetches:     cs.TotalChunkFetches,
+						DiskReads:        cs.TotalDiskReads,
+						DiskWrites:       cs.TotalDiskWrites,
+						DirtyChunks:      cs.TotalDirtyChunks,
 					})
 				}
 
@@ -698,18 +713,21 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 }
 
 type hostHeartbeatRequest struct {
-	InstanceName    string            `json:"instance_name"`
-	Zone            string            `json:"zone"`
-	GRPCAddress     string            `json:"grpc_address"`
-	HTTPAddress     string            `json:"http_address"`
-	TotalSlots      int               `json:"total_slots"`
-	UsedSlots       int               `json:"used_slots"`
-	IdleRunners     int               `json:"idle_runners"`
-	BusyRunners     int               `json:"busy_runners"`
-	SnapshotVersion string            `json:"snapshot_version"`
-	Draining        bool              `json:"draining"`
-	DiskUsage       float64           `json:"disk_usage"`
-	LoadedManifests map[string]string `json:"loaded_manifests,omitempty"`
+	InstanceName       string                       `json:"instance_name"`
+	Zone               string                       `json:"zone"`
+	GRPCAddress        string                       `json:"grpc_address"`
+	HTTPAddress        string                       `json:"http_address"`
+	IdleRunners        int                          `json:"idle_runners"`
+	BusyRunners        int                          `json:"busy_runners"`
+	SnapshotVersion    string                       `json:"snapshot_version"`
+	Draining           bool                         `json:"draining"`
+	DiskUsage          float64                      `json:"disk_usage"`
+	TotalCPUMillicores int                          `json:"total_cpu_millicores"`
+	UsedCPUMillicores  int                          `json:"used_cpu_millicores"`
+	TotalMemoryMB      int                          `json:"total_memory_mb"`
+	UsedMemoryMB       int                          `json:"used_memory_mb"`
+	LoadedManifests    map[string]string            `json:"loaded_manifests,omitempty"`
+	Runners            []runner.RunnerHeartbeatInfo `json:"runners,omitempty"`
 }
 
 type hostHeartbeatResponse struct {
@@ -749,21 +767,24 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			hbTimer := telemetry.NewStopwatch()
 			status := mgr.GetStatus()
 			reqBody := hostHeartbeatRequest{
-				InstanceName:    instanceName,
-				Zone:            zone,
-				GRPCAddress:     fmt.Sprintf("%s:%d", internalIP, grpcPort),
-				HTTPAddress:     fmt.Sprintf("%s:%d", internalIP, httpPort),
-				TotalSlots:      status.TotalSlots,
-				UsedSlots:       status.UsedSlots,
-				IdleRunners:     status.IdleRunners,
-				BusyRunners:     status.BusyRunners,
-				SnapshotVersion: status.SnapshotVersion,
-				Draining:        status.Draining,
-				DiskUsage:       mgr.DiskUsage(),
+				InstanceName:       instanceName,
+				Zone:               zone,
+				GRPCAddress:        fmt.Sprintf("%s:%d", internalIP, grpcPort),
+				HTTPAddress:        fmt.Sprintf("%s:%d", internalIP, httpPort),
+				IdleRunners:        status.IdleRunners,
+				BusyRunners:        status.BusyRunners,
+				SnapshotVersion:    status.SnapshotVersion,
+				Draining:           status.Draining,
+				DiskUsage:          mgr.DiskUsage(),
+				TotalCPUMillicores: status.TotalCPUMillicores,
+				UsedCPUMillicores:  status.UsedCPUMillicores,
+				TotalMemoryMB:      status.TotalMemoryMB,
+				UsedMemoryMB:       status.UsedMemoryMB,
 			}
 			if chunkedMgr != nil {
 				reqBody.LoadedManifests = chunkedMgr.GetLoadedManifests()
 			}
+			reqBody.Runners = mgr.GetRunnerHeartbeatInfo()
 
 			b, _ := json.Marshal(reqBody)
 			req, err := http.NewRequestWithContext(ctx, http.MethodPost, heartbeatURL, bytes.NewReader(b))
@@ -823,6 +844,14 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 					} else {
 						log.WithField("drained_idle_runners", drained).Info("Host entered draining mode")
 					}
+
+					// Pause session-bound runners so they can resume on another host
+					paused, pauseErr := mgr.PauseSessionRunners(ctx)
+					if pauseErr != nil {
+						log.WithError(pauseErr).WithField("paused", paused).Warn("Failed to pause some session runners during drain")
+					} else if paused > 0 {
+						log.WithField("paused", paused).Info("Paused session runners during drain")
+					}
 				} else {
 					wasDraining = false
 					log.Info("Host exited draining mode")
@@ -831,6 +860,7 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				wasDraining = true
 				_, _ = mgr.RemoveRunnerLabels(ctx)
 				_, _ = mgr.DrainIdleRunners(ctx)
+				_, _ = mgr.PauseSessionRunners(ctx)
 			}
 
 			// Handle snapshot sync directive from control plane
@@ -847,23 +877,81 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				}(hbResp.SnapshotVersion)
 			}
 
-			// Handle per-chunk-key manifest sync directives
+			// Handle per-workload-key manifest sync directives
 			if len(hbResp.SyncVersions) > 0 && chunkedMgr != nil {
-				for chunkKey, version := range hbResp.SyncVersions {
+				for workloadKey, version := range hbResp.SyncVersions {
 					go func(key, ver string) {
 						syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 						defer cancel()
 						if err := chunkedMgr.SyncManifest(syncCtx, key, ver); err != nil {
 							log.WithError(err).WithFields(logrus.Fields{
-								"chunk_key": key,
-								"version":   ver,
-							}).Warn("Failed to sync manifest for chunk key")
+								"workload_key": key,
+								"version":      ver,
+							}).Warn("Failed to sync manifest for workload key")
 						}
-					}(chunkKey, version)
+					}(workloadKey, version)
 				}
 			}
 		}
 	}
+}
+
+// sendDrainHeartbeat sends a single heartbeat with Draining=true so the control
+// plane marks this host as draining before the process exits.
+func sendDrainHeartbeat(mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, controlPlane, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger) {
+	log := logger.WithField("component", "drain-heartbeat")
+
+	cp := strings.TrimSpace(controlPlane)
+	if !strings.HasPrefix(cp, "http://") && !strings.HasPrefix(cp, "https://") {
+		cp = "http://" + cp
+	}
+	heartbeatURL := strings.TrimRight(cp, "/") + "/api/v1/hosts/heartbeat"
+
+	internalIP := getMetadataValue("instance/network-interfaces/0/ip")
+	if internalIP == "" {
+		internalIP = getLocalIPFallback()
+	}
+
+	status := mgr.GetStatus()
+	reqBody := hostHeartbeatRequest{
+		InstanceName:       instanceName,
+		Zone:               zone,
+		GRPCAddress:        fmt.Sprintf("%s:%d", internalIP, grpcPort),
+		HTTPAddress:        fmt.Sprintf("%s:%d", internalIP, httpPort),
+		IdleRunners:        status.IdleRunners,
+		BusyRunners:        status.BusyRunners,
+		SnapshotVersion:    status.SnapshotVersion,
+		Draining:           true,
+		DiskUsage:          mgr.DiskUsage(),
+		TotalCPUMillicores: status.TotalCPUMillicores,
+		UsedCPUMillicores:  status.UsedCPUMillicores,
+		TotalMemoryMB:      status.TotalMemoryMB,
+		UsedMemoryMB:       status.UsedMemoryMB,
+	}
+	if chunkedMgr != nil {
+		reqBody.LoadedManifests = chunkedMgr.GetLoadedManifests()
+	}
+	reqBody.Runners = mgr.GetRunnerHeartbeatInfo()
+
+	b, _ := json.Marshal(reqBody)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, heartbeatURL, bytes.NewReader(b))
+	if err != nil {
+		log.WithError(err).Warn("Failed to create drain heartbeat request")
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.WithError(err).Warn("Failed to send drain heartbeat")
+		return
+	}
+	resp.Body.Close()
+	log.WithField("status", resp.StatusCode).Info("Drain heartbeat sent to control plane")
 }
 
 func loggingInterceptor(logger *logrus.Logger) grpc.UnaryServerInterceptor {
@@ -1008,6 +1096,54 @@ func getLocalIPFallback() string {
 		}
 	}
 	return ""
+}
+
+// detectHostResources detects the total CPU and memory available on this host.
+// It reads from /proc/cpuinfo and /proc/meminfo on Linux. Returns (cpuMillicores, memoryMB).
+func detectHostResources(log *logrus.Entry) (int, int) {
+	var cpuMillicores, memoryMB int
+
+	// Detect CPU count from /proc/cpuinfo
+	cpuData, err := os.ReadFile("/proc/cpuinfo")
+	if err == nil {
+		cpuCount := 0
+		for _, line := range strings.Split(string(cpuData), "\n") {
+			if strings.HasPrefix(line, "processor") {
+				cpuCount++
+			}
+		}
+		if cpuCount > 0 {
+			cpuMillicores = cpuCount * 1000
+		}
+	}
+
+	// Detect total memory from /proc/meminfo
+	memData, err := os.ReadFile("/proc/meminfo")
+	if err == nil {
+		for _, line := range strings.Split(string(memData), "\n") {
+			if strings.HasPrefix(line, "MemTotal:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					if kb, err := fmt.Sscanf(fields[1], "%d", &memoryMB); err == nil && kb == 1 {
+						memoryMB = memoryMB / 1024 // kB -> MB
+					}
+				}
+				break
+			}
+		}
+	}
+
+	// Fallback: try GCE machine-type metadata
+	if cpuMillicores == 0 || memoryMB == 0 {
+		log.Debug("Could not detect resources from /proc, will report 0 (slot-based fallback)")
+	} else {
+		log.WithFields(logrus.Fields{
+			"cpu_millicores": cpuMillicores,
+			"memory_mb":      memoryMB,
+		}).Info("Detected host resources")
+	}
+
+	return cpuMillicores, memoryMB
 }
 
 func gcpTokenHandler(w http.ResponseWriter, r *http.Request, logger *logrus.Logger) {
@@ -1457,7 +1593,7 @@ func handleConnectRunner(w http.ResponseWriter, r *http.Request, mgr *runner.Man
 			http.Error(w, "runner has no session_id", http.StatusBadRequest)
 			return
 		}
-		resumed, err := mgr.ResumeFromSession(r.Context(), rn.SessionID, rn.ChunkKey)
+		resumed, err := mgr.ResumeFromSession(r.Context(), rn.SessionID, rn.WorkloadKey)
 		if err != nil {
 			log.WithError(err).WithField("runner_id", runnerID).Error("Failed to resume runner")
 			w.Header().Set("Content-Type", "application/json")

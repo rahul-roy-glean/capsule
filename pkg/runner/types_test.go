@@ -46,16 +46,16 @@ func TestMMDSData_BackwardsCompatible(t *testing.T) {
 	}
 }
 
-func TestAllocateRequest_ChunkKey(t *testing.T) {
+func TestAllocateRequest_WorkloadKey(t *testing.T) {
 	req := AllocateRequest{
-		RequestID: "req-1",
-		Repo:      "https://github.com/org/repo",
-		ChunkKey:  "abc1234567890abc",
-		Branch:    "main",
+		RequestID:   "req-1",
+		Repo:        "https://github.com/org/repo",
+		WorkloadKey: "abc1234567890abc",
+		Branch:      "main",
 	}
 
-	if req.ChunkKey != "abc1234567890abc" {
-		t.Errorf("ChunkKey = %q, want %q", req.ChunkKey, "abc1234567890abc")
+	if req.WorkloadKey != "abc1234567890abc" {
+		t.Errorf("WorkloadKey = %q, want %q", req.WorkloadKey, "abc1234567890abc")
 	}
 }
 

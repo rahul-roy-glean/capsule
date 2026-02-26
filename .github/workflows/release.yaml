@@ -76,7 +76,7 @@ jobs:
           # Get previous tag
           prev_tag=$(git tag --sort=-v:refname | head -2 | tail -1)
           if [ -z "$prev_tag" ] || [ "$prev_tag" = "${{ steps.version.outputs.version }}" ]; then
-            echo "body=Initial release" >> $GITHUB_OUTPUT
+            echo "Initial release" > /tmp/changelog.md
           else
             changelog=$(git log --pretty=format:"- %s (%h)" "$prev_tag".."${{ steps.version.outputs.version }}" -- . ':!docs' ':!*.md')
             # Write to file to handle multiline

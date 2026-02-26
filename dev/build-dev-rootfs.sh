@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build the minimal dev rootfs + kernel for local Firecracker testing.
-# Run inside the Lima VM: lima bash dev/build-dev-rootfs.sh
+# Usage: make dev-build
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
@@ -11,14 +12,16 @@ import (
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
 )
 
 // HostAgentServer implements the HostAgent gRPC service
 type HostAgentServer struct {
 	pb.UnimplementedHostAgentServer
-	manager    *runner.Manager
-	chunkedMgr *runner.ChunkedManager // Optional, for chunked snapshot support
-	logger     *logrus.Entry
+	manager       *runner.Manager
+	chunkedMgr    *runner.ChunkedManager // Optional, for chunked snapshot support
+	metricsClient *telemetry.Client      // Optional, for GCP Cloud Monitoring
+	logger        *logrus.Entry
 }
 
 // NewHostAgentServer creates a new HostAgentServer
@@ -38,6 +41,11 @@ func NewHostAgentServerWithChunked(mgr *runner.Manager, chunkedMgr *runner.Chunk
 	}
 }
 
+// SetMetricsClient attaches a telemetry client for GCP Cloud Monitoring.
+func (s *HostAgentServer) SetMetricsClient(c *telemetry.Client) {
+	s.metricsClient = c
+}
+
 // AllocateRunner allocates a new runner
 func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRunnerRequest) (*pb.AllocateRunnerResponse, error) {
 	s.logger.WithFields(logrus.Fields{
@@ -47,8 +55,8 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		"chunked_mode": s.chunkedMgr != nil,
 	}).Info("AllocateRunner request")
 
-	if req.ChunkKey == "" {
-		return nil, status.Error(codes.InvalidArgument, "chunk_key is required")
+	if req.WorkloadKey == "" {
+		return nil, status.Error(codes.InvalidArgument, "workload_key is required")
 	}
 
 	allocReq := runner.AllocateRequest{
@@ -58,7 +66,8 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		Commit:            req.Commit,
 		GitHubRunnerToken: req.GithubRunnerToken,
 		Labels:            req.Labels,
-		ChunkKey:          req.ChunkKey,
+		WorkloadKey:       req.WorkloadKey,
+		SnapshotVersion:   req.SnapshotVersion,
 		CISystem:          req.CiSystem,
 		SessionID:         req.SessionId,
 	}
@@ -96,11 +105,36 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 
 		// Try to resume from session snapshot
 		if s.manager.SessionExists(allocReq.SessionID) {
-			r, err = s.manager.ResumeFromSession(ctx, allocReq.SessionID, allocReq.ChunkKey)
+			resumeStart := time.Now()
+			r, err = s.manager.ResumeFromSession(ctx, allocReq.SessionID, allocReq.WorkloadKey)
+			resumeDuration := time.Since(resumeStart)
+
 			if err == nil {
 				resumed = true
+
+				// Determine routing type: GCS-backed or local
+				meta, _ := s.manager.GetSessionMetadata(allocReq.SessionID)
+				routing := telemetry.RoutingLocal
+				if meta != nil && meta.GCSManifestPath != "" {
+					routing = telemetry.RoutingGCS
+				}
+
+				if s.metricsClient != nil {
+					s.metricsClient.RecordDuration(ctx, telemetry.MetricSessionResumeDuration, resumeDuration, telemetry.Labels{
+						telemetry.LabelRouting: routing,
+					})
+					s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionResumeTotal, telemetry.Labels{
+						telemetry.LabelResult:  telemetry.ResultSuccess,
+						telemetry.LabelRouting: routing,
+					})
+				}
 			} else {
 				s.logger.WithError(err).Warn("Failed to resume from session, falling back to fresh allocation")
+				if s.metricsClient != nil {
+					s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionResumeTotal, telemetry.Labels{
+						telemetry.LabelResult: telemetry.ResultFailure,
+					})
+				}
 				err = nil // Reset error for fresh allocation
 			}
 		}
@@ -188,8 +222,6 @@ func (s *HostAgentServer) GetHostStatus(ctx context.Context, req *pb.GetHostStat
 	st := s.manager.GetStatus()
 
 	resp := &pb.HostStatus{
-		TotalSlots:      int32(st.TotalSlots),
-		UsedSlots:       int32(st.UsedSlots),
 		IdleRunners:     int32(st.IdleRunners),
 		BusyRunners:     int32(st.BusyRunners),
 		SnapshotVersion: st.SnapshotVersion,
@@ -326,13 +358,28 @@ func (s *HostAgentServer) UnquarantineRunner(ctx context.Context, req *pb.Unquar
 func (s *HostAgentServer) PauseRunner(ctx context.Context, req *pb.PauseRunnerRequest) (*pb.PauseRunnerResponse, error) {
 	s.logger.WithField("runner_id", req.RunnerId).Info("PauseRunner request")
 
+	start := time.Now()
 	result, err := s.manager.PauseRunner(ctx, req.RunnerId)
+	duration := time.Since(start)
+
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to pause runner")
+		if s.metricsClient != nil {
+			s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionPauseTotal, telemetry.Labels{
+				telemetry.LabelResult: telemetry.ResultFailure,
+			})
+		}
 		return &pb.PauseRunnerResponse{
 			Success: false,
 			Error:   err.Error(),
 		}, nil
+	}
+
+	if s.metricsClient != nil {
+		s.metricsClient.RecordDuration(ctx, telemetry.MetricSessionPauseDuration, duration, nil)
+		s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionPauseTotal, telemetry.Labels{
+			telemetry.LabelResult: telemetry.ResultSuccess,
+		})
 	}
 
 	return &pb.PauseRunnerResponse{
@@ -346,11 +393,11 @@ func (s *HostAgentServer) PauseRunner(ctx context.Context, req *pb.PauseRunnerRe
 // ResumeRunner resumes a runner from a session snapshot
 func (s *HostAgentServer) ResumeRunner(ctx context.Context, req *pb.ResumeRunnerRequest) (*pb.ResumeRunnerResponse, error) {
 	s.logger.WithFields(logrus.Fields{
-		"session_id": req.SessionId,
-		"chunk_key":  req.ChunkKey,
+		"session_id":   req.SessionId,
+		"workload_key": req.WorkloadKey,
 	}).Info("ResumeRunner request")
 
-	r, err := s.manager.ResumeFromSession(ctx, req.SessionId, req.ChunkKey)
+	r, err := s.manager.ResumeFromSession(ctx, req.SessionId, req.WorkloadKey)
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to resume runner")
 		return &pb.ResumeRunnerResponse{

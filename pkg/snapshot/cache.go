@@ -23,7 +23,7 @@ type SnapshotMetadata struct {
 	BazelVersion string            `json:"bazel_version"`
 	RepoCommit   string            `json:"repo_commit"`
 	Repo         string            `json:"repo,omitempty"`
-	ChunkKey     string            `json:"chunk_key,omitempty"`
+	WorkloadKey  string            `json:"workload_key,omitempty"`
 	Commands     []SnapshotCommand `json:"commands,omitempty"`
 	CreatedAt    time.Time         `json:"created_at"`
 	SizeBytes    int64             `json:"size_bytes"`
@@ -48,22 +48,24 @@ type SnapshotPaths struct {
 
 // Cache manages local snapshot cache with GCS sync
 type Cache struct {
-	localPath  string
-	gcsBucket  string
-	chunkKey   string
-	gcsClient  *storage.Client
-	currentVer string
-	metadata   *SnapshotMetadata
-	mu         sync.RWMutex
-	logger     *logrus.Entry
+	localPath   string
+	gcsBucket   string
+	gcsPrefix   string // top-level prefix for all GCS paths (e.g. "v1")
+	workloadKey string
+	gcsClient   *storage.Client
+	currentVer  string
+	metadata    *SnapshotMetadata
+	mu          sync.RWMutex
+	logger      *logrus.Entry
 }
 
 // CacheConfig holds configuration for snapshot cache
 type CacheConfig struct {
-	LocalPath string
-	GCSBucket string
-	ChunkKey  string
-	Logger    *logrus.Logger
+	LocalPath   string
+	GCSBucket   string
+	GCSPrefix   string // Top-level prefix for all GCS paths (e.g. "v1"); empty means no prefix
+	WorkloadKey string
+	Logger      *logrus.Logger
 }
 
 // NewCache creates a new snapshot cache manager
@@ -85,11 +87,12 @@ func NewCache(ctx context.Context, cfg CacheConfig) (*Cache, error) {
 	}
 
 	cache := &Cache{
-		localPath: cfg.LocalPath,
-		gcsBucket: cfg.GCSBucket,
-		chunkKey:  cfg.ChunkKey,
-		gcsClient: client,
-		logger:    logger.WithField("component", "snapshot-cache"),
+		localPath:   cfg.LocalPath,
+		gcsBucket:   cfg.GCSBucket,
+		gcsPrefix:   cfg.GCSPrefix,
+		workloadKey: cfg.WorkloadKey,
+		gcsClient:   client,
+		logger:      logger.WithField("component", "snapshot-cache"),
 	}
 
 	// Ensure local path exists
@@ -103,6 +106,14 @@ func NewCache(ctx context.Context, cfg CacheConfig) (*Cache, error) {
 	return cache, nil
 }
 
+// gcsPath prepends the configured GCS prefix to a path.
+func (c *Cache) gcsPath(path string) string {
+	if c.gcsPrefix != "" {
+		return c.gcsPrefix + "/" + path
+	}
+	return path
+}
+
 // SyncFromGCS syncs snapshot files from GCS to local cache
 func (c *Cache) SyncFromGCS(ctx context.Context, version string) error {
 	if c.gcsClient == nil {
@@ -114,24 +125,19 @@ func (c *Cache) SyncFromGCS(ctx context.Context, version string) error {
 	defer c.mu.Unlock()
 
 	if version == "" {
-		version = "current"
-	}
-
-	// If version is "current", try to resolve via pointer file first
-	if version == "current" {
-		if resolved, err := c.resolveCurrentPointerForRepo(ctx, c.chunkKey); err == nil && resolved != "" {
-			c.logger.WithField("resolved_version", resolved).Info("Resolved current pointer to versioned directory")
-			version = resolved
-		} else {
-			c.logger.Info("No current-pointer.json found, falling back to current/ directory")
+		resolved, err := c.resolveCurrentPointerForRepo(ctx, c.workloadKey)
+		if err != nil || resolved == "" {
+			return fmt.Errorf("failed to resolve current version for workload key %q: %w", c.workloadKey, err)
 		}
+		c.logger.WithField("resolved_version", resolved).Info("Resolved current pointer to versioned directory")
+		version = resolved
 	}
 
 	c.logger.WithField("version", version).Info("Syncing snapshot from GCS")
 
 	start := time.Now()
 
-	gcsPath := fmt.Sprintf("gs://%s/%s/", c.gcsBucket, version)
+	gcsPath := fmt.Sprintf("gs://%s/%s/", c.gcsBucket, c.gcsPath(version))
 	cmd := exec.CommandContext(ctx, "gcloud", "storage", "rsync", "-r", gcsPath, c.localPath+"/")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -154,9 +160,9 @@ func (c *Cache) SyncFromGCS(ctx context.Context, version string) error {
 	return nil
 }
 
-// resolveCurrentPointerForRepo reads the chunk-key-scoped current-pointer.json from GCS.
-func (c *Cache) resolveCurrentPointerForRepo(ctx context.Context, chunkKey string) (string, error) {
-	pointerPath := chunkKey + "/current-pointer.json"
+// resolveCurrentPointerForRepo reads the workload-key-scoped current-pointer.json from GCS.
+func (c *Cache) resolveCurrentPointerForRepo(ctx context.Context, workloadKey string) (string, error) {
+	pointerPath := c.gcsPath(workloadKey + "/current-pointer.json")
 	bucket := c.gcsClient.Bucket(c.gcsBucket)
 	obj := bucket.Object(pointerPath)
 
@@ -281,7 +287,7 @@ func (c *Cache) ListVersions(ctx context.Context) ([]string, error) {
 		if attrs.Prefix != "" {
 			// This is a "directory" (prefix)
 			version := filepath.Base(attrs.Prefix)
-			if version != "" && version != "current" {
+			if version != "" {
 				versions = append(versions, version)
 			}
 		}
@@ -297,7 +303,7 @@ func (c *Cache) GetRemoteMetadata(ctx context.Context, version string) (*Snapsho
 	}
 
 	bucket := c.gcsClient.Bucket(c.gcsBucket)
-	obj := bucket.Object(fmt.Sprintf("%s/metadata.json", version))
+	obj := bucket.Object(c.gcsPath(fmt.Sprintf("%s/metadata.json", version)))
 
 	reader, err := obj.NewReader(ctx)
 	if err != nil {
@@ -328,19 +334,12 @@ func (c *Cache) IsStale(ctx context.Context) (bool, error) {
 	localVer := c.currentVer
 	c.mu.RUnlock()
 
-	// Try to resolve the current version via pointer file first
-	remoteVer, err := c.resolveCurrentPointerForRepo(ctx, c.chunkKey)
-	if err == nil && remoteVer != "" {
-		return localVer != remoteVer, nil
-	}
-
-	// Fall back to reading metadata from current/ directory
-	remoteMetadata, err := c.GetRemoteMetadata(ctx, "current")
+	remoteVer, err := c.resolveCurrentPointerForRepo(ctx, c.workloadKey)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("failed to resolve current version: %w", err)
 	}
 
-	return localVer != remoteMetadata.Version, nil
+	return localVer != remoteVer, nil
 }
 
 // CreateOverlay creates a copy-on-write overlay of the rootfs

@@ -6,20 +6,28 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/klauspost/compress/zstd"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 	"golang.org/x/time/rate"
+	"google.golang.org/api/googleapi"
 
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/metrics"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/util/boundedstack"
 )
 
@@ -44,7 +52,25 @@ const (
 	// chunkFileUploadConcurrency controls how many chunks are uploaded in
 	// parallel during ChunkFile.
 	chunkFileUploadConcurrency = 16
+
+	// defaultGCSMaxAttempts is the default number of GCS fetch attempts
+	// before giving up on a chunk (initial attempt + retries).
+	defaultGCSMaxAttempts = 3
+
+	// defaultGCSFetchTimeout is the default per-fetch timeout used inside
+	// singleflight. Callers may have shorter deadlines but the shared fetch
+	// uses this timeout to avoid a short-lived caller poisoning the group.
+	defaultGCSFetchTimeout = 10 * time.Second
+
+	// negCacheTTL is the TTL for negative cache entries (404 Not Found).
+	negCacheTTL = 5 * time.Second
 )
+
+// ErrChunkNotFound is returned when a chunk does not exist in GCS.
+var ErrChunkNotFound = errors.New("chunk not found")
+
+// ErrChunkCorruption is returned when a chunk's content hash does not match.
+var ErrChunkCorruption = errors.New("chunk corruption detected")
 
 // ChunkedSnapshotMetadata holds metadata for a chunked snapshot.
 // Instead of storing full files, we store references to content-addressed chunks.
@@ -53,7 +79,7 @@ type ChunkedSnapshotMetadata struct {
 	BazelVersion  string            `json:"bazel_version,omitempty"`
 	RepoCommit    string            `json:"repo_commit,omitempty"`
 	Repo          string            `json:"repo,omitempty"`
-	ChunkKey      string            `json:"chunk_key,omitempty"`
+	WorkloadKey   string            `json:"workload_key,omitempty"`
 	Commands      []SnapshotCommand `json:"commands,omitempty"`
 	CreatedAt     time.Time         `json:"created_at"`
 	ChunkSize     int64             `json:"chunk_size"`
@@ -86,15 +112,30 @@ type ChunkRef struct {
 
 // ChunkStore manages storage and retrieval of content-addressed chunks
 type ChunkStore struct {
-	gcsBucket  string
-	gcsClient  *storage.Client
-	localCache string
-	encoder    *zstd.Encoder
-	decoder    *zstd.Decoder
-	logger     *logrus.Entry
+	gcsBucket   string
+	gcsPrefix   string // top-level prefix for all GCS paths (e.g. "v1")
+	gcsClient   *storage.Client
+	localCache  string
+	chunkSubdir string // "disk", "mem", or "" for legacy flat layout
+	encoder     *zstd.Encoder
+	decoder     *zstd.Decoder
+	logger      *logrus.Entry
 
 	// In-memory LRU cache for decompressed chunks
 	chunkCache *LRUCache
+
+	// Singleflight deduplication: coalesces concurrent GCS fetches for the
+	// same chunk hash into a single network call.
+	fetchGroup singleflight.Group
+
+	// Negative cache: maps hash → expiration time. Only 404 Not Found is
+	// cached; 403 Forbidden and transient errors are never cached.
+	negCache sync.Map // map[string]time.Time
+
+	// Retry / timeout configuration
+	gcsMaxAttempts  int
+	gcsFetchTimeout time.Duration
+	verifyOnRead    bool
 
 	// Eager prefetching infrastructure
 	eagerFetchStack   *boundedstack.BoundedStack[string]
@@ -107,9 +148,28 @@ type ChunkStore struct {
 // ChunkStoreConfig holds configuration for the chunk store
 type ChunkStoreConfig struct {
 	GCSBucket           string
+	GCSPrefix           string // Top-level prefix for all GCS paths (e.g. "v1"); empty means no prefix
 	LocalCachePath      string
-	ChunkCacheSizeBytes int64 // In-memory cache size (default 2GB)
+	ChunkCacheSizeBytes int64  // In-memory cache size (default 2GB)
+	ChunkSubdir         string // Subdirectory under chunks/ (e.g. "disk" or "mem"); empty means flat "chunks/"
 	Logger              *logrus.Logger
+
+	// GCSMaxAttempts is the maximum number of GCS fetch attempts per chunk
+	// (default 3). Includes the initial attempt.
+	GCSMaxAttempts int
+
+	// GCSFetchTimeout is the per-fetch timeout used inside singleflight.
+	// The caller's context deadline controls how long the caller waits,
+	// but the shared fetch uses this timeout so a short-lived caller
+	// doesn't cancel the fetch for other waiters (default 10s).
+	GCSFetchTimeout time.Duration
+
+	// DisableVerifyOnRead disables SHA-256 verification of decompressed
+	// chunks against their expected hash. When false (the zero value),
+	// every chunk read is verified; on mismatch the chunk is purged from
+	// caches, refetched once, and if still corrupt ErrChunkCorruption is
+	// returned. Set to true only for benchmarks or trusted environments.
+	DisableVerifyOnRead bool
 }
 
 // NewChunkStore creates a new chunk store
@@ -156,42 +216,60 @@ func NewChunkStore(ctx context.Context, cfg ChunkStoreConfig) (*ChunkStore, erro
 
 	eagerCtx, eagerCancel := context.WithCancel(context.Background())
 
+	// Apply config defaults
+	maxAttempts := cfg.GCSMaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = defaultGCSMaxAttempts
+	}
+	fetchTimeout := cfg.GCSFetchTimeout
+	if fetchTimeout <= 0 {
+		fetchTimeout = defaultGCSFetchTimeout
+	}
+
 	return &ChunkStore{
 		gcsBucket:        cfg.GCSBucket,
+		gcsPrefix:        cfg.GCSPrefix,
 		gcsClient:        client,
 		localCache:       cfg.LocalCachePath,
+		chunkSubdir:      cfg.ChunkSubdir,
 		encoder:          encoder,
 		decoder:          decoder,
 		logger:           logger.WithField("component", "chunk-store"),
 		chunkCache:       chunkCache,
+		gcsMaxAttempts:   maxAttempts,
+		gcsFetchTimeout:  fetchTimeout,
+		verifyOnRead:     !cfg.DisableVerifyOnRead,
 		eagerFetchStack:  eagerFetchStack,
 		eagerFetchCtx:    eagerCtx,
 		eagerFetchCancel: eagerCancel,
 	}, nil
 }
 
-// StoreChunk stores a chunk and returns its hash
+// StoreChunk stores a chunk and returns its hash.
+// Deduplication is handled via the in-memory LRU cache: if the chunk is
+// already cached we skip the upload entirely. Otherwise we upload
+// unconditionally — CAS writes are idempotent so re-uploading an existing
+// chunk is harmless and saves the two GCS round-trips (Attrs + getChunkSize)
+// that a pre-upload existence check would require.
 func (cs *ChunkStore) StoreChunk(ctx context.Context, data []byte) (string, int64, error) {
 	// Compute hash of uncompressed data
 	hash := sha256.Sum256(data)
 	hashStr := hex.EncodeToString(hash[:])
 
-	// Check if chunk already exists (deduplication)
-	exists, err := cs.chunkExists(ctx, hashStr)
-	if err != nil {
-		cs.logger.WithError(err).WithField("hash", hashStr[:12]).Warn("Failed to check chunk existence")
-	} else if exists {
-		// Chunk already exists, skip upload
-		cs.logger.WithField("hash", hashStr[:12]).Debug("Chunk already exists, skipping upload")
-		// Get the compressed size from existing chunk
-		compressedSize, _ := cs.getChunkSize(ctx, hashStr)
-		return hashStr, compressedSize, nil
+	// Fast dedup: if the chunk is in our in-memory LRU, we already have it
+	// in GCS (since we only cache after a successful upload or download).
+	if _, ok := cs.chunkCache.Get(hashStr); ok {
+		// Return estimated compressed size from what we'd produce.
+		// The exact stored size doesn't matter for chunk refs since we
+		// recompute it from GCS attrs when needed.
+		compressed := cs.encoder.EncodeAll(data, make([]byte, 0, len(data)/2))
+		return hashStr, int64(len(compressed)), nil
 	}
 
 	// Compress data
 	compressed := cs.encoder.EncodeAll(data, make([]byte, 0, len(data)/2))
 
-	// Store in GCS
+	// Store in GCS (idempotent for same hash)
 	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
 	objPath := cs.chunkPath(hashStr)
 	obj := bucket.Object(objPath)
@@ -207,13 +285,12 @@ func (cs *ChunkStore) StoreChunk(ctx context.Context, data []byte) (string, int6
 		return "", 0, fmt.Errorf("failed to close chunk writer: %w", err)
 	}
 
-	// Also store in local cache
-	if cs.localCache != "" {
-		localPath := filepath.Join(cs.localCache, hashStr)
-		if err := os.WriteFile(localPath, compressed, 0644); err != nil {
-			cs.logger.WithError(err).WithField("hash", hashStr[:12]).Warn("Failed to write chunk to local cache")
-		}
-	}
+	// Also store in local cache (atomic: write to temp + fsync + rename)
+	cs.writeLocalCache(hashStr, compressed)
+
+	// Add to in-memory cache so subsequent StoreChunk calls for the same
+	// data skip the upload entirely.
+	cs.chunkCache.Put(hashStr, data)
 
 	cs.logger.WithFields(logrus.Fields{
 		"hash":            hashStr[:12],
@@ -227,30 +304,117 @@ func (cs *ChunkStore) StoreChunk(ctx context.Context, data []byte) (string, int6
 
 // GetChunk retrieves a chunk by hash, checking caches in order:
 // 1. In-memory LRU cache (fastest)
-// 2. Local file cache (fast)
-// 3. GCS (slow, network)
+// 2. Local file cache (fast, sharded by hash[:2])
+// 3. Negative cache (reject known-missing hashes)
+// 4. Singleflight-coalesced GCS fetch with retry+backoff
+//
+// The singleflight layer uses a detached context so a short-lived caller
+// doesn't cancel the shared fetch for other waiters. The caller's context
+// controls how long *this caller* waits for the result.
 func (cs *ChunkStore) GetChunk(ctx context.Context, hash string) ([]byte, error) {
+	start := time.Now()
+
 	// 1. Check in-memory LRU cache first (fastest)
 	if data, ok := cs.chunkCache.Get(hash); ok {
+		metrics.ChunkFetchSeconds.WithLabelValues("lru_cache").Observe(time.Since(start).Seconds())
 		return data, nil
 	}
 
-	// 2. Check local file cache
-	if cs.localCache != "" {
-		localPath := filepath.Join(cs.localCache, hash)
-		if compressed, err := os.ReadFile(localPath); err == nil {
-			data, err := cs.decoder.DecodeAll(compressed, nil)
-			if err != nil {
-				cs.logger.WithError(err).WithField("hash", hash[:12]).Warn("Failed to decompress cached chunk")
-			} else {
-				// Add to in-memory cache
-				cs.chunkCache.Put(hash, data)
-				return data, nil
-			}
-		}
+	// 2. Check local file cache (sharded path)
+	if data, compressed, ok := cs.readLocalCache(hash); ok {
+		cs.chunkCache.Put(hash, data)
+		metrics.ChunkFetchSeconds.WithLabelValues("disk_cache").Observe(time.Since(start).Seconds())
+		metrics.ChunkFetchBytesTotal.WithLabelValues("disk_cache").Add(float64(len(compressed)))
+		return data, nil
 	}
 
-	// 3. Fetch from GCS
+	// 3. Check negative cache (known-missing hashes)
+	if expiry, ok := cs.negCache.Load(hash); ok {
+		if time.Now().Before(expiry.(time.Time)) {
+			metrics.ChunkNegCacheHits.Inc()
+			return nil, fmt.Errorf("chunk %s: %w (negative cached)", hash[:12], ErrChunkNotFound)
+		}
+		// Expired entry, remove it
+		cs.negCache.Delete(hash)
+	}
+
+	// 4. Singleflight-coalesced GCS fetch.
+	// Use a detached context inside singleflight so a short-deadline caller
+	// doesn't cancel the shared fetch for other waiters.
+	type fetchResult struct {
+		data       []byte
+		compressed []byte
+	}
+	v, err, shared := cs.fetchGroup.Do(hash, func() (interface{}, error) {
+		fetchCtx, fetchCancel := context.WithTimeout(context.Background(), cs.gcsFetchTimeout)
+		defer fetchCancel()
+
+		compressed, fetchErr := cs.fetchAndVerify(fetchCtx, hash)
+		if fetchErr != nil {
+			return nil, fetchErr
+		}
+
+		data, decErr := cs.decoder.DecodeAll(compressed, nil)
+		if decErr != nil {
+			return nil, fmt.Errorf("failed to decompress chunk %s: %w", hash[:12], decErr)
+		}
+
+		// Verify hash on read
+		if cs.verifyOnRead {
+			if verifyErr := cs.verifyHash(hash, data); verifyErr != nil {
+				// Corrupt from GCS — refetch once bypassing singleflight
+				cs.logger.WithField("hash", hash[:12]).Warn("GCS chunk failed hash verification, refetching once")
+				compressed2, fetchErr2 := cs.fetchFromGCS(fetchCtx, hash)
+				if fetchErr2 != nil {
+					return nil, fmt.Errorf("refetch after corruption failed for %s: %w", hash[:12], fetchErr2)
+				}
+				data2, decErr2 := cs.decoder.DecodeAll(compressed2, nil)
+				if decErr2 != nil {
+					return nil, fmt.Errorf("failed to decompress refetched chunk %s: %w", hash[:12], decErr2)
+				}
+				if verifyErr2 := cs.verifyHash(hash, data2); verifyErr2 != nil {
+					cs.logger.WithFields(logrus.Fields{
+						"hash":   hash[:12],
+						"source": "gcs",
+					}).Error("Persistent chunk corruption after refetch")
+					return nil, fmt.Errorf("chunk %s: %w", hash[:12], ErrChunkCorruption)
+				}
+				compressed = compressed2
+				data = data2
+			}
+		}
+
+		// Cache locally (atomic write) and in memory
+		cs.writeLocalCache(hash, compressed)
+		cs.chunkCache.Put(hash, data)
+
+		metrics.ChunkFetchSeconds.WithLabelValues("gcs").Observe(time.Since(start).Seconds())
+		metrics.ChunkFetchBytesTotal.WithLabelValues("gcs").Add(float64(len(compressed)))
+
+		return &fetchResult{data: data, compressed: compressed}, nil
+	})
+
+	if shared {
+		metrics.SingleflightDedupTotal.Inc()
+	}
+
+	// Check caller context after singleflight returns — even if the fetch
+	// succeeded, respect the caller's deadline.
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	result := v.(*fetchResult)
+	return result.data, nil
+}
+
+// fetchFromGCS performs a single GCS read for a chunk hash. Returns the
+// compressed bytes. Does NOT retry — callers use fetchAndVerify for that.
+func (cs *ChunkStore) fetchFromGCS(ctx context.Context, hash string) ([]byte, error) {
 	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
 	objPath := cs.chunkPath(hash)
 	obj := bucket.Object(objPath)
@@ -266,24 +430,210 @@ func (cs *ChunkStore) GetChunk(ctx context.Context, hash string) ([]byte, error)
 		return nil, fmt.Errorf("failed to read chunk %s: %w", hash[:12], err)
 	}
 
-	// Decompress
-	data, err := cs.decoder.DecodeAll(compressed, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decompress chunk %s: %w", hash[:12], err)
-	}
+	return compressed, nil
+}
 
-	// Cache locally (compressed)
-	if cs.localCache != "" {
-		localPath := filepath.Join(cs.localCache, hash)
-		if err := os.WriteFile(localPath, compressed, 0644); err != nil {
-			cs.logger.WithError(err).WithField("hash", hash[:12]).Warn("Failed to cache chunk locally")
+// fetchAndVerify wraps fetchFromGCS with retry+backoff.
+// Up to GCSMaxAttempts attempts with jittered exponential backoff.
+// Only retryable errors (5xx, timeout, connection reset) are retried.
+// Non-retryable errors (404, 403) return immediately.
+func (cs *ChunkStore) fetchAndVerify(ctx context.Context, hash string) ([]byte, error) {
+	var lastErr error
+	backoff := 20 * time.Millisecond
+
+	for attempt := 1; attempt <= cs.gcsMaxAttempts; attempt++ {
+		compressed, err := cs.fetchFromGCS(ctx, hash)
+		if err == nil {
+			return compressed, nil
+		}
+
+		lastErr = err
+
+		// Classify the error
+		if !cs.isRetryable(err) {
+			// Non-retryable: 404, 403, etc. — fail immediately
+			if cs.isNotFound(err) {
+				// Add to negative cache
+				cs.negCache.Store(hash, time.Now().Add(negCacheTTL))
+				return nil, fmt.Errorf("chunk %s: %w", hash[:12], ErrChunkNotFound)
+			}
+			return nil, err
+		}
+
+		if attempt < cs.gcsMaxAttempts {
+			// Check context before sleeping
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+
+			// Jittered exponential backoff
+			jitter := time.Duration(rand.Int63n(int64(backoff / 2)))
+			sleepDur := backoff + jitter
+			cs.logger.WithFields(logrus.Fields{
+				"hash":    hash[:12],
+				"attempt": attempt,
+				"backoff": sleepDur,
+			}).Warn("Retrying GCS fetch after transient error")
+
+			select {
+			case <-time.After(sleepDur):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+
+			backoff *= 2
 		}
 	}
 
-	// Add to in-memory cache (decompressed)
-	cs.chunkCache.Put(hash, data)
+	return nil, fmt.Errorf("chunk %s: all %d fetch attempts failed: %w", hash[:12], cs.gcsMaxAttempts, lastErr)
+}
 
-	return data, nil
+// isRetryable returns true if the error is a transient GCS error worth retrying:
+// 5xx server errors, timeouts, connection resets.
+func (cs *ChunkStore) isRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for Google API HTTP error codes
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) {
+		return apiErr.Code >= 500 // 5xx
+	}
+
+	// Check for context deadline exceeded (timeout)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	// Check for connection reset
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+
+	// Check for HTTP transport errors
+	if errors.Is(err, http.ErrHandlerTimeout) {
+		return true
+	}
+
+	errStr := err.Error()
+	return strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "i/o timeout") ||
+		strings.Contains(errStr, "TLS handshake timeout")
+}
+
+// isNotFound returns true if the error indicates the GCS object doesn't exist.
+func (cs *ChunkStore) isNotFound(err error) bool {
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return true
+	}
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) {
+		return apiErr.Code == http.StatusNotFound
+	}
+	return false
+}
+
+// verifyHash checks that the SHA-256 of data matches the expected hash.
+func (cs *ChunkStore) verifyHash(expectedHash string, data []byte) error {
+	actual := sha256.Sum256(data)
+	actualStr := hex.EncodeToString(actual[:])
+	if actualStr != expectedHash {
+		return fmt.Errorf("hash mismatch: expected %s, got %s", expectedHash[:12], actualStr[:12])
+	}
+	return nil
+}
+
+// localChunkPath returns the sharded local cache path for a chunk hash.
+// Layout: {localCache}/{hash[:2]}/{hash} — prevents millions of files in one dir.
+func (cs *ChunkStore) localChunkPath(hash string) string {
+	return filepath.Join(cs.localCache, hash[:2], hash)
+}
+
+// readLocalCache attempts to read and decompress a chunk from the local disk
+// cache. Returns (decompressed, compressed, true) on success.
+// Returns (nil, nil, false) on miss, decompress error, or hash mismatch.
+// On corrupt/invalid entries the cache file is removed automatically.
+func (cs *ChunkStore) readLocalCache(hash string) ([]byte, []byte, bool) {
+	if cs.localCache == "" {
+		return nil, nil, false
+	}
+
+	localPath := cs.localChunkPath(hash)
+	compressed, err := os.ReadFile(localPath)
+	if err != nil {
+		return nil, nil, false
+	}
+
+	data, err := cs.decoder.DecodeAll(compressed, nil)
+	if err != nil {
+		cs.logger.WithError(err).WithField("hash", hash[:12]).Warn("Failed to decompress cached chunk, removing")
+		os.Remove(localPath)
+		return nil, nil, false
+	}
+
+	if cs.verifyOnRead {
+		if verifyErr := cs.verifyHash(hash, data); verifyErr != nil {
+			cs.logger.WithError(verifyErr).WithField("hash", hash[:12]).Warn("Local cache chunk failed hash verification, removing")
+			os.Remove(localPath)
+			cs.chunkCache.Remove(hash)
+			return nil, nil, false
+		}
+	}
+
+	return data, compressed, true
+}
+
+// writeLocalCache atomically writes compressed chunk data to the local file
+// cache. Uses write-to-temp + fsync + rename to prevent partial/corrupt files
+// on crash.
+func (cs *ChunkStore) writeLocalCache(hash string, compressed []byte) {
+	if cs.localCache == "" {
+		return
+	}
+
+	destPath := cs.localChunkPath(hash)
+	dir := filepath.Dir(destPath)
+
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		cs.logger.WithError(err).WithField("hash", hash[:12]).Warn("Failed to create local cache shard dir")
+		return
+	}
+
+	// Write to temp file in the same directory (same filesystem for rename)
+	tmp, err := os.CreateTemp(dir, ".chunk-*")
+	if err != nil {
+		cs.logger.WithError(err).WithField("hash", hash[:12]).Warn("Failed to create temp file for local cache")
+		return
+	}
+	tmpPath := tmp.Name()
+
+	if _, err := tmp.Write(compressed); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		cs.logger.WithError(err).WithField("hash", hash[:12]).Warn("Failed to write chunk to temp file")
+		return
+	}
+
+	// fsync to ensure data is on disk before rename
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		cs.logger.WithError(err).WithField("hash", hash[:12]).Warn("Failed to fsync chunk temp file")
+		return
+	}
+	tmp.Close()
+
+	// Atomic rename
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		os.Remove(tmpPath)
+		cs.logger.WithError(err).WithField("hash", hash[:12]).Warn("Failed to rename chunk to local cache")
+	}
 }
 
 // GetChunkToFile retrieves a chunk and writes it directly to a file at the given offset
@@ -444,35 +794,30 @@ func (cs *ChunkStore) ReassembleFile(ctx context.Context, refs []ChunkRef, destP
 	return g.Wait()
 }
 
-// chunkPath returns the GCS path for a chunk
+// gcsPath prepends the configured GCS prefix to a path.
+// E.g. with prefix "v1": gcsPath("chunks/disk/ab/abc") → "v1/chunks/disk/ab/abc"
+func (cs *ChunkStore) gcsPath(path string) string {
+	if cs.gcsPrefix != "" {
+		return cs.gcsPrefix + "/" + path
+	}
+	return path
+}
+
+// GCSPrefix returns the configured GCS prefix (e.g. "v1").
+func (cs *ChunkStore) GCSPrefix() string {
+	return cs.gcsPrefix
+}
+
+// chunkPath returns the GCS path for a chunk.
+// Layout: chunks/{subdir}/{hash[:2]}/{hash} (e.g. chunks/disk/ab/abcdef...)
 func (cs *ChunkStore) chunkPath(hash string) string {
-	// Use hash prefix for better GCS distribution
-	return fmt.Sprintf("%s/%s/%s", ChunksPrefix, hash[:2], hash)
-}
-
-// chunkExists checks if a chunk already exists in GCS
-func (cs *ChunkStore) chunkExists(ctx context.Context, hash string) (bool, error) {
-	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
-	objPath := cs.chunkPath(hash)
-	_, err := bucket.Object(objPath).Attrs(ctx)
-	if err == storage.ErrObjectNotExist {
-		return false, nil
+	var raw string
+	if cs.chunkSubdir != "" {
+		raw = fmt.Sprintf("%s/%s/%s/%s", ChunksPrefix, cs.chunkSubdir, hash[:2], hash)
+	} else {
+		raw = fmt.Sprintf("%s/%s/%s", ChunksPrefix, hash[:2], hash)
 	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-// getChunkSize returns the compressed size of a chunk in GCS
-func (cs *ChunkStore) getChunkSize(ctx context.Context, hash string) (int64, error) {
-	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
-	objPath := cs.chunkPath(hash)
-	attrs, err := bucket.Object(objPath).Attrs(ctx)
-	if err != nil {
-		return 0, err
-	}
-	return attrs.Size, nil
+	return cs.gcsPath(raw)
 }
 
 // UploadRawFile compresses a local file with zstd and uploads it to GCS as a
@@ -599,7 +944,11 @@ func (cs *ChunkStore) DownloadRawFile(ctx context.Context, gcsObjectPath, localD
 // ListChunks lists all chunk hashes stored in GCS under the chunks/ prefix.
 func (cs *ChunkStore) ListChunks(ctx context.Context) ([]string, error) {
 	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
-	prefix := ChunksPrefix + "/"
+	rawPrefix := ChunksPrefix + "/"
+	if cs.chunkSubdir != "" {
+		rawPrefix = ChunksPrefix + "/" + cs.chunkSubdir + "/"
+	}
+	prefix := cs.gcsPath(rawPrefix)
 
 	it := bucket.Objects(ctx, &storage.Query{Prefix: prefix})
 	var hashes []string
@@ -627,6 +976,16 @@ func (cs *ChunkStore) DeleteChunk(ctx context.Context, hash string) error {
 	return obj.Delete(ctx)
 }
 
+// GetChunkCreationTime returns the creation time of a chunk in GCS.
+func (cs *ChunkStore) GetChunkCreationTime(ctx context.Context, hash string) (time.Time, error) {
+	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
+	attrs, err := bucket.Object(cs.chunkPath(hash)).Attrs(ctx)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to get chunk attrs for %s: %w", hash[:12], err)
+	}
+	return attrs.Created, nil
+}
+
 // Close closes the chunk store
 func (cs *ChunkStore) Close() error {
 	cs.StopEagerFetcher()
@@ -636,6 +995,11 @@ func (cs *ChunkStore) Close() error {
 		return cs.gcsClient.Close()
 	}
 	return nil
+}
+
+// CacheStats returns statistics for the in-memory LRU chunk cache.
+func (cs *ChunkStore) CacheStats() CacheStats {
+	return cs.chunkCache.Stats()
 }
 
 // StartEagerFetcher starts background goroutines for eager chunk prefetching.
@@ -682,67 +1046,108 @@ func (cs *ChunkStore) QueueEagerFetch(hashes []string) {
 	}
 }
 
-// eagerFetchLoop runs the eager fetch worker loop
-func (cs *ChunkStore) eagerFetchLoop(limiter *rate.Limiter, eg *errgroup.Group) {
+// eagerFetchLoop runs the eager fetch worker loop.
+// Uses a fixed worker pool (N=eagerFetchConcurrency) with the rate limiter
+// inside each worker (not in the producer), preventing unbounded goroutine
+// growth under slow GCS.
+func (cs *ChunkStore) eagerFetchLoop(limiter *rate.Limiter, _ *errgroup.Group) {
+	// Channel acts as a bounded work queue for the fixed worker pool.
+	work := make(chan string, eagerFetchBufferCapacity)
+
+	// Spawn fixed worker pool
+	var workerWg sync.WaitGroup
+	for i := 0; i < eagerFetchConcurrency; i++ {
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
+			for hash := range work {
+				// Rate limit inside the worker, not the producer
+				if err := limiter.Wait(cs.eagerFetchCtx); err != nil {
+					return
+				}
+
+				// Skip if already cached
+				if _, ok := cs.chunkCache.Get(hash); ok {
+					continue
+				}
+
+				// Skip negative-cached hashes
+				if expiry, ok := cs.negCache.Load(hash); ok {
+					if time.Now().Before(expiry.(time.Time)) {
+						continue
+					}
+				}
+
+				// Fetch chunk (goes through singleflight, correctly
+				// coalesces with demand fetches)
+				_, err := cs.GetChunk(cs.eagerFetchCtx, hash)
+				if err != nil {
+					cs.logger.WithError(err).WithField("hash", hash[:12]).Debug("Eager fetch failed")
+				}
+			}
+		}()
+	}
+
+	// Producer: pop from stack, push to work channel
+producerLoop:
 	for {
 		hash, err := cs.eagerFetchStack.Recv(cs.eagerFetchCtx)
 		if err != nil {
-			// Context cancelled or stack closed
-			return
+			break
 		}
-
-		if err := limiter.Wait(cs.eagerFetchCtx); err != nil {
-			if cs.eagerFetchCtx.Err() != nil {
-				return
-			}
-			cs.logger.WithError(err).Warn("Eager fetch rate limiter failed")
-			return
+		select {
+		case work <- hash:
+		case <-cs.eagerFetchCtx.Done():
+			break producerLoop
+		default:
+			// Queue full, drop this prefetch request
 		}
-
-		// Fetch chunk in background goroutine
-		eg.Go(func() error {
-			// Check if already in cache
-			if _, ok := cs.chunkCache.Get(hash); ok {
-				return nil
-			}
-
-			// Fetch chunk (this populates both local file cache and in-memory cache)
-			_, err := cs.GetChunk(cs.eagerFetchCtx, hash)
-			if err != nil {
-				cs.logger.WithError(err).WithField("hash", hash[:12]).Debug("Eager fetch failed")
-			}
-			return nil
-		})
 	}
+
+	close(work)
+	workerWg.Wait()
 }
 
 // ChunkedSnapshotBuilder creates chunked snapshots from existing snapshot files
 type ChunkedSnapshotBuilder struct {
-	store  *ChunkStore
-	logger *logrus.Entry
+	store    *ChunkStore // disk chunks (rootfs, kernel, state, repo-cache-seed)
+	memStore *ChunkStore // memory chunks (UFFD); nil falls back to store
+	logger   *logrus.Entry
 	// MemBackend controls how memory is stored: "chunked" (UFFD lazy via MemChunks,
 	// default) or "file" (single compressed blob via MemFilePath for file-backed restore).
 	MemBackend string
 }
 
-// NewChunkedSnapshotBuilder creates a new chunked snapshot builder
-func NewChunkedSnapshotBuilder(store *ChunkStore, logger *logrus.Logger) *ChunkedSnapshotBuilder {
+// NewChunkedSnapshotBuilder creates a new chunked snapshot builder.
+// memStore is used for memory chunks (chunks/mem/); if nil, store is used for everything.
+func NewChunkedSnapshotBuilder(store *ChunkStore, memStore *ChunkStore, logger *logrus.Logger) *ChunkedSnapshotBuilder {
 	return &ChunkedSnapshotBuilder{
 		store:      store,
+		memStore:   memStore,
 		logger:     logger.WithField("component", "chunked-snapshot-builder"),
 		MemBackend: "chunked",
 	}
 }
 
-// BuildChunkedSnapshot creates a chunked snapshot from traditional snapshot files
-func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths *SnapshotPaths, version string) (*ChunkedSnapshotMetadata, error) {
+// getMemStore returns the chunk store to use for memory chunks.
+func (b *ChunkedSnapshotBuilder) getMemStore() *ChunkStore {
+	if b.memStore != nil {
+		return b.memStore
+	}
+	return b.store
+}
+
+// BuildChunkedSnapshot creates a chunked snapshot from traditional snapshot files.
+// workloadKey is used for scoping GCS paths under {workloadKey}/snapshot_state/{version}/.
+func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths *SnapshotPaths, version, workloadKey string) (*ChunkedSnapshotMetadata, error) {
 	b.logger.WithField("version", version).Info("Building chunked snapshot")
 	start := time.Now()
 
 	meta := &ChunkedSnapshotMetadata{
-		Version:   version,
-		CreatedAt: time.Now(),
-		ChunkSize: DefaultChunkSize,
+		Version:     version,
+		WorkloadKey: workloadKey,
+		CreatedAt:   time.Now(),
+		ChunkSize:   DefaultChunkSize,
 	}
 
 	// Chunk kernel (small, usually single chunk)
@@ -780,15 +1185,15 @@ func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths
 	if paths.Mem != "" {
 		if b.MemBackend == "file" {
 			b.logger.Info("Uploading raw memory file (file-backed restore)...")
-			memGCSPath := fmt.Sprintf("%s/snapshot.mem.zst", version)
-			_, _, err := b.store.UploadRawFile(ctx, paths.Mem, memGCSPath)
+			memGCSPath := b.store.gcsPath(fmt.Sprintf("%s/snapshot_state/%s/snapshot.mem.zst", meta.WorkloadKey, version))
+			_, _, err := b.getMemStore().UploadRawFile(ctx, paths.Mem, memGCSPath)
 			if err != nil {
 				return nil, fmt.Errorf("failed to upload raw memory file: %w", err)
 			}
 			meta.MemFilePath = memGCSPath
 		} else {
 			b.logger.Info("Chunking memory file for UFFD lazy loading...")
-			memChunks, err := b.store.ChunkFile(ctx, paths.Mem, DefaultChunkSize)
+			memChunks, err := b.getMemStore().ChunkFile(ctx, paths.Mem, DefaultChunkSize)
 			if err != nil {
 				return nil, fmt.Errorf("failed to chunk memory file: %w", err)
 			}
@@ -834,10 +1239,11 @@ func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths
 	return meta, nil
 }
 
-// UploadChunkedMetadata uploads the chunked snapshot metadata to GCS
+// UploadChunkedMetadata uploads the chunked snapshot metadata to GCS.
+// Path: {workload_key}/snapshot_state/{version}/chunked-metadata.json
 func (b *ChunkedSnapshotBuilder) UploadChunkedMetadata(ctx context.Context, meta *ChunkedSnapshotMetadata) error {
 	bucket := b.store.gcsClient.Bucket(b.store.gcsBucket)
-	objPath := fmt.Sprintf("%s/chunked-metadata.json", meta.Version)
+	objPath := b.store.gcsPath(fmt.Sprintf("%s/snapshot_state/%s/chunked-metadata.json", meta.WorkloadKey, meta.Version))
 
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
@@ -860,11 +1266,11 @@ func (b *ChunkedSnapshotBuilder) UploadChunkedMetadata(ctx context.Context, meta
 	return nil
 }
 
-// ReadCurrentVersion reads the current-pointer.json for a chunk key and returns
+// ReadCurrentVersion reads the current-pointer.json for a workload key and returns
 // the version string it points to.
-func (cs *ChunkStore) ReadCurrentVersion(ctx context.Context, chunkKey string) (string, error) {
+func (cs *ChunkStore) ReadCurrentVersion(ctx context.Context, workloadKey string) (string, error) {
 	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
-	objPath := chunkKey + "/current-pointer.json"
+	objPath := cs.gcsPath(workloadKey + "/current-pointer.json")
 
 	reader, err := bucket.Object(objPath).NewReader(ctx)
 	if err != nil {
@@ -889,10 +1295,11 @@ func (cs *ChunkStore) ReadCurrentVersion(ctx context.Context, chunkKey string) (
 	return pointer.Version, nil
 }
 
-// LoadChunkedMetadata loads chunked snapshot metadata from GCS
-func (cs *ChunkStore) LoadChunkedMetadata(ctx context.Context, version string) (*ChunkedSnapshotMetadata, error) {
+// LoadChunkedMetadata loads chunked snapshot metadata from GCS.
+// Path: {workload_key}/snapshot_state/{version}/chunked-metadata.json
+func (cs *ChunkStore) LoadChunkedMetadata(ctx context.Context, workloadKey, version string) (*ChunkedSnapshotMetadata, error) {
 	bucket := cs.gcsClient.Bucket(cs.gcsBucket)
-	objPath := fmt.Sprintf("%s/chunked-metadata.json", version)
+	objPath := cs.gcsPath(fmt.Sprintf("%s/snapshot_state/%s/chunked-metadata.json", workloadKey, version))
 
 	reader, err := bucket.Object(objPath).NewReader(ctx)
 	if err != nil {

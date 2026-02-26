@@ -27,7 +27,9 @@ type ChunkedManagerConfig struct {
 	UseChunkedSnapshots bool
 	UseNetNS            bool
 	ChunkCacheSizeBytes int64
+	MemCacheSizeBytes   int64
 	MemBackend          string
+	GCSPrefix           string
 }
 
 // NewChunkedManager returns an error on non-Linux platforms
@@ -52,9 +54,12 @@ func (cm *ChunkedManager) GetChunkedStats() ChunkedStats {
 
 // ChunkedStats holds statistics (stub)
 type ChunkedStats struct {
-	CacheSize         int64
-	CacheMaxSize      int64
-	CacheItems        int
+	DiskCacheSize     int64
+	DiskCacheMaxSize  int64
+	DiskCacheItems    int
+	MemCacheSize      int64
+	MemCacheMaxSize   int64
+	MemCacheItems     int
 	TotalPageFaults   uint64
 	TotalCacheHits    uint64
 	TotalChunkFetches uint64
@@ -95,6 +100,6 @@ func (cm *ChunkedManager) GetLoadedManifests() map[string]string {
 }
 
 // SyncManifest is a stub
-func (cm *ChunkedManager) SyncManifest(ctx context.Context, chunkKey, version string) error {
+func (cm *ChunkedManager) SyncManifest(ctx context.Context, workloadKey, version string) error {
 	return fmt.Errorf("chunked snapshots are only supported on Linux")
 }

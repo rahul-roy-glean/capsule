@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -14,28 +15,76 @@ import (
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/tiers"
 )
 
 // Scheduler handles runner allocation across hosts
 type Scheduler struct {
-	hostRegistry *HostRegistry
-	db           *sql.DB
-	logger       *logrus.Entry
+	hostRegistry    *HostRegistry
+	db              *sql.DB
+	snapshotManager *SnapshotManager
+	metricsClient   *telemetry.Client
+	logger          *logrus.Entry
+
+	// connPool caches gRPC connections to host agents, keyed by address.
+	// gRPC connections are multiplexed and designed to be long-lived, so
+	// reusing them avoids TCP+TLS handshake latency on every RPC.
+	connPool sync.Map // map[string]*grpc.ClientConn
 }
 
 // NewScheduler creates a new scheduler
-func NewScheduler(hr *HostRegistry, db *sql.DB, logger *logrus.Logger) *Scheduler {
+func NewScheduler(hr *HostRegistry, db *sql.DB, sm *SnapshotManager, logger *logrus.Logger) *Scheduler {
 	return &Scheduler{
-		hostRegistry: hr,
-		db:           db,
-		logger:       logger.WithField("component", "scheduler"),
+		hostRegistry:    hr,
+		db:              db,
+		snapshotManager: sm,
+		logger:          logger.WithField("component", "scheduler"),
 	}
+}
+
+// SetMetricsClient attaches a telemetry client for GCP Cloud Monitoring.
+func (s *Scheduler) SetMetricsClient(c *telemetry.Client) {
+	s.metricsClient = c
+}
+
+// getHostConn returns a cached gRPC connection to the given address, creating
+// one if needed. Connections are long-lived and multiplexed.
+func (s *Scheduler) getHostConn(address string) (*grpc.ClientConn, error) {
+	if v, ok := s.connPool.Load(address); ok {
+		return v.(*grpc.ClientConn), nil
+	}
+
+	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to host %s: %w", address, err)
+	}
+
+	// Store-or-load to handle concurrent creation for the same address.
+	if actual, loaded := s.connPool.LoadOrStore(address, conn); loaded {
+		// Another goroutine won the race; close our duplicate.
+		conn.Close()
+		return actual.(*grpc.ClientConn), nil
+	}
+
+	return conn, nil
+}
+
+// Close closes all cached gRPC connections.
+func (s *Scheduler) Close() {
+	s.connPool.Range(func(key, value any) bool {
+		if conn, ok := value.(*grpc.ClientConn); ok {
+			conn.Close()
+		}
+		s.connPool.Delete(key)
+		return true
+	})
 }
 
 // AllocateRunnerRequest represents a request to allocate a runner
 type AllocateRunnerRequest struct {
 	RequestID         string
-	ChunkKey          string
+	WorkloadKey       string
 	Labels            map[string]string
 	GitHubRunnerToken string
 	CISystem          string
@@ -58,28 +107,33 @@ type AllocateRunnerResponse struct {
 // AllocateRunner allocates a runner on the best available host
 func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerRequest) (*AllocateRunnerResponse, error) {
 	s.logger.WithFields(logrus.Fields{
-		"request_id": req.RequestID,
-		"chunk_key":  req.ChunkKey,
+		"request_id":   req.RequestID,
+		"workload_key": req.WorkloadKey,
 	}).Info("Allocating runner")
 
 	// Derive repo slug for multi-repo support
-	chunkKey := req.ChunkKey
+	workloadKey := req.WorkloadKey
 
-	// Look up snapshot config for fairness checks, ci_system, and start_command
+	// Look up snapshot config for fairness checks, ci_system, start_command, and tier
 	var ciSystem string
+	var tierName string
 	var startCmd *snapshot.StartCommand
-	if chunkKey != "" && s.db != nil {
+	if workloadKey != "" && s.db != nil {
 		var maxConcurrent int
 		var startCommandJSON sql.NullString
-		err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, ci_system, start_command FROM snapshot_configs WHERE chunk_key = $1`, chunkKey).Scan(&maxConcurrent, &ciSystem, &startCommandJSON)
+		var tierCol sql.NullString
+		err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, ci_system, start_command, tier FROM snapshot_configs WHERE workload_key = $1`, workloadKey).Scan(&maxConcurrent, &ciSystem, &startCommandJSON, &tierCol)
 		if err == nil {
+			if tierCol.Valid && tierCol.String != "" {
+				tierName = tierCol.String
+			}
 			if maxConcurrent > 0 {
 				var currentCount int
 				_ = s.db.QueryRowContext(ctx, `
-					SELECT COUNT(*) FROM runners WHERE chunk_key = $1 AND status IN ('running','busy','initializing')
-				`, chunkKey).Scan(&currentCount)
+					SELECT COUNT(*) FROM runners WHERE workload_key = $1 AND status IN ('running','busy','initializing')
+				`, workloadKey).Scan(&currentCount)
 				if currentCount >= maxConcurrent {
-					return nil, fmt.Errorf("chunk_key %s at max concurrent runners (%d/%d)", chunkKey, currentCount, maxConcurrent)
+					return nil, fmt.Errorf("workload_key %s at max concurrent runners (%d/%d)", workloadKey, currentCount, maxConcurrent)
 				}
 			}
 			if startCommandJSON.Valid && startCommandJSON.String != "" {
@@ -92,17 +146,87 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		}
 	}
 
+	// Resolve tier (default to "m")
+	if tierName == "" {
+		tierName = tiers.DefaultTier
+	}
+	tier, _ := tiers.Lookup(tierName)
+
 	// Get available hosts
 	hosts := s.hostRegistry.GetAvailableHosts()
 	if len(hosts) == 0 {
 		return nil, fmt.Errorf("no available hosts")
 	}
 
-	// Score and select best host (with chunk-key cache affinity)
-	host := s.selectBestHostForChunkKey(hosts, chunkKey)
+	// Filter hosts that can fit this workload's resource requirements
+	var eligible []*Host
+	for _, h := range hosts {
+		if canFitWorkload(h, tier) {
+			eligible = append(eligible, h)
+		}
+	}
+	if len(eligible) == 0 {
+		// Fall back to all available hosts if none pass resource check
+		// (handles hosts that don't yet report resources)
+		eligible = hosts
+	}
+
+	// Session stickiness: if this is a session resume, prefer the host where
+	// the session was paused. This keeps the LRU chunk cache warm and avoids
+	// cold GCS fetches on resume.
+	var host *Host
+	if req.SessionID != "" && s.db != nil {
+		var sessionHostID string
+		var status string
+		err := s.db.QueryRowContext(ctx,
+			`SELECT host_id, status FROM session_snapshots WHERE session_id = $1`,
+			req.SessionID).Scan(&sessionHostID, &status)
+		if err == nil && status == "suspended" && sessionHostID != "" {
+			for _, h := range eligible {
+				if h.ID == sessionHostID {
+					host = h
+					s.logger.WithFields(logrus.Fields{
+						"session_id": req.SessionID,
+						"host_id":    sessionHostID,
+					}).Info("Session sticky routing: using original host")
+					if s.metricsClient != nil {
+						s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionResumeRouting, telemetry.Labels{
+							telemetry.LabelRouting: telemetry.RoutingSameHost,
+						})
+					}
+					break
+				}
+			}
+			if host == nil {
+				s.logger.WithFields(logrus.Fields{
+					"session_id":      req.SessionID,
+					"original_host":   sessionHostID,
+					"available_hosts": len(eligible),
+				}).Warn("Session sticky host not available, falling back to best-fit")
+				if s.metricsClient != nil {
+					s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionResumeRouting, telemetry.Labels{
+						telemetry.LabelRouting: telemetry.RoutingCrossHost,
+					})
+				}
+			}
+		}
+	}
+
+	// Fall back to workload-key cache affinity scoring
+	if host == nil {
+		host = s.selectBestHostForWorkloadKey(eligible, workloadKey)
+	}
 	if host == nil {
 		return nil, fmt.Errorf("no suitable host found")
 	}
+
+	// Optimistic reservation: increment used resources on the in-memory host.
+	// Next heartbeat from the host will correct any drift.
+	effectiveCPU := tiers.EffectiveCPUMillicores(tier)
+	s.hostRegistry.mu.Lock()
+	host.UsedCPUMillicores += effectiveCPU
+	host.UsedMemoryMB += tier.MemoryMB
+	s.hostRegistry.mu.Unlock()
 
 	s.logger.WithFields(logrus.Fields{
 		"host_id":       host.ID,
@@ -110,30 +234,48 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		"grpc_address":  host.GRPCAddress,
 	}).Debug("Selected host")
 
-	// Connect to host agent
-	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// Connect to host agent (pooled connection)
+	conn, err := s.getHostConn(host.GRPCAddress)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to host %s: %w", host.GRPCAddress, err)
+		return nil, err
 	}
-	defer conn.Close()
 
 	// Create host agent client
 	client := pb.NewHostAgentClient(conn)
+
+	// Resolve the desired snapshot version for this workload_key + host
+	var snapshotVersion string
+	if workloadKey != "" && s.snapshotManager != nil && s.snapshotManager.db != nil {
+		desired, _ := s.snapshotManager.GetDesiredVersions(ctx, host.ID)
+		if v, ok := desired[workloadKey]; ok {
+			snapshotVersion = v
+		}
+	}
+	if snapshotVersion == "" && workloadKey != "" && s.snapshotManager != nil {
+		snapshotVersion = s.snapshotManager.GetCurrentVersionForKey(workloadKey)
+	}
 
 	// Build the proto request
 	protoReq := &pb.AllocateRunnerRequest{
 		RequestId:         req.RequestID,
 		Labels:            req.Labels,
 		GithubRunnerToken: req.GitHubRunnerToken,
-		ChunkKey:          chunkKey,
+		WorkloadKey:       workloadKey,
 		CiSystem:          ciSystem,
 		SessionId:         req.SessionID,
+		SnapshotVersion:   snapshotVersion,
 	}
-	if req.VCPUs > 0 || req.MemoryMB > 0 {
-		protoReq.Resources = &pb.Resources{
-			Vcpus:    int32(req.VCPUs),
-			MemoryMb: int32(req.MemoryMB),
-		}
+	// Populate resources from tier (overrides request-level values)
+	protoReq.Resources = &pb.Resources{
+		Vcpus:    int32(tier.VCPUs),
+		MemoryMb: int32(tier.MemoryMB),
+	}
+	// Allow explicit request-level overrides if set
+	if req.VCPUs > 0 {
+		protoReq.Resources.Vcpus = int32(req.VCPUs)
+	}
+	if req.MemoryMB > 0 {
+		protoReq.Resources.MemoryMb = int32(req.MemoryMB)
 	}
 	if startCmd != nil {
 		protoReq.StartCommand = &pb.StartCommand{
@@ -146,11 +288,21 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// Call host agent to allocate runner
 	resp, err := client.AllocateRunner(ctx, protoReq)
 	if err != nil {
+		// Roll back optimistic reservation
+		s.hostRegistry.mu.Lock()
+		host.UsedCPUMillicores -= effectiveCPU
+		host.UsedMemoryMB -= tier.MemoryMB
+		s.hostRegistry.mu.Unlock()
 		s.logger.WithError(err).WithField("host", host.InstanceName).Error("gRPC AllocateRunner failed")
 		return nil, fmt.Errorf("host agent AllocateRunner failed: %w", err)
 	}
 
 	if resp.Error != "" {
+		// Roll back optimistic reservation
+		s.hostRegistry.mu.Lock()
+		host.UsedCPUMillicores -= effectiveCPU
+		host.UsedMemoryMB -= tier.MemoryMB
+		s.hostRegistry.mu.Unlock()
 		return &AllocateRunnerResponse{
 			HostID:      host.ID,
 			HostAddress: host.GRPCAddress,
@@ -161,11 +313,13 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// Register runner in our registry
 	if resp.Runner != nil {
 		if err := s.hostRegistry.AddRunner(ctx, &Runner{
-			ID:         resp.Runner.Id,
-			HostID:     host.ID,
-			InternalIP: resp.Runner.InternalIp,
-			Status:     "running",
-			ChunkKey:   chunkKey,
+			ID:               resp.Runner.Id,
+			HostID:           host.ID,
+			InternalIP:       resp.Runner.InternalIp,
+			Status:           "running",
+			WorkloadKey:      workloadKey,
+			ReservedCPU:      effectiveCPU,
+			ReservedMemoryMB: tier.MemoryMB,
 		}); err != nil {
 			s.logger.WithError(err).Warn("Failed to register runner in control plane registry")
 		}
@@ -181,8 +335,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	}, nil
 }
 
-// selectBestHostForChunkKey selects the best host with chunk-key cache affinity.
-func (s *Scheduler) selectBestHostForChunkKey(hosts []*Host, chunkKey string) *Host {
+// selectBestHostForWorkloadKey selects the best host with workload-key cache affinity.
+func (s *Scheduler) selectBestHostForWorkloadKey(hosts []*Host, workloadKey string) *Host {
 	if len(hosts) == 0 {
 		return nil
 	}
@@ -194,7 +348,7 @@ func (s *Scheduler) selectBestHostForChunkKey(hosts []*Host, chunkKey string) *H
 
 	var scored []scoredHost
 	for _, h := range hosts {
-		score := s.scoreHostForChunkKey(h, chunkKey)
+		score := s.scoreHostForWorkloadKey(h, workloadKey)
 		scored = append(scored, scoredHost{host: h, score: score})
 	}
 
@@ -205,14 +359,14 @@ func (s *Scheduler) selectBestHostForChunkKey(hosts []*Host, chunkKey string) *H
 	return scored[0].host
 }
 
-// scoreHostForChunkKey calculates a score for a host with chunk-key cache affinity.
-func (s *Scheduler) scoreHostForChunkKey(h *Host, chunkKey string) float64 {
+// scoreHostForWorkloadKey calculates a score for a host with workload-key cache affinity.
+func (s *Scheduler) scoreHostForWorkloadKey(h *Host, workloadKey string) float64 {
 	score := s.scoreHost(h)
 
 	// Repo-aware cache affinity scoring:
 	// If we have loaded manifests info (from heartbeat), prefer hosts with warm caches.
-	if chunkKey != "" && h.LoadedManifests != nil {
-		if version, ok := h.LoadedManifests[chunkKey]; ok {
+	if workloadKey != "" && h.LoadedManifests != nil {
+		if version, ok := h.LoadedManifests[workloadKey]; ok {
 			// Host has a manifest loaded for this repo
 			// Check if it's the current version (ideal) or any version (warm-ish)
 			if version != "" {
@@ -227,28 +381,34 @@ func (s *Scheduler) scoreHostForChunkKey(h *Host, chunkKey string) float64 {
 	return score
 }
 
-// scoreHost calculates a base score for a host
+// canFitWorkload checks whether a host has enough resources to run a workload
+// of the given tier.
+func canFitWorkload(h *Host, t tiers.Tier) bool {
+	if h.TotalCPUMillicores == 0 {
+		return false
+	}
+	effectiveCPU := tiers.EffectiveCPUMillicores(t)
+	return (h.TotalCPUMillicores-h.UsedCPUMillicores) >= effectiveCPU &&
+		(h.TotalMemoryMB-h.UsedMemoryMB) >= t.MemoryMB
+}
+
+// scoreHost calculates a base score for a host using resource-based metrics.
 func (s *Scheduler) scoreHost(h *Host) float64 {
 	var score float64
 
-	// Prefer hosts with idle runners (faster allocation)
+	// Prefer hosts with idle runners (cache warmth)
 	score += float64(h.IdleRunners) * 10
 
-	// Prefer hosts with more available capacity
-	availableSlots := h.TotalSlots - h.UsedSlots
-	score += float64(availableSlots) * 5
+	if h.TotalCPUMillicores > 0 {
+		cpuFree := float64(h.TotalCPUMillicores-h.UsedCPUMillicores) / float64(h.TotalCPUMillicores)
+		memFree := float64(h.TotalMemoryMB-h.UsedMemoryMB) / float64(h.TotalMemoryMB)
+		score += cpuFree * 20
+		score += memFree * 15
+	}
 
 	// Prefer hosts with recent heartbeats
 	if time.Since(h.LastHeartbeat) < 30*time.Second {
 		score += 20
-	}
-
-	// Penalize hosts with high utilization
-	if h.TotalSlots > 0 {
-		utilization := float64(h.UsedSlots) / float64(h.TotalSlots)
-		if utilization > 0.8 {
-			score -= 30
-		}
 	}
 
 	return score
@@ -273,11 +433,10 @@ func (s *Scheduler) ReleaseRunner(ctx context.Context, runnerID string, destroy 
 	}
 
 	// Connect to host and release
-	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := s.getHostConn(host.GRPCAddress)
 	if err != nil {
-		return fmt.Errorf("failed to connect to host: %w", err)
+		return err
 	}
-	defer conn.Close()
 
 	client := pb.NewHostAgentClient(conn)
 	resp, err := client.ReleaseRunner(ctx, &pb.ReleaseRunnerRequest{
@@ -292,7 +451,30 @@ func (s *Scheduler) ReleaseRunner(ctx context.Context, runnerID string, destroy 
 	}
 
 	// Update registry
-	return s.hostRegistry.RemoveRunner(runnerID)
+	if err := s.hostRegistry.RemoveRunner(runnerID); err != nil {
+		return err
+	}
+
+	// Roll back optimistic resource reservation made at allocate time.
+	// Without this, UsedCPU/Memory accumulates until the next heartbeat
+	// corrects it, causing spurious "no available hosts" under rapid
+	// allocate/release cycles.
+	if runner.ReservedCPU > 0 || runner.ReservedMemoryMB > 0 {
+		s.hostRegistry.mu.Lock()
+		if host != nil {
+			host.UsedCPUMillicores -= runner.ReservedCPU
+			host.UsedMemoryMB -= runner.ReservedMemoryMB
+			if host.UsedCPUMillicores < 0 {
+				host.UsedCPUMillicores = 0
+			}
+			if host.UsedMemoryMB < 0 {
+				host.UsedMemoryMB = 0
+			}
+		}
+		s.hostRegistry.mu.Unlock()
+	}
+
+	return nil
 }
 
 // QuarantineRunner quarantines a runner via its host agent
@@ -312,11 +494,10 @@ func (s *Scheduler) QuarantineRunner(ctx context.Context, runnerID, reason strin
 		return "", err
 	}
 
-	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := s.getHostConn(host.GRPCAddress)
 	if err != nil {
-		return "", fmt.Errorf("failed to connect to host: %w", err)
+		return "", err
 	}
-	defer conn.Close()
 
 	client := pb.NewHostAgentClient(conn)
 	resp, err := client.QuarantineRunner(ctx, &pb.QuarantineRunnerRequest{
@@ -351,11 +532,10 @@ func (s *Scheduler) UnquarantineRunner(ctx context.Context, runnerID string, unb
 		return err
 	}
 
-	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := s.getHostConn(host.GRPCAddress)
 	if err != nil {
-		return fmt.Errorf("failed to connect to host: %w", err)
+		return err
 	}
-	defer conn.Close()
 
 	client := pb.NewHostAgentClient(conn)
 	resp, err := client.UnquarantineRunner(ctx, &pb.UnquarantineRunnerRequest{
@@ -388,30 +568,36 @@ func (s *Scheduler) GetQueueDepth() int {
 func (s *Scheduler) GetStats() SchedulerStats {
 	hosts := s.hostRegistry.GetAllHosts()
 
-	var totalSlots, usedSlots, idleRunners, busyRunners int
+	var totalCPU, usedCPU, totalMem, usedMem, idleRunners, busyRunners int
 	for _, h := range hosts {
-		totalSlots += h.TotalSlots
-		usedSlots += h.UsedSlots
+		totalCPU += h.TotalCPUMillicores
+		usedCPU += h.UsedCPUMillicores
+		totalMem += h.TotalMemoryMB
+		usedMem += h.UsedMemoryMB
 		idleRunners += h.IdleRunners
 		busyRunners += h.BusyRunners
 	}
 
 	return SchedulerStats{
-		TotalHosts:  len(hosts),
-		TotalSlots:  totalSlots,
-		UsedSlots:   usedSlots,
-		IdleRunners: idleRunners,
-		BusyRunners: busyRunners,
-		QueueDepth:  s.GetQueueDepth(),
+		TotalHosts:         len(hosts),
+		TotalCPUMillicores: totalCPU,
+		UsedCPUMillicores:  usedCPU,
+		TotalMemoryMB:      totalMem,
+		UsedMemoryMB:       usedMem,
+		IdleRunners:        idleRunners,
+		BusyRunners:        busyRunners,
+		QueueDepth:         s.GetQueueDepth(),
 	}
 }
 
 // SchedulerStats holds scheduler statistics
 type SchedulerStats struct {
-	TotalHosts  int
-	TotalSlots  int
-	UsedSlots   int
-	IdleRunners int
-	BusyRunners int
-	QueueDepth  int
+	TotalHosts         int
+	TotalCPUMillicores int
+	UsedCPUMillicores  int
+	TotalMemoryMB      int
+	UsedMemoryMB       int
+	IdleRunners        int
+	BusyRunners        int
+	QueueDepth         int
 }

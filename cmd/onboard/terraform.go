@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -21,7 +22,6 @@ func stepTerraformBootstrap(cfg *Config, logger *logrus.Logger) error {
 
 	tfDir := "deploy/terraform"
 
-	// Init
 	log.Info("Running terraform init...")
 	initCmd := exec.Command("terraform", "init")
 	initCmd.Dir = tfDir
@@ -31,7 +31,6 @@ func stepTerraformBootstrap(cfg *Config, logger *logrus.Logger) error {
 		return fmt.Errorf("terraform init failed: %w", err)
 	}
 
-	// Apply
 	log.Info("Running terraform apply (bootstrap mode - stock images)...")
 	applyCmd := exec.Command("terraform", "apply",
 		"-auto-approve",
@@ -71,8 +70,8 @@ func stepTerraformFinalize(cfg *Config, logger *logrus.Logger) error {
 	return nil
 }
 
-// generateTFVars creates a terraform.tfvars file from the onboard config.
-// If targetDir is empty, it defaults to "deploy/terraform".
+// generateTFVars creates a terraform.auto.tfvars file from the onboard config.
+// If targetDir is empty it defaults to "deploy/terraform".
 func generateTFVars(cfg *Config, finalize bool, targetDir ...string) (string, error) {
 	tfDir := "deploy/terraform"
 	if len(targetDir) > 0 && targetDir[0] != "" {
@@ -81,7 +80,7 @@ func generateTFVars(cfg *Config, finalize bool, targetDir ...string) (string, er
 	tfvarsPath := filepath.Join(tfDir, "terraform.auto.tfvars")
 
 	var lines []string
-	addLine := func(key, value string) {
+	addStr := func(key, value string) {
 		lines = append(lines, fmt.Sprintf("%s = %q", key, value))
 	}
 	addBool := func(key string, value bool) {
@@ -90,51 +89,87 @@ func generateTFVars(cfg *Config, finalize bool, targetDir ...string) (string, er
 	addInt := func(key string, value int) {
 		lines = append(lines, fmt.Sprintf("%s = %d", key, value))
 	}
+	addMap := func(key string, m map[string]string) {
+		// Terraform HCL map literal.
+		if len(m) == 0 {
+			lines = append(lines, fmt.Sprintf("%s = {}", key))
+			return
+		}
+		// Sort keys for deterministic output.
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var pairs []string
+		for _, k := range keys {
+			pairs = append(pairs, fmt.Sprintf("  %q = %q", k, m[k]))
+		}
+		lines = append(lines, fmt.Sprintf("%s = {\n%s\n}", key, strings.Join(pairs, "\n")))
+	}
 
-	// Platform
-	addLine("project_id", cfg.Platform.GCPProject)
-	addLine("region", cfg.Platform.Region)
-	addLine("zone", cfg.Platform.Zone)
+	// --- Platform ---
+	addStr("project_id", cfg.Platform.GCPProject)
+	addStr("region", cfg.Platform.Region)
+	addStr("zone", cfg.Platform.Zone)
 
-	// Hosts
-	addLine("host_machine_type", cfg.Hosts.MachineType)
+	// --- Hosts ---
+	addStr("host_machine_type", cfg.Hosts.MachineType)
 	addInt("min_hosts", cfg.Hosts.MinCount)
 	addInt("max_hosts", cfg.Hosts.MaxCount)
 	addInt("host_data_disk_size_gb", cfg.Hosts.DataDiskGB)
 
-	// MicroVMs
+	// --- MicroVMs ---
 	addInt("max_runners_per_host", cfg.MicroVM.MaxPerHost)
 	addInt("idle_runners_target", cfg.MicroVM.IdleTarget)
 	addInt("vcpus_per_runner", cfg.MicroVM.VCPUs)
 	addInt("memory_per_runner_mb", cfg.MicroVM.MemoryMB)
 
-	// CI system
-	addLine("ci_system", cfg.CI.System)
-
-	// GitHub config
+	// --- CI add-on ---
+	addStr("ci_system", cfg.CI.System)
 	if cfg.CI.System == "github-actions" {
 		addBool("github_runner_enabled", true)
 		if cfg.CI.GitHub.Repo != "" {
-			addLine("github_repo", cfg.CI.GitHub.Repo)
+			addStr("github_repo", cfg.CI.GitHub.Repo)
 		}
 		if cfg.CI.GitHub.Org != "" {
-			addLine("github_org", cfg.CI.GitHub.Org)
+			addStr("github_org", cfg.CI.GitHub.Org)
 		}
 		if len(cfg.CI.GitHub.Labels) > 0 {
-			addLine("github_runner_labels", strings.Join(cfg.CI.GitHub.Labels, ","))
+			addStr("github_runner_labels", strings.Join(cfg.CI.GitHub.Labels, ","))
 		}
 		addBool("runner_ephemeral", cfg.CI.GitHub.Ephemeral)
 	}
 
-	// GitHub App
+	// --- Repository (GitHub App auth for private repos) ---
 	if cfg.Repository.GitHubAppID != "" {
-		addLine("github_app_id", cfg.Repository.GitHubAppID)
+		addStr("github_app_id", cfg.Repository.GitHubAppID)
 	}
 	if cfg.Repository.GitHubAppSecretName != "" {
-		addLine("github_app_secret", cfg.Repository.GitHubAppSecretName)
+		addStr("github_app_secret", cfg.Repository.GitHubAppSecretName)
 	}
 
-	// Finalize mode
+	// --- Bazel add-on ---
+	// repo_cache_upper_size_gb: emit whenever non-default, or for github-actions.
+	if cfg.CI.System == "github-actions" || cfg.Bazel.RepoCacheUpperSizeGB != 10 {
+		addInt("repo_cache_upper_size_gb", cfg.Bazel.RepoCacheUpperSizeGB)
+	}
+
+	// Git cache (Bazel sub-feature).
+	addBool("git_cache_enabled", cfg.Bazel.GitCache.Enabled)
+	if cfg.Bazel.GitCache.Enabled {
+		addMap("git_cache_repos", cfg.Bazel.GitCache.Repos)
+		if cfg.Bazel.GitCache.WorkspaceDir != "" {
+			addStr("git_cache_workspace_dir", cfg.Bazel.GitCache.WorkspaceDir)
+		}
+	}
+
+	// Buildbarn (Bazel sub-feature).
+	if cfg.Bazel.Buildbarn.CertsDir != "" {
+		addStr("buildbarn_certs_dir", cfg.Bazel.Buildbarn.CertsDir)
+	}
+
+	// --- Finalize mode ---
 	addBool("use_custom_host_image", finalize)
 	addBool("use_data_snapshot", finalize)
 

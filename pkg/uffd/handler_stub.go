@@ -17,12 +17,15 @@ type Handler struct{}
 
 // HandlerConfig holds configuration
 type HandlerConfig struct {
-	SocketPath string
-	ChunkStore *snapshot.ChunkStore
-	Metadata   *snapshot.ChunkedSnapshotMetadata
-	MemStart   uint64
-	MemSize    uint64
-	Logger     *logrus.Logger
+	SocketPath             string
+	ChunkStore             *snapshot.ChunkStore
+	Metadata               *snapshot.ChunkedSnapshotMetadata
+	MemStart               uint64
+	MemSize                uint64
+	Logger                 *logrus.Logger
+	FaultTimeout           time.Duration
+	MaxConsecutiveFailures int
+	OnFatal                func(error)
 }
 
 // NewHandler returns an error on non-Linux platforms

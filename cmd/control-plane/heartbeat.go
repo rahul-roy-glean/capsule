@@ -4,29 +4,39 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"time"
 )
 
 type hostHeartbeatRequest struct {
-	InstanceName    string `json:"instance_name"`
-	Zone            string `json:"zone"`
-	GRPCAddress     string `json:"grpc_address"`
-	HTTPAddress     string `json:"http_address"`
-	TotalSlots      int    `json:"total_slots"`
-	UsedSlots       int    `json:"used_slots"`
-	IdleRunners     int    `json:"idle_runners"`
-	BusyRunners     int    `json:"busy_runners"`
-	SnapshotVersion string `json:"snapshot_version"`
-	Draining        bool   `json:"draining"`
+	InstanceName       string `json:"instance_name"`
+	Zone               string `json:"zone"`
+	GRPCAddress        string `json:"grpc_address"`
+	HTTPAddress        string `json:"http_address"`
+	IdleRunners        int    `json:"idle_runners"`
+	BusyRunners        int    `json:"busy_runners"`
+	SnapshotVersion    string `json:"snapshot_version"`
+	Draining           bool   `json:"draining"`
+	TotalCPUMillicores int    `json:"total_cpu_millicores"`
+	UsedCPUMillicores  int    `json:"used_cpu_millicores"`
+	TotalMemoryMB      int    `json:"total_memory_mb"`
+	UsedMemoryMB       int    `json:"used_memory_mb"`
 	// LoadedManifests reports which chunk manifests are already loaded on this host
-	// (chunk_key → version). Used by the control plane for cache-affinity scheduling.
-	LoadedManifests map[string]string `json:"loaded_manifests,omitempty"`
+	// (workload_key → version). Used by the control plane for cache-affinity scheduling.
+	LoadedManifests map[string]string     `json:"loaded_manifests,omitempty"`
+	Runners         []heartbeatRunnerInfo `json:"runners,omitempty"`
+}
+
+// heartbeatRunnerInfo mirrors runner.RunnerHeartbeatInfo for JSON deserialization.
+type heartbeatRunnerInfo struct {
+	RunnerID    string `json:"runner_id"`
+	State       string `json:"state"`
+	WorkloadKey string `json:"workload_key"`
+	IdleSince   string `json:"idle_since,omitempty"` // RFC3339
 }
 
 type hostHeartbeatResponse struct {
-	Acknowledged       bool   `json:"acknowledged"`
-	ShouldDrain        bool   `json:"should_drain"`
-	ShouldSyncSnapshot bool   `json:"should_sync_snapshot,omitempty"`
-	SnapshotVersion    string `json:"snapshot_version,omitempty"`
+	Acknowledged bool `json:"acknowledged"`
+	ShouldDrain  bool `json:"should_drain"`
 	// SyncVersions tells the host which repo manifests (and snapshot.mem files) to
 	// pre-download. Only repos whose desired version differs from what the host has
 	// loaded are included, so a host only downloads what it's missing.
@@ -57,16 +67,18 @@ func (s *ControlPlaneServer) HandleHostHeartbeat(w http.ResponseWriter, r *http.
 	}
 
 	host, shouldDrain, err := s.hostRegistry.UpsertHeartbeat(r.Context(), HostHeartbeat{
-		InstanceName:    req.InstanceName,
-		Zone:            req.Zone,
-		GRPCAddress:     req.GRPCAddress,
-		HTTPAddress:     req.HTTPAddress,
-		TotalSlots:      req.TotalSlots,
-		UsedSlots:       req.UsedSlots,
-		IdleRunners:     req.IdleRunners,
-		BusyRunners:     req.BusyRunners,
-		SnapshotVersion: req.SnapshotVersion,
-		LoadedManifests: req.LoadedManifests,
+		InstanceName:       req.InstanceName,
+		Zone:               req.Zone,
+		GRPCAddress:        req.GRPCAddress,
+		HTTPAddress:        req.HTTPAddress,
+		IdleRunners:        req.IdleRunners,
+		BusyRunners:        req.BusyRunners,
+		SnapshotVersion:    req.SnapshotVersion,
+		LoadedManifests:    req.LoadedManifests,
+		TotalCPUMillicores: req.TotalCPUMillicores,
+		UsedCPUMillicores:  req.UsedCPUMillicores,
+		TotalMemoryMB:      req.TotalMemoryMB,
+		UsedMemoryMB:       req.UsedMemoryMB,
 	})
 	if err != nil {
 		writeJSON(w, http.StatusOK, hostHeartbeatResponse{
@@ -76,37 +88,64 @@ func (s *ControlPlaneServer) HandleHostHeartbeat(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Check if host needs a snapshot sync (legacy single-repo path)
-	currentSnapshot := s.snapshotManager.GetCurrentVersion()
-	shouldSync := currentSnapshot != "" && currentSnapshot != req.SnapshotVersion
+	// If the host reported itself as draining (e.g. SIGTERM received), mark it
+	// in the registry so the scheduler stops allocating to it.
+	if req.Draining {
+		if err := s.hostRegistry.SetHostStatusByInstanceName(r.Context(), req.InstanceName, "draining"); err != nil {
+			s.logger.WithError(err).WithField("instance_name", req.InstanceName).Warn("Failed to mark host as draining from heartbeat")
+		}
+	}
 
-	// Compute per-repo sync directives: only send repos whose desired version the
-	// host doesn't already have loaded. This avoids re-downloading snapshot.mem on
-	// every heartbeat and prevents every host from downloading every repo.
+	// Store per-runner info on the in-memory host for TTL enforcement.
+	if len(req.Runners) > 0 {
+		infos := make([]HostRunnerInfo, 0, len(req.Runners))
+		for _, ri := range req.Runners {
+			info := HostRunnerInfo{
+				RunnerID:    ri.RunnerID,
+				State:       ri.State,
+				WorkloadKey: ri.WorkloadKey,
+			}
+			if ri.IdleSince != "" {
+				if t, err := time.Parse(time.RFC3339, ri.IdleSince); err == nil {
+					info.IdleSince = t
+				}
+			}
+			infos = append(infos, info)
+		}
+		s.hostRegistry.mu.Lock()
+		host.RunnerInfos = infos
+		s.hostRegistry.mu.Unlock()
+	} else {
+		s.hostRegistry.mu.Lock()
+		host.RunnerInfos = nil
+		s.hostRegistry.mu.Unlock()
+	}
+
+	// Compute per-workload-key sync directives: only send workload keys whose
+	// desired version the host doesn't already have loaded. This avoids
+	// re-downloading snapshot.mem on every heartbeat.
 	var syncVersions map[string]string
 	if s.snapshotManager.db != nil {
 		desired, err := s.snapshotManager.GetDesiredVersions(r.Context(), host.ID)
 		if err != nil {
 			s.logger.WithError(err).Warn("Failed to get desired versions for heartbeat")
 		} else {
-			for chunkKey, ver := range desired {
-				loaded, hasLoaded := req.LoadedManifests[chunkKey]
+			for workloadKey, ver := range desired {
+				loaded, hasLoaded := req.LoadedManifests[workloadKey]
 				if !hasLoaded || loaded != ver {
 					if syncVersions == nil {
 						syncVersions = make(map[string]string)
 					}
-					syncVersions[chunkKey] = ver
+					syncVersions[workloadKey] = ver
 				}
 			}
 		}
 	}
 
 	writeJSON(w, http.StatusOK, hostHeartbeatResponse{
-		Acknowledged:       true,
-		ShouldDrain:        shouldDrain,
-		ShouldSyncSnapshot: shouldSync,
-		SnapshotVersion:    currentSnapshot,
-		SyncVersions:       syncVersions,
+		Acknowledged: true,
+		ShouldDrain:  shouldDrain,
+		SyncVersions: syncVersions,
 	})
 }
 

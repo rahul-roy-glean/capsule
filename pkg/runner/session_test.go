@@ -137,92 +137,10 @@ func TestResetTTL_NonexistentRunner(t *testing.T) {
 	m.ResetTTL("nonexistent")
 }
 
-func TestEnforceTTLs_NoTTL(t *testing.T) {
-	m := newTestManager()
-	m.runners["r1"] = &Runner{ID: "r1", State: StateIdle, TTLSeconds: 0}
-
-	m.enforceTTLs(context.Background())
-	// Should not change anything — no TTL configured
-	if m.runners["r1"].State != StateIdle {
-		t.Error("Runner without TTL should not be affected")
-	}
-}
-
-func TestEnforceTTLs_NotIdle(t *testing.T) {
-	m := newTestManager()
-	m.runners["r1"] = &Runner{
-		ID:         "r1",
-		State:      StateBusy,
-		TTLSeconds: 1,
-		AutoPause:  true,
-		LastExecAt: time.Now().Add(-1 * time.Hour),
-	}
-
-	m.enforceTTLs(context.Background())
-	// Should not pause — runner is busy, not idle
-	if m.runners["r1"].State != StateBusy {
-		t.Error("Busy runner should not be paused by TTL")
-	}
-}
-
-func TestEnforceTTLs_ActiveExecs(t *testing.T) {
-	m := newTestManager()
-	r := &Runner{
-		ID:         "r1",
-		State:      StateIdle,
-		TTLSeconds: 1,
-		AutoPause:  true,
-		LastExecAt: time.Now().Add(-1 * time.Hour),
-		SessionID:  "sess-1",
-	}
-	atomic.StoreInt32(&r.ActiveExecs, 1)
-	m.runners["r1"] = r
-
-	m.enforceTTLs(context.Background())
-	// Should not pause — has active execs
-	if r.State != StateIdle {
-		t.Error("Runner with active execs should not be paused by TTL")
-	}
-}
-
-func TestEnforceTTLs_NotExpired(t *testing.T) {
-	m := newTestManager()
-	m.runners["r1"] = &Runner{
-		ID:         "r1",
-		State:      StateIdle,
-		TTLSeconds: 3600, // 1 hour
-		AutoPause:  true,
-		LastExecAt: time.Now(), // just now
-		SessionID:  "sess-1",
-	}
-
-	m.enforceTTLs(context.Background())
-	if m.runners["r1"].State != StateIdle {
-		t.Error("Runner within TTL should not be paused")
-	}
-}
-
-func TestEnforceTTLs_ZeroLastExecAt(t *testing.T) {
-	m := newTestManager()
-	m.runners["r1"] = &Runner{
-		ID:         "r1",
-		State:      StateIdle,
-		TTLSeconds: 1,
-		AutoPause:  true,
-		// LastExecAt is zero — should be skipped
-		SessionID: "sess-1",
-	}
-
-	m.enforceTTLs(context.Background())
-	if m.runners["r1"].State != StateIdle {
-		t.Error("Runner with zero LastExecAt should not be paused")
-	}
-}
-
 func TestSessionMetadata_JSON(t *testing.T) {
 	meta := SessionMetadata{
 		SessionID:          "sess-abc",
-		ChunkKey:           "chunk123",
+		WorkloadKey:        "chunk123",
 		RunnerID:           "runner-1",
 		HostID:             "host-1",
 		Layers:             2,
@@ -261,9 +179,99 @@ func TestSessionMetadata_JSON(t *testing.T) {
 	}
 }
 
+func TestSessionMetadata_GCSFields(t *testing.T) {
+	meta := SessionMetadata{
+		SessionID:          "sess-gcs",
+		WorkloadKey:        "wk123",
+		RunnerID:           "runner-1",
+		HostID:             "host-1",
+		Layers:             1,
+		GCSManifestPath:    "v1/wk123/runner_state/runner-1/snapshot_manifest.json",
+		GCSMemIndexObject:  "v1/wk123/runner_state/runner-1/chunked-metadata.json",
+		GCSDiskIndexObject: "v1/wk123/runner_state/runner-1/disk-chunked-metadata.json",
+	}
+
+	data, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+
+	var decoded SessionMetadata
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+
+	if decoded.GCSManifestPath != meta.GCSManifestPath {
+		t.Errorf("GCSManifestPath = %q, want %q", decoded.GCSManifestPath, meta.GCSManifestPath)
+	}
+	if decoded.GCSMemIndexObject != meta.GCSMemIndexObject {
+		t.Errorf("GCSMemIndexObject = %q, want %q", decoded.GCSMemIndexObject, meta.GCSMemIndexObject)
+	}
+	if decoded.GCSDiskIndexObject != meta.GCSDiskIndexObject {
+		t.Errorf("GCSDiskIndexObject = %q, want %q", decoded.GCSDiskIndexObject, meta.GCSDiskIndexObject)
+	}
+}
+
+func TestSessionMetadata_GCSFieldsOmittedWhenEmpty(t *testing.T) {
+	// Local-only session: GCS fields should be omitted from JSON
+	meta := SessionMetadata{
+		SessionID:   "sess-local",
+		WorkloadKey: "wk456",
+		RunnerID:    "runner-2",
+		HostID:      "host-1",
+		Layers:      1,
+	}
+
+	data, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+
+	jsonStr := string(data)
+	if contains(jsonStr, "gcs_manifest_path") {
+		t.Error("gcs_manifest_path should be omitted when empty")
+	}
+	if contains(jsonStr, "gcs_mem_index_object") {
+		t.Error("gcs_mem_index_object should be omitted when empty")
+	}
+	if contains(jsonStr, "gcs_disk_index_object") {
+		t.Error("gcs_disk_index_object should be omitted when empty")
+	}
+}
+
+func TestSessionMetadata_BackwardsCompatibleWithGCSFields(t *testing.T) {
+	// Old metadata without GCS fields should unmarshal fine
+	oldJSON := `{"session_id":"s1","workload_key":"ck","runner_id":"r1","host_id":"h1","layers":1,"rootfs_path":"/tmp/x"}`
+
+	var meta SessionMetadata
+	if err := json.Unmarshal([]byte(oldJSON), &meta); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+
+	if meta.GCSManifestPath != "" {
+		t.Errorf("GCSManifestPath should be empty for old metadata, got %q", meta.GCSManifestPath)
+	}
+	if meta.GCSMemIndexObject != "" {
+		t.Errorf("GCSMemIndexObject should be empty for old metadata, got %q", meta.GCSMemIndexObject)
+	}
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && searchString(s, substr)
+}
+
+func searchString(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
 func TestSessionMetadata_BackwardsCompatible(t *testing.T) {
 	// Old metadata without TTL fields should unmarshal fine
-	oldJSON := `{"session_id":"s1","chunk_key":"ck","runner_id":"r1","host_id":"h1","layers":1,"rootfs_path":"/tmp/x"}`
+	oldJSON := `{"session_id":"s1","workload_key":"ck","runner_id":"r1","host_id":"h1","layers":1,"rootfs_path":"/tmp/x"}`
 
 	var meta SessionMetadata
 	if err := json.Unmarshal([]byte(oldJSON), &meta); err != nil {
@@ -352,12 +360,12 @@ func TestGetSessionMetadata(t *testing.T) {
 	sessDir := filepath.Join(tmpDir, "sess-1")
 	os.MkdirAll(sessDir, 0755)
 	meta := SessionMetadata{
-		SessionID:  "sess-1",
-		ChunkKey:   "ck123",
-		RunnerID:   "runner-1",
-		Layers:     3,
-		TTLSeconds: 60,
-		AutoPause:  true,
+		SessionID:   "sess-1",
+		WorkloadKey: "ck123",
+		RunnerID:    "runner-1",
+		Layers:      3,
+		TTLSeconds:  60,
+		AutoPause:   true,
 	}
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
@@ -366,8 +374,8 @@ func TestGetSessionMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSessionMetadata failed: %v", err)
 	}
-	if got.ChunkKey != "ck123" {
-		t.Errorf("ChunkKey = %q, want %q", got.ChunkKey, "ck123")
+	if got.WorkloadKey != "ck123" {
+		t.Errorf("WorkloadKey = %q, want %q", got.WorkloadKey, "ck123")
 	}
 	if got.Layers != 3 {
 		t.Errorf("Layers = %d, want 3", got.Layers)
@@ -508,22 +516,22 @@ func TestResumeFromSession_NotFound(t *testing.T) {
 	}
 }
 
-func TestResumeFromSession_ChunkKeyMismatch(t *testing.T) {
+func TestResumeFromSession_WorkloadKeyMismatch(t *testing.T) {
 	tmpDir := t.TempDir()
 	m := newTestManager(func(m *Manager) {
 		m.config.SessionDir = tmpDir
 	})
 
-	// Write metadata with chunk_key "abc"
+	// Write metadata with workload_key "abc"
 	sessDir := filepath.Join(tmpDir, "sess-1")
 	os.MkdirAll(sessDir, 0755)
-	meta := SessionMetadata{SessionID: "sess-1", ChunkKey: "abc", Layers: 1}
+	meta := SessionMetadata{SessionID: "sess-1", WorkloadKey: "abc", Layers: 1}
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
 	_, err := m.ResumeFromSession(context.Background(), "sess-1", "xyz")
 	if err == nil {
-		t.Error("ResumeFromSession should fail on chunk_key mismatch")
+		t.Error("ResumeFromSession should fail on workload_key mismatch")
 	}
 }
 
@@ -535,7 +543,7 @@ func TestResumeFromSession_NoLayers(t *testing.T) {
 
 	sessDir := filepath.Join(tmpDir, "sess-1")
 	os.MkdirAll(sessDir, 0755)
-	meta := SessionMetadata{SessionID: "sess-1", ChunkKey: "abc", Layers: 0}
+	meta := SessionMetadata{SessionID: "sess-1", WorkloadKey: "abc", Layers: 0}
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
@@ -554,7 +562,7 @@ func TestResumeFromSession_Draining(t *testing.T) {
 
 	sessDir := filepath.Join(tmpDir, "sess-1")
 	os.MkdirAll(sessDir, 0755)
-	meta := SessionMetadata{SessionID: "sess-1", ChunkKey: "abc", Layers: 1}
+	meta := SessionMetadata{SessionID: "sess-1", WorkloadKey: "abc", Layers: 1}
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
@@ -577,7 +585,7 @@ func TestResumeFromSession_AtCapacity(t *testing.T) {
 
 	sessDir := filepath.Join(tmpDir, "sess-1")
 	os.MkdirAll(sessDir, 0755)
-	meta := SessionMetadata{SessionID: "sess-1", ChunkKey: "abc", RunnerID: "r3", Layers: 1}
+	meta := SessionMetadata{SessionID: "sess-1", WorkloadKey: "abc", RunnerID: "r3", Layers: 1}
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
@@ -596,7 +604,7 @@ func TestResumeFromSession_SuspendedNotCountedForCapacity(t *testing.T) {
 
 	sessDir := filepath.Join(tmpDir, "sess-1")
 	os.MkdirAll(sessDir, 0755)
-	meta := SessionMetadata{SessionID: "sess-1", ChunkKey: "abc", RunnerID: "r3", Layers: 1}
+	meta := SessionMetadata{SessionID: "sess-1", WorkloadKey: "abc", RunnerID: "r3", Layers: 1}
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
@@ -641,7 +649,7 @@ func TestResumeFromSession_DuplicateActiveSession(t *testing.T) {
 
 	sessDir := filepath.Join(tmpDir, "sess-1")
 	os.MkdirAll(sessDir, 0755)
-	meta := SessionMetadata{SessionID: "sess-1", ChunkKey: "abc", RunnerID: "r1", Layers: 1}
+	meta := SessionMetadata{SessionID: "sess-1", WorkloadKey: "abc", RunnerID: "r1", Layers: 1}
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
