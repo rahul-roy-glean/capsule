@@ -276,7 +276,9 @@ func (hr *HostRegistry) GetAvailableHosts() []*Host {
 	return available
 }
 
-// AddRunner adds a runner to the registry
+// AddRunner adds or updates a runner in the registry.
+// Uses upsert so that session-resumed runners (which reuse the same ID) don't
+// fail on duplicate key.
 func (hr *HostRegistry) AddRunner(ctx context.Context, runner *Runner) error {
 	hr.mu.Lock()
 	defer hr.mu.Unlock()
@@ -284,6 +286,10 @@ func (hr *HostRegistry) AddRunner(ctx context.Context, runner *Runner) error {
 	_, err := hr.db.ExecContext(ctx, `
 		INSERT INTO runners (id, host_id, status, internal_ip, job_id, repo, branch, workload_key)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (id) DO UPDATE SET
+			host_id = EXCLUDED.host_id,
+			status = EXCLUDED.status,
+			internal_ip = EXCLUDED.internal_ip
 	`, runner.ID, runner.HostID, runner.Status, runner.InternalIP, runner.JobID, runner.Repo, runner.Branch, runner.WorkloadKey)
 
 	if err != nil {
