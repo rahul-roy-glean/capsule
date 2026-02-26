@@ -271,8 +271,6 @@ func initSchema(db *sql.DB) error {
 		instance_name VARCHAR(255) NOT NULL,
 		zone VARCHAR(50) NOT NULL,
 		status VARCHAR(20) NOT NULL DEFAULT 'starting',
-		total_slots INT NOT NULL,
-		used_slots INT NOT NULL DEFAULT 0,
 		idle_runners INT NOT NULL DEFAULT 0,
 		busy_runners INT NOT NULL DEFAULT 0,
 		snapshot_version VARCHAR(50),
@@ -446,6 +444,9 @@ func initSchema(db *sql.DB) error {
 		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS used_cpu_millicores INT DEFAULT 0`,
 		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS total_memory_mb INT DEFAULT 0`,
 		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS used_memory_mb INT DEFAULT 0`,
+		// Drop legacy slot columns (replaced by resource-based bin-packing)
+		`ALTER TABLE hosts DROP COLUMN IF EXISTS total_slots`,
+		`ALTER TABLE hosts DROP COLUMN IF EXISTS used_slots`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil {
@@ -484,7 +485,7 @@ func (s *ControlPlaneServer) RegisterHost(ctx context.Context, req *pb.RegisterH
 		"zone":          req.Zone,
 	}).Info("RegisterHost request")
 
-	host, err := s.hostRegistry.RegisterHost(ctx, req.InstanceName, req.Zone, 0, "")
+	host, err := s.hostRegistry.RegisterHost(ctx, req.InstanceName, req.Zone, "")
 	if err != nil {
 		return nil, err
 	}

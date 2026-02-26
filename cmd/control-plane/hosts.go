@@ -71,7 +71,7 @@ func NewHostRegistry(db *sql.DB, logger *logrus.Logger) *HostRegistry {
 }
 
 // RegisterHost registers a new host
-func (hr *HostRegistry) RegisterHost(ctx context.Context, instanceName, zone string, totalSlots int, grpcAddress string) (*Host, error) {
+func (hr *HostRegistry) RegisterHost(ctx context.Context, instanceName, zone string, grpcAddress string) (*Host, error) {
 	hr.mu.Lock()
 	defer hr.mu.Unlock()
 
@@ -82,16 +82,15 @@ func (hr *HostRegistry) RegisterHost(ctx context.Context, instanceName, zone str
 
 	var hostID string
 	err := hr.db.QueryRowContext(ctx, `
-		INSERT INTO hosts (instance_name, zone, total_slots, grpc_address, status, last_heartbeat)
-		VALUES ($1, $2, $3, $4, 'ready', NOW())
+		INSERT INTO hosts (instance_name, zone, grpc_address, status, last_heartbeat)
+		VALUES ($1, $2, $3, 'ready', NOW())
 		ON CONFLICT (instance_name) DO UPDATE SET
 			zone = EXCLUDED.zone,
-			total_slots = EXCLUDED.total_slots,
 			grpc_address = EXCLUDED.grpc_address,
 			status = 'ready',
 			last_heartbeat = NOW()
 		RETURNING id
-	`, instanceName, zone, totalSlots, grpcAddress).Scan(&hostID)
+	`, instanceName, zone, grpcAddress).Scan(&hostID)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to register host: %w", err)
