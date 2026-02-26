@@ -313,11 +313,13 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// Register runner in our registry
 	if resp.Runner != nil {
 		if err := s.hostRegistry.AddRunner(ctx, &Runner{
-			ID:          resp.Runner.Id,
-			HostID:      host.ID,
-			InternalIP:  resp.Runner.InternalIp,
-			Status:      "running",
-			WorkloadKey: workloadKey,
+			ID:               resp.Runner.Id,
+			HostID:           host.ID,
+			InternalIP:       resp.Runner.InternalIp,
+			Status:           "running",
+			WorkloadKey:      workloadKey,
+			ReservedCPU:      effectiveCPU,
+			ReservedMemoryMB: tier.MemoryMB,
 		}); err != nil {
 			s.logger.WithError(err).Warn("Failed to register runner in control plane registry")
 		}
@@ -449,7 +451,30 @@ func (s *Scheduler) ReleaseRunner(ctx context.Context, runnerID string, destroy 
 	}
 
 	// Update registry
-	return s.hostRegistry.RemoveRunner(runnerID)
+	if err := s.hostRegistry.RemoveRunner(runnerID); err != nil {
+		return err
+	}
+
+	// Roll back optimistic resource reservation made at allocate time.
+	// Without this, UsedCPU/Memory accumulates until the next heartbeat
+	// corrects it, causing spurious "no available hosts" under rapid
+	// allocate/release cycles.
+	if runner.ReservedCPU > 0 || runner.ReservedMemoryMB > 0 {
+		s.hostRegistry.mu.Lock()
+		if host != nil {
+			host.UsedCPUMillicores -= runner.ReservedCPU
+			host.UsedMemoryMB -= runner.ReservedMemoryMB
+			if host.UsedCPUMillicores < 0 {
+				host.UsedCPUMillicores = 0
+			}
+			if host.UsedMemoryMB < 0 {
+				host.UsedMemoryMB = 0
+			}
+		}
+		s.hostRegistry.mu.Unlock()
+	}
+
+	return nil
 }
 
 // QuarantineRunner quarantines a runner via its host agent

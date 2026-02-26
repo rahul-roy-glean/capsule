@@ -49,6 +49,10 @@ type Runner struct {
 	CreatedAt      time.Time
 	StartedAt      time.Time
 	CompletedAt    time.Time
+	// ReservedCPU and ReservedMemoryMB track the optimistic resource reservation
+	// made at allocate time, so ReleaseRunner can decrement them exactly.
+	ReservedCPU      int
+	ReservedMemoryMB int
 }
 
 // HostRegistry manages host registration and tracking
