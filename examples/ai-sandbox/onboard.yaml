@@ -1,0 +1,59 @@
+platform:
+  gcp_project: "my-project"
+  region: "us-central1"
+  zone: "us-central1-a"
+
+repository:
+  url: "https://github.com/myorg/my-sandbox-app"
+  branch: "main"
+
+microvm:
+  vcpus: 8
+  memory_mb: 16384          # 16GB — room for model weights in RAM
+  max_per_host: 8
+  idle_target: 4            # Keep 4 warm VMs per host for low-latency cold starts
+
+hosts:
+  machine_type: "n2-standard-64"
+  min_count: 2
+  max_count: 20
+  data_disk_gb: 500
+
+ci:
+  system: "none"
+
+workload:
+  # Steps baked into the golden snapshot during warmup.
+  # The snapshot builder boots a VM, runs these in order, then freezes it.
+  snapshot_commands:
+    - type: "shell"
+      args: ["pip3", "install", "-r", "/app/requirements.txt"]
+      run_as_root: true
+    - type: "shell"
+      args: ["python3", "/app/preload_weights.py"]
+      run_as_root: false
+
+  # The service that runs inside the VM after each restore.
+  # The thaw-agent starts this, waits for GET /health on port 8080 to return 2xx,
+  # then tells the host the runner is ready.
+  start_command:
+    command: ["python3", "/app/sandbox_server.py"]
+    port: 8080
+    health_path: "/health"
+
+# Session persistence is off by default for sandboxes — each allocation gets a
+# fresh copy of the golden snapshot. Enable session if you need multi-turn
+# conversations that preserve in-VM state across requests.
+# session:
+#   enabled: true
+#   ttl_seconds: 1800    # Pause after 30min idle
+#   auto_pause: true
+
+credentials:
+  # Inject any secrets the sandbox server needs (API keys, model tokens, etc.)
+  secrets: []
+  #   - name: "openai-key"
+  #     secret_name: "projects/my-project/secrets/openai-api-key/versions/latest"
+  #     target: "openai.key"
+  host_dirs: []
+  env: {}
