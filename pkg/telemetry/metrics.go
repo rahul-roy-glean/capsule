@@ -36,12 +36,13 @@ const (
 	MetricCPDownscalerActions = "control_plane/downscaler_actions_total"
 
 	// Fleet resource metrics — used as the primary autoscaler signal.
-	MetricCPFleetCPUTotal = "control_plane/fleet_cpu_millicores_total"
-	MetricCPFleetCPUUsed  = "control_plane/fleet_cpu_millicores_used"
-	MetricCPFleetCPUFree  = "control_plane/fleet_cpu_millicores_free"
-	MetricCPFleetMemTotal = "control_plane/fleet_memory_mb_total"
-	MetricCPFleetMemUsed  = "control_plane/fleet_memory_mb_used"
-	MetricCPFleetMemFree  = "control_plane/fleet_memory_mb_free"
+	MetricCPFleetCPUTotal    = "control_plane/fleet_cpu_millicores_total"
+	MetricCPFleetCPUUsed     = "control_plane/fleet_cpu_millicores_used"
+	MetricCPFleetCPUFree     = "control_plane/fleet_cpu_millicores_free"
+	MetricCPFleetMemTotal    = "control_plane/fleet_memory_mb_total"
+	MetricCPFleetMemUsed     = "control_plane/fleet_memory_mb_used"
+	MetricCPFleetMemFree     = "control_plane/fleet_memory_mb_free"
+	MetricCPFleetUtilization = "control_plane/fleet_utilization"
 
 	// Snapshot metrics
 	MetricSnapshotBuildDuration  = "snapshot/build_duration_seconds"

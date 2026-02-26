@@ -26,6 +26,7 @@ import (
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/tiers"
 )
 
 var (
@@ -242,7 +243,7 @@ func main() {
 	// Start background workers
 	go hostRegistry.HealthCheckLoop(ctx)
 	go snapshotFreshnessLoop(ctx, snapshotManager, snapshotConfigRegistry, logger)
-	go startDownscaler(ctx, db, hostRegistry, logger)
+	go startDownscaler(ctx, db, hostRegistry, scheduler, logger)
 	go jobQueue.jobRetryLoop(ctx)
 	go controlPlaneServer.startTTLEnforcement(ctx)
 	if metricsClient != nil {
@@ -1156,8 +1157,36 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 			mc.RecordInt(ctx, telemetry.MetricCPFleetMemUsed, fleetMemUsed, nil)
 			mc.RecordInt(ctx, telemetry.MetricCPFleetMemFree, fleetMemTotal-fleetMemUsed, nil)
 
+			// Record slot-based fleet utilization for autoscaler
+			defaultTier, _ := tiers.Lookup(tiers.DefaultTier)
+			defaultCPU := tiers.EffectiveCPUMillicores(defaultTier)
+			defaultMem := defaultTier.MemoryMB
+
+			totalSlots := 0
+			usedSlots := 0
+			for _, h := range hosts {
+				if h.Status != "ready" || h.TotalCPUMillicores == 0 {
+					continue
+				}
+				hostTotal := min(h.TotalCPUMillicores/defaultCPU, h.TotalMemoryMB/defaultMem)
+				freeCPU := max((h.TotalCPUMillicores-h.UsedCPUMillicores)/defaultCPU, 0)
+				freeMem := max((h.TotalMemoryMB-h.UsedMemoryMB)/defaultMem, 0)
+				hostFree := min(freeCPU, freeMem)
+				totalSlots += hostTotal
+				usedSlots += hostTotal - hostFree
+			}
+
+			queueDepth := sched.GetQueueDepth()
+			var utilization float64
+			if totalSlots > 0 {
+				utilization = float64(usedSlots+queueDepth) / float64(totalSlots)
+			} else if queueDepth > 0 {
+				utilization = 10.0 // no capacity but demand exists — force scale-up
+			}
+			mc.RecordFloat(ctx, telemetry.MetricCPFleetUtilization, utilization, nil)
+
 			// Record queue depth
-			mc.RecordInt(ctx, telemetry.MetricCPQueueDepth, int64(sched.GetQueueDepth()), nil)
+			mc.RecordInt(ctx, telemetry.MetricCPQueueDepth, int64(queueDepth), nil)
 
 			// Record snapshot age
 			currentVersion := sm.GetCurrentVersion()

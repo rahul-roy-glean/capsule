@@ -172,7 +172,7 @@ func (hr *HostRegistry) UpsertHeartbeat(ctx context.Context, hb HostHeartbeat) (
 			total_memory_mb = EXCLUDED.total_memory_mb,
 			used_memory_mb = EXCLUDED.used_memory_mb,
 			status = CASE
-				WHEN hosts.status IN ('draining','terminating') THEN hosts.status
+				WHEN hosts.status IN ('draining','terminating','terminated','unhealthy') THEN hosts.status
 				ELSE 'ready'
 			END
 		RETURNING id, status
@@ -335,6 +335,45 @@ func (hr *HostRegistry) RemoveRunner(runnerID string) error {
 	return nil
 }
 
+// GetRunnersByHostID returns all runners belonging to the given host.
+func (hr *HostRegistry) GetRunnersByHostID(hostID string) []*Runner {
+	hr.mu.RLock()
+	defer hr.mu.RUnlock()
+
+	var runners []*Runner
+	for _, r := range hr.runners {
+		if r.HostID == hostID {
+			runners = append(runners, r)
+		}
+	}
+	return runners
+}
+
+// RemoveHost removes a host from the in-memory map only.
+func (hr *HostRegistry) RemoveHost(hostID string) {
+	hr.mu.Lock()
+	defer hr.mu.Unlock()
+	delete(hr.hosts, hostID)
+}
+
+// CleanupHostRunners deletes all runners for a host from both DB and in-memory map.
+func (hr *HostRegistry) CleanupHostRunners(ctx context.Context, hostID string) error {
+	hr.mu.Lock()
+	defer hr.mu.Unlock()
+
+	_, err := hr.db.ExecContext(ctx, `DELETE FROM runners WHERE host_id = $1`, hostID)
+	if err != nil {
+		return fmt.Errorf("failed to delete runners for host %s: %w", hostID, err)
+	}
+
+	for id, r := range hr.runners {
+		if r.HostID == hostID {
+			delete(hr.runners, id)
+		}
+	}
+	return nil
+}
+
 // HealthCheckLoop periodically checks host health
 func (hr *HostRegistry) HealthCheckLoop(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
@@ -358,7 +397,7 @@ func (hr *HostRegistry) checkHostHealth() {
 
 	for _, host := range hr.hosts {
 		if time.Since(host.LastHeartbeat) > staleThreshold {
-			if host.Status == "ready" {
+			if host.Status == "ready" || host.Status == "draining" {
 				hr.logger.WithFields(logrus.Fields{
 					"host_id":        host.ID,
 					"instance_name":  host.InstanceName,
