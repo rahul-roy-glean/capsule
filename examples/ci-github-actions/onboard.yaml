@@ -1,0 +1,56 @@
+platform:
+  gcp_project: "my-project"
+  region: "us-central1"
+  zone: "us-central1-a"
+
+repository:
+  url: "https://github.com/myorg/myrepo"
+  branch: "main"
+  # Uncomment for private repos using GitHub App authentication:
+  # github_app_id: "12345"
+  # github_app_secret_name: "projects/my-project/secrets/github-app-key/versions/latest"
+
+microvm:
+  vcpus: 4
+  memory_mb: 8192
+  max_per_host: 16
+  idle_target: 2            # Pre-warm 2 VMs per host from the golden snapshot
+
+hosts:
+  machine_type: "n2-standard-64"
+  min_count: 2
+  max_count: 20
+  data_disk_gb: 500
+
+# CI add-on: register VMs as GitHub Actions self-hosted runners.
+ci:
+  system: "github-actions"
+  github:
+    repo: "myorg/myrepo"
+    org: "myorg"            # Register as org-level runner (optional; overrides repo)
+    labels:
+      - "self-hosted"
+      - "firecracker"
+      - "bazel"
+    ephemeral: true         # Each job gets a fresh VM; runner deregisters on completion
+
+# Bazel add-on: controls snapshot warmup and per-runner cache sizing.
+bazel:
+  warmup_targets: "//..."   # Bazel targets to fetch+build during snapshot warmup
+  repo_cache_upper_size_gb: 10
+
+  # git_cache: optional, enables fast reference cloning by mounting a host mirror.
+  # git_cache:
+  #   enabled: true
+  #   repos:
+  #     github.com/myorg/myrepo: myrepo
+  #   workspace_dir: "/mnt/ephemeral/workspace"
+
+  # buildbarn: optional mTLS certs for Buildbarn remote execution.
+  # buildbarn:
+  #   certs_dir: "/etc/glean/ci/certs/buildbarn"
+
+credentials:
+  secrets: []
+  host_dirs: []
+  env: {}
