@@ -215,7 +215,7 @@ header "5. Allocate and exec on base snapshot (verify base works)"
 # ---------------------------------------------------------------------------
 ALLOC_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
   -H 'Content-Type: application/json' \
-  -d "{\"ci_system\":\"none\", \"session_id\":\"$SESSION_ID\"}")
+  -d "{\"ci_system\":\"none\", \"workload_key\":\"$BASE_WORKLOAD_KEY\", \"session_id\":\"$SESSION_ID\"}")
 echo "Response: $ALLOC_RESP"
 
 RUNNER_ID=$(echo "$ALLOC_RESP" | jq -r '.runner_id')
@@ -249,6 +249,7 @@ else
   exit 1
 fi
 
+sleep 1
 # Simple exec
 EXEC_OUT=$(curl -sf --no-buffer -X POST "$MGR/api/v1/runners/$RUNNER_ID/exec" \
   -H 'Content-Type: application/json' \
@@ -264,8 +265,9 @@ fi
 # ---------------------------------------------------------------------------
 header "6. Pause base runner"
 # ---------------------------------------------------------------------------
-PAUSE_RESP=$(curl -sf -X POST "$MGR/api/v1/runners/$RUNNER_ID/pause" \
-  -H 'Content-Type: application/json')
+PAUSE_RESP=$(curl -sf -X POST "$CP/api/v1/runners/pause" \
+  -H 'Content-Type: application/json' \
+  -d "{\"runner_id\":\"$RUNNER_ID\"}")
 echo "Response: $PAUSE_RESP"
 
 PAUSE_SESSION=$(echo "$PAUSE_RESP" | jq -r '.session_id // empty')
@@ -316,7 +318,7 @@ header "8. Resume and verify state preserved"
 # ---------------------------------------------------------------------------
 RESUME_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
   -H 'Content-Type: application/json' \
-  -d "{\"ci_system\":\"none\", \"session_id\":\"$SESSION_ID\"}")
+  -d "{\"ci_system\":\"none\", \"workload_key\":\"$BASE_WORKLOAD_KEY\", \"session_id\":\"$SESSION_ID\"}")
 echo "Response: $RESUME_RESP"
 
 RESUME_RUNNER_ID=$(echo "$RESUME_RESP" | jq -r '.runner_id')
@@ -343,6 +345,7 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
+sleep 1
 RESUME_EXEC=$(curl -sf --no-buffer -X POST "$MGR/api/v1/runners/$RESUME_RUNNER_ID/exec" \
   -H 'Content-Type: application/json' \
   -d '{"command":["echo","resume-works"],"timeout_seconds":10}' 2>&1 || echo "EXEC_FAILED")
@@ -357,8 +360,9 @@ fi
 header "9. Multi-pause chain test (pause → resume → pause again)"
 # ---------------------------------------------------------------------------
 # Pause the resumed runner (layer 1)
-PAUSE2_RESP=$(curl -sf -X POST "$MGR/api/v1/runners/$RESUME_RUNNER_ID/pause" \
-  -H 'Content-Type: application/json')
+PAUSE2_RESP=$(curl -sf -X POST "$CP/api/v1/runners/pause" \
+  -H 'Content-Type: application/json' \
+  -d "{\"runner_id\":\"$RESUME_RUNNER_ID\"}")
 echo "Response: $PAUSE2_RESP"
 
 PAUSE2_LAYER=$(echo "$PAUSE2_RESP" | jq -r '.layer // empty')
@@ -402,7 +406,7 @@ header "10. Resume from layer 1 and verify"
 # ---------------------------------------------------------------------------
 RESUME2_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
   -H 'Content-Type: application/json' \
-  -d "{\"ci_system\":\"none\", \"session_id\":\"$SESSION_ID\"}")
+  -d "{\"ci_system\":\"none\", \"workload_key\":\"$BASE_WORKLOAD_KEY\", \"session_id\":\"$SESSION_ID\"}")
 RESUME2_RUNNER_ID=$(echo "$RESUME2_RESP" | jq -r '.runner_id')
 RESUME2_RESUMED=$(echo "$RESUME2_RESP" | jq -r '.resumed // false')
 
@@ -428,6 +432,7 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
+sleep 1
 RESUME2_EXEC=$(curl -sf --no-buffer -X POST "$MGR/api/v1/runners/$RESUME2_RUNNER_ID/exec" \
   -H 'Content-Type: application/json' \
   -d '{"command":["echo","multi-layer-works"],"timeout_seconds":10}' 2>&1 || echo "EXEC_FAILED")

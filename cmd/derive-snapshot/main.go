@@ -31,13 +31,15 @@ import (
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
+var version string // set by -ldflags "-X main.version=..."
+
 var (
 	baseWorkloadKey = flag.String("base-workload-key", "", "Workload key of the base snapshot (required)")
 	driveSpecsJSON  = flag.String("drive-specs", "[]", "JSON array of DriveSpec objects describing extension drives")
 	gcsBucket       = flag.String("gcs-bucket", "", "GCS bucket for chunk storage (required)")
 	gcsPrefix       = flag.String("gcs-prefix", "v1", "Top-level GCS prefix (e.g. 'v1')")
 	localCache      = flag.String("local-cache", "/tmp/chunk-cache", "Local chunk cache directory")
-	version         = flag.String("version", "", "Version string for the derived snapshot (default: timestamp)")
+	snapshotVersion = flag.String("version", "", "Version string for the derived snapshot (default: timestamp)")
 	setCurrent      = flag.Bool("set-current", false, "Set derived snapshot as current after building")
 	logLevel        = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 )
@@ -61,9 +63,9 @@ func main() {
 		log.Fatal("--gcs-bucket is required")
 	}
 
-	if *version == "" {
-		*version = fmt.Sprintf("v%s", time.Now().Format("20060102-150405"))
-		log.WithField("version", *version).Info("Generated version from timestamp")
+	if *snapshotVersion == "" {
+		*snapshotVersion = fmt.Sprintf("v%s", time.Now().Format("20060102-150405"))
+		log.WithField("version", *snapshotVersion).Info("Generated version from timestamp")
 	}
 
 	// Parse drive specs.
@@ -159,7 +161,7 @@ func main() {
 		baseMeta.RootfsChunks,
 		extensionDrives,
 	)
-	derivedMeta.Version = *version
+	derivedMeta.Version = *snapshotVersion
 
 	// Upload derived metadata.
 	builder := snapshot.NewChunkedSnapshotBuilder(chunkStore, memChunkStore, logger)
@@ -169,7 +171,7 @@ func main() {
 
 	log.WithFields(logrus.Fields{
 		"derived_workload_key": derivedWorkloadKey,
-		"version":              *version,
+		"version":              *snapshotVersion,
 	}).Info("Derived metadata uploaded successfully")
 
 	if *setCurrent {
@@ -182,7 +184,7 @@ func main() {
 	}
 
 	fmt.Printf("\nDerived snapshot created: %s\n", derivedWorkloadKey)
-	fmt.Printf("  Version:    %s\n", *version)
+	fmt.Printf("  Version:    %s\n", *snapshotVersion)
 	fmt.Printf("  Base key:   %s\n", *baseWorkloadKey)
 	fmt.Printf("  Drives:     %d\n", len(driveSpecs))
 }

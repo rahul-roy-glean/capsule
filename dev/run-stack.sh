@@ -46,13 +46,21 @@ if [ -f "$PID_DIR/control-plane.pid" ] || [ -f "$PID_DIR/firecracker-manager.pid
   bash "$(dirname "$0")/stop-stack.sh" 2>/dev/null || true
 fi
 
+# --- Reset stale host status ---
+# After a manager crash the control-plane marks hosts as 'unhealthy' and the
+# heartbeat upsert never flips them back. Reset so the restarted manager can
+# re-register as 'ready'.
+sudo -u postgres psql -d firecracker_runner -c \
+  "UPDATE hosts SET status = 'ready' WHERE status = 'unhealthy';" \
+  > /dev/null 2>&1 || true
+
 # --- Start control-plane ---
 echo ""
 echo "=== Starting control-plane ==="
 nohup ./bin/control-plane \
   --db-host=localhost \
   --db-user=postgres \
-  --db-password="" \
+  --db-password="${DB_PASSWORD:-postgres}" \
   --db-name=firecracker_runner \
   --db-ssl-mode=disable \
   --http-port=8080 \
@@ -83,6 +91,12 @@ done
 # --- Start firecracker-manager ---
 echo ""
 echo "=== Starting firecracker-manager ==="
+
+# In local dev /tmp/fc-dev is not a real mount point; bind-mount it so the
+# manager's data-mount readiness check passes.
+if ! grep -q "/tmp/fc-dev" /proc/mounts 2>/dev/null; then
+  sudo mount --bind /tmp/fc-dev /tmp/fc-dev
+fi
 
 # Build the full command as an array, then pass to sudo.
 SESSION_CHUNK_BUCKET=${SESSION_CHUNK_BUCKET:-}

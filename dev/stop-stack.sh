@@ -11,16 +11,16 @@ kill_pid_file() {
   if [ -f "$pidfile" ]; then
     local pid
     pid=$(cat "$pidfile")
-    if kill -0 "$pid" 2>/dev/null; then
+    if sudo kill -0 "$pid" 2>/dev/null; then
       echo "Stopping $name (PID $pid)..."
       sudo kill "$pid" 2>/dev/null || true
       # Wait up to 5s for graceful shutdown
       for i in $(seq 1 10); do
-        kill -0 "$pid" 2>/dev/null || break
+        sudo kill -0 "$pid" 2>/dev/null || break
         sleep 0.5
       done
       # Force kill if still alive
-      if kill -0 "$pid" 2>/dev/null; then
+      if sudo kill -0 "$pid" 2>/dev/null; then
         echo "  Force-killing $name..."
         sudo kill -9 "$pid" 2>/dev/null || true
       fi
@@ -60,7 +60,7 @@ done
 # 6. Clean up Firecracker sockets
 if ls /tmp/fc-dev/sockets/*.sock 2>/dev/null; then
   echo "Removing Firecracker sockets..."
-  rm -f /tmp/fc-dev/sockets/*.sock
+  sudo rm -f /tmp/fc-dev/sockets/*.sock
 fi
 
 # 7. Remove remaining PID files

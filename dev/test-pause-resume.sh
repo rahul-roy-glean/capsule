@@ -48,7 +48,7 @@ header "2. Allocate runner with session_id"
 # ---------------------------------------------------------------------------
 ALLOC_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
   -H 'Content-Type: application/json' \
-  -d "{\"ci_system\":\"none\", \"session_id\":\"$SESSION_ID\"}")
+  -d "{\"ci_system\":\"none\", \"workload_key\":\"$WORKLOAD_KEY\", \"session_id\":\"$SESSION_ID\"}")
 echo "Response: $ALLOC_RESP"
 
 RUNNER_ID=$(echo "$ALLOC_RESP" | jq -r '.runner_id')
@@ -97,6 +97,8 @@ fi
 # ---------------------------------------------------------------------------
 header "4. Execute: create a file in the VM"
 # ---------------------------------------------------------------------------
+# Brief delay for the thaw-agent to fully initialize after snapshot restore.
+sleep 1
 EXEC_OUT=$(curl -sf --no-buffer -X POST "$MGR/api/v1/runners/$RUNNER_ID/exec" \
   -H 'Content-Type: application/json' \
   -d '{"command":["sh","-c","echo session-state-test > /tmp/pause-test.txt && cat /tmp/pause-test.txt"],"timeout_seconds":10}')
@@ -118,8 +120,9 @@ fi
 # ---------------------------------------------------------------------------
 header "5. Pause runner"
 # ---------------------------------------------------------------------------
-PAUSE_RESP=$(curl -sf -X POST "$MGR/api/v1/runners/$RUNNER_ID/pause" \
-  -H 'Content-Type: application/json')
+PAUSE_RESP=$(curl -sf -X POST "$CP/api/v1/runners/pause" \
+  -H 'Content-Type: application/json' \
+  -d "{\"runner_id\":\"$RUNNER_ID\"}")
 echo "Response: $PAUSE_RESP"
 
 PAUSE_SESSION=$(echo "$PAUSE_RESP" | jq -r '.session_id // empty')
@@ -199,7 +202,7 @@ header "8. Resume: allocate with same session_id"
 # ---------------------------------------------------------------------------
 RESUME_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
   -H 'Content-Type: application/json' \
-  -d "{\"ci_system\":\"none\", \"session_id\":\"$SESSION_ID\"}")
+  -d "{\"ci_system\":\"none\", \"workload_key\":\"$WORKLOAD_KEY\", \"session_id\":\"$SESSION_ID\"}")
 echo "Response: $RESUME_RESP"
 
 RESUME_RUNNER_ID=$(echo "$RESUME_RESP" | jq -r '.runner_id')
@@ -229,6 +232,7 @@ done
 # ---------------------------------------------------------------------------
 header "9. Verify state was preserved: read the file we created before pause"
 # ---------------------------------------------------------------------------
+sleep 1
 VERIFY_OUT=$(curl -sf --no-buffer -X POST "$MGR/api/v1/runners/$RESUME_RUNNER_ID/exec" \
   -H 'Content-Type: application/json' \
   -d '{"command":["cat","/tmp/pause-test.txt"],"timeout_seconds":10}' 2>&1 || echo "EXEC_FAILED")
@@ -289,8 +293,9 @@ else
 fi
 
 # Second pause
-PAUSE2_RESP=$(curl -sf -X POST "$MGR/api/v1/runners/$RESUME_RUNNER_ID/pause" \
-  -H 'Content-Type: application/json')
+PAUSE2_RESP=$(curl -sf -X POST "$CP/api/v1/runners/pause" \
+  -H 'Content-Type: application/json' \
+  -d "{\"runner_id\":\"$RESUME_RUNNER_ID\"}")
 echo "Response: $PAUSE2_RESP"
 
 PAUSE2_LAYER=$(echo "$PAUSE2_RESP" | jq -r '.layer // empty')
@@ -352,7 +357,7 @@ header "14. Resume from layer 1 and verify all state preserved"
 # ---------------------------------------------------------------------------
 RESUME2_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
   -H 'Content-Type: application/json' \
-  -d "{\"ci_system\":\"none\", \"session_id\":\"$SESSION_ID\"}")
+  -d "{\"ci_system\":\"none\", \"workload_key\":\"$WORKLOAD_KEY\", \"session_id\":\"$SESSION_ID\"}")
 echo "Response: $RESUME2_RESP"
 
 RESUME2_RUNNER_ID=$(echo "$RESUME2_RESP" | jq -r '.runner_id')
@@ -380,6 +385,7 @@ for i in $(seq 1 30); do
 done
 
 # Verify layer 0 data still exists (survived 2 pause/resume cycles)
+sleep 1
 VERIFY_L0=$(curl -sf --no-buffer -X POST "$MGR/api/v1/runners/$RESUME2_RUNNER_ID/exec" \
   -H 'Content-Type: application/json' \
   -d '{"command":["cat","/tmp/pause-test.txt"],"timeout_seconds":10}' 2>&1 || echo "EXEC_FAILED")

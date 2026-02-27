@@ -9,11 +9,29 @@ MGR=http://localhost:9080
 echo "=== E2E Exec Test ==="
 echo ""
 
+# --- 0. Register snapshot config ---
+echo "=== 0. Register snapshot config ==="
+CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/snapshot-configs" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "display_name": "exec-test",
+    "commands": [{"type":"shell","command":"echo exec-test"}],
+    "runner_ttl_seconds": 60,
+    "auto_pause": false
+  }')
+WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.workload_key')
+echo "Registered config: workload_key=$WORKLOAD_KEY"
+
+if [ -z "$WORKLOAD_KEY" ] || [ "$WORKLOAD_KEY" = "null" ]; then
+  echo "FAIL: could not register snapshot config"
+  exit 1
+fi
+
 # --- 1. Allocate runner ---
 echo "=== 1. Allocate runner (exec mode) ==="
 RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
   -H 'Content-Type: application/json' \
-  -d '{"ci_system":"none"}')
+  -d "{\"ci_system\":\"none\", \"workload_key\":\"$WORKLOAD_KEY\"}")
 echo "Response: $RESP"
 
 RUNNER_ID=$(echo "$RESP" | jq -r '.runner_id')

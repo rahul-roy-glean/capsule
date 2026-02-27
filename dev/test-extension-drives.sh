@@ -66,7 +66,7 @@ header "2. Allocate runner with session"
 # ---------------------------------------------------------------------------
 ALLOC_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
   -H 'Content-Type: application/json' \
-  -d "{\"ci_system\":\"none\", \"session_id\":\"$SESSION_ID\"}")
+  -d "{\"ci_system\":\"none\", \"workload_key\":\"$WORKLOAD_KEY\", \"session_id\":\"$SESSION_ID\"}")
 echo "Response: $ALLOC_RESP"
 
 RUNNER_ID=$(echo "$ALLOC_RESP" | jq -r '.runner_id')
@@ -92,6 +92,7 @@ done
 # ---------------------------------------------------------------------------
 header "3. Write data to VM (simulating extension drive content)"
 # ---------------------------------------------------------------------------
+sleep 1
 # Write files that should persist across pause/resume
 EXEC_WRITE=$(curl -sf --no-buffer -X POST "$MGR/api/v1/runners/$RUNNER_ID/exec" \
   -H 'Content-Type: application/json' \
@@ -107,8 +108,9 @@ fi
 # ---------------------------------------------------------------------------
 header "4. Pause runner (first pause — layer 0)"
 # ---------------------------------------------------------------------------
-PAUSE_RESP=$(curl -sf -X POST "$MGR/api/v1/runners/$RUNNER_ID/pause" \
-  -H 'Content-Type: application/json')
+PAUSE_RESP=$(curl -sf -X POST "$CP/api/v1/runners/pause" \
+  -H 'Content-Type: application/json' \
+  -d "{\"runner_id\":\"$RUNNER_ID\"}")
 echo "Response: $PAUSE_RESP"
 
 PAUSE_SESSION=$(echo "$PAUSE_RESP" | jq -r '.session_id // empty')
@@ -158,7 +160,7 @@ header "6. Resume from first pause"
 # ---------------------------------------------------------------------------
 RESUME_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
   -H 'Content-Type: application/json' \
-  -d "{\"ci_system\":\"none\", \"session_id\":\"$SESSION_ID\"}")
+  -d "{\"ci_system\":\"none\", \"workload_key\":\"$WORKLOAD_KEY\", \"session_id\":\"$SESSION_ID\"}")
 RESUME_RUNNER_ID=$(echo "$RESUME_RESP" | jq -r '.runner_id')
 RESUME_RESUMED=$(echo "$RESUME_RESP" | jq -r '.resumed // false')
 echo "  Runner ID: $RESUME_RUNNER_ID  Resumed: $RESUME_RESUMED"
@@ -185,6 +187,7 @@ done
 # ---------------------------------------------------------------------------
 header "7. Verify data persisted across pause/resume"
 # ---------------------------------------------------------------------------
+sleep 1
 VERIFY_OUT=$(curl -sf --no-buffer -X POST "$MGR/api/v1/runners/$RESUME_RUNNER_ID/exec" \
   -H 'Content-Type: application/json' \
   -d '{"command":["cat","/tmp/ext-test/data.txt"],"timeout_seconds":10}' 2>&1 || echo "EXEC_FAILED")
@@ -221,8 +224,9 @@ else
   fail "Failed to write data before second pause"
 fi
 
-PAUSE2_RESP=$(curl -sf -X POST "$MGR/api/v1/runners/$RESUME_RUNNER_ID/pause" \
-  -H 'Content-Type: application/json')
+PAUSE2_RESP=$(curl -sf -X POST "$CP/api/v1/runners/pause" \
+  -H 'Content-Type: application/json' \
+  -d "{\"runner_id\":\"$RESUME_RUNNER_ID\"}")
 echo "Response: $PAUSE2_RESP"
 
 PAUSE2_LAYER=$(echo "$PAUSE2_RESP" | jq -r '.layer // empty')
@@ -284,7 +288,7 @@ header "10. Resume from layer 1 and verify all data"
 # ---------------------------------------------------------------------------
 RESUME2_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
   -H 'Content-Type: application/json' \
-  -d "{\"ci_system\":\"none\", \"session_id\":\"$SESSION_ID\"}")
+  -d "{\"ci_system\":\"none\", \"workload_key\":\"$WORKLOAD_KEY\", \"session_id\":\"$SESSION_ID\"}")
 RESUME2_RUNNER_ID=$(echo "$RESUME2_RESP" | jq -r '.runner_id')
 RESUME2_RESUMED=$(echo "$RESUME2_RESP" | jq -r '.resumed // false')
 
@@ -307,6 +311,7 @@ for i in $(seq 1 30); do
 done
 
 # Verify original data persists through 2 pause/resume cycles
+sleep 1
 VERIFY_L0=$(curl -sf --no-buffer -X POST "$MGR/api/v1/runners/$RESUME2_RUNNER_ID/exec" \
   -H 'Content-Type: application/json' \
   -d '{"command":["cat","/tmp/ext-test/data.txt"],"timeout_seconds":10}' 2>&1 || echo "EXEC_FAILED")
