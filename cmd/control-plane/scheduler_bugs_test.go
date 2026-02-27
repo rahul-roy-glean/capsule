@@ -2,27 +2,45 @@ package main
 
 import (
 	"testing"
+
+	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 )
 
 // TestSchedulerAllocateRequest_TTLFieldsExist verifies that the
 // AllocateRunnerRequest struct has TTL-related fields that can be
 // populated from snapshot config data.
-// BUG: The scheduler queries snapshot_configs but does NOT read
-// runner_ttl_seconds or auto_pause columns, so these are never
-// propagated to the host agent during allocation.
+// FIXED: The scheduler now reads runner_ttl_seconds and auto_pause
+// from snapshot_configs and forwards them via the gRPC proto request.
 func TestSchedulerAllocateRequest_TTLFieldsExist(t *testing.T) {
 	req := AllocateRunnerRequest{
 		WorkloadKey: "test-key",
 		SessionID:   "sess-1",
 	}
 
-	// These fields should exist on the request struct
-	// but the scheduler never populates them from the DB.
 	if req.WorkloadKey != "test-key" {
 		t.Errorf("WorkloadKey = %q, want %q", req.WorkloadKey, "test-key")
 	}
 	if req.SessionID != "sess-1" {
 		t.Errorf("SessionID = %q, want %q", req.SessionID, "sess-1")
+	}
+}
+
+// TestProtoAllocateRequest_TTLFieldsPresent verifies that the gRPC
+// AllocateRunnerRequest proto has ttl_seconds and auto_pause fields
+// so the scheduler can forward TTL config to the host agent.
+func TestProtoAllocateRequest_TTLFieldsPresent(t *testing.T) {
+	protoReq := &pb.AllocateRunnerRequest{
+		WorkloadKey: "test-key",
+		SessionId:   "sess-1",
+		TtlSeconds:  15,
+		AutoPause:   true,
+	}
+
+	if protoReq.GetTtlSeconds() != 15 {
+		t.Errorf("TtlSeconds = %d, want 15", protoReq.GetTtlSeconds())
+	}
+	if !protoReq.GetAutoPause() {
+		t.Error("AutoPause = false, want true")
 	}
 }
 

@@ -70,6 +70,8 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		SnapshotVersion:   req.SnapshotVersion,
 		CISystem:          req.CiSystem,
 		SessionID:         req.SessionId,
+		TTLSeconds:        int(req.TtlSeconds),
+		AutoPause:         req.AutoPause,
 	}
 
 	if req.Resources != nil {

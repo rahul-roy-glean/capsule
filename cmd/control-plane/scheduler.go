@@ -114,15 +114,19 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// Derive repo slug for multi-repo support
 	workloadKey := req.WorkloadKey
 
-	// Look up snapshot config for fairness checks, ci_system, start_command, and tier
+	// Look up snapshot config for fairness checks, ci_system, start_command, tier, and TTL/auto_pause
 	var ciSystem string
 	var tierName string
 	var startCmd *snapshot.StartCommand
+	var runnerTTLSeconds int
+	var autoPause bool
 	if workloadKey != "" && s.db != nil {
 		var maxConcurrent int
 		var startCommandJSON sql.NullString
 		var tierCol sql.NullString
-		err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, ci_system, start_command, tier FROM snapshot_configs WHERE workload_key = $1`, workloadKey).Scan(&maxConcurrent, &ciSystem, &startCommandJSON, &tierCol)
+		var ttlCol sql.NullInt64
+		var autoPauseCol sql.NullBool
+		err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, ci_system, start_command, tier, runner_ttl_seconds, auto_pause FROM snapshot_configs WHERE workload_key = $1`, workloadKey).Scan(&maxConcurrent, &ciSystem, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol)
 		if err == nil {
 			if tierCol.Valid && tierCol.String != "" {
 				tierName = tierCol.String
@@ -142,6 +146,12 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 					s.logger.WithError(err).Warn("Failed to parse start_command from snapshot config")
 					startCmd = nil
 				}
+			}
+			if ttlCol.Valid {
+				runnerTTLSeconds = int(ttlCol.Int64)
+			}
+			if autoPauseCol.Valid {
+				autoPause = autoPauseCol.Bool
 			}
 		}
 	}
@@ -264,6 +274,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		CiSystem:          ciSystem,
 		SessionId:         req.SessionID,
 		SnapshotVersion:   snapshotVersion,
+		TtlSeconds:        int32(runnerTTLSeconds),
+		AutoPause:         autoPause,
 	}
 	// Populate resources from tier (overrides request-level values)
 	protoReq.Resources = &pb.Resources{

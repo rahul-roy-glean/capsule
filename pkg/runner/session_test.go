@@ -137,6 +137,46 @@ func TestResetTTL_NonexistentRunner(t *testing.T) {
 	m.ResetTTL("nonexistent")
 }
 
+func TestCheckTTLExpiry(t *testing.T) {
+	m := newTestManager()
+	now := time.Now()
+
+	// r1: idle, TTL=3s, last exec 5s ago → should auto-pause (has session)
+	m.runners["r1"] = &Runner{
+		ID: "r1", State: StateIdle, TTLSeconds: 3, AutoPause: true,
+		SessionID: "sess-1", LastExecAt: now.Add(-5 * time.Second),
+	}
+	// r2: idle, TTL=3s, last exec 5s ago, no session → should release
+	m.runners["r2"] = &Runner{
+		ID: "r2", State: StateIdle, TTLSeconds: 3, AutoPause: false,
+		LastExecAt: now.Add(-5 * time.Second),
+	}
+	// r3: idle, TTL=10s, last exec 5s ago → not expired yet
+	m.runners["r3"] = &Runner{
+		ID: "r3", State: StateIdle, TTLSeconds: 10, AutoPause: true,
+		SessionID: "sess-3", LastExecAt: now.Add(-5 * time.Second),
+	}
+	// r4: busy, TTL=3s, last exec 5s ago → skip (not idle)
+	m.runners["r4"] = &Runner{
+		ID: "r4", State: StateBusy, TTLSeconds: 3, AutoPause: true,
+		SessionID: "sess-4", LastExecAt: now.Add(-5 * time.Second),
+	}
+	// r5: idle, no TTL → skip
+	m.runners["r5"] = &Runner{
+		ID: "r5", State: StateIdle, TTLSeconds: 0,
+		LastExecAt: now.Add(-5 * time.Second),
+	}
+
+	pauseIDs, releaseIDs := m.CheckTTLExpiry()
+
+	if len(pauseIDs) != 1 || pauseIDs[0] != "r1" {
+		t.Errorf("autoPauseIDs = %v, want [r1]", pauseIDs)
+	}
+	if len(releaseIDs) != 1 || releaseIDs[0] != "r2" {
+		t.Errorf("releaseIDs = %v, want [r2]", releaseIDs)
+	}
+}
+
 func TestSessionMetadata_JSON(t *testing.T) {
 	meta := SessionMetadata{
 		SessionID:          "sess-abc",

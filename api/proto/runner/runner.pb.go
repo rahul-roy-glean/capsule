@@ -773,6 +773,8 @@ type AllocateRunnerRequest struct {
 	StartCommand      *StartCommand     `protobuf:"bytes,11,opt,name=start_command,json=startCommand,proto3" json:"start_command,omitempty"`                 // Optional: user service to start inside the VM
 	SessionId         string            `protobuf:"bytes,12,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`                          // optional: bind to session for pause/resume
 	SnapshotVersion   string            `protobuf:"bytes,13,opt,name=snapshot_version,json=snapshotVersion,proto3" json:"snapshot_version,omitempty"`        // Explicit version to use; skips current-pointer.json lookup
+	TtlSeconds        int32             `protobuf:"varint,14,opt,name=ttl_seconds,json=ttlSeconds,proto3" json:"ttl_seconds,omitempty"`                     // idle timeout from snapshot config (0 = no timeout)
+	AutoPause         bool              `protobuf:"varint,15,opt,name=auto_pause,json=autoPause,proto3" json:"auto_pause,omitempty"`                        // pause on TTL expiry instead of destroy
 }
 
 func (x *AllocateRunnerRequest) Reset() {
@@ -894,6 +896,20 @@ func (x *AllocateRunnerRequest) GetSnapshotVersion() string {
 		return x.SnapshotVersion
 	}
 	return ""
+}
+
+func (x *AllocateRunnerRequest) GetTtlSeconds() int32 {
+	if x != nil {
+		return x.TtlSeconds
+	}
+	return 0
+}
+
+func (x *AllocateRunnerRequest) GetAutoPause() bool {
+	if x != nil {
+		return x.AutoPause
+	}
+	return false
 }
 
 // AllocateRunnerResponse

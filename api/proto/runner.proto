@@ -182,6 +182,8 @@ message AllocateRunnerRequest {
   StartCommand start_command = 11; // Optional: user service to start inside the VM
   string session_id = 12;         // optional: bind to session for pause/resume
   string snapshot_version = 13;   // Explicit version to use; skips current-pointer.json lookup
+  int32 ttl_seconds = 14;         // idle timeout from snapshot config (0 = no timeout)
+  bool auto_pause = 15;           // pause on TTL expiry instead of destroy
 }
 
 // AllocateRunnerResponse
