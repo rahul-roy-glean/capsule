@@ -843,38 +843,6 @@ func (m *Manager) DecrementActiveExecs(runnerID string) {
 	m.mu.Unlock()
 }
 
-// CheckTTLExpiry scans runners for expired TTLs and returns the IDs of runners
-// that should be auto-paused or released. It does NOT perform the pause/release
-// itself — the caller (autoscale loop) drives the actual operations so that
-// the heavy I/O runs outside the manager lock.
-func (m *Manager) CheckTTLExpiry() (autoPauseIDs []string, releaseIDs []string) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	now := time.Now()
-	for _, r := range m.runners {
-		if r.TTLSeconds <= 0 {
-			continue
-		}
-		// Only idle runners with no active execs qualify.
-		if r.State != StateIdle || atomic.LoadInt32(&r.ActiveExecs) > 0 {
-			continue
-		}
-		// LastExecAt is set on allocation/resume and updated on each exec decrement.
-		if r.LastExecAt.IsZero() {
-			continue
-		}
-		if now.Sub(r.LastExecAt) >= time.Duration(r.TTLSeconds)*time.Second {
-			if r.AutoPause && r.SessionID != "" {
-				autoPauseIDs = append(autoPauseIDs, r.ID)
-			} else {
-				releaseIDs = append(releaseIDs, r.ID)
-			}
-		}
-	}
-	return
-}
-
 // ResetTTL updates LastExecAt for a runner, extending its idle TTL timer.
 func (m *Manager) ResetTTL(runnerID string) {
 	m.mu.Lock()

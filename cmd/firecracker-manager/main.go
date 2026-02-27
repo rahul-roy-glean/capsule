@@ -655,21 +655,6 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				}
 			}
 
-			// TTL enforcement: auto-pause or release runners whose idle TTL expired.
-			autoPauseIDs, releaseIDs := mgr.CheckTTLExpiry()
-			for _, rid := range autoPauseIDs {
-				log.WithField("runner_id", rid).Info("TTL expired, auto-pausing runner")
-				if _, err := mgr.PauseRunner(ctx, rid); err != nil {
-					log.WithError(err).WithField("runner_id", rid).Warn("TTL auto-pause failed")
-				}
-			}
-			for _, rid := range releaseIDs {
-				log.WithField("runner_id", rid).Info("TTL expired, releasing runner")
-				if err := mgr.ReleaseRunner(rid, true); err != nil {
-					log.WithError(err).WithField("runner_id", rid).Warn("TTL release failed")
-				}
-			}
-
 			// Update Prometheus metrics
 			metrics.UpdateHostMetrics(
 				status.TotalCPUMillicores,
