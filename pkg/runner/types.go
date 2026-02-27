@@ -25,7 +25,7 @@ const (
 	StateSuspended    State = "suspended"
 )
 
-// Runner represents a single Bazel runner instance
+// Runner represents a single runner instance
 type Runner struct {
 	ID                      string
 	HostID                  string

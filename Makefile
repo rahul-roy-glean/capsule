@@ -4,7 +4,7 @@
 .PHONY: firecracker-manager control-plane snapshot-builder thaw-agent
 .PHONY: git-cache-builder git-cache-freshness data-snapshot-builder snapshot-converter derive-snapshot
 .PHONY: test-unit test-race test-cover test-integration test-all check
-.PHONY: dev-up dev-build dev-snapshot dev-stack dev-test-exec dev-test-pause-resume dev-stop
+.PHONY: dev-up dev-build dev-snapshot dev-stack dev-test-exec dev-test-pause-resume dev-test-multi-pause-dedup dev-stop
 .PHONY: dev-test-derive-snapshot dev-test-extension-drives
 .PHONY: dev-setup dev-provision
 
@@ -401,6 +401,10 @@ dev-test-exec:
 dev-test-pause-resume:
 	$(LIMA_EXEC) bash dev/test-pause-resume.sh
 
+# Run E2E multi-pause chunk dedup test via Lima VM
+dev-test-multi-pause-dedup:
+	$(LIMA_EXEC) bash dev/test-multi-pause-dedup.sh
+
 # Run E2E derive-snapshot test via Lima VM
 dev-test-derive-snapshot:
 	$(LIMA_EXEC) bash dev/test-derive-snapshot.sh
@@ -449,6 +453,10 @@ dev-test-exec-local:
 # Run E2E pause/resume test directly on Linux
 dev-test-pause-resume-local:
 	bash dev/test-pause-resume.sh
+
+# Run E2E multi-pause chunk dedup test directly on Linux
+dev-test-multi-pause-dedup-local:
+	bash dev/test-multi-pause-dedup.sh
 
 # Run E2E derive-snapshot test directly on Linux
 dev-test-derive-snapshot-local:
