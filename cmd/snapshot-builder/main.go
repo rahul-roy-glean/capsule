@@ -1105,8 +1105,8 @@ func restoreFromPreviousSnapshot(
 		return nil, nil, nil, nil, fmt.Errorf("no previous chunked snapshot found for version %s: %w", currentVersion, err)
 	}
 	log.WithFields(logrus.Fields{
-		"version":       chunkedMeta.Version,
-		"rootfs_chunks": len(chunkedMeta.RootfsChunks),
+		"version":          chunkedMeta.Version,
+		"rootfs_chunks":    len(chunkedMeta.RootfsChunks),
 		"extension_drives": len(chunkedMeta.ExtensionDrives),
 	}).Info("Loaded previous chunked snapshot metadata")
 

@@ -2,8 +2,8 @@ package snapshot
 
 // DriveSpec declares how to build and populate one extension drive.
 type DriveSpec struct {
-	DriveID   string            `json:"drive_id"`             // e.g. "git_drive"
-	Label     string            `json:"label"`                // ext4 label, <=16 chars
+	DriveID   string            `json:"drive_id"` // e.g. "git_drive"
+	Label     string            `json:"label"`    // ext4 label, <=16 chars
 	SizeGB    int               `json:"size_gb"`
 	ReadOnly  bool              `json:"read_only"`            // true = read-only at runtime
 	Commands  []SnapshotCommand `json:"commands,omitempty"`   // run inside VM at MountPath

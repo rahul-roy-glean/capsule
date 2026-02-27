@@ -410,7 +410,6 @@ func defaultTestConfig() downscalerConfig {
 	}
 }
 
-
 func TestRunDownscaleOnce_ScaleUpResizesMIG(t *testing.T) {
 	now := time.Now()
 	hosts := []*Host{

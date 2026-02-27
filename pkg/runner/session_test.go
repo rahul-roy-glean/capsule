@@ -181,11 +181,11 @@ func TestSessionMetadata_JSON(t *testing.T) {
 
 func TestSessionMetadata_GCSFields(t *testing.T) {
 	meta := SessionMetadata{
-		SessionID:          "sess-gcs",
-		WorkloadKey:        "wk123",
-		RunnerID:           "runner-1",
-		HostID:             "host-1",
-		Layers:             1,
+		SessionID:           "sess-gcs",
+		WorkloadKey:         "wk123",
+		RunnerID:            "runner-1",
+		HostID:              "host-1",
+		Layers:              1,
 		GCSManifestPath:     "v1/wk123/runner_state/runner-1/snapshot_manifest.json",
 		GCSMemIndexObject:   "v1/wk123/runner_state/runner-1/chunked-metadata.json",
 		GCSDiskIndexObjects: map[string]string{"rootfs": "v1/wk123/runner_state/runner-1/disk-chunked-metadata.json"},

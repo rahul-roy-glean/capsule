@@ -12,10 +12,11 @@ import (
 // even when fresh heartbeats arrive.
 //
 // The heartbeat upsert SQL in UpsertHeartbeat (hosts.go:174) has:
-//   status = CASE
-//       WHEN hosts.status IN ('draining','terminating','terminated','unhealthy') THEN hosts.status
-//       ELSE 'ready'
-//   END
+//
+//	status = CASE
+//	    WHEN hosts.status IN ('draining','terminating','terminated','unhealthy') THEN hosts.status
+//	    ELSE 'ready'
+//	END
 //
 // This means once a host is 'unhealthy', the CASE preserves it forever.
 func TestUnhealthyHostNeverRecovers(t *testing.T) {

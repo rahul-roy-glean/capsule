@@ -35,8 +35,8 @@ type ChunkedManager struct {
 
 	// Per-runner UFFD handlers and FUSE disks
 	uffdHandlers       map[string]*uffd.Handler
-	fuseDisks          map[string]*fuse.ChunkedDisk                         // rootfs FUSE disks per runner
-	fuseExtensionDisks map[string]map[string]*fuse.ChunkedDisk              // extension drive FUSE disks: runnerID → driveID → disk
+	fuseDisks          map[string]*fuse.ChunkedDisk            // rootfs FUSE disks per runner
+	fuseExtensionDisks map[string]map[string]*fuse.ChunkedDisk // extension drive FUSE disks: runnerID → driveID → disk
 
 	// Network namespace manager (alternative to slot-based TAPs)
 	netnsNetwork *network.NetNSNetwork
@@ -100,15 +100,15 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 	}
 
 	cm := &ChunkedManager{
-		Manager:       baseManager,
-		chunkedMetas:  make(map[string]*snapshot.ChunkedSnapshotMetadata),
+		Manager:            baseManager,
+		chunkedMetas:       make(map[string]*snapshot.ChunkedSnapshotMetadata),
 		uffdHandlers:       make(map[string]*uffd.Handler),
 		fuseDisks:          make(map[string]*fuse.ChunkedDisk),
 		fuseExtensionDisks: make(map[string]map[string]*fuse.ChunkedDisk),
-		useNetNS:      cfg.UseNetNS,
-		memBackend:    cfg.MemBackend,
-		readyTimeout:  cfg.ReadyTimeout,
-		chunkedLogger: logger.WithField("component", "chunked-manager"),
+		useNetNS:           cfg.UseNetNS,
+		memBackend:         cfg.MemBackend,
+		readyTimeout:       cfg.ReadyTimeout,
+		chunkedLogger:      logger.WithField("component", "chunked-manager"),
 	}
 
 	// Setup chunked snapshot infrastructure if enabled

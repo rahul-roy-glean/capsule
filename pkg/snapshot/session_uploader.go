@@ -26,9 +26,9 @@ const sessionChunkUploadConcurrency = 16
 // uploads them to GCS, producing self-contained ChunkIndex objects that can
 // be used by the UFFD handler on any host (no golden snapshot.mem required).
 type SessionChunkUploader struct {
-	memStore  ChunkStorer       // chunks/mem/<p0>/<hash>
-	diskStore ChunkStorer       // chunks/disk/<p0>/<hash>; may be nil
-	gcsClient *storage.Client   // for GCS-specific operations (upload/download manifests, state, etc.)
+	memStore  ChunkStorer     // chunks/mem/<p0>/<hash>
+	diskStore ChunkStorer     // chunks/disk/<p0>/<hash>; may be nil
+	gcsClient *storage.Client // for GCS-specific operations (upload/download manifests, state, etc.)
 	gcsBucket string
 	gcsPrefix string // e.g. "v1"
 	logger    *logrus.Entry

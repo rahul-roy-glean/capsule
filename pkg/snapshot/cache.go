@@ -38,12 +38,12 @@ type SnapshotMetadata struct {
 
 // SnapshotPaths holds the local paths to snapshot files
 type SnapshotPaths struct {
-	Kernel               string
-	Rootfs               string
-	Mem                  string
-	State                string
-	RepoCacheSeed        string
-	Version              string
+	Kernel        string
+	Rootfs        string
+	Mem           string
+	State         string
+	RepoCacheSeed string
+	Version       string
 	// ExtensionDriveImages maps DriveID to the local path of the extension drive image.
 	// Used by BuildChunkedSnapshot to chunk extension drives.
 	ExtensionDriveImages map[string]string

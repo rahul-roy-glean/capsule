@@ -104,7 +104,6 @@ var (
 	poolMaxRunnerMemoryGB = flag.Int("pool-max-runner-memory-gb", 2, "Max memory per pooled runner in GB")
 	poolMaxRunnerDiskGB   = flag.Int("pool-max-runner-disk-gb", 16, "Max disk per pooled runner in GB")
 	poolRecycleTimeout    = flag.Int("pool-recycle-timeout-secs", 30, "Timeout for recycling operations in seconds")
-
 )
 
 func main() {
@@ -223,24 +222,24 @@ func main() {
 
 	// Create runner manager config
 	cfg := runner.HostConfig{
-		HostID:                    hostID,
-		InstanceName:              instanceName,
-		Zone:                      zone,
-		MaxRunners:                *maxRunners,
-		IdleTarget:                *idleTarget,
-		FirecrackerBin:            *firecrackerBin,
-		SocketDir:                 *socketDir,
-		WorkspaceDir:              *workspaceDir,
-		LogDir:                    *logDir,
-		SnapshotBucket:            *snapshotBucket,
-		SnapshotCachePath:         *snapshotCache,
-		QuarantineDir:             *quarantineDir,
-		MicroVMSubnet:             *microVMSubnet,
-		ExternalInterface:         *extInterface,
-		BridgeName:                *bridgeName,
-		Environment:               *environment,
-		ControlPlaneAddr:          *controlPlane,
-		GCPProject:                gcpProjectVal,
+		HostID:            hostID,
+		InstanceName:      instanceName,
+		Zone:              zone,
+		MaxRunners:        *maxRunners,
+		IdleTarget:        *idleTarget,
+		FirecrackerBin:    *firecrackerBin,
+		SocketDir:         *socketDir,
+		WorkspaceDir:      *workspaceDir,
+		LogDir:            *logDir,
+		SnapshotBucket:    *snapshotBucket,
+		SnapshotCachePath: *snapshotCache,
+		QuarantineDir:     *quarantineDir,
+		MicroVMSubnet:     *microVMSubnet,
+		ExternalInterface: *extInterface,
+		BridgeName:        *bridgeName,
+		Environment:       *environment,
+		ControlPlaneAddr:  *controlPlane,
+		GCPProject:        gcpProjectVal,
 		// Runner pooling configuration
 		PoolEnabled:            *poolEnabled,
 		PoolMaxRunners:         *poolMaxRunners,

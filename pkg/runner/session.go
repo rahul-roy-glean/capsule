@@ -289,11 +289,11 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 					metadata.GCSManifestPath = uploader.FullGCSPath(gcsBase + "/snapshot_manifest.json")
 					metadata.GCSMemIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
 					// Carry forward previous disk index objects for drives
-				// that weren't dirty this pause so the chain is never
-				// broken. Without this, a drive dirty in pause 1 but
-				// clean in pause 2 loses its index reference, forcing
-				// a full re-upload when it's dirty again in pause 3.
-				if len(prevGCSDiskIndexObjects) > 0 || len(newExtDiskIndexes) > 0 {
+					// that weren't dirty this pause so the chain is never
+					// broken. Without this, a drive dirty in pause 1 but
+					// clean in pause 2 loses its index reference, forcing
+					// a full re-upload when it's dirty again in pause 3.
+					if len(prevGCSDiskIndexObjects) > 0 || len(newExtDiskIndexes) > 0 {
 						if metadata.GCSDiskIndexObjects == nil {
 							metadata.GCSDiskIndexObjects = make(map[string]string)
 						}

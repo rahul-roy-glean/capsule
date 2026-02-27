@@ -205,17 +205,17 @@ type CIConfig struct {
 
 // BazelConfig holds optional Bazel-specific settings for CI workloads.
 type BazelConfig struct {
-	RepoCacheUpperSizeGB  int
-	BuildbarnCertsDir     string
-	BuildbarnCertsMountPath string
+	RepoCacheUpperSizeGB      int
+	BuildbarnCertsDir         string
+	BuildbarnCertsMountPath   string
 	BuildbarnCertsImageSizeMB int
-	GitCacheEnabled       bool
-	GitCacheDir           string
-	GitCacheImagePath     string
-	GitCacheMountPath     string
-	GitCacheRepoMappings  map[string]string
-	GitCacheWorkspaceDir  string
-	GitCachePreClonedPath string
+	GitCacheEnabled           bool
+	GitCacheDir               string
+	GitCacheImagePath         string
+	GitCacheMountPath         string
+	GitCacheRepoMappings      map[string]string
+	GitCacheWorkspaceDir      string
+	GitCachePreClonedPath     string
 }
 
 // HostConfig holds configuration for the host agent.
@@ -235,9 +235,9 @@ type HostConfig struct {
 	SnapshotCachePath string
 
 	// Credentials configuration
-	CredentialsSecrets  []CredentialSecret
-	CredentialsHostDirs []CredentialHostDir
-	CredentialsEnv      map[string]string
+	CredentialsSecrets     []CredentialSecret
+	CredentialsHostDirs    []CredentialHostDir
+	CredentialsEnv         map[string]string
 	CredentialsImageSizeMB int
 
 	QuarantineDir string

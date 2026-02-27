@@ -516,7 +516,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 			Version:           "V1", // V1 for simple GET requests (thaw-agent uses V1 protocol)
 			NetworkInterfaces: []string{"eth0"},
 		},
-		Drives: m.buildDrives(extensionPaths),
+		Drives:      m.buildDrives(extensionPaths),
 		LogPath:     runner.LogPath,
 		MetricsPath: runner.MetricsPath,
 	}
