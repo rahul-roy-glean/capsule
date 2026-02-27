@@ -140,35 +140,56 @@ func TestGCSDiskIndexObjects_PreviousChaining(t *testing.T) {
 			meta1.GCSDiskIndexObjects["bazel_cache"])
 	}
 
-	// Verify the zero-dirty-chunks case: if no dirty chunks, we don't write disk index.
-	// The new pause should carry over the previous disk index objects.
+	// Simulate pause 2: only git_drive is dirty, bazel_cache is clean.
+	// The manager must carry forward bazel_cache's disk index from pause 1
+	// so that a future pause 3 can use it as base instead of falling back
+	// to the golden snapshot (which would cause a full re-upload).
+	newExtDiskIndexes := map[string]bool{
+		"git_drive": true, // dirty this pause — gets a new index path
+	}
 	meta2 := SessionMetadata{
-		SessionID:         sessionID,
-		WorkloadKey:       "wk123",
-		RunnerID:          "runner-1",
-		HostID:            "host-1",
-		Layers:            2,
-		GCSManifestPath:   "v1/wk123/runner_state/runner-1/snapshot_manifest.json",
-		GCSMemIndexObject: "v1/wk123/runner_state/runner-1/chunked-metadata.json",
-		// No dirty disks this pause — disk index objects remain empty.
-		GCSDiskIndexObjects: nil,
+		SessionID:           sessionID,
+		WorkloadKey:         "wk123",
+		RunnerID:            "runner-1",
+		HostID:              "host-1",
+		Layers:              2,
+		GCSManifestPath:     "v1/wk123/runner_state/runner-1/snapshot_manifest.json",
+		GCSMemIndexObject:   "v1/wk123/runner_state/runner-1/chunked-metadata.json",
+		GCSDiskIndexObjects: make(map[string]string),
 	}
 
-	// If no new disk indexes were written, the manager does NOT carry forward
-	// old disk index paths into the new metadata — that's by design. The
-	// DownloadManifest/GCS flow reconstructs from the manifest's ExtensionDisks,
-	// not from metadata.GCSDiskIndexObjects.
+	// Carry forward previous disk index objects for drives not dirty this pause.
+	for driveID, path := range prevGCSDiskIndexObjects {
+		if !newExtDiskIndexes[driveID] {
+			meta2.GCSDiskIndexObjects[driveID] = path
+		}
+	}
+	// Record newly uploaded disk indexes.
+	for driveID := range newExtDiskIndexes {
+		meta2.GCSDiskIndexObjects[driveID] = "v1/wk123/runner_state/runner-1/pause2-" + driveID + "-disk.json"
+	}
+
 	data2, _ := json.MarshalIndent(meta2, "", "  ")
 	if err := os.WriteFile(filepath.Join(sessDir, "metadata.json"), data2, 0644); err != nil {
 		t.Fatalf("Write failed: %v", err)
 	}
 
-	// Verify that next pause correctly reads back the empty disk index objects.
+	// Verify that pause 2 metadata carries forward bazel_cache from pause 1
+	// and has an updated path for git_drive.
 	if prevData, readErr := os.ReadFile(filepath.Join(sessDir, "metadata.json")); readErr == nil {
 		var prev SessionMetadata
 		if json.Unmarshal(prevData, &prev) == nil {
-			if prev.GCSDiskIndexObjects != nil {
-				t.Errorf("Expected nil GCSDiskIndexObjects in pause 2 metadata, got %v", prev.GCSDiskIndexObjects)
+			if len(prev.GCSDiskIndexObjects) != 2 {
+				t.Fatalf("Expected 2 GCSDiskIndexObjects in pause 2 metadata, got %d: %v", len(prev.GCSDiskIndexObjects), prev.GCSDiskIndexObjects)
+			}
+			// bazel_cache should be carried forward from pause 1 (unchanged).
+			if prev.GCSDiskIndexObjects["bazel_cache"] != meta1.GCSDiskIndexObjects["bazel_cache"] {
+				t.Errorf("bazel_cache should be carried forward from pause 1: got %q, want %q",
+					prev.GCSDiskIndexObjects["bazel_cache"], meta1.GCSDiskIndexObjects["bazel_cache"])
+			}
+			// git_drive should have the new pause 2 path.
+			if prev.GCSDiskIndexObjects["git_drive"] != "v1/wk123/runner_state/runner-1/pause2-git_drive-disk.json" {
+				t.Errorf("git_drive should have pause 2 path: got %q", prev.GCSDiskIndexObjects["git_drive"])
 			}
 		}
 	}
