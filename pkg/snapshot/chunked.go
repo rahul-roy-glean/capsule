@@ -94,8 +94,9 @@ type ChunkedSnapshotMetadata struct {
 	// file-backed mem_backend instead of UFFD lazy loading.
 	// MemChunks will be empty/nil for new-style snapshots.
 	MemFilePath string `json:"mem_file_path,omitempty"`
-	// RepoCacheSeedChunks holds chunks for the shared Bazel repo cache seed image
-	RepoCacheSeedChunks []ChunkRef `json:"repo_cache_seed_chunks,omitempty"`
+	// ExtensionDrives holds chunks for extension block devices, keyed by DriveID.
+	// Replaces the old RepoCacheSeedChunks field.
+	ExtensionDrives map[string]ExtensionDrive `json:"extension_drives,omitempty"`
 	// RootfsSourceHash is the SHA-256 hash of the original base rootfs.img used
 	// to build this snapshot. Used by incremental builds to detect rootfs changes
 	// and fall back to cold boot when the base image has been updated.
@@ -1139,7 +1140,9 @@ func (b *ChunkedSnapshotBuilder) getMemStore() *ChunkStore {
 
 // BuildChunkedSnapshot creates a chunked snapshot from traditional snapshot files.
 // workloadKey is used for scoping GCS paths under {workloadKey}/snapshot_state/{version}/.
-func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths *SnapshotPaths, version, workloadKey string) (*ChunkedSnapshotMetadata, error) {
+// driveSpecs lists extension drives to chunk; each spec's image is expected at
+// paths.ExtensionDriveImages[spec.DriveID].
+func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths *SnapshotPaths, driveSpecs []DriveSpec, version, workloadKey string) (*ChunkedSnapshotMetadata, error) {
 	b.logger.WithField("version", version).Info("Building chunked snapshot")
 	start := time.Now()
 
@@ -1217,23 +1220,39 @@ func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths
 	rootfsStat, _ := os.Stat(paths.Rootfs)
 	meta.TotalDiskSize = rootfsStat.Size()
 
-	// Chunk repo cache seed if present
-	if paths.RepoCacheSeed != "" {
-		b.logger.Info("Chunking repo cache seed...")
-		seedChunks, err := b.store.ChunkFile(ctx, paths.RepoCacheSeed, DefaultChunkSize)
-		if err != nil {
-			return nil, fmt.Errorf("failed to chunk repo cache seed: %w", err)
+	// Chunk extension drives
+	if len(driveSpecs) > 0 {
+		meta.ExtensionDrives = make(map[string]ExtensionDrive, len(driveSpecs))
+		for _, spec := range driveSpecs {
+			imgPath, ok := paths.ExtensionDriveImages[spec.DriveID]
+			if !ok || imgPath == "" {
+				continue
+			}
+			b.logger.WithField("drive_id", spec.DriveID).Info("Chunking extension drive...")
+			driveChunks, err := b.store.ChunkFile(ctx, imgPath, DefaultChunkSize)
+			if err != nil {
+				return nil, fmt.Errorf("failed to chunk extension drive %s: %w", spec.DriveID, err)
+			}
+			driveStat, _ := os.Stat(imgPath)
+			var driveSize int64
+			if driveStat != nil {
+				driveSize = driveStat.Size()
+			}
+			meta.ExtensionDrives[spec.DriveID] = ExtensionDrive{
+				Chunks:    driveChunks,
+				ReadOnly:  spec.ReadOnly,
+				SizeBytes: driveSize,
+			}
 		}
-		meta.RepoCacheSeedChunks = seedChunks
 	}
 
 	duration := time.Since(start)
 	b.logger.WithFields(logrus.Fields{
-		"version":       version,
-		"duration":      duration,
-		"mem_file_path": meta.MemFilePath,
-		"disk_chunks":   len(meta.RootfsChunks),
-		"total_chunks":  len(meta.RootfsChunks) + len(meta.RepoCacheSeedChunks) + 2,
+		"version":          version,
+		"duration":         duration,
+		"mem_file_path":    meta.MemFilePath,
+		"disk_chunks":      len(meta.RootfsChunks),
+		"extension_drives": len(meta.ExtensionDrives),
 	}).Info("Chunked snapshot built successfully")
 
 	return meta, nil

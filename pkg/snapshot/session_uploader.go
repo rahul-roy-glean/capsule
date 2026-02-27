@@ -512,6 +512,62 @@ func (u *SessionChunkUploader) WriteManifest(
 	return nil
 }
 
+// WriteManifestWithExtensions uploads SnapshotManifest and all ChunkIndex JSON files to GCS.
+// extDiskIndexes maps driveID to ChunkIndex for each dirty extension drive.
+// Per-drive disk indexes are stored at {gcsBase}/{driveID}-disk.json.
+func (u *SessionChunkUploader) WriteManifestWithExtensions(
+	ctx context.Context,
+	gcsBase string,
+	manifest *SnapshotManifest,
+	memIndex *ChunkIndex,
+	extDiskIndexes map[string]*ChunkIndex,
+) error {
+	if u.memStore == nil {
+		return fmt.Errorf("mem chunk store not configured")
+	}
+
+	bucket := u.memStore.gcsClient.Bucket(u.gcsBucket)
+
+	uploadJSON := func(objPath string, v any) error {
+		data, err := json.MarshalIndent(v, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshal %s: %w", objPath, err)
+		}
+		w := bucket.Object(objPath).NewWriter(ctx)
+		w.ContentType = "application/json"
+		if _, err := w.Write(data); err != nil {
+			w.Close()
+			return fmt.Errorf("write %s: %w", objPath, err)
+		}
+		return w.Close()
+	}
+
+	memIdxPath := u.prefixedPath(gcsBase + "/chunked-metadata.json")
+	if err := uploadJSON(memIdxPath, memIndex); err != nil {
+		return fmt.Errorf("failed to upload mem chunk index: %w", err)
+	}
+
+	for driveID, diskIdx := range extDiskIndexes {
+		diskIdxPath := u.prefixedPath(gcsBase + "/" + driveID + "-disk.json")
+		if err := uploadJSON(diskIdxPath, diskIdx); err != nil {
+			return fmt.Errorf("failed to upload disk chunk index for drive %s: %w", driveID, err)
+		}
+	}
+
+	manifestPath := u.prefixedPath(gcsBase + "/snapshot_manifest.json")
+	if err := uploadJSON(manifestPath, manifest); err != nil {
+		return fmt.Errorf("failed to upload snapshot manifest: %w", err)
+	}
+
+	u.logger.WithFields(logrus.Fields{
+		"gcs_base": gcsBase,
+		"mem_idx":  memIdxPath,
+		"manifest": manifestPath,
+	}).Info("WriteManifestWithExtensions complete")
+
+	return nil
+}
+
 // DownloadChunkIndex downloads and unmarshals a ChunkIndex from a GCS object path.
 func (u *SessionChunkUploader) DownloadChunkIndex(ctx context.Context, gcsObjectPath string) (*ChunkIndex, error) {
 	if u.memStore == nil {

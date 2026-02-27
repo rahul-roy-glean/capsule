@@ -35,3 +35,17 @@ func ComputeWorkloadKey(commands []SnapshotCommand) string {
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])[:16]
 }
+
+// ComputeDerivedWorkloadKey returns a stable 16-char hex key for a derived
+// workload. DriveSpecs are sorted by DriveID before hashing so insertion order
+// does not matter.
+func ComputeDerivedWorkloadKey(baseKey string, driveSpecs []DriveSpec) string {
+	sorted := make([]DriveSpec, len(driveSpecs))
+	copy(sorted, driveSpecs)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].DriveID < sorted[j].DriveID
+	})
+	b, _ := json.Marshal(sorted)
+	h := sha256.Sum256([]byte(baseKey + string(b)))
+	return hex.EncodeToString(h[:])[:16]
+}

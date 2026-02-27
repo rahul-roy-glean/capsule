@@ -259,98 +259,69 @@ func TestRemoveRunnerLabels_NoRunners(t *testing.T) {
 	}
 }
 
-func TestBuildDrives_WithGitCache(t *testing.T) {
+func TestBuildDrives_CredentialsOnly(t *testing.T) {
 	m := newTestManager(func(m *Manager) {
 		m.credentialsImage = "/path/to/creds.img"
-		m.gitCacheImage = "/path/to/git-cache.img"
 	})
 
-	drives := m.buildDrives("/path/to/seed.img", "/path/to/upper.img")
+	drives := m.buildDrives(nil)
 
-	if len(drives) != 4 {
-		t.Fatalf("buildDrives() returned %d drives, want 4", len(drives))
+	if len(drives) != 1 {
+		t.Fatalf("buildDrives(nil) returned %d drives, want 1", len(drives))
 	}
-
-	// Check drive IDs
-	wantIDs := []string{"repo_cache_seed", "repo_cache_upper", "credentials", "git_cache"}
-	for i, wantID := range wantIDs {
-		if drives[i].DriveID != wantID {
-			t.Errorf("drives[%d].DriveID = %q, want %q", i, drives[i].DriveID, wantID)
-		}
+	if drives[0].DriveID != "credentials" {
+		t.Errorf("drives[0].DriveID = %q, want %q", drives[0].DriveID, "credentials")
 	}
-
-	// Check repo_cache_seed is read-only
 	if !drives[0].IsReadOnly {
-		t.Error("repo_cache_seed should be read-only")
+		t.Error("credentials drive should be read-only")
 	}
-	// Check repo_cache_upper is writable
-	if drives[1].IsReadOnly {
-		t.Error("repo_cache_upper should be writable")
-	}
-	// Check credentials is read-only
-	if !drives[2].IsReadOnly {
-		t.Error("credentials should be read-only")
-	}
-	// Check git_cache is read-only
-	if !drives[3].IsReadOnly {
-		t.Error("git_cache should be read-only")
+	if drives[0].IsRootDevice {
+		t.Error("credentials drive should not be root device")
 	}
 }
 
-func TestBuildDrives_WithoutGitCache(t *testing.T) {
+func TestBuildDrives_WithExtensionDrives(t *testing.T) {
 	m := newTestManager(func(m *Manager) {
 		m.credentialsImage = "/path/to/creds.img"
-		m.gitCacheImage = "" // no git cache
-		m.config.WorkspaceDir = t.TempDir()
 	})
 
-	drives := m.buildDrives("/path/to/seed.img", "/path/to/upper.img")
+	ext := map[string]string{
+		"git_drive":   "/path/to/git.img",
+		"bazel_cache": "/path/to/bazel.img",
+	}
+	drives := m.buildDrives(ext)
 
-	// Without a git cache image, buildDrives calls getOrCreateGitCachePlaceholder which
-	// tries to create an ext4 image. On macOS (or systems without mkfs.ext4) this will
-	// fail silently and return only 3 drives. On Linux it would return 4.
-	if len(drives) < 3 {
-		t.Fatalf("buildDrives() returned %d drives, want at least 3", len(drives))
+	// credentials + 2 extension drives (sorted)
+	if len(drives) != 3 {
+		t.Fatalf("buildDrives() returned %d drives, want 3", len(drives))
 	}
 
-	// First 3 drives should always be present
-	wantIDs := []string{"repo_cache_seed", "repo_cache_upper", "credentials"}
-	for i, wantID := range wantIDs {
-		if drives[i].DriveID != wantID {
-			t.Errorf("drives[%d].DriveID = %q, want %q", i, drives[i].DriveID, wantID)
-		}
+	// First drive is always credentials
+	if drives[0].DriveID != "credentials" {
+		t.Errorf("drives[0].DriveID = %q, want %q", drives[0].DriveID, "credentials")
 	}
-}
 
-func TestBuildDrives_PathsCorrect(t *testing.T) {
-	m := newTestManager(func(m *Manager) {
-		m.credentialsImage = "/creds/image.img"
-		m.gitCacheImage = "/git/cache.img"
-	})
-
-	drives := m.buildDrives("/seed/path.img", "/upper/path.img")
-
-	if drives[0].PathOnHost != "/seed/path.img" {
-		t.Errorf("repo_cache_seed path = %q, want %q", drives[0].PathOnHost, "/seed/path.img")
+	// Extension drives should be in sorted order
+	if drives[1].DriveID != "bazel_cache" {
+		t.Errorf("drives[1].DriveID = %q, want %q", drives[1].DriveID, "bazel_cache")
 	}
-	if drives[1].PathOnHost != "/upper/path.img" {
-		t.Errorf("repo_cache_upper path = %q, want %q", drives[1].PathOnHost, "/upper/path.img")
+	if drives[2].DriveID != "git_drive" {
+		t.Errorf("drives[2].DriveID = %q, want %q", drives[2].DriveID, "git_drive")
 	}
-	if drives[2].PathOnHost != "/creds/image.img" {
-		t.Errorf("credentials path = %q, want %q", drives[2].PathOnHost, "/creds/image.img")
+	if drives[1].PathOnHost != "/path/to/bazel.img" {
+		t.Errorf("bazel_cache path = %q, want %q", drives[1].PathOnHost, "/path/to/bazel.img")
 	}
-	if drives[3].PathOnHost != "/git/cache.img" {
-		t.Errorf("git_cache path = %q, want %q", drives[3].PathOnHost, "/git/cache.img")
+	if drives[2].PathOnHost != "/path/to/git.img" {
+		t.Errorf("git_drive path = %q, want %q", drives[2].PathOnHost, "/path/to/git.img")
 	}
 }
 
 func TestBuildDrives_NoDrivesAreRootDevice(t *testing.T) {
 	m := newTestManager(func(m *Manager) {
 		m.credentialsImage = "/path/to/creds.img"
-		m.gitCacheImage = "/path/to/git-cache.img"
 	})
 
-	drives := m.buildDrives("/path/to/seed.img", "/path/to/upper.img")
+	drives := m.buildDrives(map[string]string{"ext_drive": "/path/to/ext.img"})
 
 	for i, d := range drives {
 		if d.IsRootDevice {

@@ -587,9 +587,22 @@ func main() {
 			chunkedMeta.RootfsChunks = incrementalRootfsChunks
 			chunkedMeta.TotalDiskSize = int64(len(incrementalRootfsChunks)) * chunkedMeta.ChunkSize
 
-			// Use seed chunks from FUSE if available
+			// Use seed chunks from FUSE if available (as an extension drive)
 			if incrementalSeedChunks != nil {
-				chunkedMeta.RepoCacheSeedChunks = incrementalSeedChunks
+				if chunkedMeta.ExtensionDrives == nil {
+					chunkedMeta.ExtensionDrives = make(map[string]snapshot.ExtensionDrive)
+				}
+				var seedSize int64
+				for _, c := range incrementalSeedChunks {
+					if end := c.Offset + c.Size; end > seedSize {
+						seedSize = end
+					}
+				}
+				chunkedMeta.ExtensionDrives["repo_cache_seed"] = snapshot.ExtensionDrive{
+					Chunks:    incrementalSeedChunks,
+					ReadOnly:  false,
+					SizeBytes: seedSize,
+				}
 			}
 
 			if err := builder.UploadChunkedMetadata(ctx, chunkedMeta); err != nil {
@@ -597,22 +610,33 @@ func main() {
 			}
 
 			log.WithFields(logrus.Fields{
-				"mem_file":    chunkedMeta.MemFilePath,
-				"disk_chunks": len(chunkedMeta.RootfsChunks),
-				"seed_chunks": len(chunkedMeta.RepoCacheSeedChunks),
+				"mem_file":         chunkedMeta.MemFilePath,
+				"disk_chunks":      len(chunkedMeta.RootfsChunks),
+				"extension_drives": len(chunkedMeta.ExtensionDrives),
 			}).Info("Incremental chunked snapshot built and uploaded")
 		} else {
 			// Cold boot: chunk everything from full files on disk
+			legacyDriveSpecs := []snapshot.DriveSpec{}
+			legacyDriveImages := map[string]string{}
+			if _, err := os.Stat(repoCacheSeedImg); err == nil {
+				legacyDriveSpecs = append(legacyDriveSpecs, snapshot.DriveSpec{
+					DriveID:  "repo_cache_seed",
+					Label:    "BAZEL_REPO_SEED",
+					ReadOnly: false,
+				})
+				legacyDriveImages["repo_cache_seed"] = repoCacheSeedImg
+			}
 			snapshotPaths := &snapshot.SnapshotPaths{
-				Kernel:        kernelOutput,
-				Rootfs:        workingRootfs,
-				Mem:           memPath,
-				State:         snapshotPath,
-				RepoCacheSeed: repoCacheSeedImg,
-				Version:       version,
+				Kernel:               kernelOutput,
+				Rootfs:               workingRootfs,
+				Mem:                  memPath,
+				State:                snapshotPath,
+				RepoCacheSeed:        repoCacheSeedImg,
+				Version:              version,
+				ExtensionDriveImages: legacyDriveImages,
 			}
 
-			chunkedMeta, err := builder.BuildChunkedSnapshot(ctx, snapshotPaths, version, workloadKey)
+			chunkedMeta, err := builder.BuildChunkedSnapshot(ctx, snapshotPaths, legacyDriveSpecs, version, workloadKey)
 			if err != nil {
 				log.WithError(err).Fatal("Failed to build chunked snapshot")
 			}
@@ -624,9 +648,9 @@ func main() {
 			}
 
 			log.WithFields(logrus.Fields{
-				"mem_chunks":  len(chunkedMeta.MemChunks),
-				"disk_chunks": len(chunkedMeta.RootfsChunks),
-				"seed_chunks": len(chunkedMeta.RepoCacheSeedChunks),
+				"mem_chunks":       len(chunkedMeta.MemChunks),
+				"disk_chunks":      len(chunkedMeta.RootfsChunks),
+				"extension_drives": len(chunkedMeta.ExtensionDrives),
 			}).Info("Chunked snapshot built and uploaded")
 		}
 	}
@@ -1083,7 +1107,7 @@ func restoreFromPreviousSnapshot(
 	log.WithFields(logrus.Fields{
 		"version":       chunkedMeta.Version,
 		"rootfs_chunks": len(chunkedMeta.RootfsChunks),
-		"seed_chunks":   len(chunkedMeta.RepoCacheSeedChunks),
+		"extension_drives": len(chunkedMeta.ExtensionDrives),
 	}).Info("Loaded previous chunked snapshot metadata")
 
 	// Check if base rootfs has changed since previous snapshot.
@@ -1183,13 +1207,13 @@ func restoreFromPreviousSnapshot(
 	}
 	log.Info("Mounted FUSE-backed rootfs from previous snapshot")
 
-	// 6. Mount repo-cache-seed via FUSE (if chunks exist)
+	// 6. Mount repo-cache-seed via FUSE (if chunks exist in extension drives)
 	var fuseSeedDisk *fuse.ChunkedDisk
 	var repoCacheSeedPath string
-	if len(chunkedMeta.RepoCacheSeedChunks) > 0 {
+	if seedExt, ok := chunkedMeta.ExtensionDrives["repo_cache_seed"]; ok && len(seedExt.Chunks) > 0 {
 		fuseSeedMountDir := filepath.Join(incrDir, "fuse-seed")
 		var totalSeedSize int64
-		for _, c := range chunkedMeta.RepoCacheSeedChunks {
+		for _, c := range seedExt.Chunks {
 			end := c.Offset + c.Size
 			if end > totalSeedSize {
 				totalSeedSize = end
@@ -1198,7 +1222,7 @@ func restoreFromPreviousSnapshot(
 
 		fuseSeedDisk, err = fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
 			ChunkStore: chunkStore,
-			Chunks:     chunkedMeta.RepoCacheSeedChunks,
+			Chunks:     seedExt.Chunks,
 			TotalSize:  totalSeedSize,
 			ChunkSize:  chunkedMeta.ChunkSize,
 			MountPoint: fuseSeedMountDir,

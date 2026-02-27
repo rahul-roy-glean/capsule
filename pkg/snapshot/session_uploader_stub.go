@@ -44,6 +44,11 @@ func (u *SessionChunkUploader) WriteManifest(ctx context.Context, gcsBase string
 	return fmt.Errorf("SessionChunkUploader: WriteManifest not supported on non-Linux platforms")
 }
 
+// WriteManifestWithExtensions is a stub.
+func (u *SessionChunkUploader) WriteManifestWithExtensions(ctx context.Context, gcsBase string, manifest *SnapshotManifest, memIndex *ChunkIndex, extDiskIndexes map[string]*ChunkIndex) error {
+	return fmt.Errorf("SessionChunkUploader: WriteManifestWithExtensions not supported on non-Linux platforms")
+}
+
 // DownloadChunkIndex is a stub.
 func (u *SessionChunkUploader) DownloadChunkIndex(ctx context.Context, gcsObjectPath string) (*ChunkIndex, error) {
 	return nil, fmt.Errorf("SessionChunkUploader: DownloadChunkIndex not supported on non-Linux platforms")

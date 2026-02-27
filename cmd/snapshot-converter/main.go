@@ -142,7 +142,7 @@ func main() {
 
 	// Build chunked snapshot
 	log.Info("Building chunked snapshot (this may take a while for large snapshots)...")
-	meta, err := builder.BuildChunkedSnapshot(ctx, paths, *snapshotVersion, *workloadKeyFlag)
+	meta, err := builder.BuildChunkedSnapshot(ctx, paths, nil, *snapshotVersion, *workloadKeyFlag)
 	if err != nil {
 		log.WithError(err).Fatal("Failed to build chunked snapshot")
 	}
@@ -169,7 +169,7 @@ func main() {
 	duration := time.Since(startTime)
 
 	// Calculate statistics
-	totalChunks := len(meta.MemChunks) + len(meta.RootfsChunks) + len(meta.RepoCacheSeedChunks) + 2 // +2 for kernel and state
+	totalChunks := len(meta.MemChunks) + len(meta.RootfsChunks) + len(meta.ExtensionDrives) + 2 // +2 for kernel and state
 	var totalCompressed int64
 	for _, c := range meta.MemChunks {
 		totalCompressed += c.CompressedSize

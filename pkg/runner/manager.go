@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -76,15 +77,14 @@ type Manager struct {
 	// for session pause uploads. Only populated when sessionMemStore is non-nil.
 	goldenChunkedMeta *snapshot.ChunkedSnapshotMetadata
 
-	// getDirtyDiskChunks is a callback set by ChunkedManager that returns
-	// the dirty FUSE disk chunks for a runner. Nil when FUSE disks are not in use.
-	getDirtyDiskChunks func(runnerID string) map[int][]byte
+	// getDirtyExtensionDiskChunks returns all dirty FUSE extension disk chunks for a runner.
+	// Returns a map of driveID → dirty chunks. Nil when FUSE disks are not in use.
+	getDirtyExtensionDiskChunks func(runnerID string) map[string]map[int][]byte
 
-	// setupFUSEDisk is a callback set by ChunkedManager that creates and mounts
-	// a FUSE-backed disk from chunk refs. Returns the disk image path.
-	// Used by ResumeFromSession for GCS-backed cross-host resume where the
-	// local rootfs overlay doesn't exist.
-	setupFUSEDisk func(runnerID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (diskImagePath string, err error)
+	// setupExtensionFUSEDisk is a callback set by ChunkedManager that creates
+	// and mounts a FUSE-backed disk for a specific extension drive.
+	// Returns the disk image path. Used by ResumeFromSession.
+	setupExtensionFUSEDisk func(runnerID, driveID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (diskImagePath string, err error)
 }
 
 type QuarantineOptions struct {
@@ -508,7 +508,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 			Version:           "V1", // V1 for simple GET requests (thaw-agent uses V1 protocol)
 			NetworkInterfaces: []string{"eth0"},
 		},
-		Drives:      m.buildDrives(snapshotPaths.RepoCacheSeed, repoCacheUpperPath),
+		Drives: m.buildDrives(map[string]string{"repo_cache_upper": repoCacheUpperPath}),
 		LogPath:     runner.LogPath,
 		MetricsPath: runner.MetricsPath,
 	}
@@ -1101,21 +1101,10 @@ func (m *Manager) findAvailableSlot() int {
 }
 
 // buildDrives constructs the list of block devices to attach to a microVM.
-// All drives must be present to match the snapshot's drive layout for restore to work.
-func (m *Manager) buildDrives(repoCacheSeedPath, repoCacheUpperPath string) []firecracker.Drive {
+// extensionDrivePaths maps driveID to host path for extension drives.
+// The credentials drive is always included.
+func (m *Manager) buildDrives(extensionDrivePaths map[string]string) []firecracker.Drive {
 	drives := []firecracker.Drive{
-		{
-			DriveID:      "repo_cache_seed",
-			PathOnHost:   repoCacheSeedPath,
-			IsRootDevice: false,
-			IsReadOnly:   true,
-		},
-		{
-			DriveID:      "repo_cache_upper",
-			PathOnHost:   repoCacheUpperPath,
-			IsRootDevice: false,
-			IsReadOnly:   false,
-		},
 		{
 			DriveID:      "credentials",
 			PathOnHost:   m.credentialsImage,
@@ -1124,19 +1113,18 @@ func (m *Manager) buildDrives(repoCacheSeedPath, repoCacheUpperPath string) []fi
 		},
 	}
 
-	// Always add git-cache drive to match snapshot drive layout.
-	// If no real git-cache image exists, use a placeholder.
-	// This is required for snapshot restore to work (drive IDs must match).
-	gitCacheImg := m.gitCacheImage
-	if gitCacheImg == "" {
-		gitCacheImg = m.getOrCreateGitCachePlaceholder()
+	// Append extension drives in deterministic order (sorted by driveID).
+	driveIDs := make([]string, 0, len(extensionDrivePaths))
+	for id := range extensionDrivePaths {
+		driveIDs = append(driveIDs, id)
 	}
-	if gitCacheImg != "" {
+	sort.Strings(driveIDs)
+	for _, id := range driveIDs {
 		drives = append(drives, firecracker.Drive{
-			DriveID:      "git_cache",
-			PathOnHost:   gitCacheImg,
+			DriveID:      id,
+			PathOnHost:   extensionDrivePaths[id],
 			IsRootDevice: false,
-			IsReadOnly:   true,
+			IsReadOnly:   false,
 		})
 	}
 

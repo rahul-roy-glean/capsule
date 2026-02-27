@@ -17,14 +17,20 @@ type SnapshotManifest struct {
 		TotalSizeBytes   int64  `json:"total_size_bytes"`
 		ChunkIndexObject string `json:"chunk_index_object"`
 	} `json:"memory"`
-	Disk struct {
-		Mode             string `json:"mode,omitempty"`
-		TotalSizeBytes   int64  `json:"total_size_bytes,omitempty"`
-		ChunkIndexObject string `json:"chunk_index_object,omitempty"`
-	} `json:"disk"`
-	Integrity struct {
+	// Disk covers the rootfs dirty overlay.
+	Disk DiskSection `json:"disk"`
+	// ExtensionDisks covers per-drive dirty overlays for writable extension drives.
+	ExtensionDisks map[string]DiskSection `json:"extension_disks,omitempty"`
+	Integrity      struct {
 		Algo string `json:"algo"`
 	} `json:"integrity"`
+}
+
+// DiskSection describes a single disk region in a SnapshotManifest.
+type DiskSection struct {
+	Mode             string `json:"mode,omitempty"`
+	TotalSizeBytes   int64  `json:"total_size_bytes,omitempty"`
+	ChunkIndexObject string `json:"chunk_index_object,omitempty"`
 }
 
 // ChunkIndex is the session-specific memory/disk index written during pause.
