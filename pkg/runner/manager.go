@@ -432,14 +432,17 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 
 	// Create per-runner writable repo cache layer image (upperdir/workdir lives here)
 	repoCacheStart := time.Now()
-	repoCacheUpperPath := filepath.Join(m.config.WorkspaceDir, runnerID, "repo-cache-upper.img")
-	if err := os.MkdirAll(filepath.Dir(repoCacheUpperPath), 0755); err != nil {
-		m.cleanupRunner(runnerID, tap.Name, overlayPath, "")
-		return nil, fmt.Errorf("failed to create repo-cache-upper directory: %w", err)
-	}
-	if err := createExt4Image(repoCacheUpperPath, m.config.Bazel.RepoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
-		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
-		return nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
+	var repoCacheUpperPath string
+	if m.config.Bazel.RepoCacheUpperSizeGB > 0 {
+		repoCacheUpperPath = filepath.Join(m.config.WorkspaceDir, runnerID, "repo-cache-upper.img")
+		if err := os.MkdirAll(filepath.Dir(repoCacheUpperPath), 0755); err != nil {
+			m.cleanupRunner(runnerID, tap.Name, overlayPath, "")
+			return nil, fmt.Errorf("failed to create repo-cache-upper directory: %w", err)
+		}
+		if err := createExt4Image(repoCacheUpperPath, m.config.Bazel.RepoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
+			m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+			return nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
+		}
 	}
 	repoCacheDur := time.Since(repoCacheStart)
 
@@ -490,6 +493,10 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	}).Debug("Configuring kernel network boot args")
 
 	// Create VM configuration
+	extensionPaths := make(map[string]string)
+	if repoCacheUpperPath != "" {
+		extensionPaths["repo_cache_upper"] = repoCacheUpperPath
+	}
 	vmCfg := firecracker.VMConfig{
 		VMID:           runnerID,
 		SocketDir:      m.config.SocketDir,
@@ -508,7 +515,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 			Version:           "V1", // V1 for simple GET requests (thaw-agent uses V1 protocol)
 			NetworkInterfaces: []string{"eth0"},
 		},
-		Drives: m.buildDrives(map[string]string{"repo_cache_upper": repoCacheUpperPath}),
+		Drives: m.buildDrives(extensionPaths),
 		LogPath:     runner.LogPath,
 		MetricsPath: runner.MetricsPath,
 	}
