@@ -2,9 +2,10 @@
 .PHONY: packer-init packer-validate packer-build firecracker-manager-linux release-host-image mig-rolling-update
 .PHONY: onboard onboard-validate bin-onboard
 .PHONY: firecracker-manager control-plane snapshot-builder thaw-agent
-.PHONY: git-cache-builder git-cache-freshness data-snapshot-builder snapshot-converter
+.PHONY: git-cache-builder git-cache-freshness data-snapshot-builder snapshot-converter derive-snapshot
 .PHONY: test-unit test-race test-cover test-integration test-all check
 .PHONY: dev-up dev-build dev-snapshot dev-stack dev-test-exec dev-test-pause-resume dev-test-multi-pause-dedup dev-stop
+.PHONY: dev-test-derive-snapshot dev-test-extension-drives
 .PHONY: dev-setup dev-provision
 
 # Variables
@@ -23,7 +24,7 @@ GOARCH_TARGET ?= amd64
 export PATH := /usr/local/go/bin:$(PATH)
 
 # Binaries
-BINARIES := firecracker-manager control-plane snapshot-builder thaw-agent git-cache-builder git-cache-freshness data-snapshot-builder snapshot-converter bin-onboard
+BINARIES := firecracker-manager control-plane snapshot-builder thaw-agent git-cache-builder git-cache-freshness data-snapshot-builder snapshot-converter derive-snapshot bin-onboard
 
 all: build
 
@@ -55,6 +56,9 @@ data-snapshot-builder:
 
 snapshot-converter:
 	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/snapshot-converter ./cmd/snapshot-converter
+
+derive-snapshot:
+	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/derive-snapshot ./cmd/derive-snapshot
 
 bin-onboard:
 	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/onboard ./cmd/onboard
@@ -350,6 +354,8 @@ help:
 	@echo "  dev-snapshot-local   - Build full snapshot for restore testing"
 	@echo "  dev-stack-local      - Start control-plane + firecracker-manager"
 	@echo "  dev-test-exec-local  - Run E2E exec test"
+	@echo "  dev-test-derive-snapshot-local - Run E2E derive-snapshot test"
+	@echo "  dev-test-extension-drives-local - Run E2E extension drives test"
 	@echo "  dev-stop-local       - Stop the stack"
 	@echo ""
 	@echo "Example workflow (disk snapshots):"
@@ -399,6 +405,14 @@ dev-test-pause-resume:
 dev-test-multi-pause-dedup:
 	$(LIMA_EXEC) bash dev/test-multi-pause-dedup.sh
 
+# Run E2E derive-snapshot test via Lima VM
+dev-test-derive-snapshot:
+	$(LIMA_EXEC) bash dev/test-derive-snapshot.sh
+
+# Run E2E extension drives test via Lima VM
+dev-test-extension-drives:
+	$(LIMA_EXEC) bash dev/test-extension-drives.sh
+
 # Stop the stack inside Lima VM
 dev-stop:
 	$(LIMA_EXEC) bash dev/stop-stack.sh
@@ -443,6 +457,14 @@ dev-test-pause-resume-local:
 # Run E2E multi-pause chunk dedup test directly on Linux
 dev-test-multi-pause-dedup-local:
 	bash dev/test-multi-pause-dedup.sh
+
+# Run E2E derive-snapshot test directly on Linux
+dev-test-derive-snapshot-local:
+	bash dev/test-derive-snapshot.sh
+
+# Run E2E extension drives test directly on Linux
+dev-test-extension-drives-local:
+	bash dev/test-extension-drives.sh
 
 # Stop the stack directly on Linux
 dev-stop-local:

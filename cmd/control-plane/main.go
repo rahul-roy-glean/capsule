@@ -816,14 +816,16 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 
 	// Update session_snapshots table
 	if resp.SessionId != "" {
-		_, _ = s.scheduler.db.ExecContext(r.Context(), `
+		if _, dbErr := s.scheduler.db.ExecContext(r.Context(), `
 			INSERT INTO session_snapshots (session_id, runner_id, workload_key, host_id, status, layer_count, paused_at)
 			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW())
 			ON CONFLICT (session_id) DO UPDATE SET
 				status = 'suspended',
 				layer_count = EXCLUDED.layer_count,
 				paused_at = NOW()
-		`, resp.SessionId, req.RunnerID, runner.WorkloadKey, host.ID, resp.Layer+1)
+		`, resp.SessionId, req.RunnerID, runner.WorkloadKey, host.ID, resp.Layer+1); dbErr != nil {
+			s.logger.WithError(dbErr).WithField("session_id", resp.SessionId).Error("Failed to update session_snapshots table")
+		}
 	}
 
 	// Roll back optimistic resource reservation — a paused runner no longer

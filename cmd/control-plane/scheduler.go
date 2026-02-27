@@ -474,6 +474,13 @@ func (s *Scheduler) ReleaseRunner(ctx context.Context, runnerID string, destroy 
 		s.hostRegistry.mu.Unlock()
 	}
 
+	// Clean up session_snapshots row so stale entries don't accumulate.
+	if s.db != nil {
+		if _, dbErr := s.db.ExecContext(ctx, `DELETE FROM session_snapshots WHERE runner_id = $1`, runnerID); dbErr != nil {
+			s.logger.WithError(dbErr).WithField("runner_id", runnerID).Warn("Failed to clean up session_snapshots on release")
+		}
+	}
+
 	return nil
 }
 

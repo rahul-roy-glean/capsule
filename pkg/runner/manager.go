@@ -462,6 +462,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		TapDevice:       tap.Name,
 		MAC:             tap.MAC,
 		SnapshotVersion: snapshotPaths.Version,
+		WorkloadKey:     req.WorkloadKey,
 		GitHubRepo:      req.Repo, // For pool key matching
 		Resources:       req.Resources,
 		CreatedAt:       time.Now(),

@@ -1268,10 +1268,11 @@ func regenerateHostname(runnerID string) error {
 }
 
 // watchForSnapshotRestore polls MMDS for a current_time field and syncs the
-// guest clock when it appears. After snapshot restore, the thaw-agent process
-// resumes from where it was paused (at select{} in main). The host manager
-// sets new MMDS data (including current_time) after restore. This goroutine
-// detects that and syncs the clock so GitHub runner registration can succeed.
+// guest clock and network when it changes. After a diff snapshot resume, the
+// thaw-agent process continues from where it was paused (at select{} in main).
+// The host manager sets new MMDS data (including current_time and network
+// config) after restore. This goroutine detects that, syncs the clock, and
+// reconfigures the guest network to match the new TAP slot.
 func watchForSnapshotRestore() {
 	endpoint := *mmdsEndpoint + "/latest/meta/current_time"
 	lastTime := ""
@@ -1335,6 +1336,22 @@ func watchForSnapshotRestore() {
 			"source":      "mmds-watcher",
 			"server_time": hostTime.UTC().Format(time.RFC3339),
 		}).Info("Clock synced from MMDS after snapshot restore")
+
+		// Reconfigure network — the VM may have been resumed on a different
+		// TAP slot with a new IP. Without this, the guest retains the old IP
+		// and cannot receive traffic.
+		newData, fetchErr := fetchMMDSData()
+		if fetchErr != nil {
+			log.WithError(fetchErr).Warn("watchForSnapshotRestore: failed to fetch MMDS for network reconfig")
+			continue
+		}
+		if !*skipNetwork && newData.Latest.Network.IP != "" {
+			if err := configureNetwork(newData); err != nil {
+				log.WithError(err).Warn("watchForSnapshotRestore: network reconfiguration failed")
+			} else {
+				log.WithField("new_ip", newData.Latest.Network.IP).Info("Network reconfigured after snapshot restore")
+			}
+		}
 	}
 }
 
