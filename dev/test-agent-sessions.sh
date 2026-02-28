@@ -172,10 +172,10 @@ CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/snapshot-configs" \
   -d '{
     "display_name": "agent-sandbox-test",
     "commands": [
-      {"type":"git-clone","args":["https://github.com/pallets/markupsafe","main"]},
-      {"type":"git-clone","args":["https://github.com/sindresorhus/is-odd","main"]},
+      {"type":"shell","args":["git","clone","--depth=1","--branch","main","https://github.com/pallets/markupsafe","/workspace/markupsafe"]},
+      {"type":"shell","args":["git","clone","--depth=1","--branch","main","https://github.com/sindresorhus/camelcase","/workspace/camelcase"]},
       {"type":"shell","args":["pip3","install","-e","/workspace/markupsafe"],"run_as_root":true},
-      {"type":"shell","args":["bash","-c","cd /workspace/is-odd && npm install"]}
+      {"type":"shell","args":["bash","-c","cd /workspace/camelcase && npm install"]}
     ],
     "runner_ttl_seconds": 300,
     "auto_pause": true,
@@ -259,11 +259,11 @@ else
   echo "  Output: $MARKUPSAFE_OUT"
 fi
 
-ISODD_OUT=$(vm_exec "$RUNNER_ID" "[\"ls\",\"/workspace/is-odd/package.json\"]")
+ISODD_OUT=$(vm_exec "$RUNNER_ID" "[\"ls\",\"/workspace/camelcase/package.json\"]")
 if echo "$ISODD_OUT" | grep -q "package.json"; then
-  pass "is-odd repo cloned with package.json"
+  pass "camelcase repo cloned with package.json"
 else
-  fail "is-odd repo not found or missing package.json"
+  fail "camelcase repo not found or missing package.json"
   echo "  Output: $ISODD_OUT"
 fi
 
@@ -380,12 +380,12 @@ fi
 header "11. Claude reads Node.js repo"
 # ---------------------------------------------------------------------------
 if [ "$CLAUDE_AVAILABLE" = "true" ]; then
-  CLAUDE_NODE=$(run_claude "$RUNNER_ID" "/workspace/is-odd" \
+  CLAUDE_NODE=$(run_claude "$RUNNER_ID" "/workspace/camelcase" \
     "Read index.js and explain what this module does in one sentence.")
   CLAUDE_NODE_STATUS=$(check_claude_output "$CLAUDE_NODE")
 
   case "$CLAUDE_NODE_STATUS" in
-    ok)   pass "Claude read is-odd and produced output" ;;
+    ok)   pass "Claude read camelcase and produced output" ;;
     skip) skip "Claude auth failed for Node.js repo read" ;;
     fail) fail "Exec transport broken for Claude Node.js command" ;;
   esac
@@ -584,11 +584,11 @@ else
   fail "markupsafe repo missing after resume"
 fi
 
-ISODD_RESUME=$(vm_exec "$RESUME_RUNNER_ID" "[\"ls\",\"/workspace/is-odd/package.json\"]")
+ISODD_RESUME=$(vm_exec "$RESUME_RUNNER_ID" "[\"ls\",\"/workspace/camelcase/package.json\"]")
 if echo "$ISODD_RESUME" | grep -q "package.json"; then
-  pass "is-odd repo intact after resume"
+  pass "camelcase repo intact after resume"
 else
-  fail "is-odd repo missing after resume"
+  fail "camelcase repo missing after resume"
 fi
 
 # ---------------------------------------------------------------------------
@@ -731,11 +731,11 @@ else
   fail "markupsafe repo lost after multi-layer resume"
 fi
 
-ISODD_ML=$(vm_exec "$RESUME2_RUNNER_ID" "[\"ls\",\"/workspace/is-odd/package.json\"]")
+ISODD_ML=$(vm_exec "$RESUME2_RUNNER_ID" "[\"ls\",\"/workspace/camelcase/package.json\"]")
 if echo "$ISODD_ML" | grep -q "package.json"; then
-  pass "is-odd repo intact after multi-layer resume"
+  pass "camelcase repo intact after multi-layer resume"
 else
-  fail "is-odd repo lost after multi-layer resume"
+  fail "camelcase repo lost after multi-layer resume"
 fi
 
 # =========================================================================

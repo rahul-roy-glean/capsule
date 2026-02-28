@@ -71,12 +71,17 @@ fi
 echo ""
 echo "--- Building golden snapshot with repos baked in ---"
 
-# Snapshot commands: clone repos + install deps
+# Snapshot commands: clone repos + install deps.
+# We use "shell" + git clone instead of "git-clone" because:
+#   1. git-clone uses the repoName/repoName convention (GitHub Actions compat)
+#      which puts repos at /workspace/markupsafe/markupsafe — awkward for agent use
+#   2. git-clone requires a git_token in MMDS for private repos; public repos
+#      work fine with plain git clone + GIT_TERMINAL_PROMPT=0
 SNAPSHOT_COMMANDS='[
-  {"type":"git-clone","args":["https://github.com/pallets/markupsafe","main"]},
-  {"type":"git-clone","args":["https://github.com/sindresorhus/is-odd","main"]},
+  {"type":"shell","args":["git","clone","--depth=1","--branch","main","https://github.com/pallets/markupsafe","/workspace/markupsafe"]},
+  {"type":"shell","args":["git","clone","--depth=1","--branch","main","https://github.com/sindresorhus/camelcase","/workspace/camelcase"]},
   {"type":"shell","args":["pip3","install","-e","/workspace/markupsafe"],"run_as_root":true},
-  {"type":"shell","args":["bash","-c","cd /workspace/is-odd && npm install"]}
+  {"type":"shell","args":["bash","-c","cd /workspace/camelcase && npm install"]}
 ]'
 
 rm -rf "$OUTPUT_DIR"
