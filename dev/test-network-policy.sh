@@ -192,6 +192,16 @@ else
   fail "Unrestricted runner has no network access"
 fi
 
+# Release unrestricted runner — we're done with it for connectivity tests.
+# Keep RUNNER_ID for validation tests in step 15 (runner must still exist).
+# Actually release it now and allocate fresh for validation later.
+curl -sf -X POST "$CP/api/v1/runners/release" \
+  -H 'Content-Type: application/json' \
+  -d "{\"runner_id\":\"$RUNNER_ID\"}" > /dev/null 2>&1 || true
+echo "  (released unrestricted runner to free capacity)"
+# Remove from cleanup list
+RUNNER_IDS=("${RUNNER_IDS[@]/$RUNNER_ID/}")
+
 # =========================================================================
 # PART 2: ci-standard preset enforcement
 # =========================================================================
@@ -282,11 +292,62 @@ else
 fi
 
 # =========================================================================
-# PART 4: deny-default enforcement (positive + negative)
+# PART 4: Quarantine override + emergency kill switch
+# (Uses RUNNER_ID_CI which is still alive from step 6)
 # =========================================================================
 
 # ---------------------------------------------------------------------------
-header "10. Allocate runner with deny-default + allowed CIDR"
+header "10. Quarantine runner (overrides policy)"
+# ---------------------------------------------------------------------------
+QUARANTINE_RESP=$(curl -sf -X POST "$MGR/api/v1/runners/quarantine?runner_id=$RUNNER_ID_CI&block_egress=true&pause_vm=false")
+Q_OK=$(echo "$QUARANTINE_RESP" | jq -r '.success // false')
+[ "$Q_OK" = "true" ] && pass "Runner quarantined" || fail "Quarantine failed: $QUARANTINE_RESP"
+
+# ---------------------------------------------------------------------------
+header "11. Unquarantine runner (restores previous policy)"
+# ---------------------------------------------------------------------------
+UNQ_RESP=$(curl -sf -X POST "$MGR/api/v1/runners/unquarantine?runner_id=$RUNNER_ID_CI&unblock_egress=true&resume_vm=false")
+UQ_OK=$(echo "$UNQ_RESP" | jq -r '.success // false')
+[ "$UQ_OK" = "true" ] && pass "Runner unquarantined" || fail "Unquarantine failed: $UNQ_RESP"
+
+RESTORED=$(curl -s "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID_CI")
+RESTORED_NAME=$(echo "$RESTORED" | jq -r '.policy.name // ""')
+if [ "$RESTORED_NAME" = "custom-deny" ]; then
+  pass "Policy restored to custom-deny after unquarantine"
+else
+  fail "Policy not restored: expected custom-deny, got '$RESTORED_NAME'"
+fi
+
+# ---------------------------------------------------------------------------
+header "12. Emergency block egress (host-level kill switch)"
+# ---------------------------------------------------------------------------
+EMERG_RESP=$(curl -sf -X POST "$MGR/api/v1/runners/quarantine?runner_id=$RUNNER_ID_CI&block_egress=true&pause_vm=false")
+EMERG_OK=$(echo "$EMERG_RESP" | jq -r '.success // false')
+[ "$EMERG_OK" = "true" ] && pass "Emergency egress block applied" || fail "Emergency block failed"
+
+BLOCKED=$(vm_tcp_check_blocked "$RUNNER_ID_CI" "8.8.8.8" "53")
+if echo "$BLOCKED" | grep -q "NET_BLOCKED"; then
+  pass "Emergency block: egress blocked"
+elif echo "$BLOCKED" | grep -q "NET_OK"; then
+  fail "Emergency block: egress NOT blocked"
+else
+  pass "Emergency block: egress appears blocked (timeout)"
+fi
+
+# Unquarantine to clean up, then release ci-standard runner to free capacity
+curl -sf -X POST "$MGR/api/v1/runners/unquarantine?runner_id=$RUNNER_ID_CI&unblock_egress=true&resume_vm=false" > /dev/null
+curl -sf -X POST "$CP/api/v1/runners/release" \
+  -H 'Content-Type: application/json' \
+  -d "{\"runner_id\":\"$RUNNER_ID_CI\"}" > /dev/null 2>&1 || true
+echo "  (released ci-standard runner to free capacity)"
+RUNNER_IDS=("${RUNNER_IDS[@]/$RUNNER_ID_CI/}")
+
+# =========================================================================
+# PART 5: deny-default enforcement (positive + negative)
+# =========================================================================
+
+# ---------------------------------------------------------------------------
+header "13. Allocate runner with deny-default + allowed CIDR"
 # ---------------------------------------------------------------------------
 RUNNER_ID_DENY=$(allocate_and_wait "{
   \"ci_system\":\"none\",
@@ -302,7 +363,7 @@ fi
 sleep 1
 
 # ---------------------------------------------------------------------------
-header "11. deny-default: allowed CIDR reachable (positive)"
+header "14. deny-default: allowed CIDR reachable (positive)"
 # ---------------------------------------------------------------------------
 ALLOW_EXEC=$(vm_tcp_check "$RUNNER_ID_DENY" "8.8.8.8" "53")
 if echo "$ALLOW_EXEC" | grep -q "NET_OK"; then
@@ -312,7 +373,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-header "11b. deny-default: non-allowed IP blocked (negative)"
+header "14b. deny-default: non-allowed IP blocked (negative)"
 # ---------------------------------------------------------------------------
 DENY_EXEC=$(vm_tcp_check_blocked "$RUNNER_ID_DENY" "1.1.1.1" "80")
 echo "  $DENY_EXEC"
@@ -326,54 +387,8 @@ else
 fi
 
 # =========================================================================
-# PART 5: Quarantine override + emergency kill switch
-# =========================================================================
-
-# ---------------------------------------------------------------------------
-header "12. Quarantine runner (overrides policy)"
-# ---------------------------------------------------------------------------
-QUARANTINE_RESP=$(curl -sf -X POST "$MGR/api/v1/runners/quarantine?runner_id=$RUNNER_ID_CI&block_egress=true&pause_vm=false")
-Q_OK=$(echo "$QUARANTINE_RESP" | jq -r '.success // false')
-[ "$Q_OK" = "true" ] && pass "Runner quarantined" || fail "Quarantine failed: $QUARANTINE_RESP"
-
-# ---------------------------------------------------------------------------
-header "13. Unquarantine runner (restores previous policy)"
-# ---------------------------------------------------------------------------
-UNQ_RESP=$(curl -sf -X POST "$MGR/api/v1/runners/unquarantine?runner_id=$RUNNER_ID_CI&unblock_egress=true&resume_vm=false")
-UQ_OK=$(echo "$UNQ_RESP" | jq -r '.success // false')
-[ "$UQ_OK" = "true" ] && pass "Runner unquarantined" || fail "Unquarantine failed: $UNQ_RESP"
-
-RESTORED=$(curl -s "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID_CI")
-RESTORED_NAME=$(echo "$RESTORED" | jq -r '.policy.name // ""')
-if [ "$RESTORED_NAME" = "custom-deny" ]; then
-  pass "Policy restored to custom-deny after unquarantine"
-else
-  fail "Policy not restored: expected custom-deny, got '$RESTORED_NAME'"
-fi
-
-# ---------------------------------------------------------------------------
-header "14. Emergency block egress (host-level kill switch)"
-# ---------------------------------------------------------------------------
-# Emergency block via quarantine (host FORWARD chain DROP on veth)
-EMERG_RESP=$(curl -sf -X POST "$MGR/api/v1/runners/quarantine?runner_id=$RUNNER_ID_CI&block_egress=true&pause_vm=false")
-EMERG_OK=$(echo "$EMERG_RESP" | jq -r '.success // false')
-[ "$EMERG_OK" = "true" ] && pass "Emergency egress block applied" || fail "Emergency block failed"
-
-# Verify egress is dead
-BLOCKED=$(vm_tcp_check_blocked "$RUNNER_ID_CI" "8.8.8.8" "53")
-if echo "$BLOCKED" | grep -q "NET_BLOCKED"; then
-  pass "Emergency block: egress blocked"
-elif echo "$BLOCKED" | grep -q "NET_OK"; then
-  fail "Emergency block: egress NOT blocked"
-else
-  pass "Emergency block: egress appears blocked (timeout)"
-fi
-
-# Unquarantine to restore for cleanup
-curl -sf -X POST "$MGR/api/v1/runners/unquarantine?runner_id=$RUNNER_ID_CI&unblock_egress=true&resume_vm=false" > /dev/null
-
-# =========================================================================
 # PART 6: Validation (HTTP 400 for invalid policies)
+# (Uses RUNNER_ID_DENY which is still alive)
 # =========================================================================
 
 # ---------------------------------------------------------------------------
@@ -382,7 +397,7 @@ header "15. Validate policy API returns HTTP 400 for invalid policies"
 
 # A) Domain rules in allow-default
 HTTP_A=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-  "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID" \
+  "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID_DENY" \
   -H 'Content-Type: application/json' \
   -d '{"policy":{"default_egress_action":"allow","allowed_egress":[{"domains":["github.com"]}]}}')
 echo "  Domain rules in allow-default: HTTP $HTTP_A"
@@ -390,7 +405,7 @@ echo "  Domain rules in allow-default: HTTP $HTTP_A"
 
 # B) Invalid CIDR
 HTTP_B=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-  "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID" \
+  "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID_DENY" \
   -H 'Content-Type: application/json' \
   -d '{"policy":{"default_egress_action":"deny","allowed_egress":[{"cidrs":["not-a-cidr"]}]}}')
 echo "  Invalid CIDR: HTTP $HTTP_B"
@@ -398,14 +413,14 @@ echo "  Invalid CIDR: HTTP $HTTP_B"
 
 # C) Internal CIDR broader than /16
 HTTP_C=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-  "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID" \
+  "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID_DENY" \
   -H 'Content-Type: application/json' \
   -d '{"policy":{"default_egress_action":"deny","internal_access":{"allowed_internal_cidrs":["10.0.0.0/8"]}}}')
 echo "  Internal CIDR /8: HTTP $HTTP_C"
 [ "$HTTP_C" = "400" ] && pass "HTTP 400: internal CIDR broader than /16 rejected" || fail "Expected HTTP 400, got $HTTP_C"
 
 # D) Verify error body includes structured code
-ERR_BODY=$(curl -s -X POST "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID" \
+ERR_BODY=$(curl -s -X POST "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID_DENY" \
   -H 'Content-Type: application/json' \
   -d '{"policy":{"default_egress_action":"allow","allowed_egress":[{"domains":["x.com"]}]}}')
 ERR_CODE=$(echo "$ERR_BODY" | jq -r '.code // ""')
