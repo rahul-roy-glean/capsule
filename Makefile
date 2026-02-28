@@ -8,6 +8,7 @@
 .PHONY: dev-test-derive-snapshot dev-test-extension-drives dev-test-gcs-pause-resume
 .PHONY: dev-test-gcs-rootfs-durability dev-test-file-ops dev-test-pty dev-test-checkpoint
 .PHONY: dev-test-auto-resume dev-test-template-tags dev-test-network-policy
+.PHONY: dev-agent-rootfs dev-agent-snapshot dev-test-agent-sessions dev-test-agent-e2e
 .PHONY: dev-setup dev-provision
 
 # Variables
@@ -438,3 +439,16 @@ dev-test-template-tags:
 
 dev-test-network-policy:
 	bash dev/test-network-policy.sh
+
+# AI Agent Sandbox E2E tests
+dev-agent-rootfs:
+	bash dev/build-agent-rootfs.sh
+
+dev-agent-snapshot:
+	bash dev/test-agent-onboard.sh
+
+dev-test-agent-sessions:
+	bash dev/test-agent-sessions.sh
+
+dev-test-agent-e2e:
+	bash dev/test-agent-e2e.sh
