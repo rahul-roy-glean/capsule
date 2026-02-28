@@ -1649,15 +1649,11 @@ func autoResumeIfSuspended(ctx context.Context, mgr *runner.Manager, log *logrus
 			return nil, fmt.Errorf("auto-resume failed: %w", err)
 		}
 
-		// Wait for thaw-agent to become ready
-		if err := waitForThawAgent(resumed.InternalIP, 30*time.Second); err != nil {
+		// Wait for thaw-agent exec readiness — /alive responds before /exec
+		// is fully functional after snapshot restore, so probe with a real exec.
+		if err := waitForThawAgentExec(resumed.InternalIP, 30*time.Second); err != nil {
 			return nil, fmt.Errorf("thaw-agent not ready after resume: %w", err)
 		}
-
-		// Brief settling period after resume — the thaw-agent's /alive endpoint
-		// may respond before the exec handler is fully ready to process commands
-		// (MMDS re-read, goroutine scheduling after snapshot restore).
-		time.Sleep(2 * time.Second)
 
 		return resumed, nil
 	})
@@ -1671,17 +1667,22 @@ func autoResumeIfSuspended(ctx context.Context, mgr *runner.Manager, log *logrus
 	return result.(*runner.Runner), nil
 }
 
-// waitForThawAgent polls the thaw-agent health endpoint until it returns 200 or the timeout expires.
-func waitForThawAgent(ip net.IP, timeout time.Duration) error {
-	healthURL := fmt.Sprintf("http://%s:%d/alive", ip.String(), snapshot.ThawAgentDebugPort)
-	client := &http.Client{Timeout: 2 * time.Second}
+// waitForThawAgentExec polls the thaw-agent by sending a trivial exec command
+// until it responds successfully. This is more reliable than checking /alive
+// after snapshot restore, because /alive can respond before the exec handler
+// is fully functional.
+func waitForThawAgentExec(ip net.IP, timeout time.Duration) error {
+	execURL := fmt.Sprintf("http://%s:%d/exec", ip.String(), snapshot.ThawAgentDebugPort)
+	client := &http.Client{Timeout: 5 * time.Second}
 	deadline := time.Now().Add(timeout)
+	body := []byte(`{"command":["echo","ready"],"timeout_seconds":3}`)
 
 	for time.Now().Before(deadline) {
-		resp, err := client.Get(healthURL)
+		resp, err := client.Post(execURL, "application/json", bytes.NewReader(body))
 		if err == nil {
+			respBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
+			if resp.StatusCode == http.StatusOK && strings.Contains(string(respBody), "ready") {
 				return nil
 			}
 		}
