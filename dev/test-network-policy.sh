@@ -133,7 +133,7 @@ done
 header "4. Get policy for unrestricted runner (should be empty)"
 # ---------------------------------------------------------------------------
 sleep 1
-POLICY_RESP=$(curl -sf "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID")
+POLICY_RESP=$(curl -s "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID")
 echo "  Response: $POLICY_RESP"
 
 POLICY_VERSION=$(echo "$POLICY_RESP" | jq -r '.version // 0')
@@ -203,7 +203,7 @@ done
 header "7. Verify ci-standard policy is applied"
 # ---------------------------------------------------------------------------
 sleep 1
-CI_POLICY_RESP=$(curl -sf "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID_CI")
+CI_POLICY_RESP=$(curl -s "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID_CI")
 echo "  Response: $CI_POLICY_RESP"
 
 CI_POLICY_VER=$(echo "$CI_POLICY_RESP" | jq -r '.version // 0')
@@ -251,7 +251,7 @@ fi
 # ---------------------------------------------------------------------------
 header "9. Update policy at runtime (switch to deny-default)"
 # ---------------------------------------------------------------------------
-UPDATE_RESP=$(curl -sf -X POST "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID_CI" \
+UPDATE_RESP=$(curl -s -X POST "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID_CI" \
   -H 'Content-Type: application/json' \
   -d '{
     "policy": {
@@ -280,7 +280,7 @@ else
 fi
 
 # Verify the updated policy reads back
-UPDATED_POLICY_RESP=$(curl -sf "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID_CI")
+UPDATED_POLICY_RESP=$(curl -s "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID_CI")
 UPDATED_NAME=$(echo "$UPDATED_POLICY_RESP" | jq -r '.policy.name // ""')
 UPDATED_ACTION=$(echo "$UPDATED_POLICY_RESP" | jq -r '.policy.default_egress_action // ""')
 
@@ -366,7 +366,7 @@ else
 fi
 
 # Verify policy is still the updated custom-deny policy
-RESTORED_POLICY=$(curl -sf "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID_CI")
+RESTORED_POLICY=$(curl -s "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID_CI")
 RESTORED_NAME=$(echo "$RESTORED_POLICY" | jq -r '.policy.name // ""')
 
 if [ "$RESTORED_NAME" = "custom-deny" ]; then
@@ -392,7 +392,7 @@ INVALID_RESP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
 echo "  Domain rules in allow-default: HTTP $INVALID_RESP"
 
 # Even though the response code may be 200 with success=false, check the body
-INVALID_BODY=$(curl -sf -X POST "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID" \
+INVALID_BODY=$(curl -s -X POST "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID" \
   -H 'Content-Type: application/json' \
   -d '{
     "policy": {
@@ -409,7 +409,7 @@ else
 fi
 
 # Invalid CIDR should be rejected
-INVALID_CIDR_BODY=$(curl -sf -X POST "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID" \
+INVALID_CIDR_BODY=$(curl -s -X POST "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID" \
   -H 'Content-Type: application/json' \
   -d '{
     "policy": {
@@ -426,7 +426,7 @@ else
 fi
 
 # Internal CIDR broader than /16 should be rejected
-INVALID_INTERNAL=$(curl -sf -X POST "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID" \
+INVALID_INTERNAL=$(curl -s -X POST "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID" \
   -H 'Content-Type: application/json' \
   -d '{
     "policy": {
