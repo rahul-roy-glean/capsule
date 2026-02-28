@@ -1668,7 +1668,7 @@ func autoResumeIfSuspended(ctx context.Context, mgr *runner.Manager, log *logrus
 
 // waitForThawAgent polls the thaw-agent health endpoint until it returns 200 or the timeout expires.
 func waitForThawAgent(ip net.IP, timeout time.Duration) error {
-	healthURL := fmt.Sprintf("http://%s:%d/", ip.String(), snapshot.ThawAgentHealthPort)
+	healthURL := fmt.Sprintf("http://%s:%d/alive", ip.String(), snapshot.ThawAgentDebugPort)
 	client := &http.Client{Timeout: 2 * time.Second}
 	deadline := time.Now().Add(timeout)
 
