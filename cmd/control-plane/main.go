@@ -157,12 +157,13 @@ func main() {
 	// Create services
 	hostRegistry := NewHostRegistry(db, logger)
 	snapshotManager := NewSnapshotManager(ctx, db, *gcsBucket, *gcsPrefix, gcpProjectVal, gcpZoneVal, logger)
-	scheduler := NewScheduler(hostRegistry, db, snapshotManager, logger)
+	tagRegistry := NewSnapshotTagRegistry(db, logger)
+	scheduler := NewScheduler(hostRegistry, db, snapshotManager, tagRegistry, logger)
 	if metricsClient != nil {
 		scheduler.SetMetricsClient(metricsClient)
 	}
 	jobQueue := NewJobQueue(db, scheduler, hostRegistry, logger)
-	snapshotConfigRegistry := NewSnapshotConfigRegistry(db, snapshotManager, logger)
+	snapshotConfigRegistry := NewSnapshotConfigRegistry(db, snapshotManager, tagRegistry, logger)
 
 	// Load existing state from DB (best-effort)
 	if err := hostRegistry.LoadFromDB(ctx); err != nil {
@@ -462,6 +463,16 @@ func initSchema(db *sql.DB) error {
 		// Drop unused repo/branch columns from runners
 		`ALTER TABLE runners DROP COLUMN IF EXISTS repo`,
 		`ALTER TABLE runners DROP COLUMN IF EXISTS branch`,
+		// Snapshot tags for template versioning (WS6)
+		`CREATE TABLE IF NOT EXISTS snapshot_tags (
+			tag           VARCHAR(64) NOT NULL,
+			workload_key  VARCHAR(16) NOT NULL,
+			version       VARCHAR(255) NOT NULL,
+			description   TEXT DEFAULT '',
+			created_at    TIMESTAMP DEFAULT NOW(),
+			PRIMARY KEY (tag, workload_key)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_snapshot_tags_workload ON snapshot_tags(workload_key)`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil {
@@ -595,6 +606,7 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		WorkloadKey string            `json:"workload_key"`
 		Labels      map[string]string `json:"labels"`
 		SessionID   string            `json:"session_id"`
+		SnapshotTag string            `json:"snapshot_tag"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
@@ -619,6 +631,7 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		WorkloadKey: req.WorkloadKey,
 		Labels:      req.Labels,
 		SessionID:   req.SessionID,
+		SnapshotTag: req.SnapshotTag,
 	})
 	if err != nil {
 		s.logger.WithError(err).Error("Manual allocation failed")

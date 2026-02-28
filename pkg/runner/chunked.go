@@ -170,6 +170,8 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 			baseManager.SetSessionStores(memChunkStore, chunkStore, nil)
 			baseManager.getDirtyExtensionDiskChunks = cm.getAllDirtyExtensionDiskChunks
 			baseManager.setupExtensionFUSEDisk = cm.setupExtensionFUSEDiskForRunner
+			baseManager.getDirtyRootfsDiskChunks = cm.getDirtyRootfsDiskChunksCallback
+			baseManager.setupRootfsFUSEDisk = cm.setupRootfsFUSEDiskForRunner
 			cm.chunkedLogger.Info("GCS-backed session pause/resume enabled (stores wired)")
 		}
 
@@ -1234,6 +1236,54 @@ func (cm *ChunkedManager) setupExtensionFUSEDiskForRunner(runnerID, driveID stri
 		"drive_id":  driveID,
 		"chunks":    len(chunks),
 	}).Info("FUSE extension disk mounted for session resume")
+
+	return fuseDisk.DiskImagePath(), nil
+}
+
+// getDirtyRootfsDiskChunksCallback returns dirty FUSE rootfs disk chunks for a runner.
+// Used as a callback by Manager.PauseRunner for GCS-backed rootfs upload.
+func (cm *ChunkedManager) getDirtyRootfsDiskChunksCallback(runnerID string) map[int][]byte {
+	cm.mu.RLock()
+	disk, ok := cm.fuseDisks[runnerID]
+	cm.mu.RUnlock()
+	if !ok || disk == nil {
+		return nil
+	}
+	return disk.GetDirtyChunks()
+}
+
+// setupRootfsFUSEDiskForRunner creates and mounts a FUSE-backed rootfs disk.
+// Used by Manager.ResumeFromSession for GCS-backed cross-host resume.
+func (cm *ChunkedManager) setupRootfsFUSEDiskForRunner(runnerID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (string, error) {
+	fuseMountDir := filepath.Join(cm.config.WorkspaceDir, runnerID, "fuse-rootfs")
+	if err := os.MkdirAll(fuseMountDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create FUSE rootfs mount dir: %w", err)
+	}
+
+	fuseDisk, err := fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
+		ChunkStore: cm.chunkStore,
+		Chunks:     chunks,
+		TotalSize:  totalSize,
+		ChunkSize:  chunkSize,
+		MountPoint: fuseMountDir,
+		Logger:     cm.logger.Logger,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create FUSE rootfs disk: %w", err)
+	}
+
+	if err := fuseDisk.Mount(); err != nil {
+		return "", fmt.Errorf("failed to mount FUSE rootfs disk: %w", err)
+	}
+
+	cm.mu.Lock()
+	cm.fuseDisks[runnerID] = fuseDisk
+	cm.mu.Unlock()
+
+	cm.chunkedLogger.WithFields(logrus.Fields{
+		"runner_id": runnerID,
+		"chunks":    len(chunks),
+	}).Info("FUSE rootfs disk mounted for session resume")
 
 	return fuseDisk.DiskImagePath(), nil
 }

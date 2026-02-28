@@ -294,7 +294,9 @@ func main() {
 			}
 		})
 		http.HandleFunc("/exec", execHandler)
+		http.HandleFunc("/pty", ptyHandler)
 		http.HandleFunc("/service-logs", serviceLogsHandler)
+		registerFileHandlers()
 		if err := http.ListenAndServe(":10501", nil); err != nil {
 			log.WithError(err).Debug("Early health server failed")
 		}

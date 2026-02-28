@@ -775,6 +775,7 @@ type AllocateRunnerRequest struct {
 	SnapshotVersion   string            `protobuf:"bytes,13,opt,name=snapshot_version,json=snapshotVersion,proto3" json:"snapshot_version,omitempty"`        // Explicit version to use; skips current-pointer.json lookup
 	TtlSeconds        int32             `protobuf:"varint,14,opt,name=ttl_seconds,json=ttlSeconds,proto3" json:"ttl_seconds,omitempty"`                      // idle timeout from snapshot config (0 = no timeout)
 	AutoPause         bool              `protobuf:"varint,15,opt,name=auto_pause,json=autoPause,proto3" json:"auto_pause,omitempty"`                         // pause on TTL expiry instead of destroy
+	SnapshotTag       string            `protobuf:"bytes,16,opt,name=snapshot_tag,json=snapshotTag,proto3" json:"snapshot_tag,omitempty"`                       // optional: named tag to resolve snapshot version
 }
 
 func (x *AllocateRunnerRequest) Reset() {
@@ -910,6 +911,13 @@ func (x *AllocateRunnerRequest) GetAutoPause() bool {
 		return x.AutoPause
 	}
 	return false
+}
+
+func (x *AllocateRunnerRequest) GetSnapshotTag() string {
+	if x != nil {
+		return x.SnapshotTag
+	}
+	return ""
 }
 
 // AllocateRunnerResponse

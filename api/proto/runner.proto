@@ -184,6 +184,7 @@ message AllocateRunnerRequest {
   string snapshot_version = 13;   // Explicit version to use; skips current-pointer.json lookup
   int32 ttl_seconds = 14;         // idle timeout from snapshot config (0 = no timeout)
   bool auto_pause = 15;           // pause on TTL expiry instead of destroy
+  string snapshot_tag = 16;       // optional: named tag to resolve snapshot version
 }
 
 // AllocateRunnerResponse

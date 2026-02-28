@@ -24,6 +24,7 @@ type Scheduler struct {
 	hostRegistry    *HostRegistry
 	db              *sql.DB
 	snapshotManager *SnapshotManager
+	tagRegistry     *SnapshotTagRegistry
 	metricsClient   *telemetry.Client
 	logger          *logrus.Entry
 
@@ -34,11 +35,12 @@ type Scheduler struct {
 }
 
 // NewScheduler creates a new scheduler
-func NewScheduler(hr *HostRegistry, db *sql.DB, sm *SnapshotManager, logger *logrus.Logger) *Scheduler {
+func NewScheduler(hr *HostRegistry, db *sql.DB, sm *SnapshotManager, tr *SnapshotTagRegistry, logger *logrus.Logger) *Scheduler {
 	return &Scheduler{
 		hostRegistry:    hr,
 		db:              db,
 		snapshotManager: sm,
+		tagRegistry:     tr,
 		logger:          logger.WithField("component", "scheduler"),
 	}
 }
@@ -91,6 +93,7 @@ type AllocateRunnerRequest struct {
 	SessionID         string
 	VCPUs             int
 	MemoryMB          int
+	SnapshotTag       string
 }
 
 // AllocateRunnerResponse represents the response from runner allocation
@@ -255,7 +258,25 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 
 	// Resolve the desired snapshot version for this workload_key + host
 	var snapshotVersion string
-	if workloadKey != "" && s.snapshotManager != nil && s.snapshotManager.db != nil {
+
+	// If a snapshot_tag was specified, resolve it to a version first
+	if req.SnapshotTag != "" && workloadKey != "" && s.tagRegistry != nil {
+		if v, err := s.tagRegistry.ResolveTagVersion(ctx, workloadKey, req.SnapshotTag); err == nil {
+			snapshotVersion = v
+			s.logger.WithFields(logrus.Fields{
+				"workload_key": workloadKey,
+				"snapshot_tag": req.SnapshotTag,
+				"version":      v,
+			}).Info("Resolved snapshot_tag to version")
+		} else {
+			s.logger.WithError(err).WithFields(logrus.Fields{
+				"workload_key": workloadKey,
+				"snapshot_tag": req.SnapshotTag,
+			}).Warn("Failed to resolve snapshot_tag, falling back to default version")
+		}
+	}
+
+	if snapshotVersion == "" && workloadKey != "" && s.snapshotManager != nil && s.snapshotManager.db != nil {
 		desired, _ := s.snapshotManager.GetDesiredVersions(ctx, host.ID)
 		if v, ok := desired[workloadKey]; ok {
 			snapshotVersion = v

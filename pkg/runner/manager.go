@@ -85,6 +85,14 @@ type Manager struct {
 	// and mounts a FUSE-backed disk for a specific extension drive.
 	// Returns the disk image path. Used by ResumeFromSession.
 	setupExtensionFUSEDisk func(runnerID, driveID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (diskImagePath string, err error)
+
+	// getDirtyRootfsDiskChunks returns dirty FUSE rootfs disk chunks for a runner.
+	// Nil when FUSE rootfs disks are not in use (non-chunked mode).
+	getDirtyRootfsDiskChunks func(runnerID string) map[int][]byte
+
+	// setupRootfsFUSEDisk creates and mounts a FUSE-backed rootfs disk from
+	// ChunkRefs during GCS-backed session resume. Returns the disk image path.
+	setupRootfsFUSEDisk func(runnerID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (diskImagePath string, err error)
 }
 
 type QuarantineOptions struct {

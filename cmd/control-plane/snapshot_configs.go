@@ -40,14 +40,16 @@ type SnapshotConfig struct {
 type SnapshotConfigRegistry struct {
 	db              *sql.DB
 	snapshotManager *SnapshotManager
+	tagRegistry     *SnapshotTagRegistry
 	logger          *logrus.Entry
 }
 
 // NewSnapshotConfigRegistry creates a new SnapshotConfigRegistry.
-func NewSnapshotConfigRegistry(db *sql.DB, sm *SnapshotManager, logger *logrus.Logger) *SnapshotConfigRegistry {
+func NewSnapshotConfigRegistry(db *sql.DB, sm *SnapshotManager, tr *SnapshotTagRegistry, logger *logrus.Logger) *SnapshotConfigRegistry {
 	return &SnapshotConfigRegistry{
 		db:              db,
 		snapshotManager: sm,
+		tagRegistry:     tr,
 		logger:          logger.WithField("component", "snapshot-config-registry"),
 	}
 }
@@ -359,6 +361,29 @@ func (r *SnapshotConfigRegistry) HandleSnapshotConfigs(w http.ResponseWriter, re
 	// Check for /build suffix
 	if strings.HasSuffix(path, "/build") {
 		r.HandleTriggerBuild(w, req)
+		return
+	}
+
+	// Check for /tags or /tags/{tag} — route to tag registry
+	if idx := strings.Index(path, "/tags"); idx >= 0 {
+		workloadKey := path[:idx]
+		subpath := path[idx+len("/tags"):]
+		if r.tagRegistry != nil {
+			r.tagRegistry.HandleTags(w, req, workloadKey, subpath)
+		} else {
+			http.Error(w, "tag registry not configured", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Check for /promote — route to tag registry
+	if strings.HasSuffix(path, "/promote") {
+		workloadKey := strings.TrimSuffix(path, "/promote")
+		if r.tagRegistry != nil {
+			r.tagRegistry.HandlePromote(w, req, workloadKey)
+		} else {
+			http.Error(w, "tag registry not configured", http.StatusInternalServerError)
+		}
 		return
 	}
 

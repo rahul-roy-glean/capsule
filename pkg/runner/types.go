@@ -106,6 +106,7 @@ type AllocateRequest struct {
 	SessionID         string                 // optional: bind to session for pause/resume
 	TTLSeconds        int                    // idle timeout from snapshot config
 	AutoPause         bool                   // pause on TTL vs destroy
+	SnapshotTag       string                 // optional: named tag to resolve snapshot version
 }
 
 // MMDSData represents data to inject into the microVM via MMDS

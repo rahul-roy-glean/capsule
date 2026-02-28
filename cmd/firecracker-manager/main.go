@@ -17,11 +17,14 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
@@ -105,6 +108,9 @@ var (
 	poolMaxRunnerDiskGB   = flag.Int("pool-max-runner-disk-gb", 16, "Max disk per pooled runner in GB")
 	poolRecycleTimeout    = flag.Int("pool-recycle-timeout-secs", 30, "Timeout for recycling operations in seconds")
 )
+
+// resumeGates prevents thundering-herd on concurrent auto-resume for the same runner.
+var resumeGates sync.Map // runnerID -> *singleflight.Group
 
 func main() {
 	flag.Parse()
@@ -1256,6 +1262,13 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 			return
 		}
 
+		// Handle /api/v1/runners/{id}/pty (interactive terminal via WebSocket)
+		if ptyParts := strings.SplitN(suffix, "/pty", 2); len(ptyParts) == 2 && (ptyParts[1] == "" || ptyParts[1][0] == '?') {
+			runnerID := strings.TrimSuffix(ptyParts[0], "/")
+			handlePTYProxy(w, r, mgr, log, runnerID)
+			return
+		}
+
 		// Handle /api/v1/runners/{id}/service-logs (proxy to thaw-agent's service-logs)
 		if slParts := strings.SplitN(suffix, "/service-logs", 2); len(slParts) == 2 {
 			runnerID := strings.TrimSuffix(slParts[0], "/")
@@ -1271,11 +1284,27 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 			return
 		}
 
+		// Handle /api/v1/runners/{id}/checkpoint (non-destructive checkpoint, VM keeps running)
+		if cpParts := strings.SplitN(suffix, "/checkpoint", 2); len(cpParts) == 2 && cpParts[1] == "" {
+			runnerID := cpParts[0]
+			runnerID = strings.TrimSuffix(runnerID, "/")
+			handleCheckpointRunner(w, r, mgr, log, runnerID)
+			return
+		}
+
 		// Handle /api/v1/runners/{id}/connect (extend TTL or resume)
 		if connectParts := strings.SplitN(suffix, "/connect", 2); len(connectParts) == 2 && connectParts[1] == "" {
 			runnerID := connectParts[0]
 			runnerID = strings.TrimSuffix(runnerID, "/")
 			handleConnectRunner(w, r, mgr, log, runnerID)
+			return
+		}
+
+		// Handle /api/v1/runners/{id}/files/{op} (file operations in VM)
+		if filesParts := strings.SplitN(suffix, "/files/", 2); len(filesParts) == 2 {
+			runnerID := strings.TrimSuffix(filesParts[0], "/")
+			fileOp := filesParts[1]
+			handleFileOp(w, r, mgr, log, runnerID, fileOp)
 			return
 		}
 
@@ -1294,6 +1323,17 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Runner not found: %s", runnerID), http.StatusNotFound)
 			return
+		}
+
+		// Auto-resume suspended runners on proxy traffic
+		if rn.State == runner.StateSuspended {
+			resumed, resumeErr := autoResumeIfSuspended(r.Context(), mgr, log, runnerID, rn)
+			if resumeErr != nil {
+				log.WithError(resumeErr).WithField("runner_id", runnerID).Warn("Auto-resume failed for proxy")
+				http.Error(w, "auto-resume failed: "+resumeErr.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			rn = resumed
 		}
 
 		if rn.InternalIP == nil {
@@ -1362,6 +1402,17 @@ func handleExecCommand(w http.ResponseWriter, r *http.Request, mgr *runner.Manag
 		return
 	}
 
+	// Auto-resume if suspended
+	if rn.State == runner.StateSuspended {
+		resumed, err := autoResumeIfSuspended(r.Context(), mgr, log, runnerID, rn)
+		if err != nil {
+			log.WithError(err).WithField("runner_id", runnerID).Warn("Auto-resume failed for exec")
+			http.Error(w, "auto-resume failed: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		rn = resumed
+	}
+
 	// Build target URL to thaw-agent's /exec on debug port
 	targetURL := fmt.Sprintf("http://%s:%d/exec", rn.InternalIP.String(), snapshot.ThawAgentDebugPort)
 
@@ -1412,6 +1463,226 @@ func handleExecCommand(w http.ResponseWriter, r *http.Request, mgr *runner.Manag
 		w.Write([]byte("\n"))
 		flusher.Flush()
 	}
+}
+
+// handlePTYProxy upgrades the client connection to WebSocket, dials the
+// thaw-agent's /pty endpoint inside the VM, and pumps frames bidirectionally.
+func handlePTYProxy(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string) {
+	// Look up runner
+	rn, err := mgr.GetRunner(runnerID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("runner not found: %s", runnerID), http.StatusNotFound)
+		return
+	}
+	if rn.InternalIP == nil {
+		http.Error(w, "runner has no internal IP", http.StatusServiceUnavailable)
+		return
+	}
+	if rn.State == runner.StateQuarantined || rn.State == runner.StateTerminated {
+		http.Error(w, fmt.Sprintf("runner is %s", rn.State), http.StatusConflict)
+		return
+	}
+
+	// Auto-resume if suspended
+	if rn.State == runner.StateSuspended {
+		resumed, err := autoResumeIfSuspended(r.Context(), mgr, log, runnerID, rn)
+		if err != nil {
+			log.WithError(err).WithField("runner_id", runnerID).Warn("Auto-resume failed for pty")
+			http.Error(w, "auto-resume failed: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		rn = resumed
+	}
+
+	// Track active execs for TTL enforcement
+	mgr.IncrementActiveExecs(runnerID)
+	defer mgr.DecrementActiveExecs(runnerID)
+
+	// Build backend WebSocket URL (thaw-agent debug port)
+	backendURL := fmt.Sprintf("ws://%s:%d/pty?%s", rn.InternalIP.String(), snapshot.ThawAgentDebugPort, r.URL.RawQuery)
+	log.WithFields(logrus.Fields{
+		"runner_id":   runnerID,
+		"backend_url": backendURL,
+	}).Debug("Proxying PTY WebSocket to thaw-agent")
+
+	// Upgrade client-side to WebSocket
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+	clientConn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.WithError(err).Warn("Client WebSocket upgrade failed")
+		return
+	}
+	defer clientConn.Close()
+
+	// Dial backend WebSocket to thaw-agent
+	dialer := websocket.Dialer{}
+	backendConn, _, err := dialer.Dial(backendURL, nil)
+	if err != nil {
+		log.WithError(err).Warn("Backend WebSocket dial failed")
+		clientConn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "backend connect failed"))
+		return
+	}
+	defer backendConn.Close()
+
+	// Bidirectional frame pump
+	done := make(chan struct{}, 2)
+
+	// Client -> Backend
+	go func() {
+		defer func() { done <- struct{}{} }()
+		for {
+			msgType, msg, err := clientConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if err := backendConn.WriteMessage(msgType, msg); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Backend -> Client
+	go func() {
+		defer func() { done <- struct{}{} }()
+		for {
+			msgType, msg, err := backendConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if err := clientConn.WriteMessage(msgType, msg); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Wait for either side to disconnect
+	<-done
+}
+
+// handleFileOp proxies a POST /files/{op} request to a runner's thaw-agent.
+func handleFileOp(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID, fileOp string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	rn, err := mgr.GetRunner(runnerID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("runner not found: %s", runnerID), http.StatusNotFound)
+		return
+	}
+	if rn.InternalIP == nil {
+		http.Error(w, "runner has no internal IP", http.StatusServiceUnavailable)
+		return
+	}
+	if rn.State == runner.StateQuarantined || rn.State == runner.StateTerminated {
+		http.Error(w, fmt.Sprintf("runner is %s", rn.State), http.StatusConflict)
+		return
+	}
+
+	// Auto-resume if suspended
+	if rn.State == runner.StateSuspended {
+		resumed, err := autoResumeIfSuspended(r.Context(), mgr, log, runnerID, rn)
+		if err != nil {
+			log.WithError(err).WithField("runner_id", runnerID).Warn("Auto-resume failed for file op")
+			http.Error(w, "auto-resume failed: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		rn = resumed
+	}
+
+	targetURL := fmt.Sprintf("http://%s:%d/files/%s", rn.InternalIP.String(), snapshot.ThawAgentDebugPort, fileOp)
+
+	log.WithFields(logrus.Fields{
+		"runner_id": runnerID,
+		"file_op":   fileOp,
+		"target":    targetURL,
+	}).Debug("Proxying file op request to thaw-agent")
+
+	mgr.IncrementActiveExecs(runnerID)
+	defer mgr.DecrementActiveExecs(runnerID)
+
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, r.Body)
+	if err != nil {
+		http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
+		return
+	}
+	upstreamReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(upstreamReq)
+	if err != nil {
+		log.WithError(err).WithField("runner_id", runnerID).Warn("Failed to reach thaw-agent for file op")
+		http.Error(w, "bad gateway: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+// autoResumeIfSuspended checks if a runner is suspended and auto-resumes it.
+// Returns the updated runner or an error. If the runner is not suspended, it
+// returns the original runner unchanged.
+func autoResumeIfSuspended(ctx context.Context, mgr *runner.Manager, log *logrus.Entry, runnerID string, rn *runner.Runner) (*runner.Runner, error) {
+	if rn.State != runner.StateSuspended || rn.SessionID == "" {
+		return rn, nil
+	}
+
+	log.WithFields(logrus.Fields{
+		"runner_id":  runnerID,
+		"session_id": rn.SessionID,
+	}).Info("Auto-resuming suspended runner")
+
+	// Use singleflight to prevent thundering-herd on concurrent requests
+	val, _ := resumeGates.LoadOrStore(runnerID, &singleflight.Group{})
+	group := val.(*singleflight.Group)
+
+	result, err, _ := group.Do(runnerID, func() (interface{}, error) {
+		resumed, err := mgr.ResumeFromSession(ctx, rn.SessionID, rn.WorkloadKey)
+		if err != nil {
+			return nil, fmt.Errorf("auto-resume failed: %w", err)
+		}
+
+		// Wait for thaw-agent to become ready
+		if err := waitForThawAgent(resumed.InternalIP, 30*time.Second); err != nil {
+			return nil, fmt.Errorf("thaw-agent not ready after resume: %w", err)
+		}
+
+		return resumed, nil
+	})
+
+	// Clean up the gate after resume completes
+	resumeGates.Delete(runnerID)
+
+	if err != nil {
+		return nil, err
+	}
+	return result.(*runner.Runner), nil
+}
+
+// waitForThawAgent polls the thaw-agent health endpoint until it returns 200 or the timeout expires.
+func waitForThawAgent(ip net.IP, timeout time.Duration) error {
+	healthURL := fmt.Sprintf("http://%s:%d/", ip.String(), snapshot.ThawAgentHealthPort)
+	client := &http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(healthURL)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("thaw-agent at %s not ready after %s", ip.String(), timeout)
 }
 
 // handleServiceLogs proxies GET /runners/{id}/service-logs to the thaw-agent's
@@ -1559,6 +1830,32 @@ func handlePauseRunner(w http.ResponseWriter, r *http.Request, mgr *runner.Manag
 		"session_id":          result.SessionID,
 		"layer":               result.Layer,
 		"snapshot_size_bytes": result.SnapshotSizeBytes,
+	})
+}
+
+// handleCheckpointRunner handles POST /api/v1/runners/{id}/checkpoint
+// Creates a non-destructive snapshot without stopping the VM.
+func handleCheckpointRunner(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	result, err := mgr.CheckpointRunner(r.Context(), runnerID)
+	if err != nil {
+		log.WithError(err).WithField("runner_id", runnerID).Error("Failed to checkpoint runner")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"session_id":          result.SessionID,
+		"layer":               result.Layer,
+		"snapshot_size_bytes": result.SnapshotSizeBytes,
+		"running":             result.Running,
 	})
 }
 
