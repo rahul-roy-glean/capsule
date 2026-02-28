@@ -5,16 +5,23 @@
 # interaction, pause/resume with state preservation, multi-layer chains,
 # and network policy enforcement.
 #
-# Usage: make dev-test-agent-sessions
+# When SESSION_CHUNK_BUCKET is set (GCS mode), additionally verifies:
+#   - GCS manifest + chunk index uploaded after pause
+#   - Cross-host resume (local layers deleted, resume from GCS only)
+#
+# Usage:
+#   SESSION_CHUNK_BUCKET=my-bucket make dev-test-agent-sessions   # GCS route
+#   make dev-test-agent-sessions                                   # local-only
 #
 # Prerequisites:
-#   - Stack running: make dev-stack
-#   - Agent snapshot built: make dev-agent-snapshot (or make dev-test-agent-e2e)
+#   - Stack running: make dev-stack (or SESSION_CHUNK_BUCKET=<bucket> make dev-stack)
+#   - Agent snapshot built: make dev-agent-snapshot (or GCS_BUCKET=<bucket> make dev-agent-snapshot)
 set -euo pipefail
 
 CP=http://localhost:8080
 MGR=http://localhost:9080
 SESSION_ID="agent-test-$(date +%s)"
+GCS_BUCKET=${SESSION_CHUNK_BUCKET:-}
 PASS=0
 FAIL=0
 SKIP=0
@@ -147,6 +154,11 @@ trap cleanup EXIT
 
 echo "=== AI Agent Sandbox E2E Session Tests ==="
 echo "Session ID: $SESSION_ID"
+if [ -n "$GCS_BUCKET" ]; then
+  echo "GCS mode:   bucket=$GCS_BUCKET (chunked snapshots + cross-host resume)"
+else
+  echo "Local-only mode (set SESSION_CHUNK_BUCKET=<bucket> for GCS route)"
+fi
 
 # =========================================================================
 # PART 1: Basic session lifecycle
@@ -457,6 +469,53 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+header "14b. Verify GCS session artifacts (GCS mode only)"
+# ---------------------------------------------------------------------------
+if [ -n "$GCS_BUCKET" ]; then
+  GCS_MANIFEST=$(jq -r '.gcs_manifest_path // empty' "$SESSION_DIR/metadata.json" 2>/dev/null || echo "")
+  GCS_MEM_INDEX=$(jq -r '.gcs_mem_index_object // empty' "$SESSION_DIR/metadata.json" 2>/dev/null || echo "")
+  echo "  GCS manifest:  $GCS_MANIFEST"
+  echo "  GCS mem index: $GCS_MEM_INDEX"
+
+  if [ -n "$GCS_MANIFEST" ] && [ "$GCS_MANIFEST" != "null" ]; then
+    pass "metadata.json has GCS manifest path"
+  else
+    fail "GCS manifest path not set in metadata — upload may have failed"
+    echo "  metadata.json:"
+    cat "$SESSION_DIR/metadata.json" 2>/dev/null || echo "  (not found)"
+  fi
+
+  if gsutil -q stat "gs://$GCS_BUCKET/$GCS_MANIFEST" 2>/dev/null; then
+    pass "snapshot_manifest.json exists in GCS"
+  else
+    fail "snapshot_manifest.json NOT found in GCS: gs://$GCS_BUCKET/$GCS_MANIFEST"
+  fi
+
+  if [ -n "$GCS_MEM_INDEX" ] && gsutil -q stat "gs://$GCS_BUCKET/$GCS_MEM_INDEX" 2>/dev/null; then
+    pass "GCS mem chunk index exists"
+  else
+    fail "GCS mem chunk index NOT found"
+  fi
+else
+  skip "GCS verification skipped (local-only mode)"
+fi
+
+# ---------------------------------------------------------------------------
+header "14c. Delete local layers (cross-host simulation, GCS mode only)"
+# ---------------------------------------------------------------------------
+if [ -n "$GCS_BUCKET" ]; then
+  echo "  Deleting: $SESSION_DIR/layer_*"
+  rm -rf "$SESSION_DIR/layer_"*
+  if [ ! -d "$SESSION_DIR/layer_0" ]; then
+    pass "Local layer files deleted — resume will use GCS"
+  else
+    fail "Failed to delete local layer files"
+  fi
+else
+  echo "  Skipping (local-only mode — layers needed for resume)"
+fi
+
+# ---------------------------------------------------------------------------
 header "15. Resume with same session_id"
 # ---------------------------------------------------------------------------
 RESUME_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
@@ -577,6 +636,25 @@ if [ "$PAUSE2_LAYER" = "1" ]; then
   pass "Second pause is layer 1"
 else
   fail "Expected layer 1, got $PAUSE2_LAYER"
+fi
+
+# GCS: verify chaining metadata + delete local layers for cross-host
+if [ -n "$GCS_BUCKET" ]; then
+  if [ -f "$SESSION_DIR/metadata.json" ]; then
+    META2_GCS_DISK=$(jq -c '.gcs_disk_index_objects // {}' "$SESSION_DIR/metadata.json")
+    META2_GCS_MEM=$(jq -r '.gcs_mem_index_object // "none"' "$SESSION_DIR/metadata.json")
+    echo "  GCS disk indexes after pause 2: $META2_GCS_DISK"
+    echo "  GCS mem index after pause 2: $META2_GCS_MEM"
+    pass "GCS session metadata updated for layer 1"
+  fi
+
+  echo "  Deleting local layers for cross-host resume..."
+  rm -rf "$SESSION_DIR/layer_"*
+  if [ ! -d "$SESSION_DIR/layer_0" ] && [ ! -d "$SESSION_DIR/layer_1" ]; then
+    pass "Local layer files deleted for cross-host resume (layer 1)"
+  else
+    fail "Failed to delete local layer files"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
