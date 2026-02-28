@@ -237,6 +237,8 @@ echo "  version=$CI_VER name=$CI_NAME action=$CI_ACTION"
 # ---------------------------------------------------------------------------
 header "8. ci-standard: external egress works"
 # ---------------------------------------------------------------------------
+# Brief delay for thaw-agent to fully initialize after snapshot restore.
+sleep 2
 EXEC_CI=$(vm_tcp_check "$RUNNER_ID_CI" "8.8.8.8" "53")
 if echo "$EXEC_CI" | grep -q "NET_OK"; then
   pass "ci-standard: external egress works"
@@ -360,7 +362,7 @@ else
   fail "Failed to allocate deny-default runner"
 fi
 
-sleep 1
+sleep 2
 
 # ---------------------------------------------------------------------------
 header "14. deny-default: allowed CIDR reachable (positive)"
