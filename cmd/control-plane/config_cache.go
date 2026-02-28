@@ -29,7 +29,7 @@ type WorkloadConfig struct {
 // registration, with DB fallback on cache miss.
 type ConfigCache struct {
 	mu             sync.RWMutex
-	repoToWorkload map[string]string         // repo (owner/name) → workload_key
+	repoToWorkload map[string]string          // repo (owner/name) → workload_key
 	workloadConfig map[string]*WorkloadConfig // workload_key → config
 	db             *sql.DB
 	logger         *logrus.Entry

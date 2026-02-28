@@ -1206,7 +1206,6 @@ func (sm *SnapshotManager) SetActiveSnapshotForKey(ctx context.Context, workload
 	return tx.Commit()
 }
 
-
 // monitorSnapshotBuildForKey monitors a repo-scoped snapshot build.
 // After build completes, it auto-validates and optionally auto-rolls out.
 func (sm *SnapshotManager) monitorSnapshotBuildForKey(ctx context.Context, version, instanceName, workloadKey string) {

@@ -31,9 +31,9 @@ type LayeredConfig struct {
 		CISystem             string `json:"ci_system,omitempty" yaml:"ci_system"`
 		AutoRollout          bool   `json:"auto_rollout,omitempty" yaml:"auto_rollout"`
 		SessionMaxAgeSeconds int    `json:"session_max_age_seconds,omitempty" yaml:"session_max_age_seconds"`
-		RootfsSizeGB         int    `json:"rootfs_size_gb,omitempty" yaml:"rootfs_size_gb"`         // rootfs size for layer 0 (default 8)
-		RunnerUser           string `json:"runner_user,omitempty" yaml:"runner_user"`               // user for non-root commands (default "runner")
-		WorkspaceSizeGB      int    `json:"workspace_size_gb,omitempty" yaml:"workspace_size_gb"`   // auto-injected workspace drive size (default 50)
+		RootfsSizeGB         int    `json:"rootfs_size_gb,omitempty" yaml:"rootfs_size_gb"`       // rootfs size for layer 0 (default 8)
+		RunnerUser           string `json:"runner_user,omitempty" yaml:"runner_user"`             // user for non-root commands (default "runner")
+		WorkspaceSizeGB      int    `json:"workspace_size_gb,omitempty" yaml:"workspace_size_gb"` // auto-injected workspace drive size (default 50)
 	} `json:"config" yaml:"config"`
 	StartCommand    *StartCommand `json:"start_command,omitempty" yaml:"start_command"`
 	GitHubAppID     string        `json:"github_app_id,omitempty" yaml:"github_app_id"`
@@ -44,8 +44,8 @@ type LayeredConfig struct {
 type LayerMaterialized struct {
 	LayerDef
 	LayerHash       string `json:"layer_hash"`
-	ParentLayerHash string `json:"parent_layer_hash"` // "" for root
-	Depth           int    `json:"depth"`              // 0 for root
+	ParentLayerHash string `json:"parent_layer_hash"`    // "" for root
+	Depth           int    `json:"depth"`                // 0 for root
 	BaseImage       string `json:"base_image,omitempty"` // only set on the platform layer (depth 0)
 }
 

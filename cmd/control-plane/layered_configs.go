@@ -47,23 +47,23 @@ func (r *LayeredConfigRegistry) SetConfigCache(cc *ConfigCache) {
 
 // StoredLayeredConfig is the DB representation of a layered config.
 type StoredLayeredConfig struct {
-	ConfigID             string                `json:"config_id"`
-	DisplayName          string                `json:"display_name"`
-	LeafLayerHash        string                `json:"leaf_layer_hash"`
-	LeafWorkloadKey      string                `json:"leaf_workload_key"`
-	Tier                 string                `json:"tier"`
-	CISystem             string                `json:"ci_system"`
-	GitHubAppID          string                `json:"github_app_id,omitempty"`
-	GitHubAppSecret      string                `json:"github_app_secret,omitempty"`
+	ConfigID             string                 `json:"config_id"`
+	DisplayName          string                 `json:"display_name"`
+	LeafLayerHash        string                 `json:"leaf_layer_hash"`
+	LeafWorkloadKey      string                 `json:"leaf_workload_key"`
+	Tier                 string                 `json:"tier"`
+	CISystem             string                 `json:"ci_system"`
+	GitHubAppID          string                 `json:"github_app_id,omitempty"`
+	GitHubAppSecret      string                 `json:"github_app_secret,omitempty"`
 	StartCommand         *snapshot.StartCommand `json:"start_command,omitempty"`
-	RunnerTTLSeconds     int                   `json:"runner_ttl_seconds"`
-	SessionMaxAgeSeconds int                   `json:"session_max_age_seconds"`
-	AutoPause            bool                  `json:"auto_pause"`
-	AutoRollout          bool                  `json:"auto_rollout"`
-	MaxConcurrentRunners int                   `json:"max_concurrent_runners"`
-	BuildSchedule        string                `json:"build_schedule"`
-	CreatedAt            time.Time             `json:"created_at"`
-	UpdatedAt            time.Time             `json:"updated_at"`
+	RunnerTTLSeconds     int                    `json:"runner_ttl_seconds"`
+	SessionMaxAgeSeconds int                    `json:"session_max_age_seconds"`
+	AutoPause            bool                   `json:"auto_pause"`
+	AutoRollout          bool                   `json:"auto_rollout"`
+	MaxConcurrentRunners int                    `json:"max_concurrent_runners"`
+	BuildSchedule        string                 `json:"build_schedule"`
+	CreatedAt            time.Time              `json:"created_at"`
+	UpdatedAt            time.Time              `json:"updated_at"`
 }
 
 // LayerStatus is the status of a single layer in a layered config.

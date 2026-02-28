@@ -56,9 +56,9 @@ var (
 	gcpProject      = flag.String("gcp-project", "", "GCP project for Secret Manager (defaults to metadata project)")
 
 	// Layer build flags
-	layerHash         = flag.String("layer-hash", "", "Layer hash for metadata tagging")
-	parentWorkloadKey = flag.String("parent-workload-key", "", "Parent layer's hash, used as GCS workload key to load parent snapshot")
-	parentVersion     = flag.String("parent-version", "", "Version of parent snapshot to restore from")
+	layerHash            = flag.String("layer-hash", "", "Layer hash for metadata tagging")
+	parentWorkloadKey    = flag.String("parent-workload-key", "", "Parent layer's hash, used as GCS workload key to load parent snapshot")
+	parentVersion        = flag.String("parent-version", "", "Version of parent snapshot to restore from")
 	layerDrives          = flag.String("layer-drives", "", "JSON array of DriveSpec for this layer's new extension drives")
 	buildType            = flag.String("build-type", "init", "Build type: init, refresh, or reattach")
 	previousLayerKey     = flag.String("previous-layer-key", "", "Old layer hash for loading extension drives during reattach")
@@ -167,7 +167,7 @@ func main() {
 	if *layerHash != "" {
 		effectiveWorkloadKey = *layerHash
 		log.WithFields(logrus.Fields{
-			"layer_hash":           *layerHash,
+			"layer_hash":             *layerHash,
 			"effective_workload_key": effectiveWorkloadKey,
 		}).Info("Layer mode: using layer_hash as GCS key")
 	}
