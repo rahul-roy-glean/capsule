@@ -1654,6 +1654,11 @@ func autoResumeIfSuspended(ctx context.Context, mgr *runner.Manager, log *logrus
 			return nil, fmt.Errorf("thaw-agent not ready after resume: %w", err)
 		}
 
+		// Brief settling period after resume — the thaw-agent's /alive endpoint
+		// may respond before the exec handler is fully ready to process commands
+		// (MMDS re-read, goroutine scheduling after snapshot restore).
+		time.Sleep(2 * time.Second)
+
 		return resumed, nil
 	})
 
