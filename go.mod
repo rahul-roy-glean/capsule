@@ -22,7 +22,8 @@ require (
 	github.com/vishvananda/netlink v1.1.0
 	github.com/vishvananda/netns v0.0.5
 	golang.org/x/sync v0.18.0
-	golang.org/x/sys v0.40.0
+	golang.org/x/sys v0.41.0
+	golang.org/x/term v0.40.0
 	golang.org/x/time v0.14.0
 	google.golang.org/api v0.256.0
 	google.golang.org/genproto/googleapis/api v0.0.0-20251111163417-95abcf5c77ba
