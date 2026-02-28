@@ -652,7 +652,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 
 	// Setup symlinks for snapshot restore
 	m.mu.Lock()
-	cleanup, symlinkErr := m.setupSnapshotSymlinks(overlayPath, repoCacheUpperPath, snapshotPaths)
+	cleanup, symlinkErr := m.setupSnapshotSymlinks(overlayPath, extensionDrivePaths)
 	m.mu.Unlock()
 	if symlinkErr != nil {
 		uffdHandler.Stop()
