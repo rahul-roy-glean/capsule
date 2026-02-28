@@ -47,11 +47,11 @@ if [ -f "$PID_DIR/control-plane.pid" ] || [ -f "$PID_DIR/firecracker-manager.pid
 fi
 
 # --- Reset stale host status ---
-# After a manager crash the control-plane marks hosts as 'unhealthy' and the
-# heartbeat upsert never flips them back. Reset so the restarted manager can
+# After a manager crash or unclean shutdown the control-plane may have hosts
+# stuck as 'unhealthy' or 'draining'. Reset so the restarted manager can
 # re-register as 'ready'.
 sudo -u postgres psql -d firecracker_runner -c \
-  "UPDATE hosts SET status = 'ready' WHERE status = 'unhealthy';" \
+  "UPDATE hosts SET status = 'ready' WHERE status IN ('unhealthy', 'draining');" \
   > /dev/null 2>&1 || true
 
 # --- Start control-plane ---
