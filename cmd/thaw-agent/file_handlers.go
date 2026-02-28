@@ -24,17 +24,31 @@ func validatePath(p string) (string, int, string) {
 		return "", http.StatusBadRequest, "path must be absolute"
 	}
 
-	// Resolve symlinks.  If the target doesn't exist yet (e.g. for write/mkdir),
-	// resolve the parent directory instead and re-append the base name.
-	resolved, err := filepath.EvalSymlinks(p)
+	// Clean the path first to resolve . and .. before symlink resolution.
+	cleaned := filepath.Clean(p)
+
+	// Resolve symlinks. If the target doesn't exist yet (e.g. for write/mkdir),
+	// walk up the path until we find an existing ancestor, resolve symlinks on
+	// that, then re-append the non-existent suffix.
+	resolved, err := filepath.EvalSymlinks(cleaned)
 	if err != nil {
-		// Target may not exist yet — try resolving the parent.
-		dir := filepath.Dir(p)
-		resolvedDir, err2 := filepath.EvalSymlinks(dir)
-		if err2 != nil {
+		// Walk up to find the deepest existing ancestor.
+		remaining := cleaned
+		var suffix string
+		for remaining != "/" && remaining != "." {
+			parent := filepath.Dir(remaining)
+			suffix = filepath.Join(filepath.Base(remaining), suffix)
+			resolvedParent, err2 := filepath.EvalSymlinks(parent)
+			if err2 == nil {
+				resolved = filepath.Join(resolvedParent, suffix)
+				err = nil
+				break
+			}
+			remaining = parent
+		}
+		if err != nil {
 			return "", http.StatusBadRequest, "cannot resolve path: " + err.Error()
 		}
-		resolved = filepath.Join(resolvedDir, filepath.Base(p))
 	}
 
 	for _, root := range allowedRoots {
