@@ -77,6 +77,15 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		NetworkPolicyPreset: req.NetworkPolicyPreset,
 	}
 
+	// Extract network policy from labels (control plane packs them here
+	// because manually-added proto fields 17-18 aren't in the wire descriptor).
+	if v, ok := req.Labels["_network_policy_preset"]; ok && v != "" {
+		allocReq.NetworkPolicyPreset = v
+	}
+	if v, ok := req.Labels["_network_policy_json"]; ok && v != "" {
+		req.NetworkPolicyJson = v
+	}
+
 	// Parse network policy JSON if provided
 	if req.NetworkPolicyJson != "" {
 		var np network.NetworkPolicy

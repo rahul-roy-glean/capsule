@@ -290,17 +290,28 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 
 	// Build the proto request
 	protoReq := &pb.AllocateRunnerRequest{
-		RequestId:           req.RequestID,
-		Labels:              req.Labels,
-		GithubRunnerToken:   req.GitHubRunnerToken,
-		WorkloadKey:         workloadKey,
-		CiSystem:            ciSystem,
-		SessionId:           req.SessionID,
-		SnapshotVersion:     snapshotVersion,
-		TtlSeconds:          int32(runnerTTLSeconds),
-		AutoPause:           autoPause,
-		NetworkPolicyPreset: req.NetworkPolicyPreset,
-		NetworkPolicyJson:   req.NetworkPolicyJSON,
+		RequestId:         req.RequestID,
+		Labels:            req.Labels,
+		GithubRunnerToken: req.GitHubRunnerToken,
+		WorkloadKey:       workloadKey,
+		CiSystem:          ciSystem,
+		SessionId:         req.SessionID,
+		SnapshotVersion:   snapshotVersion,
+		TtlSeconds:        int32(runnerTTLSeconds),
+		AutoPause:         autoPause,
+	}
+	// Pass network policy fields via labels (proto fields 17-18 not in
+	// generated wire descriptor; labels are serialized reliably).
+	if req.NetworkPolicyPreset != "" || req.NetworkPolicyJSON != "" {
+		if protoReq.Labels == nil {
+			protoReq.Labels = make(map[string]string)
+		}
+		if req.NetworkPolicyPreset != "" {
+			protoReq.Labels["_network_policy_preset"] = req.NetworkPolicyPreset
+		}
+		if req.NetworkPolicyJSON != "" {
+			protoReq.Labels["_network_policy_json"] = req.NetworkPolicyJSON
+		}
 	}
 	// Populate resources from tier (overrides request-level values)
 	protoReq.Resources = &pb.Resources{
