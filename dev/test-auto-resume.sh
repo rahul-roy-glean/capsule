@@ -1,123 +1,178 @@
 #!/bin/bash
-# E2E test: allocate -> pause (suspend) -> exec (triggers auto-resume) -> release
-# Usage: make dev-test-auto-resume
+# E2E test: Traffic-triggered auto-resume (WS5)
+#
+# Tests that sending an exec request to a suspended runner automatically
+# resumes it without requiring an explicit /connect call.
+#
+# Usage:
+#   SESSION_CHUNK_BUCKET=rroy-gc-testing make dev-test-auto-resume
+#
+# Prerequisites:
+#   - Golden chunked snapshot uploaded: GCS_BUCKET=<bucket> ENABLE_CHUNKED=true make dev-snapshot
+#   - Stack running with GCS sessions:  SESSION_CHUNK_BUCKET=<bucket> make dev-stack
 set -euo pipefail
 
 CP=http://localhost:8080
 MGR=http://localhost:9080
+SESSION_ID="auto-e2e-$(date +%s)"
+GCS_BUCKET=${SESSION_CHUNK_BUCKET:-}
+PASS=0
+FAIL=0
 
-echo "=== E2E Auto-Resume Test ==="
-echo ""
+pass() { echo "  ✓ $1"; PASS=$((PASS + 1)); }
+fail() { echo "  ✗ $1"; FAIL=$((FAIL + 1)); }
+header() { echo ""; echo "=== $1 ==="; }
 
-# --- 0. Register snapshot config with auto_pause ---
-echo "=== 0. Register snapshot config ==="
-CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/snapshot-configs" \
+cleanup() {
+  if [ -n "${RUNNER_ID:-}" ]; then
+    echo "Cleaning up runner $RUNNER_ID..."
+    curl -s -X POST "$CP/api/v1/runners/release" \
+      -H 'Content-Type: application/json' \
+      -d "{\"runner_id\": \"$RUNNER_ID\", \"destroy\": true}" > /dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+if [ -z "$GCS_BUCKET" ]; then
+  echo "FAIL: SESSION_CHUNK_BUCKET is required."
+  echo "Usage: SESSION_CHUNK_BUCKET=your-bucket make dev-test-auto-resume"
+  exit 1
+fi
+
+echo "GCS bucket: $GCS_BUCKET"
+echo "Session ID: $SESSION_ID"
+
+# ---------------------------------------------------------------------------
+header "1. Register snapshot config"
+# ---------------------------------------------------------------------------
+SNAPSHOT_COMMANDS=${SNAPSHOT_COMMANDS:-'[{"type":"shell","args":["echo","dev-snapshot-ready"]}]'}
+CONFIG_RESP=$(curl -s -X POST "$CP/api/v1/snapshot-configs" \
   -H 'Content-Type: application/json' \
   -d '{
-    "display_name": "auto-resume-test",
-    "commands": [{"type":"shell","command":"echo auto-resume-test"}],
-    "runner_ttl_seconds": 120,
-    "auto_pause": true
+    "display_name": "rootfs-durability-test",
+    "commands": '"$SNAPSHOT_COMMANDS"',
+    "runner_ttl_seconds": 300,
+    "auto_pause": true,
+    "session_max_age_seconds": 3600
   }')
 WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.workload_key')
-echo "Registered config: workload_key=$WORKLOAD_KEY"
+echo "  workload_key=$WORKLOAD_KEY"
 
-if [ -z "$WORKLOAD_KEY" ] || [ "$WORKLOAD_KEY" = "null" ]; then
-  echo "FAIL: could not register snapshot config"
-  exit 1
-fi
-
-# --- 1. Allocate runner ---
-echo "=== 1. Allocate runner ==="
-RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
-  -H 'Content-Type: application/json' \
-  -d "{\"ci_system\":\"none\", \"workload_key\":\"$WORKLOAD_KEY\"}")
-echo "Response: $RESP"
-
-RUNNER_ID=$(echo "$RESP" | jq -r '.runner_id')
-echo "Runner ID: $RUNNER_ID"
-
-if [ -z "$RUNNER_ID" ] || [ "$RUNNER_ID" = "null" ]; then
-  echo "FAIL: no runner_id in response"
-  exit 1
-fi
-
-# --- 2. Poll until ready ---
-echo ""
-echo "=== 2. Poll until ready ==="
-for i in $(seq 1 60); do
-  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-    "$CP/api/v1/runners/status?runner_id=$RUNNER_ID")
-  if [ "$HTTP_CODE" = "200" ]; then
-    echo "Runner ready after ${i}s"
-    break
-  fi
-  if [ "$i" = "60" ]; then
-    echo "FAIL: runner not ready after 60s"
-    exit 1
-  fi
-  echo -n "."
-  sleep 1
-done
-echo ""
-
-# --- 3. Verify exec works before pause ---
-echo "=== 3. Verify exec works before pause ==="
-OUTPUT=$(curl -sf --no-buffer -X POST "$MGR/api/v1/runners/$RUNNER_ID/exec" \
-  -H 'Content-Type: application/json' \
-  -d '{"command":["echo","before-pause"],"timeout_seconds":10}')
-echo "$OUTPUT"
-if ! echo "$OUTPUT" | grep -q "before-pause"; then
-  echo "FAIL: exec before pause did not return expected output"
-  exit 1
-fi
-echo "OK: exec works before pause"
-
-# --- 4. Pause the runner (creates session snapshot) ---
-echo ""
-echo "=== 4. Pause runner ==="
-PAUSE_RESP=$(curl -sf -X POST "$MGR/api/v1/runners/$RUNNER_ID/pause")
-echo "Pause response: $PAUSE_RESP"
-
-# Give the pause a moment to complete
-sleep 2
-
-# Check runner state - should be suspended
-echo "Checking runner state..."
-STATUS_RESP=$(curl -sf "$CP/api/v1/runners/status?runner_id=$RUNNER_ID" 2>/dev/null || echo '{"state":"unknown"}')
-STATE=$(echo "$STATUS_RESP" | jq -r '.state // "unknown"')
-echo "Runner state: $STATE"
-
-if [ "$STATE" != "suspended" ] && [ "$STATE" != "paused" ]; then
-  echo "WARN: runner state is '$STATE' (expected 'suspended')"
-  echo "  Auto-resume test may not be meaningful if runner is not suspended."
-fi
-
-# --- 5. Execute on suspended runner (should auto-resume) ---
-echo ""
-echo "=== 5. Execute on suspended runner (triggers auto-resume) ==="
-RESUME_OUTPUT=$(curl -sf --no-buffer --max-time 60 -X POST "$MGR/api/v1/runners/$RUNNER_ID/exec" \
-  -H 'Content-Type: application/json' \
-  -d '{"command":["echo","after-resume"],"timeout_seconds":30}')
-echo "$RESUME_OUTPUT"
-
-if echo "$RESUME_OUTPUT" | grep -q "after-resume"; then
-  echo "OK: auto-resume succeeded and exec returned expected output"
-elif echo "$RESUME_OUTPUT" | grep -q "auto-resume failed"; then
-  echo "WARN: auto-resume failed (may need session snapshot support configured)"
+if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then
+  pass "Snapshot config registered"
 else
-  echo "WARN: unexpected output (check if auto-resume is configured)"
+  fail "Snapshot config registration failed: $CONFIG_RESP"
+  exit 1
 fi
 
-# --- 6. Release runner ---
-echo ""
-echo "=== 6. Release runner ==="
-RELEASE_RESP=$(curl -sf -X POST "$CP/api/v1/runners/release" \
+# ---------------------------------------------------------------------------
+header "2. Allocate runner with session"
+# ---------------------------------------------------------------------------
+ALLOC_RESP=$(curl -s -X POST "$CP/api/v1/runners/allocate" \
   -H 'Content-Type: application/json' \
-  -d "{\"runner_id\":\"$RUNNER_ID\"}")
-echo "Response: $RELEASE_RESP"
+  -d "{
+    \"workload_key\": \"$WORKLOAD_KEY\",
+    \"session_id\": \"$SESSION_ID\",
+    \"ttl_seconds\": 300,
+    \"auto_pause\": true
+  }")
+RUNNER_ID=$(echo "$ALLOC_RESP" | jq -r '.runner_id // .runner.id')
+HOST_ADDR=$(echo "$ALLOC_RESP" | jq -r '.host_address')
+echo "  runner_id=$RUNNER_ID host=$HOST_ADDR"
 
+if [ -n "$RUNNER_ID" ] && [ "$RUNNER_ID" != "null" ]; then
+  pass "Runner allocated"
+else
+  fail "Failed to allocate runner: $ALLOC_RESP"
+  exit 1
+fi
+
+HOST=$MGR
+sleep 2  # wait for thaw-agent readiness
+
+# ---------------------------------------------------------------------------
+header "3. Write marker file"
+# ---------------------------------------------------------------------------
+EXEC_RESP=$(curl -s -X POST "$HOST/api/v1/runners/$RUNNER_ID/exec" \
+  -H 'Content-Type: application/json' \
+  -d '{"command": ["bash", "-c", "echo auto-marker > /tmp/auto-test.txt && echo ok"]}')
+if echo "$EXEC_RESP" | grep -q "ok"; then
+  pass "Wrote marker file"
+else
+  fail "Failed to write marker: $EXEC_RESP"
+fi
+
+# ---------------------------------------------------------------------------
+header "4. Pause runner"
+# ---------------------------------------------------------------------------
+PAUSE_RESP=$(curl -s -X POST "$HOST/api/v1/runners/$RUNNER_ID/pause")
+PAUSE_SESSION=$(echo "$PAUSE_RESP" | jq -r '.session_id')
+echo "  pause response: $PAUSE_RESP"
+
+if [ -n "$PAUSE_SESSION" ] && [ "$PAUSE_SESSION" != "null" ]; then
+  pass "Runner paused"
+else
+  fail "Failed to pause: $PAUSE_RESP"
+fi
+
+sleep 2  # wait for state to settle
+
+# ---------------------------------------------------------------------------
+header "5. Verify runner is suspended"
+# ---------------------------------------------------------------------------
+STATUS_RESP=$(curl -s "$CP/api/v1/runners/status?runner_id=$RUNNER_ID" 2>/dev/null || echo '{"state":"unknown"}')
+STATE=$(echo "$STATUS_RESP" | jq -r '.state // "unknown"')
+echo "  runner state: $STATE"
+
+if [ "$STATE" = "suspended" ] || [ "$STATE" = "paused" ]; then
+  pass "Runner is suspended"
+else
+  echo "  (state is '$STATE' — auto-resume test may still work if runner is in a pausable state)"
+fi
+
+# ---------------------------------------------------------------------------
+header "6. Exec on suspended runner (triggers auto-resume)"
+# ---------------------------------------------------------------------------
+# This is the key test: sending an exec to a suspended runner should
+# automatically resume it without needing an explicit /connect call.
+EXEC_RESP=$(curl -s --max-time 60 -X POST "$HOST/api/v1/runners/$RUNNER_ID/exec" \
+  -H 'Content-Type: application/json' \
+  -d '{"command": ["cat", "/tmp/auto-test.txt"], "timeout_seconds": 30}')
+echo "  exec response: $EXEC_RESP"
+
+if echo "$EXEC_RESP" | grep -q "auto-marker"; then
+  pass "Auto-resume succeeded — marker survived"
+else
+  fail "Auto-resume failed or marker lost: $EXEC_RESP"
+fi
+
+# ---------------------------------------------------------------------------
+header "7. Verify runner is running again"
+# ---------------------------------------------------------------------------
+EXEC_RESP=$(curl -s -X POST "$HOST/api/v1/runners/$RUNNER_ID/exec" \
+  -H 'Content-Type: application/json' \
+  -d '{"command": ["echo", "still-alive"]}')
+if echo "$EXEC_RESP" | grep -q "still-alive"; then
+  pass "Runner is running after auto-resume"
+else
+  fail "Runner not responding after auto-resume: $EXEC_RESP"
+fi
+
+# ---------------------------------------------------------------------------
+header "8. Release runner"
+# ---------------------------------------------------------------------------
+RELEASE_RESP=$(curl -s -X POST "$CP/api/v1/runners/release" \
+  -H 'Content-Type: application/json' \
+  -d "{\"runner_id\": \"$RUNNER_ID\", \"destroy\": true}")
+RUNNER_ID=""  # prevent cleanup trap from double-releasing
+pass "Runner released"
+
+# ---------------------------------------------------------------------------
+header "Results"
+# ---------------------------------------------------------------------------
 echo ""
-echo "========================================="
-echo "=== AUTO-RESUME TEST COMPLETE ==="
-echo "========================================="
+echo "Passed: $PASS  Failed: $FAIL"
+if [ "$FAIL" -gt 0 ]; then
+  exit 1
+fi
+echo "All tests passed!"
