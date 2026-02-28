@@ -88,7 +88,8 @@ else
   exit 1
 fi
 
-HOST=${HOST_ADDR:-$MGR}
+# Use the manager's HTTP endpoint (not the gRPC address from allocate response)
+HOST=$MGR
 sleep 2  # wait for thaw-agent readiness
 
 # ---------------------------------------------------------------------------
