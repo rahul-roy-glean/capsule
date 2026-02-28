@@ -49,13 +49,15 @@ if [ -z "$RUNNER_ID" ] || [ "$RUNNER_ID" = "null" ]; then
   exit 1
 fi
 
-# --- 2. Poll until ready ---
+# --- 2. Poll until thaw-agent is ready ---
 echo ""
 echo "=== 2. Poll until ready ==="
 for i in $(seq 1 60); do
-  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-    "$CP/api/v1/runners/status?runner_id=$RUNNER_ID")
-  if [ "$HTTP_CODE" = "200" ]; then
+  EXEC_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    "$MGR/api/v1/runners/$RUNNER_ID/exec" \
+    -H 'Content-Type: application/json' \
+    -d '{"command":["echo","ready"],"timeout_seconds":2}')
+  if [ "$EXEC_CODE" = "200" ]; then
     echo "Runner ready after ${i}s"
     break
   fi
@@ -63,7 +65,6 @@ for i in $(seq 1 60); do
     echo "FAIL: runner not ready after 60s"
     exit 1
   fi
-  echo -n "."
   sleep 1
 done
 echo ""
