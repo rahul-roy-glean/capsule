@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 
@@ -37,9 +38,7 @@ func getNetworkPolicyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Ha
 		resp := map[string]any{
 			"runner_id": runnerID,
 			"version":   version,
-		}
-		if policy != nil {
-			resp["policy"] = policy
+			"policy":    policy, // null when no policy (consistent shape)
 		}
 
 		writeJSONResponse(w, http.StatusOK, resp)
@@ -74,8 +73,21 @@ func updateNetworkPolicyHandler(mgr *runner.Manager, logger *logrus.Logger) http
 
 		if err := mgr.UpdateNetworkPolicy(runnerID, body.Policy); err != nil {
 			log.WithError(err).WithField("runner_id", runnerID).Warn("Update network policy failed")
-			writeJSONResponse(w, http.StatusOK, map[string]any{
+
+			// Validation errors → 400; operational errors → 500
+			status := http.StatusInternalServerError
+			code := "POLICY_UPDATE_FAILED"
+			if strings.Contains(err.Error(), "invalid network policy:") {
+				status = http.StatusBadRequest
+				code = "INVALID_POLICY"
+			} else if strings.Contains(err.Error(), "runner not found") {
+				status = http.StatusNotFound
+				code = "RUNNER_NOT_FOUND"
+			}
+
+			writeJSONResponse(w, status, map[string]any{
 				"success":   false,
+				"code":      code,
 				"error":     err.Error(),
 				"runner_id": runnerID,
 			})
