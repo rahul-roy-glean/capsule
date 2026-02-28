@@ -33,9 +33,14 @@ header() { echo ""; echo "=== $1 ==="; }
 # Helper: exec inside a VM, return raw ndjson output
 vm_exec() {
   local rid="$1"; shift
-  curl -sf --no-buffer --max-time 15 -X POST "$MGR/api/v1/runners/$rid/exec" \
+  local out
+  if ! out=$(curl -sf --no-buffer --max-time 15 -X POST "$MGR/api/v1/runners/$rid/exec" \
     -H 'Content-Type: application/json' \
-    -d "{\"command\":$1,\"timeout_seconds\":10}" 2>&1 || echo '{"type":"error","message":"curl_failed"}'
+    -d "{\"command\":$1,\"timeout_seconds\":10}" 2>&1); then
+    echo "EXEC_PROXY_FAILED"
+    return 0  # don't blow up set -e; caller checks output
+  fi
+  echo "$out"
 }
 
 # Helper: TCP connectivity test (returns NET_OK or NET_FAIL)
@@ -48,6 +53,41 @@ vm_tcp_check() {
 vm_tcp_check_blocked() {
   local rid="$1" host="$2" port="$3"
   vm_exec "$rid" "[\"bash\",\"-c\",\"timeout 3 bash -c '(echo > /dev/tcp/$host/$port) 2>/dev/null && echo NET_OK || echo NET_BLOCKED' || echo NET_BLOCKED\"]"
+}
+
+# Helper: wait for thaw-agent to be reachable (retry exec up to 10s)
+wait_for_exec() {
+  local rid="$1"
+  echo -n "  Waiting for thaw-agent exec..." >&2
+  for i in $(seq 1 10); do
+    local out
+    out=$(vm_exec "$rid" "[\"echo\",\"THAW_OK\"]")
+    if echo "$out" | grep -q "THAW_OK"; then
+      echo " ready (${i}s)" >&2
+      return 0
+    fi
+    echo -n "." >&2
+    sleep 1
+  done
+  echo " FAILED (thaw-agent unreachable after 10s)" >&2
+  return 1
+}
+
+# Helper: dump iptables for debugging (call on failure)
+dump_netns_iptables() {
+  local rid="$1"
+  local id8="${rid:0:8}"
+  local ns="fc-$id8"
+  echo "  --- iptables dump for $ns ---"
+  echo "  FORWARD chain:"
+  sudo ip netns exec "$ns" iptables -S FORWARD 2>/dev/null || echo "    (failed)"
+  echo "  POLICY-INGRESS:"
+  sudo ip netns exec "$ns" iptables -S POLICY-INGRESS 2>/dev/null || echo "    (no chain)"
+  echo "  POLICY-EGRESS:"
+  sudo ip netns exec "$ns" iptables -S POLICY-EGRESS 2>/dev/null || echo "    (no chain)"
+  echo "  nat PREROUTING:"
+  sudo ip netns exec "$ns" iptables -t nat -S PREROUTING 2>/dev/null || echo "    (failed)"
+  echo "  ---"
 }
 
 # Helper: allocate runner and wait for ready, returns runner_id on stdout
@@ -237,13 +277,21 @@ echo "  version=$CI_VER name=$CI_NAME action=$CI_ACTION"
 # ---------------------------------------------------------------------------
 header "8. ci-standard: external egress works"
 # ---------------------------------------------------------------------------
-# Brief delay for thaw-agent to fully initialize after snapshot restore.
-sleep 2
-EXEC_CI=$(vm_tcp_check "$RUNNER_ID_CI" "8.8.8.8" "53")
-if echo "$EXEC_CI" | grep -q "NET_OK"; then
-  pass "ci-standard: external egress works"
+# Wait for thaw-agent to be reachable before testing network policy
+if ! wait_for_exec "$RUNNER_ID_CI"; then
+  fail "ci-standard: thaw-agent exec unreachable (cannot test network policy)"
+  dump_netns_iptables "$RUNNER_ID_CI"
 else
-  fail "ci-standard: external egress blocked"
+  EXEC_CI=$(vm_tcp_check "$RUNNER_ID_CI" "8.8.8.8" "53")
+  if echo "$EXEC_CI" | grep -q "NET_OK"; then
+    pass "ci-standard: external egress works"
+  elif echo "$EXEC_CI" | grep -q "EXEC_PROXY_FAILED"; then
+    fail "ci-standard: exec proxy failed (transport issue, not policy)"
+    dump_netns_iptables "$RUNNER_ID_CI"
+  else
+    fail "ci-standard: external egress blocked"
+    dump_netns_iptables "$RUNNER_ID_CI"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -367,11 +415,20 @@ sleep 2
 # ---------------------------------------------------------------------------
 header "14. deny-default: allowed CIDR reachable (positive)"
 # ---------------------------------------------------------------------------
-ALLOW_EXEC=$(vm_tcp_check "$RUNNER_ID_DENY" "8.8.8.8" "53")
-if echo "$ALLOW_EXEC" | grep -q "NET_OK"; then
-  pass "deny-default: 8.8.8.8:53 reachable (in allow list)"
+if ! wait_for_exec "$RUNNER_ID_DENY"; then
+  fail "deny-default: thaw-agent exec unreachable (cannot test network policy)"
+  dump_netns_iptables "$RUNNER_ID_DENY"
 else
-  fail "deny-default: 8.8.8.8:53 NOT reachable (should be allowed)"
+  ALLOW_EXEC=$(vm_tcp_check "$RUNNER_ID_DENY" "8.8.8.8" "53")
+  if echo "$ALLOW_EXEC" | grep -q "NET_OK"; then
+    pass "deny-default: 8.8.8.8:53 reachable (in allow list)"
+  elif echo "$ALLOW_EXEC" | grep -q "EXEC_PROXY_FAILED"; then
+    fail "deny-default: exec proxy failed (transport issue, not policy)"
+    dump_netns_iptables "$RUNNER_ID_DENY"
+  else
+    fail "deny-default: 8.8.8.8:53 NOT reachable (should be allowed)"
+    dump_netns_iptables "$RUNNER_ID_DENY"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
