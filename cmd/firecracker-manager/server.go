@@ -184,6 +184,13 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		}, nil
 	}
 
+	// Apply network policy if requested
+	if allocReq.NetworkPolicyPreset != "" || allocReq.NetworkPolicy != nil {
+		if policyErr := s.manager.ApplyNetworkPolicy(r.ID, allocReq); policyErr != nil {
+			s.logger.WithError(policyErr).WithField("runner_id", r.ID).Warn("Failed to apply network policy (non-fatal)")
+		}
+	}
+
 	return &pb.AllocateRunnerResponse{
 		Runner:    runnerToProto(r),
 		Resumed:   resumed,

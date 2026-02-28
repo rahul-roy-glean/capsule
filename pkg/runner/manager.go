@@ -1146,14 +1146,22 @@ func (m *Manager) UpdateNetworkPolicy(runnerID string, newPolicy *network.Networ
 	if !ok {
 		return fmt.Errorf("runner not found: %s", runnerID)
 	}
-	if enforcer == nil {
-		return fmt.Errorf("no policy enforcer for runner %s", runnerID)
+
+	if enforcer != nil {
+		// Existing enforcer: update in place
+		if err := enforcer.Update(newPolicy); err != nil {
+			return fmt.Errorf("update policy: %w", err)
+		}
+	} else if m.netnsNetwork != nil {
+		// No enforcer yet but netns available: create and apply
+		req := AllocateRequest{NetworkPolicy: newPolicy}
+		if err := m.ApplyNetworkPolicy(runnerID, req); err != nil {
+			return fmt.Errorf("apply policy on update: %w", err)
+		}
+		return nil // ApplyNetworkPolicy already sets version to 1
 	}
 
-	if err := enforcer.Update(newPolicy); err != nil {
-		return fmt.Errorf("update policy: %w", err)
-	}
-
+	// Store policy on runner (either enforcer updated or no netns)
 	m.mu.Lock()
 	r.NetworkPolicy = newPolicy
 	r.NetworkPolicyVersion++

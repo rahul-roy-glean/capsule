@@ -147,23 +147,16 @@ fi
 # ---------------------------------------------------------------------------
 header "5. Verify unrestricted runner has network access"
 # ---------------------------------------------------------------------------
+# Use /dev/tcp bash builtin — works without ping/nslookup being installed.
 EXEC_OUT=$(curl -sf --no-buffer -X POST "$MGR/api/v1/runners/$RUNNER_ID/exec" \
   -H 'Content-Type: application/json' \
-  -d '{"command":["sh","-c","ping -c1 -W2 8.8.8.8 >/dev/null 2>&1 && echo PING_OK || echo PING_FAIL"],"timeout_seconds":10}')
+  -d '{"command":["bash","-c","(echo > /dev/tcp/8.8.8.8/53) 2>/dev/null && echo NET_OK || echo NET_FAIL"],"timeout_seconds":10}')
 echo "  $EXEC_OUT"
 
-if echo "$EXEC_OUT" | grep -q "PING_OK"; then
-  pass "Unrestricted runner can reach 8.8.8.8"
+if echo "$EXEC_OUT" | grep -q "NET_OK"; then
+  pass "Unrestricted runner can reach 8.8.8.8:53"
 else
-  # Ping might be blocked by host firewall; try DNS instead
-  DNS_OUT=$(curl -sf --no-buffer -X POST "$MGR/api/v1/runners/$RUNNER_ID/exec" \
-    -H 'Content-Type: application/json' \
-    -d '{"command":["sh","-c","nslookup github.com >/dev/null 2>&1 && echo DNS_OK || echo DNS_FAIL"],"timeout_seconds":10}')
-  if echo "$DNS_OUT" | grep -q "DNS_OK"; then
-    pass "Unrestricted runner can resolve DNS"
-  else
-    fail "Unrestricted runner has no network access (expected unrestricted)"
-  fi
+  fail "Unrestricted runner has no network access (expected unrestricted)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -233,19 +226,12 @@ header "8. Verify ci-standard allows external egress"
 # ---------------------------------------------------------------------------
 EXEC_CI=$(curl -sf --no-buffer -X POST "$MGR/api/v1/runners/$RUNNER_ID_CI/exec" \
   -H 'Content-Type: application/json' \
-  -d '{"command":["sh","-c","ping -c1 -W2 8.8.8.8 >/dev/null 2>&1 && echo PING_OK || echo PING_FAIL"],"timeout_seconds":10}')
+  -d '{"command":["bash","-c","(echo > /dev/tcp/8.8.8.8/53) 2>/dev/null && echo NET_OK || echo NET_FAIL"],"timeout_seconds":10}')
 
-if echo "$EXEC_CI" | grep -q "PING_OK"; then
+if echo "$EXEC_CI" | grep -q "NET_OK"; then
   pass "ci-standard: external egress works"
 else
-  DNS_CI=$(curl -sf --no-buffer -X POST "$MGR/api/v1/runners/$RUNNER_ID_CI/exec" \
-    -H 'Content-Type: application/json' \
-    -d '{"command":["sh","-c","nslookup github.com >/dev/null 2>&1 && echo DNS_OK || echo DNS_FAIL"],"timeout_seconds":10}')
-  if echo "$DNS_CI" | grep -q "DNS_OK"; then
-    pass "ci-standard: external DNS works"
-  else
-    fail "ci-standard: no external access"
-  fi
+  fail "ci-standard: no external access"
 fi
 
 # ---------------------------------------------------------------------------
@@ -328,12 +314,12 @@ header "11. Verify deny-default blocks general egress"
 sleep 1
 DENY_EXEC=$(curl -sf --no-buffer -X POST "$MGR/api/v1/runners/$RUNNER_ID_DENY/exec" \
   -H 'Content-Type: application/json' \
-  -d '{"command":["sh","-c","ping -c1 -W3 1.1.1.1 >/dev/null 2>&1 && echo PING_OK || echo PING_BLOCKED"],"timeout_seconds":10}')
+  -d '{"command":["bash","-c","(echo > /dev/tcp/1.1.1.1/80) 2>/dev/null && echo NET_OK || echo NET_BLOCKED"],"timeout_seconds":10}')
 echo "  $DENY_EXEC"
 
-if echo "$DENY_EXEC" | grep -q "PING_BLOCKED"; then
+if echo "$DENY_EXEC" | grep -q "NET_BLOCKED"; then
   pass "deny-default: external egress blocked (1.1.1.1 unreachable)"
-elif echo "$DENY_EXEC" | grep -q "PING_OK"; then
+elif echo "$DENY_EXEC" | grep -q "NET_OK"; then
   fail "deny-default: external egress NOT blocked (1.1.1.1 reachable — policy not enforced)"
 else
   pass "deny-default: egress appears blocked (no clear response)"
