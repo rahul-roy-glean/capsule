@@ -29,6 +29,15 @@ fail() { echo "  ✗ $1"; FAIL=$((FAIL + 1)); }
 header() { echo ""; echo "=== $1 ==="; }
 
 RUNNER_IDS=()
+HAS_IPSET=false
+if command -v ipset >/dev/null 2>&1; then
+  HAS_IPSET=true
+fi
+if [ "$HAS_IPSET" = "false" ]; then
+  echo "WARNING: ipset not installed — iptables enforcement tests will be skipped"
+  echo "  Install with: sudo apt-get install -y ipset"
+fi
+
 cleanup() {
   for rid in "${RUNNER_IDS[@]}"; do
     if [ -n "$rid" ]; then
@@ -237,6 +246,7 @@ fi
 # ---------------------------------------------------------------------------
 header "9. Update policy at runtime (switch to deny-default)"
 # ---------------------------------------------------------------------------
+if [ "$HAS_IPSET" = "true" ]; then
 UPDATE_RESP=$(curl -s -X POST "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID_CI" \
   -H 'Content-Type: application/json' \
   -d '{
@@ -275,10 +285,14 @@ if [ "$UPDATED_NAME" = "custom-deny" ] && [ "$UPDATED_ACTION" = "deny" ]; then
 else
   fail "Policy readback mismatch: name=$UPDATED_NAME action=$UPDATED_ACTION"
 fi
+else
+  echo "  SKIP: ipset not installed"
+fi
 
 # ---------------------------------------------------------------------------
 header "10. Allocate runner with custom deny-default policy"
 # ---------------------------------------------------------------------------
+if [ "$HAS_IPSET" = "true" ]; then
 ALLOC_DENY_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
   -H 'Content-Type: application/json' \
   -d "{
@@ -324,6 +338,9 @@ elif echo "$DENY_EXEC" | grep -q "NET_OK"; then
 else
   pass "deny-default: egress appears blocked (no clear response)"
 fi
+else
+  echo "  SKIP: ipset not installed (steps 10-11 require iptables enforcement)"
+fi
 
 # ---------------------------------------------------------------------------
 header "12. Quarantine runner (should override to quarantine policy)"
@@ -351,7 +368,8 @@ else
   fail "Unquarantine failed: $UNQUARANTINE_RESP"
 fi
 
-# Verify policy is still the updated custom-deny policy
+# Verify policy is still the updated custom-deny policy (only if step 9 ran)
+if [ "$HAS_IPSET" = "true" ]; then
 RESTORED_POLICY=$(curl -s "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID_CI")
 RESTORED_NAME=$(echo "$RESTORED_POLICY" | jq -r '.policy.name // ""')
 
@@ -359,6 +377,9 @@ if [ "$RESTORED_NAME" = "custom-deny" ]; then
   pass "Policy restored after unquarantine"
 else
   fail "Policy not restored: expected custom-deny, got '$RESTORED_NAME'"
+fi
+else
+  echo "  SKIP: policy restore check (ipset not installed, step 9 was skipped)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -387,7 +408,7 @@ INVALID_BODY=$(curl -s -X POST "$MGR/api/v1/runners/network-policy?runner_id=$RU
     }
   }' 2>&1 || echo '{"success":false}')
 
-INVALID_SUCCESS=$(echo "$INVALID_BODY" | jq -r '.success // true')
+INVALID_SUCCESS=$(echo "$INVALID_BODY" | jq -r '.success')
 if [ "$INVALID_SUCCESS" = "false" ]; then
   pass "API rejected domain rules in allow-default mode"
 else
@@ -404,7 +425,7 @@ INVALID_CIDR_BODY=$(curl -s -X POST "$MGR/api/v1/runners/network-policy?runner_i
     }
   }' 2>&1 || echo '{"success":false}')
 
-INVALID_CIDR_SUCCESS=$(echo "$INVALID_CIDR_BODY" | jq -r '.success // true')
+INVALID_CIDR_SUCCESS=$(echo "$INVALID_CIDR_BODY" | jq -r '.success')
 if [ "$INVALID_CIDR_SUCCESS" = "false" ]; then
   pass "API rejected invalid CIDR"
 else
@@ -421,7 +442,7 @@ INVALID_INTERNAL=$(curl -s -X POST "$MGR/api/v1/runners/network-policy?runner_id
     }
   }' 2>&1 || echo '{"success":false}')
 
-INVALID_INTERNAL_SUCCESS=$(echo "$INVALID_INTERNAL" | jq -r '.success // true')
+INVALID_INTERNAL_SUCCESS=$(echo "$INVALID_INTERNAL" | jq -r '.success')
 if [ "$INVALID_INTERNAL_SUCCESS" = "false" ]; then
   pass "API rejected internal CIDR broader than /16"
 else

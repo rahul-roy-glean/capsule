@@ -85,15 +85,17 @@ func (s *Scheduler) Close() {
 
 // AllocateRunnerRequest represents a request to allocate a runner
 type AllocateRunnerRequest struct {
-	RequestID         string
-	WorkloadKey       string
-	Labels            map[string]string
-	GitHubRunnerToken string
-	CISystem          string
-	SessionID         string
-	VCPUs             int
-	MemoryMB          int
-	SnapshotTag       string
+	RequestID           string
+	WorkloadKey         string
+	Labels              map[string]string
+	GitHubRunnerToken   string
+	CISystem            string
+	SessionID           string
+	VCPUs               int
+	MemoryMB            int
+	SnapshotTag         string
+	NetworkPolicyPreset string
+	NetworkPolicyJSON   string
 }
 
 // AllocateRunnerResponse represents the response from runner allocation
@@ -288,15 +290,17 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 
 	// Build the proto request
 	protoReq := &pb.AllocateRunnerRequest{
-		RequestId:         req.RequestID,
-		Labels:            req.Labels,
-		GithubRunnerToken: req.GitHubRunnerToken,
-		WorkloadKey:       workloadKey,
-		CiSystem:          ciSystem,
-		SessionId:         req.SessionID,
-		SnapshotVersion:   snapshotVersion,
-		TtlSeconds:        int32(runnerTTLSeconds),
-		AutoPause:         autoPause,
+		RequestId:           req.RequestID,
+		Labels:              req.Labels,
+		GithubRunnerToken:   req.GitHubRunnerToken,
+		WorkloadKey:         workloadKey,
+		CiSystem:            ciSystem,
+		SessionId:           req.SessionID,
+		SnapshotVersion:     snapshotVersion,
+		TtlSeconds:          int32(runnerTTLSeconds),
+		AutoPause:           autoPause,
+		NetworkPolicyPreset: req.NetworkPolicyPreset,
+		NetworkPolicyJson:   req.NetworkPolicyJSON,
 	}
 	// Populate resources from tier (overrides request-level values)
 	protoReq.Resources = &pb.Resources{

@@ -607,11 +607,13 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 	}
 
 	var req struct {
-		RequestID   string            `json:"request_id"`
-		WorkloadKey string            `json:"workload_key"`
-		Labels      map[string]string `json:"labels"`
-		SessionID   string            `json:"session_id"`
-		SnapshotTag string            `json:"snapshot_tag"`
+		RequestID           string            `json:"request_id"`
+		WorkloadKey         string            `json:"workload_key"`
+		Labels              map[string]string `json:"labels"`
+		SessionID           string            `json:"session_id"`
+		SnapshotTag         string            `json:"snapshot_tag"`
+		NetworkPolicyPreset string            `json:"network_policy_preset"`
+		NetworkPolicyJSON   string            `json:"network_policy_json"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
@@ -632,11 +634,13 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 	}).Info("Manual runner allocation request")
 
 	resp, err := s.scheduler.AllocateRunner(r.Context(), AllocateRunnerRequest{
-		RequestID:   req.RequestID,
-		WorkloadKey: req.WorkloadKey,
-		Labels:      req.Labels,
-		SessionID:   req.SessionID,
-		SnapshotTag: req.SnapshotTag,
+		RequestID:           req.RequestID,
+		WorkloadKey:         req.WorkloadKey,
+		Labels:              req.Labels,
+		SessionID:           req.SessionID,
+		SnapshotTag:         req.SnapshotTag,
+		NetworkPolicyPreset: req.NetworkPolicyPreset,
+		NetworkPolicyJSON:   req.NetworkPolicyJSON,
 	})
 	if err != nil {
 		s.logger.WithError(err).Error("Manual allocation failed")

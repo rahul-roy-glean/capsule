@@ -22,7 +22,7 @@ apt-get update
 apt-get install -y --no-install-recommends \
   ca-certificates curl wget gnupg lsb-release \
   e2fsprogs qemu-utils \
-  bridge-utils iptables iproute2 \
+  bridge-utils iptables iproute2 ipset \
   jq git make build-essential \
   docker.io docker-buildx \
   postgresql postgresql-client
