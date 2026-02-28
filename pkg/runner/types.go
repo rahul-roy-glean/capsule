@@ -4,6 +4,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
@@ -57,6 +58,14 @@ type Runner struct {
 	QuarantinePaused        bool
 	ServicePort             int // Port of the user's service inside the VM (from StartCommand)
 
+	// Network policy fields
+	NetworkPolicy        *network.NetworkPolicy `json:"network_policy,omitempty"`
+	NetworkPolicyVersion int                    `json:"network_policy_version,omitempty"`
+	PreQuarantinePolicy  *network.NetworkPolicy `json:"pre_quarantine_policy,omitempty"`
+	DynamicDomainsAdded  int                    `json:"dynamic_domains_added,omitempty"`
+	DynamicCIDRsAdded    int                    `json:"dynamic_cidrs_added,omitempty"`
+	EmergencyEgressBlocked bool                 `json:"emergency_egress_blocked,omitempty"`
+
 	// Pool-related fields
 	PoolKey          *RunnerKey `json:"pool_key,omitempty"`
 	PausedAt         time.Time  `json:"paused_at,omitempty"`
@@ -107,6 +116,8 @@ type AllocateRequest struct {
 	TTLSeconds        int                    // idle timeout from snapshot config
 	AutoPause         bool                   // pause on TTL vs destroy
 	SnapshotTag       string                 // optional: named tag to resolve snapshot version
+	NetworkPolicyPreset string               // optional: named preset (e.g., "ci-standard")
+	NetworkPolicy     *network.NetworkPolicy // optional: full policy override
 }
 
 // MMDSData represents data to inject into the microVM via MMDS

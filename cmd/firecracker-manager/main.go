@@ -472,6 +472,16 @@ func main() {
 	httpMux.Handle("/metrics", promhttp.Handler())
 	httpMux.HandleFunc("/api/v1/runners/quarantine", drainingGuard(mgr, quarantineRunnerHandler(mgr, logger)))
 	httpMux.HandleFunc("/api/v1/runners/unquarantine", drainingGuard(mgr, unquarantineRunnerHandler(mgr, logger)))
+	httpMux.HandleFunc("/api/v1/runners/network-policy", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			getNetworkPolicyHandler(mgr, logger)(w, r)
+		case http.MethodPost:
+			updateNetworkPolicyHandler(mgr, logger)(w, r)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
 	httpMux.HandleFunc("/snapshot/sync", snapshotSyncHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/gc", gcHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/pool/flush", poolFlushHandler(mgr, logger))

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -10,6 +11,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
@@ -72,6 +74,16 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		SessionID:         req.SessionId,
 		TTLSeconds:        int(req.TtlSeconds),
 		AutoPause:         req.AutoPause,
+		NetworkPolicyPreset: req.NetworkPolicyPreset,
+	}
+
+	// Parse network policy JSON if provided
+	if req.NetworkPolicyJson != "" {
+		var np network.NetworkPolicy
+		if err := json.Unmarshal([]byte(req.NetworkPolicyJson), &np); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid network_policy_json: %v", err)
+		}
+		allocReq.NetworkPolicy = &np
 	}
 
 	if req.Resources != nil {

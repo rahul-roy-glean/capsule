@@ -378,6 +378,8 @@ func initSchema(db *sql.DB) error {
 			max_concurrent_runners INT DEFAULT 0,
 			current_version        VARCHAR(255),
 			auto_rollout           BOOLEAN DEFAULT true,
+			network_policy         JSONB DEFAULT NULL,
+			network_policy_preset  VARCHAR(64) DEFAULT '',
 			created_at             TIMESTAMP DEFAULT NOW()
 		)`,
 		// Rename chunk_key -> workload_key in existing tables (idempotent: no-op if column doesn't exist or target already exists)
@@ -473,6 +475,9 @@ func initSchema(db *sql.DB) error {
 			PRIMARY KEY (tag, workload_key)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_tags_workload ON snapshot_tags(workload_key)`,
+		// Network policy columns on snapshot_configs
+		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS network_policy JSONB DEFAULT NULL`,
+		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS network_policy_preset VARCHAR(64) DEFAULT ''`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil {

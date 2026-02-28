@@ -33,6 +33,8 @@ type SnapshotConfig struct {
 	SessionMaxAgeSeconds int                        `json:"session_max_age_seconds"`
 	AutoPause            bool                       `json:"auto_pause"`
 	Tier                 string                     `json:"tier"`
+	NetworkPolicy        json.RawMessage            `json:"network_policy,omitempty"`
+	NetworkPolicyPreset  string                     `json:"network_policy_preset,omitempty"`
 	CreatedAt            time.Time                  `json:"created_at"`
 }
 
@@ -123,19 +125,21 @@ func (r *SnapshotConfigRegistry) GetSnapshotConfig(ctx context.Context, workload
 	var githubAppID, githubAppSecret, startCommandJSON sql.NullString
 
 	var incrementalCommandsJSON sql.NullString
+	var networkPolicyJSON sql.NullString
+	var networkPolicyPreset sql.NullString
 
 	err := r.db.QueryRowContext(ctx, `
 		SELECT workload_key, display_name, commands, incremental_commands, build_schedule,
 		       max_concurrent_runners, current_version, auto_rollout,
 		       ci_system, github_app_id, github_app_secret, start_command,
 		       runner_ttl_seconds, session_max_age_seconds, auto_pause,
-		       tier, created_at
+		       tier, network_policy, network_policy_preset, created_at
 		FROM snapshot_configs WHERE workload_key = $1
 	`, workloadKey).Scan(&sc.WorkloadKey, &sc.DisplayName, &commandsJSON, &incrementalCommandsJSON, &sc.BuildSchedule,
 		&sc.MaxConcurrentRunners, &currentVersion, &sc.AutoRollout,
 		&sc.CISystem, &githubAppID, &githubAppSecret, &startCommandJSON,
 		&sc.RunnerTTLSeconds, &sc.SessionMaxAgeSeconds, &sc.AutoPause,
-		&sc.Tier, &sc.CreatedAt)
+		&sc.Tier, &networkPolicyJSON, &networkPolicyPreset, &sc.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("snapshot config not found: %s", workloadKey)
 	}
@@ -161,6 +165,12 @@ func (r *SnapshotConfigRegistry) GetSnapshotConfig(ctx context.Context, workload
 		sc.StartCommand = &snapshot.StartCommand{}
 		json.Unmarshal([]byte(startCommandJSON.String), sc.StartCommand)
 	}
+	if networkPolicyJSON.Valid && networkPolicyJSON.String != "" {
+		sc.NetworkPolicy = json.RawMessage(networkPolicyJSON.String)
+	}
+	if networkPolicyPreset.Valid {
+		sc.NetworkPolicyPreset = networkPolicyPreset.String
+	}
 	return &sc, nil
 }
 
@@ -171,7 +181,7 @@ func (r *SnapshotConfigRegistry) ListSnapshotConfigs(ctx context.Context) ([]*Sn
 		       max_concurrent_runners, current_version, auto_rollout,
 		       ci_system, github_app_id, github_app_secret, start_command,
 		       runner_ttl_seconds, session_max_age_seconds, auto_pause,
-		       tier, created_at
+		       tier, network_policy, network_policy_preset, created_at
 		FROM snapshot_configs ORDER BY workload_key
 	`)
 	if err != nil {
@@ -186,12 +196,13 @@ func (r *SnapshotConfigRegistry) ListSnapshotConfigs(ctx context.Context) ([]*Sn
 		var commandsJSON string
 		var incrementalCommandsJSON sql.NullString
 		var githubAppID, githubAppSecret, startCommandJSON sql.NullString
+		var networkPolicyJSON, networkPolicyPreset sql.NullString
 
 		if err := rows.Scan(&sc.WorkloadKey, &sc.DisplayName, &commandsJSON, &incrementalCommandsJSON, &sc.BuildSchedule,
 			&sc.MaxConcurrentRunners, &currentVersion, &sc.AutoRollout,
 			&sc.CISystem, &githubAppID, &githubAppSecret, &startCommandJSON,
 			&sc.RunnerTTLSeconds, &sc.SessionMaxAgeSeconds, &sc.AutoPause,
-			&sc.Tier, &sc.CreatedAt); err != nil {
+			&sc.Tier, &networkPolicyJSON, &networkPolicyPreset, &sc.CreatedAt); err != nil {
 			return nil, err
 		}
 		if currentVersion.Valid {
@@ -212,6 +223,12 @@ func (r *SnapshotConfigRegistry) ListSnapshotConfigs(ctx context.Context) ([]*Sn
 		if startCommandJSON.Valid && startCommandJSON.String != "" {
 			sc.StartCommand = &snapshot.StartCommand{}
 			json.Unmarshal([]byte(startCommandJSON.String), sc.StartCommand)
+		}
+		if networkPolicyJSON.Valid && networkPolicyJSON.String != "" {
+			sc.NetworkPolicy = json.RawMessage(networkPolicyJSON.String)
+		}
+		if networkPolicyPreset.Valid {
+			sc.NetworkPolicyPreset = networkPolicyPreset.String
 		}
 		configs = append(configs, &sc)
 	}

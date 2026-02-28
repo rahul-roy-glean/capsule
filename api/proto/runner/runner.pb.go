@@ -775,7 +775,9 @@ type AllocateRunnerRequest struct {
 	SnapshotVersion   string            `protobuf:"bytes,13,opt,name=snapshot_version,json=snapshotVersion,proto3" json:"snapshot_version,omitempty"`        // Explicit version to use; skips current-pointer.json lookup
 	TtlSeconds        int32             `protobuf:"varint,14,opt,name=ttl_seconds,json=ttlSeconds,proto3" json:"ttl_seconds,omitempty"`                      // idle timeout from snapshot config (0 = no timeout)
 	AutoPause         bool              `protobuf:"varint,15,opt,name=auto_pause,json=autoPause,proto3" json:"auto_pause,omitempty"`                         // pause on TTL expiry instead of destroy
-	SnapshotTag       string            `protobuf:"bytes,16,opt,name=snapshot_tag,json=snapshotTag,proto3" json:"snapshot_tag,omitempty"`                       // optional: named tag to resolve snapshot version
+	SnapshotTag         string            `protobuf:"bytes,16,opt,name=snapshot_tag,json=snapshotTag,proto3" json:"snapshot_tag,omitempty"`                       // optional: named tag to resolve snapshot version
+	NetworkPolicyPreset string            `protobuf:"bytes,17,opt,name=network_policy_preset,json=networkPolicyPreset,proto3" json:"network_policy_preset,omitempty"` // optional: named preset
+	NetworkPolicyJson   string            `protobuf:"bytes,18,opt,name=network_policy_json,json=networkPolicyJson,proto3" json:"network_policy_json,omitempty"`       // optional: full policy JSON
 }
 
 func (x *AllocateRunnerRequest) Reset() {
@@ -916,6 +918,20 @@ func (x *AllocateRunnerRequest) GetAutoPause() bool {
 func (x *AllocateRunnerRequest) GetSnapshotTag() string {
 	if x != nil {
 		return x.SnapshotTag
+	}
+	return ""
+}
+
+func (x *AllocateRunnerRequest) GetNetworkPolicyPreset() string {
+	if x != nil {
+		return x.NetworkPolicyPreset
+	}
+	return ""
+}
+
+func (x *AllocateRunnerRequest) GetNetworkPolicyJson() string {
+	if x != nil {
+		return x.NetworkPolicyJson
 	}
 	return ""
 }
