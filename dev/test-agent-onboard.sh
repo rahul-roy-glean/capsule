@@ -80,7 +80,7 @@ echo "--- Building golden snapshot with repos baked in ---"
 SNAPSHOT_COMMANDS='[
   {"type":"shell","args":["git","clone","--depth=1","--branch","main","https://github.com/pallets/markupsafe","/workspace/markupsafe"]},
   {"type":"shell","args":["git","clone","--depth=1","--branch","main","https://github.com/sindresorhus/camelcase","/workspace/camelcase"]},
-  {"type":"shell","args":["pip3","install","-e","/workspace/markupsafe"],"run_as_root":true},
+  {"type":"shell","args":["pip3","install","--break-system-packages","-e","/workspace/markupsafe"],"run_as_root":true},
   {"type":"shell","args":["bash","-c","cd /workspace/camelcase && npm install"]}
 ]'
 
