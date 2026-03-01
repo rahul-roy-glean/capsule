@@ -543,7 +543,7 @@ echo "Starting snapshot builder setup..."
 
 # Install Firecracker
 ARCH=$(uname -m)
-FC_VERSION="1.14.1"
+FC_VERSION="1.14.2"
 echo "Installing Firecracker v${FC_VERSION}..."
 cd /tmp
 curl -fSL "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-${ARCH}.tgz" -o firecracker.tgz

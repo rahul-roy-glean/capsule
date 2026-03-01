@@ -20,7 +20,7 @@ variable "zone" {
 
 variable "firecracker_version" {
   type        = string
-  default     = "1.14.1"
+  default     = "1.14.2"
   description = "Firecracker version to install"
 }
 
