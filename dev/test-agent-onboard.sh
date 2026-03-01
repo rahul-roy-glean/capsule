@@ -78,8 +78,8 @@ echo "--- Building golden snapshot with repos baked in ---"
 #   2. git-clone requires a git_token in MMDS for private repos; public repos
 #      work fine with plain git clone + GIT_TERMINAL_PROMPT=0
 SNAPSHOT_COMMANDS='[
-  {"type":"shell","args":["git","clone","--depth=1","--branch","main","https://github.com/pallets/markupsafe","/workspace/markupsafe"]},
-  {"type":"shell","args":["git","clone","--depth=1","--branch","main","https://github.com/sindresorhus/camelcase","/workspace/camelcase"]},
+  {"type":"shell","args":["bash","-c","rm -rf /workspace/markupsafe && git clone --depth=1 --branch main https://github.com/pallets/markupsafe /workspace/markupsafe"]},
+  {"type":"shell","args":["bash","-c","rm -rf /workspace/camelcase && git clone --depth=1 --branch main https://github.com/sindresorhus/camelcase /workspace/camelcase"]},
   {"type":"shell","args":["pip3","install","--break-system-packages","markupsafe"],"run_as_root":true}
 ]'
 

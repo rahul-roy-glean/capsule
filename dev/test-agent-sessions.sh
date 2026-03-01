@@ -172,8 +172,8 @@ CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/snapshot-configs" \
   -d '{
     "display_name": "agent-sandbox-test",
     "commands": [
-      {"type":"shell","args":["git","clone","--depth=1","--branch","main","https://github.com/pallets/markupsafe","/workspace/markupsafe"]},
-      {"type":"shell","args":["git","clone","--depth=1","--branch","main","https://github.com/sindresorhus/camelcase","/workspace/camelcase"]},
+      {"type":"shell","args":["bash","-c","rm -rf /workspace/markupsafe && git clone --depth=1 --branch main https://github.com/pallets/markupsafe /workspace/markupsafe"]},
+      {"type":"shell","args":["bash","-c","rm -rf /workspace/camelcase && git clone --depth=1 --branch main https://github.com/sindresorhus/camelcase /workspace/camelcase"]},
       {"type":"shell","args":["pip3","install","--break-system-packages","markupsafe"],"run_as_root":true}
     ],
     "runner_ttl_seconds": 300,
