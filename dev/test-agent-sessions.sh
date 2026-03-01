@@ -193,18 +193,27 @@ fi
 # ---------------------------------------------------------------------------
 header "2. Allocate runner with session_id + network policy"
 # ---------------------------------------------------------------------------
-sleep 1
-ALLOC_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
-  -H 'Content-Type: application/json' \
-  -d "{
-    \"ci_system\":\"none\",
-    \"workload_key\":\"$WORKLOAD_KEY\",
-    \"session_id\":\"$SESSION_ID\",
-    \"network_policy_preset\":\"ci-standard\"
-  }")
+# Wait for the manager to heartbeat so the control plane has an available host.
+echo -n "  Waiting for host to register..."
+for i in $(seq 1 30); do
+  ALLOC_RESP=$(curl -s -X POST "$CP/api/v1/runners/allocate" \
+    -H 'Content-Type: application/json' \
+    -d "{
+      \"ci_system\":\"none\",
+      \"workload_key\":\"$WORKLOAD_KEY\",
+      \"session_id\":\"$SESSION_ID\",
+      \"network_policy_preset\":\"ci-standard\"
+    }")
+  RUNNER_ID=$(echo "$ALLOC_RESP" | jq -r '.runner_id // empty')
+  if [ -n "$RUNNER_ID" ] && [ "$RUNNER_ID" != "null" ]; then
+    echo " allocated (${i}s)"
+    break
+  fi
+  echo -n "."
+  sleep 2
+done
 echo "Response: $ALLOC_RESP"
 
-RUNNER_ID=$(echo "$ALLOC_RESP" | jq -r '.runner_id')
 RESUMED=$(echo "$ALLOC_RESP" | jq -r '.resumed // false')
 RUNNER_IDS+=("$RUNNER_ID")
 
