@@ -40,12 +40,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     npm \
     && rm -rf /var/lib/apt/lists/*
 
-# Claude Code
-RUN curl -fsSL https://claude.ai/install.sh | bash
-
 # Create runner user with NOPASSWD sudo
 RUN useradd -m -s /bin/bash -G sudo runner \
     && echo "runner ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/runner
+
+# Claude Code — install as runner user so it goes into /home/runner/.claude/
+# The install script uses $HOME to determine the install location.
+RUN su - runner -c "curl -fsSL https://claude.ai/install.sh | bash"
+
+# Ensure claude is on PATH for all users (thaw-agent execs as runner)
+RUN echo 'export PATH="/home/runner/.claude/bin:/home/runner/.local/bin:$PATH"' >> /home/runner/.bashrc \
+    && echo 'PATH="/home/runner/.claude/bin:/home/runner/.local/bin:$PATH"' >> /etc/environment
 
 # Claude Code settings for headless Vertex AI usage
 RUN mkdir -p /home/runner/.claude && \
