@@ -157,13 +157,19 @@ func main() {
 	// Create services
 	hostRegistry := NewHostRegistry(db, logger)
 	snapshotManager := NewSnapshotManager(ctx, db, *gcsBucket, *gcsPrefix, gcpProjectVal, gcpZoneVal, logger)
+	configCache := NewConfigCache(db, logger)
 	tagRegistry := NewSnapshotTagRegistry(db, logger)
 	scheduler := NewScheduler(hostRegistry, db, snapshotManager, tagRegistry, logger)
+	scheduler.SetConfigCache(configCache)
 	if metricsClient != nil {
 		scheduler.SetMetricsClient(metricsClient)
 	}
 	jobQueue := NewJobQueue(db, scheduler, hostRegistry, logger)
-	snapshotConfigRegistry := NewSnapshotConfigRegistry(db, snapshotManager, tagRegistry, logger)
+	jobQueue.SetConfigCache(configCache)
+	layeredConfigRegistry := NewLayeredConfigRegistry(db, snapshotManager, logger)
+	layeredConfigRegistry.SetConfigCache(configCache)
+	layerBuildScheduler := NewLayerBuildScheduler(db, snapshotManager, logger, 4)
+	layeredConfigRegistry.SetLayerBuilder(layerBuildScheduler)
 
 	// Load existing state from DB (best-effort)
 	if err := hostRegistry.LoadFromDB(ctx); err != nil {
@@ -215,9 +221,9 @@ func main() {
 	httpMux.HandleFunc("/api/v1/hosts", controlPlaneServer.HandleGetHosts)
 	httpMux.HandleFunc("/api/v1/hosts/heartbeat", controlPlaneServer.HandleHostHeartbeat)
 	httpMux.HandleFunc("/api/v1/snapshots", controlPlaneServer.HandleGetSnapshots)
-	// Snapshot config registry endpoints
-	httpMux.HandleFunc("/api/v1/snapshot-configs/", snapshotConfigRegistry.HandleSnapshotConfigs)
-	httpMux.HandleFunc("/api/v1/snapshot-configs", snapshotConfigRegistry.HandleSnapshotConfigs)
+	// Layered config registry endpoints
+	httpMux.HandleFunc("/api/v1/layered-configs/", layeredConfigRegistry.HandleLayeredConfigs)
+	httpMux.HandleFunc("/api/v1/layered-configs", layeredConfigRegistry.HandleLayeredConfigs)
 	// Version/rollout endpoints (Phase 4)
 	httpMux.HandleFunc("/api/v1/versions/desired", controlPlaneServer.HandleGetDesiredVersions)
 	httpMux.HandleFunc("/api/v1/versions/fleet", controlPlaneServer.HandleGetFleetConvergence)
@@ -243,10 +249,10 @@ func main() {
 
 	// Start background workers
 	go hostRegistry.HealthCheckLoop(ctx)
-	go snapshotFreshnessLoop(ctx, snapshotManager, snapshotConfigRegistry, logger)
 	go startDownscaler(ctx, db, hostRegistry, scheduler, logger)
 	go jobQueue.jobRetryLoop(ctx)
 	go controlPlaneServer.startTTLEnforcement(ctx)
+	go layerBuildScheduler.Run(ctx)
 	if metricsClient != nil {
 		go controlPlaneMetricsLoop(ctx, hostRegistry, scheduler, snapshotManager, metricsClient, logger)
 	}
@@ -369,41 +375,16 @@ func initSchema(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_version_assignments_repo ON version_assignments(repo_slug)`,
 		`CREATE INDEX IF NOT EXISTS idx_version_assignments_host ON version_assignments(host_id)`,
-		// workload_key migration: add snapshot_configs table
-		`CREATE TABLE IF NOT EXISTS snapshot_configs (
-			workload_key              VARCHAR(16) PRIMARY KEY,
-			display_name           VARCHAR(255),
-			commands               TEXT NOT NULL DEFAULT '[]',
-			build_schedule         VARCHAR(64) DEFAULT '',
-			max_concurrent_runners INT DEFAULT 0,
-			current_version        VARCHAR(255),
-			auto_rollout           BOOLEAN DEFAULT true,
-			network_policy         JSONB DEFAULT NULL,
-			network_policy_preset  VARCHAR(64) DEFAULT '',
-			created_at             TIMESTAMP DEFAULT NOW()
-		)`,
 		// Rename chunk_key -> workload_key in existing tables (idempotent: no-op if column doesn't exist or target already exists)
-		`DO $$ BEGIN ALTER TABLE snapshot_configs RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
 		`DO $$ BEGIN ALTER TABLE snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
 		`DO $$ BEGIN ALTER TABLE version_assignments RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
 		`DO $$ BEGIN ALTER TABLE session_snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
 		// Add workload_key column to snapshots (for fresh installs without chunk_key)
 		`ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshots_workload_key ON snapshots(workload_key)`,
-		// GitHub App credentials for snapshot configs
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS github_app_id VARCHAR(255) DEFAULT ''`,
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS github_app_secret VARCHAR(255) DEFAULT ''`,
-		// Add ci_system column to snapshot_configs (defaults to empty string = no CI system)
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS ci_system VARCHAR(64) DEFAULT ''`,
-		// Add start_command column to snapshot_configs (JSON-encoded StartCommand)
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS start_command TEXT DEFAULT ''`,
 		// Add workload_key column to version_assignments
 		`ALTER TABLE version_assignments ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_version_assignments_workload ON version_assignments(workload_key)`,
-		// Session pause/resume: TTL and auto-pause config
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS runner_ttl_seconds INT DEFAULT 0`,
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS session_max_age_seconds INT DEFAULT 86400`,
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS auto_pause BOOLEAN DEFAULT false`,
 		// Session snapshots tracking for pause/resume
 		`CREATE TABLE IF NOT EXISTS session_snapshots (
 			session_id    TEXT PRIMARY KEY,
@@ -438,10 +419,6 @@ func initSchema(db *sql.DB) error {
 		// Add workload_key column to runners
 		`ALTER TABLE runners ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_runners_workload_key ON runners(workload_key)`,
-		// Incremental commands for snapshot configs
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS incremental_commands JSONB DEFAULT '[]'`,
-		// Tier-based resource sizing
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS tier VARCHAR(8) DEFAULT 'm'`,
 		// Host resource tracking for bin-packing scheduler
 		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS total_cpu_millicores INT DEFAULT 0`,
 		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS used_cpu_millicores INT DEFAULT 0`,
@@ -465,6 +442,113 @@ func initSchema(db *sql.DB) error {
 		// Drop unused repo/branch columns from runners
 		`ALTER TABLE runners DROP COLUMN IF EXISTS repo`,
 		`ALTER TABLE runners DROP COLUMN IF EXISTS branch`,
+		// Layered snapshot pipeline tables
+		`CREATE TABLE IF NOT EXISTS snapshot_layers (
+			layer_hash           VARCHAR(64) PRIMARY KEY,
+			parent_layer_hash    VARCHAR(64) REFERENCES snapshot_layers(layer_hash),
+			config_name          VARCHAR(255) NOT NULL,
+			depth                INT NOT NULL DEFAULT 0,
+			init_commands        JSONB NOT NULL DEFAULT '[]',
+			refresh_commands     JSONB DEFAULT '[]',
+			drives               JSONB DEFAULT '[]',
+			refresh_interval     VARCHAR(64) DEFAULT '',
+			current_version      VARCHAR(255),
+			status               VARCHAR(32) DEFAULT 'pending',
+			created_at           TIMESTAMP DEFAULT NOW(),
+			updated_at           TIMESTAMP DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_layers_parent ON snapshot_layers(parent_layer_hash)`,
+		`CREATE INDEX IF NOT EXISTS idx_layers_status ON snapshot_layers(status)`,
+		`CREATE TABLE IF NOT EXISTS snapshot_builds (
+			build_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			layer_hash        VARCHAR(64) NOT NULL REFERENCES snapshot_layers(layer_hash),
+			version           VARCHAR(255) NOT NULL,
+			status            VARCHAR(32) DEFAULT 'queued',
+			build_type        VARCHAR(16) DEFAULT 'init',
+			instance_name     VARCHAR(255),
+			parent_version    VARCHAR(255),
+			started_at        TIMESTAMP,
+			completed_at      TIMESTAMP,
+			failure_reason    TEXT,
+			retry_count       INT DEFAULT 0,
+			max_retries       INT DEFAULT 3,
+			created_at        TIMESTAMP DEFAULT NOW(),
+			UNIQUE(layer_hash, version)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_builds_status ON snapshot_builds(status, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_builds_layer ON snapshot_builds(layer_hash)`,
+		`CREATE TABLE IF NOT EXISTS layered_configs (
+			config_id              VARCHAR(64) PRIMARY KEY,
+			display_name           VARCHAR(255) NOT NULL,
+			config_json            TEXT NOT NULL,
+			leaf_layer_hash        VARCHAR(64),
+			leaf_workload_key      VARCHAR(16),
+			tier                   VARCHAR(8) DEFAULT 'm',
+			ci_system              VARCHAR(64) DEFAULT '',
+			github_app_id          VARCHAR(255) DEFAULT '',
+			github_app_secret      VARCHAR(255) DEFAULT '',
+			start_command          TEXT DEFAULT '',
+			runner_ttl_seconds     INT DEFAULT 0,
+			session_max_age_seconds INT DEFAULT 86400,
+			auto_pause             BOOLEAN DEFAULT false,
+			auto_rollout           BOOLEAN DEFAULT true,
+			max_concurrent_runners INT DEFAULT 0,
+			build_schedule         VARCHAR(64) DEFAULT '',
+			created_at             TIMESTAMP DEFAULT NOW(),
+			updated_at             TIMESTAMP DEFAULT NOW()
+		)`,
+		// Indexes for layered_configs lookups
+		`CREATE INDEX IF NOT EXISTS idx_layered_configs_leaf_wk ON layered_configs(leaf_workload_key)`,
+		`CREATE INDEX IF NOT EXISTS idx_layered_configs_leaf_hash ON layered_configs(leaf_layer_hash)`,
+		// Network policy columns on layered_configs
+		`ALTER TABLE layered_configs ADD COLUMN IF NOT EXISTS network_policy JSONB DEFAULT NULL`,
+		`ALTER TABLE layered_configs ADD COLUMN IF NOT EXISTS network_policy_preset VARCHAR(64) DEFAULT ''`,
+		// Mapping table: repo → workload_key for CI webhook routing.
+		// This is a CI integration concern, not part of the core config model.
+		`CREATE TABLE IF NOT EXISTS repo_workload_mappings (
+			repo          VARCHAR(512) PRIMARY KEY,
+			workload_key  VARCHAR(16) NOT NULL,
+			source        VARCHAR(32) DEFAULT 'auto',
+			created_at    TIMESTAMP DEFAULT NOW()
+		)`,
+		// Reattach build support: track old layer hash/version for drive reuse
+		`ALTER TABLE snapshot_builds ADD COLUMN IF NOT EXISTS old_layer_hash VARCHAR(64)`,
+		`ALTER TABLE snapshot_builds ADD COLUMN IF NOT EXISTS old_layer_version VARCHAR(255)`,
+		// config_id links a build to the owning layered_configs row for tier/credential lookups
+		`ALTER TABLE snapshot_builds ADD COLUMN IF NOT EXISTS config_id VARCHAR(64)`,
+		// All-chain drives: union of drives across all layers in a config
+		`ALTER TABLE snapshot_layers ADD COLUMN IF NOT EXISTS all_chain_drives JSONB DEFAULT '[]'`,
+		// Re-activate layers that are referenced by a config but were incorrectly deactivated.
+		`UPDATE snapshot_layers SET status='active' WHERE status='inactive'
+			AND layer_hash IN (
+				WITH RECURSIVE config_layers AS (
+					SELECT sl.layer_hash, sl.parent_layer_hash
+					FROM snapshot_layers sl
+					JOIN layered_configs lc ON lc.leaf_layer_hash = sl.layer_hash
+					UNION ALL
+					SELECT sl.layer_hash, sl.parent_layer_hash
+					FROM snapshot_layers sl
+					JOIN config_layers cl ON cl.parent_layer_hash = sl.layer_hash
+				)
+				SELECT layer_hash FROM config_layers
+			)`,
+		// Deactivate orphaned layers not referenced by any config and cancel their active builds.
+		// Walk the parent chain from each config's leaf_layer_hash to find all referenced layers.
+		`UPDATE snapshot_layers SET status='inactive' WHERE status IN ('active', 'pending')
+			AND layer_hash NOT IN (
+				WITH RECURSIVE config_layers AS (
+					SELECT sl.layer_hash, sl.parent_layer_hash
+					FROM snapshot_layers sl
+					JOIN layered_configs lc ON lc.leaf_layer_hash = sl.layer_hash
+					UNION ALL
+					SELECT sl.layer_hash, sl.parent_layer_hash
+					FROM snapshot_layers sl
+					JOIN config_layers cl ON cl.parent_layer_hash = sl.layer_hash
+				)
+				SELECT layer_hash FROM config_layers
+			)`,
+		`UPDATE snapshot_builds SET status='cancelled' WHERE status IN ('queued','waiting_parent','running')
+			AND layer_hash IN (SELECT layer_hash FROM snapshot_layers WHERE status='inactive')`,
 		// Snapshot tags for template versioning (WS6)
 		`CREATE TABLE IF NOT EXISTS snapshot_tags (
 			tag           VARCHAR(64) NOT NULL,
@@ -475,15 +559,52 @@ func initSchema(db *sql.DB) error {
 			PRIMARY KEY (tag, workload_key)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_tags_workload ON snapshot_tags(workload_key)`,
-		// Network policy columns on snapshot_configs
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS network_policy JSONB DEFAULT NULL`,
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS network_policy_preset VARCHAR(64) DEFAULT ''`,
 	}
-	for _, stmt := range migrations {
-		if _, err := db.Exec(stmt); err != nil {
+	logger := logrus.WithField("component", "migrations")
+	for i, stmt := range migrations {
+		result, err := db.Exec(stmt)
+		if err != nil {
 			return err
 		}
+		if n, _ := result.RowsAffected(); n > 0 {
+			logger.WithFields(logrus.Fields{
+				"migration": i,
+				"rows":      n,
+			}).Info("Migration applied")
+		}
 	}
+
+	// Log layer statuses for debugging
+	rows, err := db.Query(`SELECT layer_hash, config_name, status FROM snapshot_layers ORDER BY config_name`)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var hash, name, status string
+			rows.Scan(&hash, &name, &status)
+			logger.WithFields(logrus.Fields{
+				"layer_hash": hash[:16],
+				"name":       name,
+				"status":     status,
+			}).Info("Layer status at startup")
+		}
+	}
+
+	// Log active builds
+	rows2, err := db.Query(`SELECT build_id, layer_hash, status, build_type FROM snapshot_builds WHERE status IN ('queued','waiting_parent','running') ORDER BY created_at`)
+	if err == nil {
+		defer rows2.Close()
+		for rows2.Next() {
+			var bid, hash, status, btype string
+			rows2.Scan(&bid, &hash, &status, &btype)
+			logger.WithFields(logrus.Fields{
+				"build_id":   bid,
+				"layer_hash": hash[:16],
+				"status":     status,
+				"build_type": btype,
+			}).Info("Active build at startup")
+		}
+	}
+
 	return nil
 }
 

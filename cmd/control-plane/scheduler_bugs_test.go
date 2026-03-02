@@ -10,7 +10,7 @@ import (
 // AllocateRunnerRequest struct has TTL-related fields that can be
 // populated from snapshot config data.
 // FIXED: The scheduler now reads runner_ttl_seconds and auto_pause
-// from snapshot_configs and forwards them via the gRPC proto request.
+// from layered_configs and forwards them via the gRPC proto request.
 func TestSchedulerAllocateRequest_TTLFieldsExist(t *testing.T) {
 	req := AllocateRunnerRequest{
 		WorkloadKey: "test-key",

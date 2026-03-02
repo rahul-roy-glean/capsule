@@ -15,6 +15,7 @@ type JobQueue struct {
 	db           *sql.DB
 	scheduler    *Scheduler
 	hostRegistry *HostRegistry
+	configCache  *ConfigCache
 	logger       *logrus.Entry
 }
 
@@ -26,6 +27,11 @@ func NewJobQueue(db *sql.DB, scheduler *Scheduler, hostRegistry *HostRegistry, l
 		hostRegistry: hostRegistry,
 		logger:       logger.WithField("component", "job-queue"),
 	}
+}
+
+// SetConfigCache sets the in-memory config cache for fast repo lookups.
+func (jq *JobQueue) SetConfigCache(cc *ConfigCache) {
+	jq.configCache = cc
 }
 
 // EnqueueJob inserts a new job row from a webhook event and returns the job ID.
@@ -104,8 +110,13 @@ func (jq *JobQueue) processQueuedJobs(ctx context.Context) {
 			continue
 		}
 
-		// Look up workload_key from snapshot_configs by matching a git-clone command for this repo
-		workloadKey := lookupWorkloadKeyForRepo(jq.db, repo)
+		// Look up workload_key: in-memory cache first, DB fallback
+		var workloadKey string
+		if jq.configCache != nil {
+			workloadKey = jq.configCache.GetWorkloadKeyForRepo(repo)
+		} else {
+			workloadKey = lookupWorkloadKeyForRepo(jq.db, repo)
+		}
 
 		// Attempt allocation
 		req := AllocateRunnerRequest{
@@ -183,28 +194,38 @@ func parseLabels(labelsJSON []byte) []string {
 	return labels
 }
 
-// lookupWorkloadKeyForRepo finds the workload_key in snapshot_configs whose commands
-// contain a git-clone arg matching the given repo name. Returns "" if not found.
+// lookupWorkloadKeyForRepo finds the workload_key matching the given repo name.
+// Uses the repo_workload_mappings table for O(1) indexed lookup, then falls back
+// to scanning config tables for backward compatibility (and backfills the mapping).
 func lookupWorkloadKeyForRepo(db *sql.DB, repoFullName string) string {
-	if db == nil {
+	if db == nil || repoFullName == "" {
 		return ""
 	}
-	rows, err := db.Query(`SELECT workload_key, commands FROM snapshot_configs`)
-	if err != nil {
-		return ""
-	}
-	defer rows.Close()
 
-	for rows.Next() {
-		var workloadKey, commandsJSON string
-		if err := rows.Scan(&workloadKey, &commandsJSON); err != nil {
-			continue
-		}
-		// If any command arg contains the repo name, use this workload_key
-		if commandsJSON != "" && containsRepo(commandsJSON, repoFullName) {
-			return workloadKey
+	// Fast path: indexed lookup in the mapping table
+	var wk string
+	err := db.QueryRow(`SELECT workload_key FROM repo_workload_mappings WHERE repo = $1`, repoFullName).Scan(&wk)
+	if err == nil && wk != "" {
+		return wk
+	}
+
+	// Slow fallback: scan layered_configs config_json
+	lcRows, err := db.Query(`SELECT leaf_workload_key, config_json FROM layered_configs`)
+	if err == nil {
+		defer lcRows.Close()
+		for lcRows.Next() {
+			var workloadKey, configJSON string
+			if err := lcRows.Scan(&workloadKey, &configJSON); err != nil {
+				continue
+			}
+			if configJSON != "" && containsRepo(configJSON, repoFullName) {
+				// Backfill the mapping table for next time
+				db.Exec(`INSERT INTO repo_workload_mappings (repo, workload_key, source) VALUES ($1, $2, 'backfill') ON CONFLICT (repo) DO UPDATE SET workload_key = EXCLUDED.workload_key`, repoFullName, workloadKey)
+				return workloadKey
+			}
 		}
 	}
+
 	return ""
 }
 
