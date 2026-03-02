@@ -155,7 +155,7 @@ CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "netpol-test",
-    "layers": [{"name": "base", "init_commands": [{"type":"shell","command":"echo netpol-test"}]}],
+    "layers": [{"name": "base", "init_commands": [{"type":"shell","command":"echo netpol-test-nopolicy"}]}],
     "config": {"runner_ttl_seconds": 120, "auto_pause": false}
   }')
 CONFIG_ID=$(echo "$CONFIG_RESP" | jq -r '.config_id')

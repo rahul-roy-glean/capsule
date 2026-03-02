@@ -62,6 +62,8 @@ type StoredLayeredConfig struct {
 	AutoRollout          bool                   `json:"auto_rollout"`
 	MaxConcurrentRunners int                    `json:"max_concurrent_runners"`
 	BuildSchedule        string                 `json:"build_schedule"`
+	NetworkPolicyPreset  string                 `json:"network_policy_preset,omitempty"`
+	NetworkPolicy        json.RawMessage        `json:"network_policy,omitempty"`
 	CreatedAt            time.Time              `json:"created_at"`
 	UpdatedAt            time.Time              `json:"updated_at"`
 }
@@ -240,17 +242,21 @@ func (r *LayeredConfigRegistry) GetLayeredConfig(ctx context.Context, configID s
 	var sc StoredLayeredConfig
 	var startCommandJSON sql.NullString
 	var githubAppID, githubAppSecret sql.NullString
+	var npPreset sql.NullString
+	var npJSON sql.NullString
 
 	err := r.db.QueryRowContext(ctx, `
 		SELECT config_id, display_name, leaf_layer_hash, leaf_workload_key,
 		       tier, ci_system, github_app_id, github_app_secret, start_command,
 		       runner_ttl_seconds, session_max_age_seconds, auto_pause, auto_rollout,
-		       max_concurrent_runners, build_schedule, created_at, updated_at
+		       max_concurrent_runners, build_schedule, network_policy_preset, network_policy,
+		       created_at, updated_at
 		FROM layered_configs WHERE config_id = $1
 	`, configID).Scan(&sc.ConfigID, &sc.DisplayName, &sc.LeafLayerHash, &sc.LeafWorkloadKey,
 		&sc.Tier, &sc.CISystem, &githubAppID, &githubAppSecret, &startCommandJSON,
 		&sc.RunnerTTLSeconds, &sc.SessionMaxAgeSeconds, &sc.AutoPause, &sc.AutoRollout,
-		&sc.MaxConcurrentRunners, &sc.BuildSchedule, &sc.CreatedAt, &sc.UpdatedAt)
+		&sc.MaxConcurrentRunners, &sc.BuildSchedule, &npPreset, &npJSON,
+		&sc.CreatedAt, &sc.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("layered config not found: %s", configID)
 	}
@@ -266,6 +272,12 @@ func (r *LayeredConfigRegistry) GetLayeredConfig(ctx context.Context, configID s
 	if startCommandJSON.Valid && startCommandJSON.String != "" {
 		sc.StartCommand = &snapshot.StartCommand{}
 		json.Unmarshal([]byte(startCommandJSON.String), sc.StartCommand)
+	}
+	if npPreset.Valid {
+		sc.NetworkPolicyPreset = npPreset.String
+	}
+	if npJSON.Valid && npJSON.String != "" && npJSON.String != "null" {
+		sc.NetworkPolicy = json.RawMessage(npJSON.String)
 	}
 	return &sc, nil
 }
