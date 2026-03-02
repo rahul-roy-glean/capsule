@@ -3,7 +3,7 @@
 #
 # Tests the full network policy lifecycle:
 #   1. API CRUD for policies (presets, custom, get/update)
-#   2. Policy on snapshot configs (DB integration)
+#   2. Policy on layered configs (DB integration)
 #   3. Allocation with policy preset / custom policy
 #   4. Policy enforcement (deny-default blocks, allow-default permits)
 #   5. RFC1918 blocking under ci-standard
@@ -149,27 +149,28 @@ echo "=== E2E Network Policy Tests ==="
 # =========================================================================
 
 # ---------------------------------------------------------------------------
-header "1. Register snapshot config (no policy — backwards compat)"
+header "1. Register layered config (no policy — backwards compat)"
 # ---------------------------------------------------------------------------
-CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/snapshot-configs" \
+CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "netpol-test",
-    "commands": [{"type":"shell","command":"echo netpol-test"}],
-    "runner_ttl_seconds": 120,
-    "auto_pause": false
+    "layers": [{"name": "base", "init_commands": [{"type":"shell","command":"echo netpol-test"}]}],
+    "config": {"runner_ttl_seconds": 120, "auto_pause": false}
   }')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.workload_key')
-echo "  workload_key=$WORKLOAD_KEY"
+CONFIG_ID=$(echo "$CONFIG_RESP" | jq -r '.config_id')
+WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.leaf_workload_key')
+echo "  config_id=$CONFIG_ID  workload_key=$WORKLOAD_KEY"
 
 if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then
-  pass "Snapshot config registered (no policy)"
+  pass "Layered config registered (no policy)"
 else
-  fail "Snapshot config registration failed"; exit 1
+  fail "Layered config registration failed"; exit 1
 fi
 
-NP=$(echo "$CONFIG_RESP" | jq -r '.network_policy // "null"')
-NP_PRESET=$(echo "$CONFIG_RESP" | jq -r '.network_policy_preset // ""')
+GET_RESP=$(curl -sf "$CP/api/v1/layered-configs/$CONFIG_ID")
+NP=$(echo "$GET_RESP" | jq -r '.config.network_policy // "null"')
+NP_PRESET=$(echo "$GET_RESP" | jq -r '.config.network_policy_preset // ""')
 if [ "$NP" = "null" ] && [ -z "$NP_PRESET" ]; then
   pass "Config has no network policy (backwards compatible)"
 else
@@ -177,18 +178,18 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-header "2. Register snapshot config with policy preset"
+header "2. Register layered config with policy preset"
 # ---------------------------------------------------------------------------
-CONFIG_PRESET_RESP=$(curl -sf -X POST "$CP/api/v1/snapshot-configs" \
+CONFIG_PRESET_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "netpol-ci-test",
-    "commands": [{"type":"shell","command":"echo netpol-ci"}],
-    "runner_ttl_seconds": 120,
-    "auto_pause": false,
-    "network_policy_preset": "ci-standard"
+    "layers": [{"name": "base", "init_commands": [{"type":"shell","command":"echo netpol-ci"}]}],
+    "config": {"runner_ttl_seconds": 120, "auto_pause": false, "network_policy_preset": "ci-standard"}
   }')
-NP_PRESET2=$(echo "$CONFIG_PRESET_RESP" | jq -r '.network_policy_preset // ""')
+CONFIG_PRESET_ID=$(echo "$CONFIG_PRESET_RESP" | jq -r '.config_id')
+GET_PRESET_RESP=$(curl -sf "$CP/api/v1/layered-configs/$CONFIG_PRESET_ID")
+NP_PRESET2=$(echo "$GET_PRESET_RESP" | jq -r '.config.network_policy_preset // ""')
 echo "  preset=$NP_PRESET2"
 
 if [ "$NP_PRESET2" = "ci-standard" ]; then
