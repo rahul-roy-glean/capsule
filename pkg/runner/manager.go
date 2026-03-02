@@ -501,8 +501,11 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		"netmask":  netmask,
 	}).Debug("Configuring kernel network boot args")
 
-	// Create VM configuration
+	// Create VM configuration — resolve extension drives dynamically from snapshot
 	extensionPaths := make(map[string]string)
+	for driveID, path := range snapshotPaths.ExtensionDriveImages {
+		extensionPaths[driveID] = path
+	}
 	if repoCacheUpperPath != "" {
 		extensionPaths["repo_cache_upper"] = repoCacheUpperPath
 	}
@@ -562,7 +565,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		// for LoadSnapshot, then rename it back. Running VMs are unaffected
 		// because they hold TAP FDs (kernel tracks by ifindex, not name).
 		restoreOK := false
-		cleanup, symlinkErr := m.setupSnapshotSymlinks(overlayPath, repoCacheUpperPath, snapshotPaths)
+		cleanup, symlinkErr := m.setupSnapshotSymlinks(overlayPath, extensionPaths)
 		if symlinkErr != nil {
 			m.logger.WithError(symlinkErr).Warn("Failed to setup snapshot symlinks, falling back to cold boot")
 		} else if useNetNS {
@@ -1168,15 +1171,9 @@ const snapshotTAPName = "tap-slot-0"
 // Returns a cleanup function that removes the symlinks. The cleanup should be
 // called after LoadSnapshot returns, as Firecracker holds open file descriptors
 // and no longer needs the symlink paths.
-func (m *Manager) setupSnapshotSymlinks(overlayPath, repoCacheUpperPath string, snapshotPaths *snapshot.SnapshotPaths) (func(), error) {
+func (m *Manager) setupSnapshotSymlinks(overlayPath string, extensionDrivePaths map[string]string) (func(), error) {
 	if err := os.MkdirAll(snapshotSymlinkDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create snapshot symlink dir: %w", err)
-	}
-
-	// Resolve git-cache image path (same logic as buildDrives)
-	gitCacheImg := m.gitCacheImage
-	if gitCacheImg == "" {
-		gitCacheImg = m.getOrCreateGitCachePlaceholder()
 	}
 
 	// Map snapshot filenames to actual host paths.
@@ -1186,10 +1183,12 @@ func (m *Manager) setupSnapshotSymlinks(overlayPath, repoCacheUpperPath string, 
 		target string // actual path on host
 	}{
 		{"rootfs.img", overlayPath},
-		{"repo-cache-seed.img", snapshotPaths.RepoCacheSeed},
-		{"repo-cache-upper.img", repoCacheUpperPath},
 		{"credentials.img", m.credentialsImage},
-		{"git-cache.img", gitCacheImg},
+	}
+	// Add extension drives by driveID (e.g. "repo_cache_seed" → "repo-cache-seed.img")
+	for driveID, path := range extensionDrivePaths {
+		name := strings.ReplaceAll(driveID, "_", "-") + ".img"
+		symlinks = append(symlinks, struct{ name, target string }{name, path})
 	}
 
 	var created []string
@@ -1285,32 +1284,6 @@ func (m *Manager) setupSnapshotTAPRename(currentTAP string) (func(), error) {
 	}
 
 	return restore, nil
-}
-
-// getOrCreateGitCachePlaceholder ensures a placeholder git-cache image exists for snapshot restore compatibility.
-func (m *Manager) getOrCreateGitCachePlaceholder() string {
-	sharedDir := filepath.Join(m.config.WorkspaceDir, "_shared")
-	placeholderPath := filepath.Join(sharedDir, "git-cache-placeholder.img")
-
-	// Check if already exists
-	if _, err := os.Stat(placeholderPath); err == nil {
-		return placeholderPath
-	}
-
-	// Create placeholder directory
-	if err := os.MkdirAll(sharedDir, 0755); err != nil {
-		m.logger.WithError(err).Warn("Failed to create shared dir for git-cache placeholder")
-		return ""
-	}
-
-	// Create small placeholder image (64MB is minimum for ext4)
-	if err := createExt4ImageMB(placeholderPath, 64, "GIT_CACHE"); err != nil {
-		m.logger.WithError(err).Warn("Failed to create git-cache placeholder image")
-		return ""
-	}
-
-	m.logger.WithField("path", placeholderPath).Info("Created git-cache placeholder image for snapshot compatibility")
-	return placeholderPath
 }
 
 func createExt4Image(path string, sizeGB int, label string) error {

@@ -30,7 +30,7 @@ func (s *ControlPlaneServer) startTTLEnforcement(ctx context.Context) {
 }
 
 func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
-	// Build a lookup of workload_key → (ttl, auto_pause) from snapshot_configs.
+	// Build a lookup of workload_key → (ttl, auto_pause) from layered_configs.
 	type ttlConfig struct {
 		ttlSeconds int
 		autoPause  bool
@@ -38,9 +38,9 @@ func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
 	configs := make(map[string]ttlConfig)
 	if s.snapshotManager != nil && s.snapshotManager.db != nil {
 		rows, err := s.snapshotManager.db.QueryContext(ctx,
-			`SELECT workload_key, runner_ttl_seconds, auto_pause FROM snapshot_configs WHERE auto_pause = true AND runner_ttl_seconds > 0`)
+			`SELECT leaf_workload_key, runner_ttl_seconds, auto_pause FROM layered_configs WHERE auto_pause = true AND runner_ttl_seconds > 0`)
 		if err != nil {
-			s.logger.WithError(err).Warn("TTL enforcement: failed to query snapshot_configs")
+			s.logger.WithError(err).Warn("TTL enforcement: failed to query layered_configs")
 			return
 		}
 		defer rows.Close()
