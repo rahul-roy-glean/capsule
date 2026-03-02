@@ -162,6 +162,79 @@ FROM snapshots
 ORDER BY created_at DESC
 LIMIT 10;
 
+-- Layered snapshot pipeline tables
+
+-- snapshot_layers: the layer DAG
+CREATE TABLE IF NOT EXISTS snapshot_layers (
+    layer_hash           VARCHAR(64) PRIMARY KEY,
+    parent_layer_hash    VARCHAR(64) REFERENCES snapshot_layers(layer_hash),
+    config_name          VARCHAR(255) NOT NULL,
+    depth                INT NOT NULL DEFAULT 0,
+    init_commands        JSONB NOT NULL DEFAULT '[]',
+    refresh_commands     JSONB DEFAULT '[]',
+    drives               JSONB DEFAULT '[]',
+    all_chain_drives     JSONB DEFAULT '[]',
+    refresh_interval     VARCHAR(64) DEFAULT '',
+    current_version      VARCHAR(255),
+    status               VARCHAR(32) DEFAULT 'pending',
+    created_at           TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at           TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_layers_parent ON snapshot_layers(parent_layer_hash);
+CREATE INDEX IF NOT EXISTS idx_layers_status ON snapshot_layers(status);
+
+-- snapshot_builds: the build queue
+CREATE TABLE IF NOT EXISTS snapshot_builds (
+    build_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    layer_hash        VARCHAR(64) NOT NULL REFERENCES snapshot_layers(layer_hash),
+    version           VARCHAR(255) NOT NULL,
+    status            VARCHAR(32) DEFAULT 'queued',
+    build_type        VARCHAR(16) DEFAULT 'init',
+    instance_name     VARCHAR(255),
+    parent_version    VARCHAR(255),
+    started_at        TIMESTAMP WITH TIME ZONE,
+    completed_at      TIMESTAMP WITH TIME ZONE,
+    failure_reason    TEXT,
+    retry_count       INT DEFAULT 0,
+    max_retries       INT DEFAULT 3,
+    old_layer_hash    VARCHAR(64),
+    old_layer_version VARCHAR(255),
+    config_id         VARCHAR(64) DEFAULT '',
+    created_at        TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(layer_hash, version)
+);
+CREATE INDEX IF NOT EXISTS idx_builds_status ON snapshot_builds(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_builds_layer ON snapshot_builds(layer_hash);
+-- Enforce at most one active build per layer to prevent duplicate VM launches
+CREATE UNIQUE INDEX IF NOT EXISTS idx_builds_one_active_per_layer
+    ON snapshot_builds (layer_hash) WHERE status IN ('queued', 'waiting_parent', 'running');
+
+-- layered_configs: top-level config ownership
+CREATE TABLE IF NOT EXISTS layered_configs (
+    config_id              VARCHAR(64) PRIMARY KEY,
+    display_name           VARCHAR(255) NOT NULL,
+    config_json            TEXT NOT NULL,
+    leaf_layer_hash        VARCHAR(64),
+    leaf_workload_key      VARCHAR(16),
+    tier                   VARCHAR(8) DEFAULT 'm',
+    ci_system              VARCHAR(64) DEFAULT '',
+    github_app_id          VARCHAR(255) DEFAULT '',
+    github_app_secret      VARCHAR(255) DEFAULT '',
+    start_command          TEXT DEFAULT '',
+    runner_ttl_seconds     INT DEFAULT 0,
+    session_max_age_seconds INT DEFAULT 86400,
+    auto_pause             BOOLEAN DEFAULT false,
+    auto_rollout           BOOLEAN DEFAULT true,
+    max_concurrent_runners INT DEFAULT 0,
+    build_schedule         VARCHAR(64) DEFAULT '',
+    created_at             TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at             TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Indexes for layered_configs lookups
+CREATE INDEX IF NOT EXISTS idx_layered_configs_leaf_wk ON layered_configs(leaf_workload_key);
+CREATE INDEX IF NOT EXISTS idx_layered_configs_leaf_hash ON layered_configs(leaf_layer_hash);
+
 -- Grant permissions (adjust as needed)
 -- GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO firecracker_app;
 -- GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO firecracker_app;

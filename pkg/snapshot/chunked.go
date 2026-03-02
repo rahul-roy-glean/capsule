@@ -101,6 +101,12 @@ type ChunkedSnapshotMetadata struct {
 	// to build this snapshot. Used by incremental builds to detect rootfs changes
 	// and fall back to cold boot when the base image has been updated.
 	RootfsSourceHash string `json:"rootfs_source_hash,omitempty"`
+	// Layer fields for layered snapshot builds.
+	LayerHash       string `json:"layer_hash,omitempty"`
+	ParentLayerHash string `json:"parent_layer_hash,omitempty"`
+	ParentVersion   string `json:"parent_version,omitempty"`
+	LayerDepth      int    `json:"layer_depth,omitempty"`
+	LayerName       string `json:"layer_name,omitempty"`
 }
 
 // ChunkRef references a single chunk by its content hash
