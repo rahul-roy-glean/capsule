@@ -43,10 +43,11 @@ type LayeredConfig struct {
 // LayerMaterialized is a LayerDef with computed hash chain info.
 type LayerMaterialized struct {
 	LayerDef
-	LayerHash       string `json:"layer_hash"`
-	ParentLayerHash string `json:"parent_layer_hash"`    // "" for root
-	Depth           int    `json:"depth"`                // 0 for root
-	BaseImage       string `json:"base_image,omitempty"` // only set on the platform layer (depth 0)
+	LayerHash       string      `json:"layer_hash"`
+	ParentLayerHash string      `json:"parent_layer_hash"`        // "" for root
+	Depth           int         `json:"depth"`                    // 0 for root
+	BaseImage       string      `json:"base_image,omitempty"`     // only set on the platform layer (depth 0)
+	AllChainDrives  []DriveSpec `json:"all_chain_drives,omitempty"` // union of all drives across all layers in the config
 }
 
 // ValidateLayeredConfig checks a LayeredConfig for correctness.
@@ -143,6 +144,23 @@ func MaterializeLayers(cfg *LayeredConfig) []LayerMaterialized {
 			result[i].BaseImage = cfg.BaseImage
 		}
 		parentHash = layerHash
+	}
+
+	// Compute the union of all drives across all layers.
+	// Every layer gets the same set so that Firecracker snapshot restore
+	// works — you can't add/remove drives between snapshot and restore.
+	seen := make(map[string]bool)
+	var allDrives []DriveSpec
+	for _, layer := range result {
+		for _, d := range layer.Drives {
+			if !seen[d.DriveID] {
+				seen[d.DriveID] = true
+				allDrives = append(allDrives, d)
+			}
+		}
+	}
+	for i := range result {
+		result[i].AllChainDrives = allDrives
 	}
 
 	return result

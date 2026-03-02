@@ -510,12 +510,85 @@ func initSchema(db *sql.DB) error {
 		// Reattach build support: track old layer hash/version for drive reuse
 		`ALTER TABLE snapshot_builds ADD COLUMN IF NOT EXISTS old_layer_hash VARCHAR(64)`,
 		`ALTER TABLE snapshot_builds ADD COLUMN IF NOT EXISTS old_layer_version VARCHAR(255)`,
+		// All-chain drives: union of drives across all layers in a config
+		`ALTER TABLE snapshot_layers ADD COLUMN IF NOT EXISTS all_chain_drives JSONB DEFAULT '[]'`,
+		// Re-activate layers that are referenced by a config but were incorrectly deactivated.
+		`UPDATE snapshot_layers SET status='active' WHERE status='inactive'
+			AND layer_hash IN (
+				WITH RECURSIVE config_layers AS (
+					SELECT sl.layer_hash, sl.parent_layer_hash
+					FROM snapshot_layers sl
+					JOIN layered_configs lc ON lc.leaf_layer_hash = sl.layer_hash
+					UNION ALL
+					SELECT sl.layer_hash, sl.parent_layer_hash
+					FROM snapshot_layers sl
+					JOIN config_layers cl ON cl.parent_layer_hash = sl.layer_hash
+				)
+				SELECT layer_hash FROM config_layers
+			)`,
+		// Deactivate orphaned layers not referenced by any config and cancel their active builds.
+		// Walk the parent chain from each config's leaf_layer_hash to find all referenced layers.
+		`UPDATE snapshot_layers SET status='inactive' WHERE status IN ('active', 'pending')
+			AND layer_hash NOT IN (
+				WITH RECURSIVE config_layers AS (
+					SELECT sl.layer_hash, sl.parent_layer_hash
+					FROM snapshot_layers sl
+					JOIN layered_configs lc ON lc.leaf_layer_hash = sl.layer_hash
+					UNION ALL
+					SELECT sl.layer_hash, sl.parent_layer_hash
+					FROM snapshot_layers sl
+					JOIN config_layers cl ON cl.parent_layer_hash = sl.layer_hash
+				)
+				SELECT layer_hash FROM config_layers
+			)`,
+		`UPDATE snapshot_builds SET status='cancelled' WHERE status IN ('queued','waiting_parent','running')
+			AND layer_hash IN (SELECT layer_hash FROM snapshot_layers WHERE status='inactive')`,
 	}
-	for _, stmt := range migrations {
-		if _, err := db.Exec(stmt); err != nil {
+	logger := logrus.WithField("component", "migrations")
+	for i, stmt := range migrations {
+		result, err := db.Exec(stmt)
+		if err != nil {
 			return err
 		}
+		if n, _ := result.RowsAffected(); n > 0 {
+			logger.WithFields(logrus.Fields{
+				"migration": i,
+				"rows":      n,
+			}).Info("Migration applied")
+		}
 	}
+
+	// Log layer statuses for debugging
+	rows, err := db.Query(`SELECT layer_hash, config_name, status FROM snapshot_layers ORDER BY config_name`)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var hash, name, status string
+			rows.Scan(&hash, &name, &status)
+			logger.WithFields(logrus.Fields{
+				"layer_hash": hash[:16],
+				"name":       name,
+				"status":     status,
+			}).Info("Layer status at startup")
+		}
+	}
+
+	// Log active builds
+	rows2, err := db.Query(`SELECT build_id, layer_hash, status, build_type FROM snapshot_builds WHERE status IN ('queued','waiting_parent','running') ORDER BY created_at`)
+	if err == nil {
+		defer rows2.Close()
+		for rows2.Next() {
+			var bid, hash, status, btype string
+			rows2.Scan(&bid, &hash, &status, &btype)
+			logger.WithFields(logrus.Fields{
+				"build_id":   bid,
+				"layer_hash": hash[:16],
+				"status":     status,
+				"build_type": btype,
+			}).Info("Active build at startup")
+		}
+	}
+
 	return nil
 }
 

@@ -125,6 +125,7 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 		initCmdsJSON, _ := json.Marshal(layer.InitCommands)
 		refreshCmdsJSON, _ := json.Marshal(layer.RefreshCommands)
 		drivesJSON, _ := json.Marshal(layer.Drives)
+		allChainDrivesJSON, _ := json.Marshal(layer.AllChainDrives)
 
 		var parentHash *string
 		if layer.ParentLayerHash != "" {
@@ -132,13 +133,14 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 		}
 
 		_, err := tx.ExecContext(ctx, `
-			INSERT INTO snapshot_layers (layer_hash, parent_layer_hash, config_name, depth, init_commands, refresh_commands, drives, refresh_interval)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			INSERT INTO snapshot_layers (layer_hash, parent_layer_hash, config_name, depth, init_commands, refresh_commands, drives, all_chain_drives, refresh_interval)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 			ON CONFLICT (layer_hash) DO UPDATE SET
 				config_name = EXCLUDED.config_name,
+				all_chain_drives = EXCLUDED.all_chain_drives,
 				updated_at = NOW()
 		`, layer.LayerHash, parentHash, layer.Name, layer.Depth,
-			string(initCmdsJSON), string(refreshCmdsJSON), string(drivesJSON), layer.RefreshInterval)
+			string(initCmdsJSON), string(refreshCmdsJSON), string(drivesJSON), string(allChainDrivesJSON), layer.RefreshInterval)
 		if err != nil {
 			return "", "", fmt.Errorf("failed to insert layer %s: %w", layer.Name, err)
 		}
@@ -301,82 +303,69 @@ func (r *LayeredConfigRegistry) ListLayeredConfigs(ctx context.Context) ([]*Stor
 }
 
 // GetLayerStatuses returns the status of all layers in a config.
-// Uses a single query to fetch all layer statuses instead of N round trips.
+// Walks up from leaf_layer_hash using parent pointers instead of
+// re-parsing config JSON and re-computing hashes.
 func (r *LayeredConfigRegistry) GetLayerStatuses(ctx context.Context, configID string) ([]LayerStatus, error) {
-	// Parse config_json to get layer chain
-	var cfgJSON string
-	err := r.db.QueryRowContext(ctx, `SELECT config_json FROM layered_configs WHERE config_id = $1`, configID).Scan(&cfgJSON)
+	var leafHash string
+	err := r.db.QueryRowContext(ctx, `SELECT leaf_layer_hash FROM layered_configs WHERE config_id = $1`, configID).Scan(&leafHash)
 	if err != nil {
 		return nil, err
 	}
 
-	var cfg snapshot.LayeredConfig
-	if err := json.Unmarshal([]byte(cfgJSON), &cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse stored config: %w", err)
-	}
-
-	layers := snapshot.MaterializeLayers(&cfg)
-	if len(layers) == 0 {
-		return nil, nil
-	}
-
-	// Build a map of layer_hash → DB status in one query
-	// Collect all hashes for an IN clause
-	hashArgs := make([]interface{}, len(layers))
-	placeholders := make([]string, len(layers))
-	for i, l := range layers {
-		hashArgs[i] = l.LayerHash
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
-	}
-
-	query := fmt.Sprintf(`SELECT layer_hash, status, current_version FROM snapshot_layers WHERE layer_hash IN (%s)`,
-		strings.Join(placeholders, ","))
-	rows, err := r.db.QueryContext(ctx, query, hashArgs...)
+	rows, err := r.db.QueryContext(ctx, `
+		WITH RECURSIVE chain AS (
+			SELECT layer_hash, parent_layer_hash, config_name, depth, status, current_version
+			FROM snapshot_layers WHERE layer_hash = $1
+			UNION ALL
+			SELECT sl.layer_hash, sl.parent_layer_hash, sl.config_name, sl.depth, sl.status, sl.current_version
+			FROM snapshot_layers sl
+			JOIN chain c ON sl.layer_hash = c.parent_layer_hash
+		)
+		SELECT layer_hash, config_name, depth, status, current_version
+		FROM chain ORDER BY depth
+	`, leafHash)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	type layerInfo struct {
-		status         string
-		currentVersion string
-	}
-	infoMap := make(map[string]layerInfo)
+	var statuses []LayerStatus
 	for rows.Next() {
-		var hash string
+		var ls LayerStatus
 		var status, currentVersion sql.NullString
-		if err := rows.Scan(&hash, &status, &currentVersion); err != nil {
+		if err := rows.Scan(&ls.LayerHash, &ls.Name, &ls.Depth, &status, &currentVersion); err != nil {
 			continue
 		}
-		info := layerInfo{}
 		if status.Valid {
-			info.status = status.String
+			ls.Status = status.String
+		} else {
+			ls.Status = "unknown"
 		}
 		if currentVersion.Valid {
-			info.currentVersion = currentVersion.String
+			ls.CurrentVersion = currentVersion.String
 		}
-		infoMap[hash] = info
-	}
-
-	statuses := make([]LayerStatus, len(layers))
-	for i, layer := range layers {
-		statuses[i] = LayerStatus{
-			Name:      layer.Name,
-			LayerHash: layer.LayerHash,
-			Depth:     layer.Depth,
-		}
-		if info, ok := infoMap[layer.LayerHash]; ok {
-			statuses[i].Status = info.status
-			statuses[i].CurrentVersion = info.currentVersion
-		} else {
-			statuses[i].Status = "unknown"
-		}
+		statuses = append(statuses, ls)
 	}
 	return statuses, nil
 }
 
-// DeleteLayeredConfig deletes a layered config. Layers shared by other configs are preserved.
+// DeleteLayeredConfig deletes a layered config. Layers shared by other configs are preserved;
+// orphaned layers (not referenced by any remaining config) are deactivated and their builds cancelled.
 func (r *LayeredConfigRegistry) DeleteLayeredConfig(ctx context.Context, configID string) error {
+	// Load the config's layer hashes before deleting
+	var configJSON string
+	err := r.db.QueryRowContext(ctx, `SELECT config_json FROM layered_configs WHERE config_id = $1`, configID).Scan(&configJSON)
+	if err != nil {
+		return fmt.Errorf("layered config not found: %s", configID)
+	}
+
+	var cfg snapshot.LayeredConfig
+	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
+		return fmt.Errorf("failed to parse config: %w", err)
+	}
+	layers := snapshot.MaterializeLayers(&cfg)
+
+	// Delete the config
 	result, err := r.db.ExecContext(ctx, `DELETE FROM layered_configs WHERE config_id = $1`, configID)
 	if err != nil {
 		return err
@@ -385,6 +374,47 @@ func (r *LayeredConfigRegistry) DeleteLayeredConfig(ctx context.Context, configI
 	if rows == 0 {
 		return fmt.Errorf("layered config not found: %s", configID)
 	}
+
+	// For each layer, check if it's still referenced by another config.
+	// Walk the parent chain from each remaining config's leaf_layer_hash.
+	// If the layer is in any config's chain, preserve it.
+	for _, layer := range layers {
+		var referenced int
+		r.db.QueryRowContext(ctx, `
+			WITH RECURSIVE config_layers AS (
+				SELECT sl.layer_hash, sl.parent_layer_hash
+				FROM snapshot_layers sl
+				JOIN layered_configs lc ON lc.leaf_layer_hash = sl.layer_hash
+				UNION ALL
+				SELECT sl.layer_hash, sl.parent_layer_hash
+				FROM snapshot_layers sl
+				JOIN config_layers cl ON cl.parent_layer_hash = sl.layer_hash
+			)
+			SELECT COUNT(*) FROM config_layers WHERE layer_hash = $1
+		`, layer.LayerHash).Scan(&referenced)
+
+		if referenced > 0 {
+			r.logger.WithFields(logrus.Fields{
+				"layer_hash": layer.LayerHash[:16],
+			}).Debug("Layer still referenced by other configs, preserving")
+			continue
+		}
+
+		// Deactivate orphaned layer
+		r.db.ExecContext(ctx, `UPDATE snapshot_layers SET status='inactive' WHERE layer_hash=$1`, layer.LayerHash)
+
+		// Cancel active builds
+		r.db.ExecContext(ctx, `
+			UPDATE snapshot_builds SET status='cancelled'
+			WHERE layer_hash=$1 AND status IN ('queued','waiting_parent','running')
+		`, layer.LayerHash)
+
+		r.logger.WithFields(logrus.Fields{
+			"layer_hash": layer.LayerHash[:16],
+			"layer_name": layer.Name,
+		}).Info("Deactivated orphaned layer and cancelled builds")
+	}
+
 	return nil
 }
 
@@ -502,10 +532,18 @@ func (r *LayeredConfigRegistry) handleGetLayeredConfig(w http.ResponseWriter, re
 
 	layerStatuses, _ := r.GetLayerStatuses(req.Context(), configID)
 
+	// Include the raw config definition so callers can see commands/layers
+	var rawConfig json.RawMessage
+	var cfgJSON string
+	if err := r.db.QueryRowContext(req.Context(), `SELECT config_json FROM layered_configs WHERE config_id = $1`, configID).Scan(&cfgJSON); err == nil {
+		rawConfig = json.RawMessage(cfgJSON)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"config": sc,
-		"layers": layerStatuses,
+		"config":     sc,
+		"layers":     layerStatuses,
+		"definition": rawConfig,
 	})
 }
 
@@ -556,8 +594,9 @@ func (r *LayeredConfigRegistry) handleTriggerBuild(w http.ResponseWriter, req *h
 	}
 
 	layers := snapshot.MaterializeLayers(&cfg)
+	forceRebuild := req.URL.Query().Get("force") == "true"
 	if r.layerBuilder != nil {
-		if err := r.layerBuilder.EnqueueChainBuild(req.Context(), layers, 0, "init"); err != nil {
+		if err := r.layerBuilder.EnqueueChainBuild(req.Context(), layers, 0, "init", configID, forceRebuild); err != nil {
 			http.Error(w, fmt.Sprintf("failed to enqueue build: %s", err), http.StatusInternalServerError)
 			return
 		}
@@ -568,6 +607,7 @@ func (r *LayeredConfigRegistry) handleTriggerBuild(w http.ResponseWriter, req *h
 	json.NewEncoder(w).Encode(map[string]string{
 		"config_id": configID,
 		"status":    "build_enqueued",
+		"force":     fmt.Sprintf("%v", forceRebuild),
 	})
 }
 
@@ -615,7 +655,7 @@ func (r *LayeredConfigRegistry) handleRefreshLayer(w http.ResponseWriter, req *h
 	}
 
 	if r.layerBuilder != nil {
-		if err := r.layerBuilder.EnqueueChainBuild(req.Context(), layers, startDepth, "refresh"); err != nil {
+		if err := r.layerBuilder.EnqueueChainBuild(req.Context(), layers, startDepth, "refresh", configID); err != nil {
 			http.Error(w, fmt.Sprintf("failed to enqueue refresh: %s", err), http.StatusInternalServerError)
 			return
 		}

@@ -173,6 +173,7 @@ CREATE TABLE IF NOT EXISTS snapshot_layers (
     init_commands        JSONB NOT NULL DEFAULT '[]',
     refresh_commands     JSONB DEFAULT '[]',
     drives               JSONB DEFAULT '[]',
+    all_chain_drives     JSONB DEFAULT '[]',
     refresh_interval     VARCHAR(64) DEFAULT '',
     current_version      VARCHAR(255),
     status               VARCHAR(32) DEFAULT 'pending',
@@ -198,11 +199,15 @@ CREATE TABLE IF NOT EXISTS snapshot_builds (
     max_retries       INT DEFAULT 3,
     old_layer_hash    VARCHAR(64),
     old_layer_version VARCHAR(255),
+    config_id         VARCHAR(64) DEFAULT '',
     created_at        TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     UNIQUE(layer_hash, version)
 );
 CREATE INDEX IF NOT EXISTS idx_builds_status ON snapshot_builds(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_builds_layer ON snapshot_builds(layer_hash);
+-- Enforce at most one active build per layer to prevent duplicate VM launches
+CREATE UNIQUE INDEX IF NOT EXISTS idx_builds_one_active_per_layer
+    ON snapshot_builds (layer_hash) WHERE status IN ('queued', 'waiting_parent', 'running');
 
 -- layered_configs: top-level config ownership
 CREATE TABLE IF NOT EXISTS layered_configs (

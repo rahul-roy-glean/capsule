@@ -180,8 +180,14 @@ func main() {
 		}
 	}
 
-	// For refresh/reattach builds, use the incremental restore path
+	// For refresh/reattach builds, use the incremental restore path.
+	// Also use it for init builds that have a parent layer (child init builds
+	// should restore from parent snapshot, not cold boot).
 	incremental := *buildType == "refresh" || *buildType == "reattach"
+	if !incremental && *parentWorkloadKey != "" && *parentVersion != "" {
+		incremental = true
+		log.Info("Init build with parent layer: will restore from parent snapshot")
+	}
 	if incremental {
 		log.WithField("build_type", *buildType).Info("Using incremental restore path")
 	}
@@ -231,11 +237,11 @@ func main() {
 
 	// Try incremental/reattach restore from previous snapshot
 	if incremental {
-		if *buildType == "reattach" && *previousLayerKey != "" && *previousLayerVersion != "" && *parentWorkloadKey != "" && *parentVersion != "" {
-			// Reattach: parent's VM state + old layer's extension drives
-			log.Info("Attempting reattach from parent + old layer drives...")
+		if *parentWorkloadKey != "" && *parentVersion != "" {
+			// Restore from parent layer: parent's VM state (+ old layer's extension drives if reattach)
+			log.Info("Attempting restore from parent layer...")
 			var reattachErr error
-			vm, fuseDisk, fuseSeedDisk, incrUffdHandler, reattachErr = reattachFromParent(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken, commands)
+			vm, fuseDisk, fuseSeedDisk, incrUffdHandler, reattachErr = reattachFromParent(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken, commands, newDrives)
 			if reattachErr != nil {
 				log.WithError(reattachErr).Warn("Reattach failed, falling back to cold boot")
 				vm = nil
@@ -306,46 +312,90 @@ func main() {
 			log.Info("Rootfs expanded successfully")
 		}
 
-		// Create (or seed) shared repo cache seed image
-		log.WithFields(logrus.Fields{
-			"path":     repoCacheSeedImg,
-			"size_gb":  *repoCacheSeedSizeGB,
-			"seed_dir": *repoCacheSeedDir,
-		}).Info("Creating repo-cache seed image")
-		if err := createExt4Image(repoCacheSeedImg, *repoCacheSeedSizeGB, "BAZEL_REPO_SEED"); err != nil {
-			log.WithError(err).Fatal("Failed to create repo-cache seed image")
-		}
-		if *repoCacheSeedDir != "" {
-			if err := seedExt4ImageFromDir(repoCacheSeedImg, *repoCacheSeedDir, log); err != nil {
-				log.WithError(err).Warn("Failed to seed repo-cache image from directory; continuing with empty seed")
-			}
-		}
-
-		// Create a placeholder per-VM repo cache upper image
-		repoCacheUpperImg := filepath.Join(*outputDir, "repo-cache-upper.img")
-		if err := createExt4Image(repoCacheUpperImg, *repoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
-			log.WithError(err).Fatal("Failed to create repo-cache upper image")
-		}
-
-		// Create a placeholder credentials image
-		credentialsImg := filepath.Join(*outputDir, "credentials.img")
-		if err := createExt4ImageMB(credentialsImg, 32, "CREDENTIALS"); err != nil {
-			log.WithError(err).Fatal("Failed to create credentials image")
-		}
-
-		// Create or copy git-cache image
-		gitCacheImg := filepath.Join(*outputDir, "git-cache.img")
+		// Build the list of extension drives for the VM.
+		// Layer builds: create full-size sparse drives for all drives defined
+		// across ALL layers in the config (the "chain union"). Every layer gets
+		// the same set of drives so that Firecracker snapshot restore works —
+		// you can't add/remove drives between snapshot and restore. Sparse files
+		// don't consume actual disk space until written to.
+		//
+		// Legacy builds: use the hardcoded repo_cache_seed/upper/credentials/git_cache.
+		var drives []firecracker.Drive
 		gitCacheEnabled := false
-		if *gitCachePath != "" {
-			log.WithField("source", *gitCachePath).Info("Copying pre-populated git-cache image...")
-			if err := copyFile(*gitCachePath, gitCacheImg); err != nil {
-				log.WithError(err).Fatal("Failed to copy git-cache image")
+
+		if *layerHash != "" {
+			// Layer mode: create sparse drives for all config-defined drives.
+			log.WithField("num_drives", len(newDrives)).Info("Layer mode: creating sparse drives for all chain drives")
+			for _, d := range newDrives {
+				imgPath := filepath.Join(*outputDir, d.DriveID+".img")
+				sizeGB := d.SizeGB
+				if sizeGB <= 0 {
+					sizeGB = 50
+				}
+				label := d.Label
+				if label == "" {
+					label = strings.ToUpper(d.DriveID)
+				}
+				if err := createExt4Image(imgPath, sizeGB, label); err != nil {
+					log.WithError(err).WithField("drive_id", d.DriveID).Fatal("Failed to create drive image")
+				}
+				drives = append(drives, firecracker.Drive{
+					DriveID:      d.DriveID,
+					PathOnHost:   imgPath,
+					IsRootDevice: false,
+					IsReadOnly:   d.ReadOnly,
+				})
+				log.WithFields(logrus.Fields{
+					"drive_id": d.DriveID,
+					"size_gb":  sizeGB,
+					"label":    label,
+				}).Info("Created sparse drive")
 			}
-			gitCacheEnabled = true
 		} else {
-			log.Info("Creating placeholder git-cache image...")
-			if err := createExt4ImageMB(gitCacheImg, 64, "GIT_CACHE"); err != nil {
-				log.WithError(err).Fatal("Failed to create git-cache image")
+			// Legacy mode: create hardcoded drives
+			log.WithFields(logrus.Fields{
+				"path":     repoCacheSeedImg,
+				"size_gb":  *repoCacheSeedSizeGB,
+				"seed_dir": *repoCacheSeedDir,
+			}).Info("Creating repo-cache seed image")
+			if err := createExt4Image(repoCacheSeedImg, *repoCacheSeedSizeGB, "BAZEL_REPO_SEED"); err != nil {
+				log.WithError(err).Fatal("Failed to create repo-cache seed image")
+			}
+			if *repoCacheSeedDir != "" {
+				if err := seedExt4ImageFromDir(repoCacheSeedImg, *repoCacheSeedDir, log); err != nil {
+					log.WithError(err).Warn("Failed to seed repo-cache image from directory; continuing with empty seed")
+				}
+			}
+
+			repoCacheUpperImg := filepath.Join(*outputDir, "repo-cache-upper.img")
+			if err := createExt4Image(repoCacheUpperImg, *repoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
+				log.WithError(err).Fatal("Failed to create repo-cache upper image")
+			}
+
+			credentialsImg := filepath.Join(*outputDir, "credentials.img")
+			if err := createExt4ImageMB(credentialsImg, 32, "CREDENTIALS"); err != nil {
+				log.WithError(err).Fatal("Failed to create credentials image")
+			}
+
+			gitCacheImg := filepath.Join(*outputDir, "git-cache.img")
+			if *gitCachePath != "" {
+				log.WithField("source", *gitCachePath).Info("Copying pre-populated git-cache image...")
+				if err := copyFile(*gitCachePath, gitCacheImg); err != nil {
+					log.WithError(err).Fatal("Failed to copy git-cache image")
+				}
+				gitCacheEnabled = true
+			} else {
+				log.Info("Creating placeholder git-cache image...")
+				if err := createExt4ImageMB(gitCacheImg, 64, "GIT_CACHE"); err != nil {
+					log.WithError(err).Fatal("Failed to create git-cache image")
+				}
+			}
+
+			drives = []firecracker.Drive{
+				{DriveID: "repo_cache_seed", PathOnHost: repoCacheSeedImg, IsRootDevice: false, IsReadOnly: false},
+				{DriveID: "repo_cache_upper", PathOnHost: repoCacheUpperImg, IsRootDevice: false, IsReadOnly: false},
+				{DriveID: "credentials", PathOnHost: credentialsImg, IsRootDevice: false, IsReadOnly: true},
+				{DriveID: "git_cache", PathOnHost: gitCacheImg, IsRootDevice: false, IsReadOnly: true},
 			}
 		}
 
@@ -367,32 +417,7 @@ func main() {
 				Version:           "V1",
 				NetworkInterfaces: []string{"eth0"},
 			},
-			Drives: []firecracker.Drive{
-				{
-					DriveID:      "repo_cache_seed",
-					PathOnHost:   repoCacheSeedImg,
-					IsRootDevice: false,
-					IsReadOnly:   false,
-				},
-				{
-					DriveID:      "repo_cache_upper",
-					PathOnHost:   repoCacheUpperImg,
-					IsRootDevice: false,
-					IsReadOnly:   false,
-				},
-				{
-					DriveID:      "credentials",
-					PathOnHost:   credentialsImg,
-					IsRootDevice: false,
-					IsReadOnly:   true,
-				},
-				{
-					DriveID:      "git_cache",
-					PathOnHost:   gitCacheImg,
-					IsRootDevice: false,
-					IsReadOnly:   true,
-				},
-			},
+			Drives: drives,
 		}
 
 		var err error
@@ -477,10 +502,20 @@ func main() {
 	// Copy kernel to output
 	kernelOutput := filepath.Join(*outputDir, "kernel.bin")
 	if wasIncremental {
-		// Incremental: kernel was downloaded to incremental subdir, copy to output
+		// Incremental/reattach: kernel was downloaded to a subdir, copy to output.
+		// Check both "incremental" (self-refresh) and "reattach" (parent-based) paths.
 		incrKernel := filepath.Join(*outputDir, "incremental", "kernel.bin")
-		if err := copyFile(incrKernel, kernelOutput); err != nil {
-			log.WithError(err).Fatal("Failed to copy kernel from incremental dir")
+		reattachKernel := filepath.Join(*outputDir, "reattach", "kernel.bin")
+		var kernelSrc string
+		if _, err := os.Stat(incrKernel); err == nil {
+			kernelSrc = incrKernel
+		} else if _, err := os.Stat(reattachKernel); err == nil {
+			kernelSrc = reattachKernel
+		} else {
+			log.Fatal("Failed to find kernel in incremental or reattach dir")
+		}
+		if err := copyFile(kernelSrc, kernelOutput); err != nil {
+			log.WithError(err).Fatal("Failed to copy kernel from restore dir")
 		}
 	} else {
 		// Cold boot: copy kernel from flag path
@@ -679,17 +714,33 @@ func main() {
 				"extension_drives": len(chunkedMeta.ExtensionDrives),
 			}).Info("Incremental chunked snapshot built and uploaded")
 		} else {
-			// Cold boot: chunk everything from full files on disk
-			legacyDriveSpecs := []snapshot.DriveSpec{}
-			legacyDriveImages := map[string]string{}
-			if _, err := os.Stat(repoCacheSeedImg); err == nil {
-				legacyDriveSpecs = append(legacyDriveSpecs, snapshot.DriveSpec{
-					DriveID:  "repo_cache_seed",
-					Label:    "BAZEL_REPO_SEED",
-					ReadOnly: false,
-				})
-				legacyDriveImages["repo_cache_seed"] = repoCacheSeedImg
+			// Cold boot: chunk everything from full files on disk.
+			// Include all drives (config-defined or legacy) so child layers
+			// can restore them via FUSE for filesystem consistency.
+			driveSpecs := []snapshot.DriveSpec{}
+			driveImages := map[string]string{}
+
+			if *layerHash != "" && len(newDrives) > 0 {
+				// Layer mode: include config-defined drives
+				for _, d := range newDrives {
+					imgPath := filepath.Join(*outputDir, d.DriveID+".img")
+					if _, err := os.Stat(imgPath); err == nil {
+						driveSpecs = append(driveSpecs, d)
+						driveImages[d.DriveID] = imgPath
+					}
+				}
+			} else {
+				// Legacy mode: include repo_cache_seed
+				if _, err := os.Stat(repoCacheSeedImg); err == nil {
+					driveSpecs = append(driveSpecs, snapshot.DriveSpec{
+						DriveID:  "repo_cache_seed",
+						Label:    "BAZEL_REPO_SEED",
+						ReadOnly: false,
+					})
+					driveImages["repo_cache_seed"] = repoCacheSeedImg
+				}
 			}
+
 			snapshotPaths := &snapshot.SnapshotPaths{
 				Kernel:               kernelOutput,
 				Rootfs:               workingRootfs,
@@ -697,10 +748,10 @@ func main() {
 				State:                snapshotPath,
 				RepoCacheSeed:        repoCacheSeedImg,
 				Version:              version,
-				ExtensionDriveImages: legacyDriveImages,
+				ExtensionDriveImages: driveImages,
 			}
 
-			chunkedMeta, err := builder.BuildChunkedSnapshot(ctx, snapshotPaths, legacyDriveSpecs, version, effectiveWorkloadKey)
+			chunkedMeta, err := builder.BuildChunkedSnapshot(ctx, snapshotPaths, driveSpecs, version, effectiveWorkloadKey)
 			if err != nil {
 				log.WithError(err).Fatal("Failed to build chunked snapshot")
 			}
@@ -1565,6 +1616,7 @@ func reattachFromParent(
 	vmID, tapName, guestMAC, bootArgs string,
 	gitToken, gcpAccessToken string,
 	commands []snapshot.SnapshotCommand,
+	newDrives []snapshot.DriveSpec,
 ) (*firecracker.VM, *fuse.ChunkedDisk, *fuse.ChunkedDisk, *uffd.Handler, error) {
 	reattachDir := filepath.Join(*outputDir, "reattach")
 	if err := os.MkdirAll(reattachDir, 0755); err != nil {
@@ -1595,17 +1647,22 @@ func reattachFromParent(
 		"rootfs_chunks":  len(parentMeta.RootfsChunks),
 	}).Info("Loaded parent layer metadata for reattach")
 
-	// 2. Load old layer metadata (for extension drives)
-	oldLayerMeta, err := chunkStore.LoadChunkedMetadata(ctx, *previousLayerKey, *previousLayerVersion)
-	if err != nil {
-		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("failed to load old layer metadata: %w", err)
+	// 2. Load old layer metadata (for extension drives) — optional for init builds
+	var oldLayerMeta *snapshot.ChunkedSnapshotMetadata
+	if *previousLayerKey != "" && *previousLayerVersion != "" {
+		oldLayerMeta, err = chunkStore.LoadChunkedMetadata(ctx, *previousLayerKey, *previousLayerVersion)
+		if err != nil {
+			chunkStore.Close()
+			return nil, nil, nil, nil, fmt.Errorf("failed to load old layer metadata: %w", err)
+		}
+		log.WithFields(logrus.Fields{
+			"old_layer_key":     *previousLayerKey,
+			"old_layer_version": *previousLayerVersion,
+			"extension_drives":  len(oldLayerMeta.ExtensionDrives),
+		}).Info("Loaded old layer metadata for reattach (extension drives)")
+	} else {
+		log.Info("No old layer data (init build from parent), skipping extension drive reuse")
 	}
-	log.WithFields(logrus.Fields{
-		"old_layer_key":     *previousLayerKey,
-		"old_layer_version": *previousLayerVersion,
-		"extension_drives":  len(oldLayerMeta.ExtensionDrives),
-	}).Info("Loaded old layer metadata for reattach (extension drives)")
 
 	// 3. Prepare memory restore from parent
 	localMemPath := filepath.Join(reattachDir, "snapshot.mem")
@@ -1677,80 +1734,112 @@ func reattachFromParent(
 	}
 	log.Info("Mounted FUSE-backed rootfs from parent for reattach")
 
-	// 7. Mount old layer's extension drives via FUSE
+	// 7. Build extension drives for the restored VM.
+	// The drives must match what the parent snapshot had. For layer builds,
+	// the parent was built with config-defined drives only (no legacy drives).
+	// For legacy builds, mount parent's drives via FUSE for consistency.
 	var fuseSeedDisk *fuse.ChunkedDisk
-	var repoCacheSeedPath string
-	if seedExt, ok := oldLayerMeta.ExtensionDrives["repo_cache_seed"]; ok && len(seedExt.Chunks) > 0 {
-		fuseSeedMountDir := filepath.Join(reattachDir, "fuse-seed")
-		var totalSeedSize int64
-		for _, c := range seedExt.Chunks {
+	var extraFuseDisks []*fuse.ChunkedDisk
+	var vmDrives []firecracker.Drive
+
+	// Helper to mount an extension drive from chunked metadata via FUSE
+	mountExtDrive := func(driveID, mountSubdir string, meta *snapshot.ChunkedSnapshotMetadata, sourceName string) (string, *fuse.ChunkedDisk, error) {
+		ext, ok := meta.ExtensionDrives[driveID]
+		if !ok || len(ext.Chunks) == 0 {
+			return "", nil, fmt.Errorf("drive %s not found in %s metadata", driveID, sourceName)
+		}
+		mountDir := filepath.Join(reattachDir, mountSubdir)
+		var totalSize int64
+		for _, c := range ext.Chunks {
 			end := c.Offset + c.Size
-			if end > totalSeedSize {
-				totalSeedSize = end
+			if end > totalSize {
+				totalSize = end
 			}
 		}
-		fuseSeedDisk, err = fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
+		disk, err := fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
 			ChunkStore: chunkStore,
-			Chunks:     seedExt.Chunks,
-			TotalSize:  totalSeedSize,
-			ChunkSize:  oldLayerMeta.ChunkSize,
-			MountPoint: fuseSeedMountDir,
+			Chunks:     ext.Chunks,
+			TotalSize:  totalSize,
+			ChunkSize:  meta.ChunkSize,
+			MountPoint: mountDir,
 			Logger:     logger,
 		})
 		if err != nil {
-			fuseDisk.Unmount()
-			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to create FUSE seed disk from old layer: %w", err)
+			return "", nil, fmt.Errorf("failed to create FUSE %s disk: %w", driveID, err)
 		}
-		if err := fuseSeedDisk.Mount(); err != nil {
-			fuseDisk.Unmount()
-			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to mount FUSE seed disk from old layer: %w", err)
+		if err := disk.Mount(); err != nil {
+			return "", nil, fmt.Errorf("failed to mount FUSE %s disk: %w", driveID, err)
 		}
-		repoCacheSeedPath = fuseSeedDisk.DiskImagePath()
-		log.Info("Mounted FUSE-backed repo-cache-seed from old layer for reattach")
-	} else {
-		repoCacheSeedPath = filepath.Join(reattachDir, "repo-cache-seed.img")
-		if err := createExt4Image(repoCacheSeedPath, *repoCacheSeedSizeGB, "BAZEL_REPO_SEED"); err != nil {
-			fuseDisk.Unmount()
-			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to create repo-cache-seed image: %w", err)
+		log.WithFields(logrus.Fields{
+			"drive_id": driveID,
+			"source":   sourceName,
+		}).Info("Mounted FUSE-backed extension drive")
+		return disk.DiskImagePath(), disk, nil
+	}
+
+	// Mount drives that exist in the parent/old-layer metadata via FUSE.
+	// This ensures the kernel's VFS state is consistent with the drive content.
+	extSource := oldLayerMeta
+	extSourceName := "old layer"
+	if extSource == nil {
+		extSource = parentMeta
+		extSourceName = "parent layer"
+	}
+	if extSource != nil && len(extSource.ExtensionDrives) > 0 {
+		for driveID := range extSource.ExtensionDrives {
+			mountSubdir := fmt.Sprintf("fuse-%s", driveID)
+			path, disk, err := mountExtDrive(driveID, mountSubdir, extSource, extSourceName)
+			if err != nil {
+				log.WithError(err).WithField("drive_id", driveID).Warn("Failed to mount extension drive from parent, will create fresh")
+				continue
+			}
+			if driveID == "repo_cache_seed" {
+				fuseSeedDisk = disk
+			} else {
+				extraFuseDisks = append(extraFuseDisks, disk)
+			}
+			vmDrives = append(vmDrives, firecracker.Drive{
+				DriveID: driveID, PathOnHost: path, IsRootDevice: false, IsReadOnly: false,
+			})
 		}
 	}
 
-	var workspaceDrivePath string
-	var workspaceFuseDisk *fuse.ChunkedDisk
-	if wsExt, ok := oldLayerMeta.ExtensionDrives["workspace"]; ok && len(wsExt.Chunks) > 0 {
-		wsMountDir := filepath.Join(reattachDir, "fuse-workspace")
-		var totalWsSize int64
-		for _, c := range wsExt.Chunks {
-			end := c.Offset + c.Size
-			if end > totalWsSize {
-				totalWsSize = end
-			}
+	// For layer builds, also create fresh drives for any NEW drives in this
+	// layer's config (newDrives) that weren't in the parent snapshot.
+	existingDrives := make(map[string]bool)
+	for _, d := range vmDrives {
+		existingDrives[d.DriveID] = true
+	}
+	for _, d := range newDrives {
+		if existingDrives[d.DriveID] {
+			continue // already mounted from parent
 		}
-		wsDisk, err := fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
-			ChunkStore: chunkStore,
-			Chunks:     wsExt.Chunks,
-			TotalSize:  totalWsSize,
-			ChunkSize:  oldLayerMeta.ChunkSize,
-			MountPoint: wsMountDir,
-			Logger:     logger,
+		imgPath := filepath.Join(reattachDir, d.DriveID+".img")
+		sizeGB := d.SizeGB
+		if sizeGB <= 0 {
+			sizeGB = 50
+		}
+		label := d.Label
+		if label == "" {
+			label = strings.ToUpper(d.DriveID)
+		}
+		if err := createExt4Image(imgPath, sizeGB, label); err != nil {
+			fuseDisk.Unmount()
+			chunkStore.Close()
+			return nil, nil, nil, nil, fmt.Errorf("failed to create drive %s: %w", d.DriveID, err)
+		}
+		vmDrives = append(vmDrives, firecracker.Drive{
+			DriveID: d.DriveID, PathOnHost: imgPath, IsRootDevice: false, IsReadOnly: d.ReadOnly,
 		})
-		if err != nil {
-			log.WithError(err).Warn("Failed to create FUSE workspace disk from old layer, will use fresh")
-		} else if err := wsDisk.Mount(); err != nil {
-			log.WithError(err).Warn("Failed to mount FUSE workspace disk from old layer, will use fresh")
-		} else {
-			workspaceFuseDisk = wsDisk
-			workspaceDrivePath = wsDisk.DiskImagePath()
-			log.Info("Mounted FUSE-backed workspace drive from old layer for reattach")
-		}
+		log.WithFields(logrus.Fields{
+			"drive_id": d.DriveID,
+			"size_gb":  sizeGB,
+		}).Info("Created fresh drive for new layer config")
 	}
 
 	cleanupFuse := func() {
-		if workspaceFuseDisk != nil {
-			workspaceFuseDisk.Unmount()
+		for _, d := range extraFuseDisks {
+			d.Unmount()
 		}
 		if fuseSeedDisk != nil {
 			fuseSeedDisk.Unmount()
@@ -1759,48 +1848,31 @@ func reattachFromParent(
 		chunkStore.Close()
 	}
 
-	repoCacheUpperPath := filepath.Join(reattachDir, "repo-cache-upper.img")
-	if err := createExt4Image(repoCacheUpperPath, *repoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
-		cleanupFuse()
-		return nil, nil, nil, nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
-	}
-	credentialsPath := filepath.Join(reattachDir, "credentials.img")
-	if err := createExt4ImageMB(credentialsPath, 32, "CREDENTIALS"); err != nil {
-		cleanupFuse()
-		return nil, nil, nil, nil, fmt.Errorf("failed to create credentials image: %w", err)
-	}
-	gitCachePath := filepath.Join(reattachDir, "git-cache.img")
-	if err := createExt4ImageMB(gitCachePath, 64, "GIT_CACHE"); err != nil {
-		cleanupFuse()
-		return nil, nil, nil, nil, fmt.Errorf("failed to create git-cache image: %w", err)
-	}
-
+	// Symlinks for snapshot creation (rootfs is always needed)
 	if err := os.MkdirAll(snapshotSymlinkDir, 0755); err != nil {
 		cleanupFuse()
 		return nil, nil, nil, nil, fmt.Errorf("failed to create snapshot symlink dir: %w", err)
 	}
-	symlinks := []struct {
-		name   string
-		target string
-	}{
-		{"rootfs.img", fuseDisk.DiskImagePath()},
-		{"repo-cache-seed.img", repoCacheSeedPath},
-		{"repo-cache-upper.img", repoCacheUpperPath},
-		{"credentials.img", credentialsPath},
-		{"git-cache.img", gitCachePath},
+	symlinkRootfs := filepath.Join(snapshotSymlinkDir, "rootfs.img")
+	os.Remove(symlinkRootfs)
+	if err := os.Symlink(fuseDisk.DiskImagePath(), symlinkRootfs); err != nil {
+		cleanupFuse()
+		return nil, nil, nil, nil, fmt.Errorf("symlink rootfs: %w", err)
 	}
+	// Also create symlinks for each drive (used by snapshot upload)
+	// Use driveID+".img" (no underscore-to-hyphen) to match cold boot paths
+	// that are baked into the snapshot state file.
 	var createdSymlinks []string
-	for _, s := range symlinks {
-		linkPath := filepath.Join(snapshotSymlinkDir, s.name)
+	createdSymlinks = append(createdSymlinks, symlinkRootfs)
+	for _, d := range vmDrives {
+		driveName := d.DriveID + ".img"
+		linkPath := filepath.Join(snapshotSymlinkDir, driveName)
 		os.Remove(linkPath)
-		if err := os.Symlink(s.target, linkPath); err != nil {
-			for _, c := range createdSymlinks {
-				os.Remove(c)
-			}
-			cleanupFuse()
-			return nil, nil, nil, nil, fmt.Errorf("symlink %s -> %s: %w", linkPath, s.target, err)
+		if err := os.Symlink(d.PathOnHost, linkPath); err != nil {
+			log.WithError(err).WithField("drive", driveName).Warn("Failed to create drive symlink")
+		} else {
+			createdSymlinks = append(createdSymlinks, linkPath)
 		}
-		createdSymlinks = append(createdSymlinks, linkPath)
 	}
 
 	// 10. Create VM and restore from parent snapshot
@@ -1822,17 +1894,7 @@ func reattachFromParent(
 			Version:           "V1",
 			NetworkInterfaces: []string{"eth0"},
 		},
-		Drives: []firecracker.Drive{
-			{DriveID: "repo_cache_seed", PathOnHost: repoCacheSeedPath, IsRootDevice: false, IsReadOnly: false},
-			{DriveID: "repo_cache_upper", PathOnHost: repoCacheUpperPath, IsRootDevice: false, IsReadOnly: false},
-			{DriveID: "credentials", PathOnHost: credentialsPath, IsRootDevice: false, IsReadOnly: true},
-			{DriveID: "git_cache", PathOnHost: gitCachePath, IsRootDevice: false, IsReadOnly: true},
-		},
-	}
-	if workspaceDrivePath != "" {
-		vmCfg.Drives = append(vmCfg.Drives, firecracker.Drive{
-			DriveID: "workspace", PathOnHost: workspaceDrivePath, IsRootDevice: false, IsReadOnly: false,
-		})
+		Drives: vmDrives,
 	}
 	vm, err := firecracker.NewVM(vmCfg, logger)
 	if err != nil {

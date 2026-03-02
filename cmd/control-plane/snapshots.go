@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -754,6 +755,46 @@ func (sm *SnapshotManager) checkSnapshotComplete(ctx context.Context, version st
 	return true, nil
 }
 
+// checkLayerBuildComplete checks if a layer build is complete by looking for
+// the chunked-metadata.json under the layer hash's snapshot_state directory.
+// Layer builds use: {gcsPrefix}/{layerHash}/snapshot_state/{version}/chunked-metadata.json
+// and update: {gcsPrefix}/{layerHash}/current-pointer.json last.
+func (sm *SnapshotManager) checkLayerBuildComplete(ctx context.Context, layerHash, version string) (bool, error) {
+	if sm.gcsClient == nil {
+		return false, fmt.Errorf("GCS client not available")
+	}
+
+	bucket := sm.gcsClient.Bucket(sm.gcsBucket)
+
+	// Check for chunked-metadata.json under the version directory
+	metadataPath := sm.gcsPath(fmt.Sprintf("%s/snapshot_state/%s/chunked-metadata.json", layerHash, version))
+	if _, err := bucket.Object(metadataPath).Attrs(ctx); err != nil {
+		return false, nil
+	}
+
+	// Also verify current-pointer.json points to this version (written last by snapshot-builder)
+	pointerPath := sm.gcsPath(layerHash + "/current-pointer.json")
+	reader, err := bucket.Object(pointerPath).NewReader(ctx)
+	if err != nil {
+		return false, nil
+	}
+	defer reader.Close()
+
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return false, nil
+	}
+
+	var pointer struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(data, &pointer); err != nil {
+		return false, nil
+	}
+
+	return pointer.Version == version, nil
+}
+
 // isBuilderVMRunning checks if the builder VM is still running
 func (sm *SnapshotManager) isBuilderVMRunning(ctx context.Context, instanceName string) (bool, error) {
 	instancesClient, err := compute.NewInstancesRESTClient(ctx)
@@ -768,6 +809,10 @@ func (sm *SnapshotManager) isBuilderVMRunning(ctx context.Context, instanceName 
 		Instance: instanceName,
 	})
 	if err != nil {
+		// Treat 404 (VM not found / already deleted) as "not running"
+		if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "NOT_FOUND") || strings.Contains(err.Error(), "notFound") {
+			return false, nil
+		}
 		return false, err
 	}
 
