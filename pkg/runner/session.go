@@ -1002,6 +1002,11 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
+	// Include the repo-cache-upper drive in the symlink map so Firecracker can find it.
+	if repoCacheUpperPath != "" {
+		extensionDrivePaths["repo_cache_upper"] = repoCacheUpperPath
+	}
+
 	// Setup symlinks for snapshot restore
 	m.mu.Lock()
 	cleanup, symlinkErr := m.setupSnapshotSymlinks(overlayPath, extensionDrivePaths)

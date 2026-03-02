@@ -158,9 +158,9 @@ func main() {
 	hostRegistry := NewHostRegistry(db, logger)
 	snapshotManager := NewSnapshotManager(ctx, db, *gcsBucket, *gcsPrefix, gcpProjectVal, gcpZoneVal, logger)
 	configCache := NewConfigCache(db, logger)
-	scheduler := NewScheduler(hostRegistry, db, snapshotManager, logger)
-	scheduler.SetConfigCache(configCache)
 	tagRegistry := NewSnapshotTagRegistry(db, logger)
+	scheduler := NewScheduler(hostRegistry, db, snapshotManager, tagRegistry, logger)
+	scheduler.SetConfigCache(configCache)
 	if metricsClient != nil {
 		scheduler.SetMetricsClient(metricsClient)
 	}
@@ -170,7 +170,6 @@ func main() {
 	layeredConfigRegistry.SetConfigCache(configCache)
 	layerBuildScheduler := NewLayerBuildScheduler(db, snapshotManager, logger, 4)
 	layeredConfigRegistry.SetLayerBuilder(layerBuildScheduler)
-	snapshotConfigRegistry := NewSnapshotConfigRegistry(db, snapshotManager, tagRegistry, logger)
 
 	// Load existing state from DB (best-effort)
 	if err := hostRegistry.LoadFromDB(ctx); err != nil {
