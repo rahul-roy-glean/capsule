@@ -44,9 +44,9 @@ type LayeredConfig struct {
 type LayerMaterialized struct {
 	LayerDef
 	LayerHash       string      `json:"layer_hash"`
-	ParentLayerHash string      `json:"parent_layer_hash"`        // "" for root
-	Depth           int         `json:"depth"`                    // 0 for root
-	BaseImage       string      `json:"base_image,omitempty"`     // only set on the platform layer (depth 0)
+	ParentLayerHash string      `json:"parent_layer_hash"`          // "" for root
+	Depth           int         `json:"depth"`                      // 0 for root
+	BaseImage       string      `json:"base_image,omitempty"`       // only set on the platform layer (depth 0)
 	AllChainDrives  []DriveSpec `json:"all_chain_drives,omitempty"` // union of all drives across all layers in the config
 }
 
