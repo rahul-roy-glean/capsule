@@ -559,6 +559,11 @@ func initSchema(db *sql.DB) error {
 			PRIMARY KEY (tag, workload_key)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_tags_workload ON snapshot_tags(workload_key)`,
+		// Denormalize config_id into snapshot_builds for efficient query joins
+		`ALTER TABLE snapshot_builds ADD COLUMN IF NOT EXISTS config_id VARCHAR(64) DEFAULT ''`,
+		// Prevent duplicate active builds per layer
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_builds_one_active_per_layer
+			ON snapshot_builds (layer_hash) WHERE status IN ('queued', 'waiting_parent', 'running')`,
 	}
 	logger := logrus.WithField("component", "migrations")
 	for i, stmt := range migrations {

@@ -154,6 +154,14 @@ build {
     ]
   }
 
+  # Install Docker (needed for layer builder --base-image rootfs builds)
+  provisioner "shell" {
+    inline = [
+      "curl -fsSL https://get.docker.com | sudo sh",
+      "sudo systemctl enable docker"
+    ]
+  }
+
   # Install qemu-img for overlay creation
   provisioner "shell" {
     inline = [
