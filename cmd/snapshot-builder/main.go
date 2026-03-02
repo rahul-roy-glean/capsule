@@ -2213,6 +2213,16 @@ DHCP=no
 	os.WriteFile(filepath.Join(rootfsDir, "etc/hostname"), []byte("runner\n"), 0644)
 	os.WriteFile(filepath.Join(rootfsDir, "etc/resolv.conf.default"), []byte("nameserver 8.8.8.8\n"), 0644)
 
+	// Fix nsswitch.conf to use files+dns instead of systemd-resolve (which is masked).
+	// Many Docker images ship with "hosts: files resolve [!UNAVAIL=return] dns" which
+	// breaks getent/glibc resolution when systemd-resolved is not running.
+	nsswitchPath := filepath.Join(rootfsDir, "etc/nsswitch.conf")
+	if nssData, err := os.ReadFile(nsswitchPath); err == nil {
+		fixed := strings.ReplaceAll(string(nssData), "resolve [!UNAVAIL=return]", "")
+		fixed = strings.ReplaceAll(fixed, "resolve", "")
+		os.WriteFile(nsswitchPath, []byte(fixed), 0644)
+	}
+
 	// 10. Enable serial console for Firecracker
 	exec.Command("chroot", rootfsDir, "systemctl", "enable", "serial-getty@ttyS0.service").Run()
 
