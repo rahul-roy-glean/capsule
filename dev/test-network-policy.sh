@@ -122,6 +122,7 @@ allocate_and_wait() {
 }
 
 RUNNER_IDS=()
+CONFIG_IDS=()
 cleanup() {
   for rid in "${RUNNER_IDS[@]}"; do
     if [ -n "$rid" ]; then
@@ -130,8 +131,26 @@ cleanup() {
         -d "{\"runner_id\": \"$rid\", \"destroy\": true}" > /dev/null 2>&1 || true
     fi
   done
+  # Delete configs created by this test run
+  for cid in "${CONFIG_IDS[@]}"; do
+    if [ -n "$cid" ]; then
+      curl -s -X DELETE "$CP/api/v1/layered-configs/$cid" > /dev/null 2>&1 || true
+    fi
+  done
 }
 trap cleanup EXIT
+
+# Pre-cleanup: delete any leftover configs from previous runs by listing all
+# configs and deleting any whose display_name starts with "netpol-test".
+pre_cleanup() {
+  local list
+  list=$(curl -sf "$CP/api/v1/layered-configs" 2>/dev/null) || return 0
+  echo "$list" | jq -r '.configs[]? | select(.display_name | startswith("netpol-test")) | .config_id' | while read -r cid; do
+    curl -s -X DELETE "$CP/api/v1/layered-configs/$cid" > /dev/null 2>&1 || true
+    echo "  pre-cleanup: deleted stale config $cid"
+  done
+}
+pre_cleanup
 
 HAS_IPSET=false
 if command -v ipset >/dev/null 2>&1; then
@@ -160,6 +179,7 @@ CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
   }')
 CONFIG_ID=$(echo "$CONFIG_RESP" | jq -r '.config_id')
 WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.leaf_workload_key')
+CONFIG_IDS+=("$CONFIG_ID")
 echo "  config_id=$CONFIG_ID  workload_key=$WORKLOAD_KEY"
 
 if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then
@@ -188,6 +208,7 @@ CONFIG_PRESET_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
     "config": {"runner_ttl_seconds": 120, "auto_pause": false, "network_policy_preset": "ci-standard"}
   }')
 CONFIG_PRESET_ID=$(echo "$CONFIG_PRESET_RESP" | jq -r '.config_id')
+CONFIG_IDS+=("$CONFIG_PRESET_ID")
 GET_PRESET_RESP=$(curl -sf "$CP/api/v1/layered-configs/$CONFIG_PRESET_ID")
 NP_PRESET2=$(echo "$GET_PRESET_RESP" | jq -r '.config.network_policy_preset // ""')
 echo "  preset=$NP_PRESET2"
