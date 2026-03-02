@@ -102,8 +102,8 @@ class TestRunnerSession:
         assert result["success"] is True
 
 
-class TestFromTemplate:
-    def test_from_template(self, runners: Runners, http_client: HttpClient) -> None:
+class TestFromConfig:
+    def test_from_config(self, runners: Runners, http_client: HttpClient) -> None:
         alloc_data = {
             "runner_id": "r-42",
             "host_id": "h-1",
@@ -113,17 +113,17 @@ class TestFromTemplate:
         }
         mock_resp = httpx.Response(200, json=alloc_data)
         with patch.object(http_client._client, "request", return_value=mock_resp):
-            session = runners.from_template("my-workload", tag="stable")
+            session = runners.from_config("my-workload", tag="stable")
         assert isinstance(session, RunnerSession)
         assert session.runner_id == "r-42"
         assert session.session_id == "s-1"
         assert runners._host_cache["r-42"] == "10.0.0.1:8080"
 
-    def test_from_template_with_labels(self, runners: Runners, http_client: HttpClient) -> None:
+    def test_from_config_with_labels(self, runners: Runners, http_client: HttpClient) -> None:
         alloc_data = {"runner_id": "r-99", "host_address": "h:8080", "resumed": False}
         mock_resp = httpx.Response(200, json=alloc_data)
         with patch.object(http_client._client, "request", return_value=mock_resp) as mock_req:
-            runners.from_template("wk-1", tag="dev", labels={"env": "ci"})
+            runners.from_config("wk-1", tag="dev", labels={"env": "ci"})
         # Verify the allocate call included the label
         call_kwargs = mock_req.call_args
         assert call_kwargs is not None

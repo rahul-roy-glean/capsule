@@ -8,17 +8,17 @@ from bf_sdk.resources.snapshot_configs import SnapshotConfigs
 
 
 @dataclass(frozen=True)
-class Template:
-    """Declarative sandbox template definition.
+class RunnerConfig:
+    """Declarative runner configuration.
 
-    A Template is a pure-data description of a desired runner shape.
+    A RunnerConfig is a pure-data description of a desired runner shape.
     It maps 1:1 to a SnapshotConfig on the server, with fluent builder
     methods for ergonomic construction.
 
     Usage::
 
-        tpl = (
-            Template("my-workload")
+        cfg = (
+            RunnerConfig("my-workload")
             .with_display_name("My sandbox")
             .with_commands(["pip install -e .[dev]"])
             .with_tier("small")
@@ -44,48 +44,48 @@ class Template:
 
     # -- Fluent withers (return new immutable copy) ----------------------------
 
-    def with_display_name(self, name: str) -> Template:
+    def with_display_name(self, name: str) -> RunnerConfig:
         return replace(self, _display_name=name)
 
-    def with_commands(self, cmds: list[str | dict[str, Any]]) -> Template:
+    def with_commands(self, cmds: list[str | dict[str, Any]]) -> RunnerConfig:
         normalized = [{"command": c} if isinstance(c, str) else c for c in cmds]
         return replace(self, _commands=normalized)
 
-    def with_incremental_commands(self, cmds: list[str | dict[str, Any]]) -> Template:
+    def with_incremental_commands(self, cmds: list[str | dict[str, Any]]) -> RunnerConfig:
         normalized = [{"command": c} if isinstance(c, str) else c for c in cmds]
         return replace(self, _incremental_commands=normalized)
 
-    def with_build_schedule(self, schedule: str) -> Template:
+    def with_build_schedule(self, schedule: str) -> RunnerConfig:
         return replace(self, _build_schedule=schedule)
 
-    def with_max_concurrent_runners(self, n: int) -> Template:
+    def with_max_concurrent_runners(self, n: int) -> RunnerConfig:
         return replace(self, _max_concurrent_runners=n)
 
-    def with_ci_system(self, system: str) -> Template:
+    def with_ci_system(self, system: str) -> RunnerConfig:
         return replace(self, _ci_system=system)
 
-    def with_start_command(self, cmd: dict[str, Any]) -> Template:
+    def with_start_command(self, cmd: dict[str, Any]) -> RunnerConfig:
         return replace(self, _start_command=cmd)
 
-    def with_runner_ttl(self, seconds: int) -> Template:
+    def with_runner_ttl(self, seconds: int) -> RunnerConfig:
         return replace(self, _runner_ttl_seconds=seconds)
 
-    def with_session_max_age(self, seconds: int) -> Template:
+    def with_session_max_age(self, seconds: int) -> RunnerConfig:
         return replace(self, _session_max_age_seconds=seconds)
 
-    def with_auto_pause(self, enabled: bool = True) -> Template:
+    def with_auto_pause(self, enabled: bool = True) -> RunnerConfig:
         return replace(self, _auto_pause=enabled)
 
-    def with_tier(self, tier: str) -> Template:
+    def with_tier(self, tier: str) -> RunnerConfig:
         return replace(self, _tier=tier)
 
-    def with_network_policy_preset(self, preset: str) -> Template:
+    def with_network_policy_preset(self, preset: str) -> RunnerConfig:
         return replace(self, _network_policy_preset=preset)
 
-    def with_network_policy(self, policy: Any) -> Template:
+    def with_network_policy(self, policy: Any) -> RunnerConfig:
         return replace(self, _network_policy=policy)
 
-    def with_labels(self, labels: dict[str, str]) -> Template:
+    def with_labels(self, labels: dict[str, str]) -> RunnerConfig:
         return replace(self, _labels=labels)
 
     # -- Serialization ---------------------------------------------------------
@@ -121,29 +121,29 @@ class Template:
         return kw
 
 
-class Templates:
-    """High-level declarative template management.
+class RunnerConfigs:
+    """High-level declarative runner config management.
 
-    Composes ``SnapshotConfigs`` to provide a "declare → build → tag → spawn"
-    workflow similar to E2B's template DSL.
+    Composes ``SnapshotConfigs`` to provide a "declare -> build -> tag -> spawn"
+    workflow.
     """
 
     def __init__(self, snapshot_configs: SnapshotConfigs) -> None:
         self._sc = snapshot_configs
 
-    def apply(self, tpl: Template) -> SnapshotConfig:
-        """Upsert a template's SnapshotConfig on the control plane."""
-        return self._sc.create(**tpl.to_create_kwargs())
+    def apply(self, cfg: RunnerConfig) -> SnapshotConfig:
+        """Upsert a runner config on the control plane."""
+        return self._sc.create(**cfg.to_create_kwargs())
 
     def build(
         self,
-        tpl: Template | str,
+        cfg: RunnerConfig | str,
         *,
         tag: str | None = None,
         incremental: bool = False,
     ) -> BuildResult:
         """Trigger a snapshot build, optionally tagging the resulting version."""
-        wk = tpl.workload_key if isinstance(tpl, Template) else tpl
+        wk = cfg.workload_key if isinstance(cfg, RunnerConfig) else cfg
         result = self._sc.trigger_build(wk, incremental=incremental)
         if tag:
             self._sc.create_tag(wk, tag=tag, version=result.version)
@@ -151,26 +151,26 @@ class Templates:
 
     def promote(
         self,
-        tpl: Template | str,
+        cfg: RunnerConfig | str,
         *,
         tag: str,
         to: str = "stable",
     ) -> SnapshotTag:
         """Promote a tag by copying its version to a target tag.
 
-        E.g. ``promote(tpl, tag="dev", to="stable")`` resolves the ``dev``
+        E.g. ``promote(cfg, tag="dev", to="stable")`` resolves the ``dev``
         tag's version and creates/updates the ``stable`` tag to point to it.
         """
-        wk = tpl.workload_key if isinstance(tpl, Template) else tpl
+        wk = cfg.workload_key if isinstance(cfg, RunnerConfig) else cfg
         source = self._sc.get_tag(wk, tag)
         return self._sc.create_tag(wk, tag=to, version=source.version)
 
-    def get(self, tpl: Template | str) -> SnapshotConfig:
-        """Get the current SnapshotConfig for a template."""
-        wk = tpl.workload_key if isinstance(tpl, Template) else tpl
+    def get(self, cfg: RunnerConfig | str) -> SnapshotConfig:
+        """Get the current SnapshotConfig for a runner config."""
+        wk = cfg.workload_key if isinstance(cfg, RunnerConfig) else cfg
         return self._sc.get(wk)
 
-    def list_tags(self, tpl: Template | str) -> list[SnapshotTag]:
-        """List all tags for a template."""
-        wk = tpl.workload_key if isinstance(tpl, Template) else tpl
+    def list_tags(self, cfg: RunnerConfig | str) -> list[SnapshotTag]:
+        """List all tags for a runner config."""
+        wk = cfg.workload_key if isinstance(cfg, RunnerConfig) else cfg
         return self._sc.list_tags(wk)

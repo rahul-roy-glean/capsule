@@ -13,8 +13,8 @@ from bf_sdk._errors import (
 )
 from bf_sdk._version import __version__
 from bf_sdk.client import BFClient
+from bf_sdk.runner_config import RunnerConfig, RunnerConfigs
 from bf_sdk.runner_session import RunnerSession
-from bf_sdk.templates import Template, Templates
 
 __all__ = [
     "BFAuthError",
@@ -27,8 +27,8 @@ __all__ = [
     "BFRateLimited",
     "BFServiceUnavailable",
     "BFTimeoutError",
+    "RunnerConfig",
+    "RunnerConfigs",
     "RunnerSession",
-    "Template",
-    "Templates",
     "__version__",
 ]

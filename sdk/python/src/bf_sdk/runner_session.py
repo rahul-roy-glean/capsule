@@ -19,7 +19,7 @@ class RunnerSession:
 
     Usage::
 
-        with client.runners.from_template("my-workload", tag="stable") as r:
+        with client.runners.from_config("my-workload", tag="stable") as r:
             r.exec("python", "-c", "print('hello')")
             with r.shell() as sh:
                 sh.send("ls\\n")

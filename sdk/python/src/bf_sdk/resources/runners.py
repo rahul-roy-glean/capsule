@@ -132,7 +132,7 @@ class Runners:
             time.sleep(poll_interval)
         raise TimeoutError(f"Runner {runner_id} did not become ready within {timeout}s")
 
-    def from_template(
+    def from_config(
         self,
         workload_key: str,
         *,
@@ -142,11 +142,11 @@ class Runners:
         network_policy_preset: str | None = None,
         network_policy_json: str | None = None,
     ) -> RunnerSession:
-        """Allocate a runner from a template tag and return a RunnerSession handle.
+        """Allocate a runner from a runner config tag and return a RunnerSession handle.
 
-        This is the "Sandbox.create(template=...)" equivalent::
+        Usage::
 
-            with client.runners.from_template("my-workload", tag="stable") as r:
+            with client.runners.from_config("my-workload", tag="stable") as r:
                 r.exec("python", "-c", "print(42)")
         """
         alloc = self.allocate(
