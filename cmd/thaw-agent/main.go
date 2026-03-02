@@ -7,7 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
+	gonet "net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -500,6 +500,20 @@ func main() {
 					// Incremental re-warmup: runner_id changed but mode still warmup
 					mmdsData.Latest = newData.Latest
 					log.WithField("new_runner_id", newData.Latest.Meta.RunnerID).Info("Re-warmup: incremental snapshot build detected")
+
+					// Reconfigure network before running warmup commands.
+					// The snapshot's network state may be stale (empty resolv.conf, broken routes).
+					if !*skipNetwork {
+						tempData := &MMDSData{}
+						tempData.Latest = newData.Latest
+						log.Info("Re-warmup: reconfiguring network...")
+						if err := configureNetwork(tempData); err != nil {
+							log.WithError(err).Error("Re-warmup: network reconfig failed")
+						} else {
+							log.Info("Re-warmup: network reconfigured successfully")
+						}
+					}
+
 					globalWarmupState = &WarmupState{StartedAt: time.Now()}
 					if err := runWarmupMode(mmdsData); err != nil {
 						globalWarmupState.Error = err.Error()
@@ -1192,19 +1206,111 @@ func configureNetwork(data *MMDSData) error {
 		}
 	}
 
+	// Fix nsswitch.conf: remove systemd-resolve references so glibc uses /etc/resolv.conf directly.
+	// Ubuntu 24.04 ships "hosts: files resolve [!UNAVAIL=return] dns" which breaks DNS
+	// when systemd-resolved is masked (as in Firecracker VMs).
+	if nssData, err := os.ReadFile("/etc/nsswitch.conf"); err == nil {
+		nss := string(nssData)
+		if strings.Contains(nss, "resolve") {
+			nss = strings.ReplaceAll(nss, "resolve [!UNAVAIL=return]", "")
+			nss = strings.ReplaceAll(nss, "resolve", "")
+			os.WriteFile("/etc/nsswitch.conf", []byte(nss), 0644)
+			log.Info("Fixed nsswitch.conf: removed systemd-resolve references")
+		}
+	}
+
 	// Check if kernel already configured the network (via ip= boot parameter)
-	// If so, skip IP reconfiguration but still ensure DNS is configured
-	out, _ := exec.Command("ip", "addr", "show", "dev", iface).Output()
+	// Use Go's net package since the guest rootfs may not have the `ip` command.
 	expectedIP := strings.Split(net.IP, "/")[0]
-	if strings.Contains(string(out), expectedIP) {
-		log.WithField("ip", expectedIP).Info("Network IP already configured by kernel, ensuring DNS is set")
-		// Still configure DNS since kernel ip= parameter doesn't set it
+	ipAlreadyConfigured := false
+	if goIface, err := gonet.InterfaceByName(iface); err == nil {
+		addrs, _ := goIface.Addrs()
+		for _, addr := range addrs {
+			if strings.Contains(addr.String(), expectedIP) {
+				ipAlreadyConfigured = true
+				break
+			}
+		}
+		log.WithFields(logrus.Fields{"iface": iface, "addrs": fmt.Sprintf("%v", addrs), "found": ipAlreadyConfigured}).Info("configureNetwork: checked interface via Go net package")
+	} else {
+		log.WithError(err).Warn("configureNetwork: could not get interface by name, falling back to ip command")
+		// Fallback to ip command
+		out, _ := exec.Command("ip", "addr", "show", "dev", iface).CombinedOutput()
+		ipAlreadyConfigured = strings.Contains(string(out), expectedIP)
+	}
+	if ipAlreadyConfigured {
+		log.WithField("ip", expectedIP).Info("Network IP already configured by kernel, ensuring DNS and routes are set")
+
+		// Ensure interface is up (check via /sys/class/net, no ip command needed)
+		if operState, err := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/operstate", iface)); err == nil {
+			log.WithField("operstate", strings.TrimSpace(string(operState))).Info("configureNetwork: interface operstate")
+			if strings.TrimSpace(string(operState)) != "up" {
+				// Try ip command if available, otherwise interface should come up on its own
+				exec.Command("ip", "link", "set", iface, "up").Run()
+			}
+		}
+
+		// Check default route via /proc/net/route (no ip command needed)
+		// Format: Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+		// Default route has Destination=00000000
+		if net.Gateway != "" {
+			routeData, routeErr := os.ReadFile("/proc/net/route")
+			log.WithFields(logrus.Fields{"routes": string(routeData), "err": routeErr}).Info("configureNetwork: /proc/net/route")
+			hasDefaultRoute := false
+			if routeErr == nil {
+				for _, line := range strings.Split(string(routeData), "\n") {
+					fields := strings.Fields(line)
+					if len(fields) >= 3 && fields[1] == "00000000" {
+						hasDefaultRoute = true
+						break
+					}
+				}
+			}
+			if hasDefaultRoute {
+				log.Info("configureNetwork: default route already exists")
+			} else {
+				log.WithField("gateway", net.Gateway).Warn("configureNetwork: no default route found, trying to add via ip command")
+				exec.Command("ip", "route", "add", "default", "via", net.Gateway).Run()
+			}
+		} else {
+			log.Warn("configureNetwork: no gateway in MMDS data!")
+		}
+
+		// Configure DNS since kernel ip= parameter doesn't set it
 		if net.DNS != "" {
+			// Remove symlink if present (Ubuntu uses symlink to systemd-resolved stub)
+			if linkTarget, err := os.Readlink("/etc/resolv.conf"); err == nil {
+				log.WithField("target", linkTarget).Info("configureNetwork: resolv.conf is symlink, removing")
+				os.Remove("/etc/resolv.conf")
+			}
 			resolv := fmt.Sprintf("nameserver %s\n", net.DNS)
 			if err := os.WriteFile("/etc/resolv.conf", []byte(resolv), 0644); err != nil {
 				log.WithError(err).Warn("Failed to write resolv.conf")
+			} else {
+				log.WithField("dns", net.DNS).Info("configureNetwork: wrote resolv.conf")
 			}
+		} else {
+			log.Warn("configureNetwork: no DNS in MMDS data!")
 		}
+
+		// Verify after config
+		resolvCheck, _ := os.ReadFile("/etc/resolv.conf")
+		routeCheck, _ := os.ReadFile("/proc/net/route")
+		log.WithFields(logrus.Fields{
+			"resolv_conf": strings.TrimSpace(string(resolvCheck)),
+			"routes":      strings.TrimSpace(string(routeCheck)),
+		}).Info("configureNetwork: post-config state")
+
+		// Quick connectivity test using Go's net.DialTimeout (no ping needed)
+		testConn, testErr := gonet.DialTimeout("tcp", net.Gateway+":80", 2*time.Second)
+		if testErr != nil {
+			// TCP to gateway:80 won't work, try UDP DNS instead
+			log.WithField("gateway_test_err", testErr.Error()).Info("configureNetwork: gateway TCP test (expected to fail, not a real service)")
+		} else {
+			testConn.Close()
+			log.Info("configureNetwork: gateway reachable")
+		}
+
 		return nil
 	}
 
@@ -2478,15 +2584,74 @@ func verifyConnectivity(repoURL string) error {
 		}
 	}
 
-	// Check DNS resolution using getent (available on all Linux systems)
+	// Check DNS resolution - try Go's resolver first, then getent as fallback
 	log.WithField("host", host).Info("Checking DNS resolution...")
-	if output, err := exec.Command("getent", "hosts", host).CombinedOutput(); err != nil {
-		return fmt.Errorf("DNS resolution failed for %s: %s", host, strings.TrimSpace(string(output)))
+
+	// Try Go's built-in resolver (uses /etc/resolv.conf directly, bypasses nsswitch)
+	addrs, goErr := gonet.LookupHost(host)
+	if goErr != nil {
+		// Go resolver failed - collect diagnostics
+		var diag strings.Builder
+		diag.WriteString(fmt.Sprintf("Go LookupHost error: %v. ", goErr))
+
+		if nssData, err := os.ReadFile("/etc/nsswitch.conf"); err == nil {
+			for _, line := range strings.Split(string(nssData), "\n") {
+				if strings.HasPrefix(strings.TrimSpace(line), "hosts:") {
+					diag.WriteString(fmt.Sprintf("nsswitch: %s. ", strings.TrimSpace(line)))
+					break
+				}
+			}
+		}
+		if resolvData, err := os.ReadFile("/etc/resolv.conf"); err == nil {
+			diag.WriteString(fmt.Sprintf("resolv.conf: [%s]. ", strings.TrimSpace(string(resolvData))))
+		} else {
+			diag.WriteString(fmt.Sprintf("resolv.conf read err: %v. ", err))
+		}
+		if linkTarget, err := os.Readlink("/etc/resolv.conf"); err == nil {
+			diag.WriteString(fmt.Sprintf("resolv.conf symlink->%s. ", linkTarget))
+		}
+		// ip addr
+		if addrOut, err := exec.Command("ip", "addr").CombinedOutput(); err == nil {
+			diag.WriteString(fmt.Sprintf("ip_addr: [%s]. ", strings.TrimSpace(string(addrOut))))
+		} else {
+			diag.WriteString(fmt.Sprintf("ip_addr err: %v. ", err))
+			// fallback: read /proc/net/if_inet6 or /sys
+			if ifData, err2 := os.ReadFile("/proc/net/dev"); err2 == nil {
+				diag.WriteString(fmt.Sprintf("proc_net_dev: [%s]. ", strings.TrimSpace(string(ifData))))
+			}
+		}
+		// Routes
+		if routeOut, err := exec.Command("ip", "route").CombinedOutput(); err == nil {
+			diag.WriteString(fmt.Sprintf("routes: [%s]. ", strings.TrimSpace(string(routeOut))))
+		} else {
+			diag.WriteString(fmt.Sprintf("ip_route err: %v. ", err))
+			// fallback: /proc/net/route
+			if procRoute, err2 := os.ReadFile("/proc/net/route"); err2 == nil {
+				diag.WriteString(fmt.Sprintf("proc_route: [%s]. ", strings.TrimSpace(string(procRoute))))
+			}
+		}
+		// Ping gateway
+		pingGW, pingGWErr := exec.Command("ping", "-c", "1", "-W", "2", "172.16.0.1").CombinedOutput()
+		if pingGWErr != nil {
+			diag.WriteString(fmt.Sprintf("ping_gw(172.16.0.1) failed: %s. ", strings.TrimSpace(string(pingGW))))
+		} else {
+			diag.WriteString("ping_gw OK. ")
+		}
+		// Ping 8.8.8.8
+		ping8, ping8Err := exec.Command("ping", "-c", "1", "-W", "2", "8.8.8.8").CombinedOutput()
+		if ping8Err != nil {
+			diag.WriteString(fmt.Sprintf("ping_8888 failed: %s", strings.TrimSpace(string(ping8))))
+		} else {
+			diag.WriteString("ping_8888 OK")
+		}
+
+		return fmt.Errorf("DNS resolution failed for %s: %s", host, diag.String())
 	}
+	log.WithFields(logrus.Fields{"host": host, "addrs": addrs}).Info("DNS resolution succeeded")
 
 	// Check TCP connectivity to HTTPS port
 	log.WithField("host", host).Info("Checking TCP connectivity to port 443...")
-	conn, err := net.DialTimeout("tcp", host+":443", 10*time.Second)
+	conn, err := gonet.DialTimeout("tcp", host+":443", 10*time.Second)
 	if err != nil {
 		// Log diagnostic info
 		log.WithError(err).Error("TCP connection failed")
@@ -2924,7 +3089,7 @@ func startHealthServer(mmdsData *MMDSData) {
 
 	// Check if :10500 is already bound (from warmup mode). If so, skip —
 	// the warmup health server is already running and has the same endpoints.
-	ln, err := net.Listen("tcp", ":10500")
+	ln, err := gonet.Listen("tcp", ":10500")
 	if err != nil {
 		log.Info("Health server :10500 already running (from warmup), skipping")
 		return

@@ -415,7 +415,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			ID:               resp.Runner.Id,
 			HostID:           host.ID,
 			InternalIP:       resp.Runner.InternalIp,
-			Status:           "running",
+			Status:           "busy",
 			WorkloadKey:      workloadKey,
 			ReservedCPU:      effectiveCPU,
 			ReservedMemoryMB: tier.MemoryMB,
