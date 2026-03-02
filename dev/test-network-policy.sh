@@ -3,7 +3,7 @@
 #
 # Tests the full network policy lifecycle:
 #   1. API CRUD for policies (presets, custom, get/update)
-#   2. Policy on snapshot configs (DB integration)
+#   2. Policy on layered configs (DB integration)
 #   3. Allocation with policy preset / custom policy
 #   4. Policy enforcement (deny-default blocks, allow-default permits)
 #   5. RFC1918 blocking under ci-standard
@@ -122,6 +122,7 @@ allocate_and_wait() {
 }
 
 RUNNER_IDS=()
+CONFIG_IDS=()
 cleanup() {
   for rid in "${RUNNER_IDS[@]}"; do
     if [ -n "$rid" ]; then
@@ -130,8 +131,26 @@ cleanup() {
         -d "{\"runner_id\": \"$rid\", \"destroy\": true}" > /dev/null 2>&1 || true
     fi
   done
+  # Delete configs created by this test run
+  for cid in "${CONFIG_IDS[@]}"; do
+    if [ -n "$cid" ]; then
+      curl -s -X DELETE "$CP/api/v1/layered-configs/$cid" > /dev/null 2>&1 || true
+    fi
+  done
 }
 trap cleanup EXIT
+
+# Pre-cleanup: delete any leftover configs from previous runs by listing all
+# configs and deleting any whose display_name starts with "netpol-test".
+pre_cleanup() {
+  local list
+  list=$(curl -sf "$CP/api/v1/layered-configs" 2>/dev/null) || return 0
+  echo "$list" | jq -r '.configs[]? | select(.display_name | startswith("netpol-test")) | .config_id' | while read -r cid; do
+    curl -s -X DELETE "$CP/api/v1/layered-configs/$cid" > /dev/null 2>&1 || true
+    echo "  pre-cleanup: deleted stale config $cid"
+  done
+}
+pre_cleanup
 
 HAS_IPSET=false
 if command -v ipset >/dev/null 2>&1; then
@@ -149,27 +168,29 @@ echo "=== E2E Network Policy Tests ==="
 # =========================================================================
 
 # ---------------------------------------------------------------------------
-header "1. Register snapshot config (no policy — backwards compat)"
+header "1. Register layered config (no policy — backwards compat)"
 # ---------------------------------------------------------------------------
-CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/snapshot-configs" \
+CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "netpol-test",
-    "commands": [{"type":"shell","command":"echo netpol-test"}],
-    "runner_ttl_seconds": 120,
-    "auto_pause": false
+    "layers": [{"name": "base", "init_commands": [{"type":"shell","args":["echo","netpol-test-nopolicy"]}]}],
+    "config": {"runner_ttl_seconds": 120, "auto_pause": false}
   }')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.workload_key')
-echo "  workload_key=$WORKLOAD_KEY"
+CONFIG_ID=$(echo "$CONFIG_RESP" | jq -r '.config_id')
+WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.leaf_workload_key')
+CONFIG_IDS+=("$CONFIG_ID")
+echo "  config_id=$CONFIG_ID  workload_key=$WORKLOAD_KEY"
 
 if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then
-  pass "Snapshot config registered (no policy)"
+  pass "Layered config registered (no policy)"
 else
-  fail "Snapshot config registration failed"; exit 1
+  fail "Layered config registration failed"; exit 1
 fi
 
-NP=$(echo "$CONFIG_RESP" | jq -r '.network_policy // "null"')
-NP_PRESET=$(echo "$CONFIG_RESP" | jq -r '.network_policy_preset // ""')
+GET_RESP=$(curl -sf "$CP/api/v1/layered-configs/$CONFIG_ID")
+NP=$(echo "$GET_RESP" | jq -r '.config.network_policy // "null"')
+NP_PRESET=$(echo "$GET_RESP" | jq -r '.config.network_policy_preset // ""')
 if [ "$NP" = "null" ] && [ -z "$NP_PRESET" ]; then
   pass "Config has no network policy (backwards compatible)"
 else
@@ -177,18 +198,19 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-header "2. Register snapshot config with policy preset"
+header "2. Register layered config with policy preset"
 # ---------------------------------------------------------------------------
-CONFIG_PRESET_RESP=$(curl -sf -X POST "$CP/api/v1/snapshot-configs" \
+CONFIG_PRESET_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "netpol-ci-test",
-    "commands": [{"type":"shell","command":"echo netpol-ci"}],
-    "runner_ttl_seconds": 120,
-    "auto_pause": false,
-    "network_policy_preset": "ci-standard"
+    "layers": [{"name": "base", "init_commands": [{"type":"shell","args":["echo","netpol-ci"]}]}],
+    "config": {"runner_ttl_seconds": 120, "auto_pause": false, "network_policy_preset": "ci-standard"}
   }')
-NP_PRESET2=$(echo "$CONFIG_PRESET_RESP" | jq -r '.network_policy_preset // ""')
+CONFIG_PRESET_ID=$(echo "$CONFIG_PRESET_RESP" | jq -r '.config_id')
+CONFIG_IDS+=("$CONFIG_PRESET_ID")
+GET_PRESET_RESP=$(curl -sf "$CP/api/v1/layered-configs/$CONFIG_PRESET_ID")
+NP_PRESET2=$(echo "$GET_PRESET_RESP" | jq -r '.config.network_policy_preset // ""')
 echo "  preset=$NP_PRESET2"
 
 if [ "$NP_PRESET2" = "ci-standard" ]; then
@@ -200,7 +222,9 @@ fi
 # ---------------------------------------------------------------------------
 header "3. Allocate runner without policy (unrestricted)"
 # ---------------------------------------------------------------------------
-RUNNER_ID=$(allocate_and_wait "{\"ci_system\":\"none\", \"workload_key\":\"$WORKLOAD_KEY\"}")
+# Use the no-policy config's workload key. pre_cleanup() cleared stale DB
+# rows so the cache will only see this config with no preset set.
+RUNNER_ID=$(allocate_and_wait "{\"ci_system\":\"none\",\"workload_key\":\"$WORKLOAD_KEY\"}")
 if [ "$RUNNER_ID" != "ALLOC_FAILED" ]; then
   pass "Runner allocated (no policy)"
 else

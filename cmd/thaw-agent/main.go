@@ -1859,6 +1859,10 @@ func dispatchCommand(cmd snapshot.SnapshotCommand, data *MMDSData) error {
 		return runGCPAuthCommand(data)
 	case "shell":
 		return runShellCommand(cmd.Args, cmd.RunAsRoot, data)
+	case "base-image", "platform-setup", "platform-user":
+		// Declarative markers used for layer hash computation only;
+		// the snapshot-builder handles these during rootfs setup before VM boot.
+		return nil
 	default:
 		return fmt.Errorf("unknown command type: %q", cmd.Type)
 	}
