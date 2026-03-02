@@ -15,29 +15,29 @@ pip install -e ".[dev]"
 
 ## Quickstart
 
-The fastest way to get started is the declarative **RunnerConfig** API — declare your runner shape once, build and tag it, then spawn runners from the tag:
+The fastest way to get started is the declarative **RunnerConfig** API — declare your runner shape once, build it, then spawn runners:
 
 ```python
 from bf_sdk import BFClient, RunnerConfig
 
 # 1. Define your runner config
 cfg = (
-    RunnerConfig("my-workload")
-    .with_display_name("My dev sandbox")
+    RunnerConfig("My dev sandbox")
+    .with_base_image("ubuntu:22.04")
     .with_commands(["apt-get install -y python3", "pip install -e .[dev]"])
     .with_tier("small")
-    .with_runner_ttl(3600)
+    .with_ttl(3600)
     .with_auto_pause(True)
+    .with_auto_rollout(True)
 )
 
 with BFClient(base_url="http://localhost:8080", api_key="my-key") as bf:
-    # 2. Register the config, build a snapshot, and tag it
-    bf.runner_configs.apply(cfg)
-    bf.runner_configs.build(cfg, tag="dev")
-    bf.runner_configs.promote(cfg, tag="dev", to="stable")
+    # 2. Register the config and build
+    result = bf.runner_configs.apply(cfg)
+    bf.runner_configs.build(result.config_id)
 
-    # 3. Spawn a runner from the tag (auto-released on exit)
-    with bf.runners.from_config("my-workload", tag="stable") as r:
+    # 3. Spawn a runner from the config (auto-released on exit)
+    with bf.runners.from_config(result.leaf_workload_key) as r:
         # Run a command and collect output
         output, code = r.exec_collect("python", "-c", "print('hello')")
         print(output, code)
@@ -90,30 +90,36 @@ with BFClient(base_url="http://localhost:8080", api_key="my-key") as client:
     client.runners.release(runner.runner_id)
 ```
 
-## Snapshot Config Management
+## Layered Config Management
 
 ```python
 from bf_sdk import BFClient
 
 with BFClient() as client:
     # List configs
-    configs = client.snapshot_configs.list()
+    configs = client.layered_configs.list()
 
-    # Create a config
-    config = client.snapshot_configs.create(
-        display_name="My Workload",
-        commands=[{"command": "apt-get install -y python3"}],
-        ci_system="none",
-    )
+    # Create a layered config
+    result = client.layered_configs.create({
+        "display_name": "My Workload",
+        "base_image": "ubuntu:22.04",
+        "layers": [
+            {"name": "deps", "init_commands": [{"command": "apt-get install -y python3"}]},
+            {"name": "app", "init_commands": [{"command": "pip install ."}]},
+        ],
+        "config": {"tier": "small", "auto_rollout": True},
+    })
 
     # Trigger a build
-    build = client.snapshot_configs.trigger_build(config.workload_key)
+    build = client.layered_configs.build(result.config_id)
 
-    # Tag and promote
-    client.snapshot_configs.create_tag(
-        config.workload_key, tag="stable", version=build.version
-    )
-    client.snapshot_configs.promote(config.workload_key, tag="stable")
+    # Get config details with layer statuses
+    detail = client.layered_configs.get(result.config_id)
+    for layer in detail.layers or []:
+        print(f"{layer.name}: {layer.status}")
+
+    # Refresh a specific layer
+    client.layered_configs.refresh_layer(result.config_id, "deps")
 ```
 
 ## Configuration
@@ -128,10 +134,10 @@ with BFClient() as client:
 
 | SDK concept | Server primitive | Description |
 |---|---|---|
-| `RunnerConfig` | SnapshotConfig | Declarative runner shape (commands, tier, TTL, etc.) |
-| `runner_configs.build()` | `/snapshot-configs/{wk}/build` | Build a snapshot image from a config |
-| `runner_configs.promote()` | Tag create | Copy a tag's version to a target tag (e.g. dev -> stable) |
-| `runners.from_config()` | `/runners/allocate` | Spawn a runner from a tagged config |
+| `RunnerConfig` | LayeredConfig | Declarative runner shape (layers, tier, TTL, etc.) |
+| `runner_configs.build()` | `/layered-configs/{id}/build` | Build all layers in a config |
+| `layered_configs.refresh_layer()` | `/layered-configs/{id}/layers/{name}/refresh` | Refresh a specific layer |
+| `runners.from_config()` | `/runners/allocate` | Spawn a runner from a config |
 | `RunnerSession` | Runner ID + host cache | High-level handle with exec/shell/pause/resume |
 
 ## Host Reconnection

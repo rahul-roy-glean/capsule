@@ -208,13 +208,19 @@ class Runners:
 
     # -- Internal host resolution ----------------------------------------------
 
+    @staticmethod
+    def _ensure_scheme(addr: str) -> str:
+        if not addr.startswith(("http://", "https://")):
+            return f"http://{addr}"
+        return addr
+
     def _resolve_host(self, runner_id: str) -> str:
         if runner_id in self._host_cache:
-            return self._host_cache[runner_id]
+            return self._ensure_scheme(self._host_cache[runner_id])
         result = self.connect(runner_id)
         if result.host_address:
             self._host_cache[runner_id] = result.host_address
-            return result.host_address
+            return self._ensure_scheme(result.host_address)
         raise BFServiceUnavailable(f"No host address available for runner {runner_id}")
 
     def _exec_with_host_retry(self, runner_id: str, body: dict[str, Any]) -> Iterator[ExecEvent]:

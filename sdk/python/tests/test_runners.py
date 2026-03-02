@@ -91,7 +91,7 @@ class TestRunners:
     def test_resolve_host_uses_cache(self, runners: Runners) -> None:
         runners._host_cache["r-1"] = "cached-host:8080"
         host = runners._resolve_host("r-1")
-        assert host == "cached-host:8080"
+        assert host == "http://cached-host:8080"
 
     def test_shell_returns_session(self, runners: Runners) -> None:
         runners._host_cache["r-1"] = "10.0.0.1:8080"
