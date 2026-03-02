@@ -25,6 +25,7 @@ type Scheduler struct {
 	db              *sql.DB
 	snapshotManager *SnapshotManager
 	tagRegistry     *SnapshotTagRegistry
+	configCache     *ConfigCache
 	metricsClient   *telemetry.Client
 	logger          *logrus.Entry
 
@@ -48,6 +49,11 @@ func NewScheduler(hr *HostRegistry, db *sql.DB, sm *SnapshotManager, tr *Snapsho
 // SetMetricsClient attaches a telemetry client for GCP Cloud Monitoring.
 func (s *Scheduler) SetMetricsClient(c *telemetry.Client) {
 	s.metricsClient = c
+}
+
+// SetConfigCache sets the in-memory config cache for fast workload config lookups.
+func (s *Scheduler) SetConfigCache(cc *ConfigCache) {
+	s.configCache = cc
 }
 
 // getHostConn returns a cached gRPC connection to the given address, creating
@@ -119,44 +125,68 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// Derive repo slug for multi-repo support
 	workloadKey := req.WorkloadKey
 
-	// Look up snapshot config for fairness checks, ci_system, start_command, tier, and TTL/auto_pause
+	// Look up config for fairness checks, ci_system, start_command, tier, and TTL/auto_pause.
+	// Uses in-memory cache first, falls back to DB on miss.
 	var ciSystem string
 	var tierName string
 	var startCmd *snapshot.StartCommand
 	var runnerTTLSeconds int
 	var autoPause bool
-	if workloadKey != "" && s.db != nil {
-		var maxConcurrent int
-		var startCommandJSON sql.NullString
-		var tierCol sql.NullString
-		var ttlCol sql.NullInt64
-		var autoPauseCol sql.NullBool
-		err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, ci_system, start_command, tier, runner_ttl_seconds, auto_pause FROM snapshot_configs WHERE workload_key = $1`, workloadKey).Scan(&maxConcurrent, &ciSystem, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol)
-		if err == nil {
-			if tierCol.Valid && tierCol.String != "" {
-				tierName = tierCol.String
-			}
-			if maxConcurrent > 0 {
+	if workloadKey != "" {
+		var wc *WorkloadConfig
+		if s.configCache != nil {
+			wc = s.configCache.GetWorkloadConfig(ctx, workloadKey)
+		}
+		if wc != nil {
+			tierName = wc.Tier
+			ciSystem = wc.CISystem
+			startCmd = wc.StartCommand
+			runnerTTLSeconds = wc.RunnerTTLSeconds
+			autoPause = wc.AutoPause
+			if wc.MaxConcurrentRunners > 0 && s.db != nil {
 				var currentCount int
 				_ = s.db.QueryRowContext(ctx, `
 					SELECT COUNT(*) FROM runners WHERE workload_key = $1 AND status IN ('running','busy','initializing')
 				`, workloadKey).Scan(&currentCount)
-				if currentCount >= maxConcurrent {
-					return nil, fmt.Errorf("workload_key %s at max concurrent runners (%d/%d)", workloadKey, currentCount, maxConcurrent)
+				if currentCount >= wc.MaxConcurrentRunners {
+					return nil, fmt.Errorf("workload_key %s at max concurrent runners (%d/%d)", workloadKey, currentCount, wc.MaxConcurrentRunners)
 				}
 			}
-			if startCommandJSON.Valid && startCommandJSON.String != "" {
-				startCmd = &snapshot.StartCommand{}
-				if err := json.Unmarshal([]byte(startCommandJSON.String), startCmd); err != nil {
-					s.logger.WithError(err).Warn("Failed to parse start_command from snapshot config")
-					startCmd = nil
+		} else if s.db != nil {
+			// No cache or cache miss: fall back to DB
+			var maxConcurrent int
+			var startCommandJSON sql.NullString
+			var tierCol sql.NullString
+			var ttlCol sql.NullInt64
+			var autoPauseCol sql.NullBool
+
+			err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, ci_system, start_command, tier, runner_ttl_seconds, auto_pause FROM layered_configs WHERE leaf_workload_key = $1`, workloadKey).Scan(&maxConcurrent, &ciSystem, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol)
+			if err == nil {
+				if tierCol.Valid && tierCol.String != "" {
+					tierName = tierCol.String
 				}
-			}
-			if ttlCol.Valid {
-				runnerTTLSeconds = int(ttlCol.Int64)
-			}
-			if autoPauseCol.Valid {
-				autoPause = autoPauseCol.Bool
+				if maxConcurrent > 0 {
+					var currentCount int
+					_ = s.db.QueryRowContext(ctx, `
+						SELECT COUNT(*) FROM runners WHERE workload_key = $1 AND status IN ('running','busy','initializing')
+					`, workloadKey).Scan(&currentCount)
+					if currentCount >= maxConcurrent {
+						return nil, fmt.Errorf("workload_key %s at max concurrent runners (%d/%d)", workloadKey, currentCount, maxConcurrent)
+					}
+				}
+				if startCommandJSON.Valid && startCommandJSON.String != "" {
+					startCmd = &snapshot.StartCommand{}
+					if err := json.Unmarshal([]byte(startCommandJSON.String), startCmd); err != nil {
+						s.logger.WithError(err).Warn("Failed to parse start_command from config")
+						startCmd = nil
+					}
+				}
+				if ttlCol.Valid {
+					runnerTTLSeconds = int(ttlCol.Int64)
+				}
+				if autoPauseCol.Valid {
+					autoPause = autoPauseCol.Bool
+				}
 			}
 		}
 	}

@@ -250,6 +250,28 @@ func (c *Cache) GetSnapshotPaths() (*SnapshotPaths, error) {
 		}
 	}
 
+	// Scan for extension drive images: any .img file that isn't a known
+	// infrastructure file. This handles both legacy drives (repo-cache-seed.img)
+	// and new layered drives (workspace.img, etc.).
+	paths.ExtensionDriveImages = make(map[string]string)
+	knownFiles := map[string]bool{
+		"kernel.bin":            true,
+		"rootfs.img":            true,
+		"snapshot.mem":          true,
+		"snapshot.state":        true,
+		"metadata.json":         true,
+		"chunked-metadata.json": true,
+	}
+	entries, _ := os.ReadDir(c.localPath)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".img") || knownFiles[e.Name()] {
+			continue
+		}
+		driveID := strings.TrimSuffix(e.Name(), ".img")
+		driveID = strings.ReplaceAll(driveID, "-", "_")
+		paths.ExtensionDriveImages[driveID] = filepath.Join(c.localPath, e.Name())
+	}
+
 	return paths, nil
 }
 

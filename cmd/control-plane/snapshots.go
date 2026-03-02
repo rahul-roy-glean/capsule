@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -18,8 +19,6 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/tiers"
 )
 
 // Snapshot represents a snapshot version
@@ -500,9 +499,7 @@ shutdown -h now
 }
 
 // launchSnapshotBuilderVMForKey creates a GCE instance to build a snapshot from commands JSON.
-// When incremental is true, the builder passes --incremental to the snapshot-builder binary
-// and runs on a spot (preemptible) instance. Full builds use on-demand instances.
-func (sm *SnapshotManager) launchSnapshotBuilderVMForKey(ctx context.Context, instanceName, workloadKey, commandsJSON, version, githubAppID, githubAppSecret string, incremental bool, incrementalCommandsJSON string, snapshotVCPUs, snapshotMemoryMB int) error {
+func (sm *SnapshotManager) launchSnapshotBuilderVMForKey(ctx context.Context, instanceName, workloadKey, commandsJSON, version, githubAppID, githubAppSecret string, buildType string, snapshotVCPUs, snapshotMemoryMB int) error {
 	if sm.gcpProject == "" {
 		sm.logger.Warn("GCP project not configured, skipping VM launch")
 		return nil
@@ -527,13 +524,9 @@ func (sm *SnapshotManager) launchSnapshotBuilderVMForKey(ctx context.Context, in
 			githubAppID, githubAppSecret, sm.gcpProject)
 	}
 	gcsBase := sm.gcsPath("build-artifacts")
-	incrementalFlag := ""
-	if incremental {
-		incrementalFlag = "--incremental"
-	}
-	incrementalCommandsFlag := ""
-	if incrementalCommandsJSON != "" {
-		incrementalCommandsFlag = fmt.Sprintf("--incremental-commands='%s'", incrementalCommandsJSON)
+	buildTypeFlag := ""
+	if buildType != "" && buildType != "init" {
+		buildTypeFlag = fmt.Sprintf("--build-type=%s", buildType)
 	}
 
 	startupScript := fmt.Sprintf(`#!/bin/bash
@@ -581,10 +574,10 @@ fi
 	--vcpus=%d \
 	--memory-mb=%d \
     --version="%s" \
-    %s %s %s
+    %s %s
 echo "Snapshot build complete, shutting down..."
 shutdown -h now
-`, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, workloadKey, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, commandsJSON, sm.gcsBucket, sm.gcsPrefix, snapshotVCPUs, snapshotMemoryMB, version, githubFlags, incrementalFlag, incrementalCommandsFlag)
+`, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, workloadKey, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, commandsJSON, sm.gcsBucket, sm.gcsPrefix, snapshotVCPUs, snapshotMemoryMB, version, githubFlags, buildTypeFlag)
 
 	// Size the builder VM to fit the snapshot build: give it at least 8 vCPUs
 	// or the snapshot's vCPUs + 2 headroom, whichever is larger.
@@ -650,9 +643,9 @@ shutdown -h now
 				},
 			},
 			Scheduling: &computepb.Scheduling{
-				// Incremental builds are fast and cheap to retry — use spot instances.
-				// Full builds are long-running — use on-demand instances.
-				Preemptible: proto.Bool(incremental),
+				// Refresh builds are fast and cheap to retry — use spot instances.
+				// Init builds are long-running — use on-demand instances.
+				Preemptible: proto.Bool(buildType == "refresh" || buildType == "reattach"),
 			},
 		},
 	}
@@ -762,6 +755,46 @@ func (sm *SnapshotManager) checkSnapshotComplete(ctx context.Context, version st
 	return true, nil
 }
 
+// checkLayerBuildComplete checks if a layer build is complete by looking for
+// the chunked-metadata.json under the layer hash's snapshot_state directory.
+// Layer builds use: {gcsPrefix}/{layerHash}/snapshot_state/{version}/chunked-metadata.json
+// and update: {gcsPrefix}/{layerHash}/current-pointer.json last.
+func (sm *SnapshotManager) checkLayerBuildComplete(ctx context.Context, layerHash, version string) (bool, error) {
+	if sm.gcsClient == nil {
+		return false, fmt.Errorf("GCS client not available")
+	}
+
+	bucket := sm.gcsClient.Bucket(sm.gcsBucket)
+
+	// Check for chunked-metadata.json under the version directory
+	metadataPath := sm.gcsPath(fmt.Sprintf("%s/snapshot_state/%s/chunked-metadata.json", layerHash, version))
+	if _, err := bucket.Object(metadataPath).Attrs(ctx); err != nil {
+		return false, nil
+	}
+
+	// Also verify current-pointer.json points to this version (written last by snapshot-builder)
+	pointerPath := sm.gcsPath(layerHash + "/current-pointer.json")
+	reader, err := bucket.Object(pointerPath).NewReader(ctx)
+	if err != nil {
+		return false, nil
+	}
+	defer reader.Close()
+
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return false, nil
+	}
+
+	var pointer struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(data, &pointer); err != nil {
+		return false, nil
+	}
+
+	return pointer.Version == version, nil
+}
+
 // isBuilderVMRunning checks if the builder VM is still running
 func (sm *SnapshotManager) isBuilderVMRunning(ctx context.Context, instanceName string) (bool, error) {
 	instancesClient, err := compute.NewInstancesRESTClient(ctx)
@@ -776,6 +809,10 @@ func (sm *SnapshotManager) isBuilderVMRunning(ctx context.Context, instanceName 
 		Instance: instanceName,
 	})
 	if err != nil {
+		// Treat 404 (VM not found / already deleted) as "not running"
+		if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "NOT_FOUND") || strings.Contains(err.Error(), "notFound") {
+			return false, nil
+		}
 		return false, err
 	}
 
@@ -1214,65 +1251,6 @@ func (sm *SnapshotManager) SetActiveSnapshotForKey(ctx context.Context, workload
 	return tx.Commit()
 }
 
-// TriggerSnapshotBuildForKey triggers a snapshot build for a specific workload key.
-// When incremental is true, the builder restores from the previous snapshot and
-// the VM runs on a spot (preemptible) instance to save costs. Full builds use
-// on-demand instances since they are long-running and expensive to retry.
-func (sm *SnapshotManager) TriggerSnapshotBuildForKey(ctx context.Context, workloadKey string, commands []snapshot.SnapshotCommand, incrementalCommands []snapshot.SnapshotCommand, githubAppID, githubAppSecret string, incremental bool) (string, error) {
-	version := fmt.Sprintf("v%s-%s", time.Now().Format("20060102-150405"), workloadKey)
-
-	sm.logger.WithFields(logrus.Fields{
-		"version":      version,
-		"workload_key": workloadKey,
-		"incremental":  incremental,
-	}).Info("Triggering snapshot build for key")
-
-	// Create snapshot record
-	metricsJSON, _ := json.Marshal(SnapshotMetrics{})
-
-	commandsJSON, _ := json.Marshal(commands)
-	_, err := sm.db.ExecContext(ctx, `
-		INSERT INTO snapshots (version, status, gcs_path, bazel_version, repo_commit, size_bytes, metrics, workload_key)
-		VALUES ($1, 'building', $2, '', '', 0, $3, $4)
-	`, version, fmt.Sprintf("gs://%s/%s/", sm.gcsBucket, sm.gcsPath(workloadKey+"/snapshot_state/"+version)),
-		string(metricsJSON), workloadKey)
-	if err != nil {
-		return "", err
-	}
-
-	// Pass incremental commands to the VM when doing an incremental build
-	var incrementalCommandsJSON string
-	if incremental && len(incrementalCommands) > 0 {
-		b, _ := json.Marshal(incrementalCommands)
-		incrementalCommandsJSON = string(b)
-	}
-
-	// Look up tier for this workload key to determine snapshot vCPUs/memory
-	snapshotVCPUs := 4 // default "m" tier
-	snapshotMemoryMB := 4096
-	if sm.db != nil {
-		var tierName sql.NullString
-		if err := sm.db.QueryRowContext(ctx, `SELECT tier FROM snapshot_configs WHERE workload_key = $1`, workloadKey).Scan(&tierName); err == nil && tierName.Valid && tierName.String != "" {
-			if t, err := tiers.Lookup(tierName.String); err == nil {
-				snapshotVCPUs = t.VCPUs
-				snapshotMemoryMB = t.MemoryMB
-			}
-		}
-	}
-
-	// Launch snapshot builder VM
-	instanceName := fmt.Sprintf("snapshot-builder-%s", version)
-	if err := sm.launchSnapshotBuilderVMForKey(ctx, instanceName, workloadKey, string(commandsJSON), version, githubAppID, githubAppSecret, incremental, incrementalCommandsJSON, snapshotVCPUs, snapshotMemoryMB); err != nil {
-		sm.UpdateSnapshotStatus(ctx, version, "failed")
-		return "", fmt.Errorf("failed to launch snapshot builder: %w", err)
-	}
-
-	// Monitor build in background
-	go sm.monitorSnapshotBuildForKey(context.Background(), version, instanceName, workloadKey)
-
-	return version, nil
-}
-
 // monitorSnapshotBuildForKey monitors a repo-scoped snapshot build.
 // After build completes, it auto-validates and optionally auto-rolls out.
 func (sm *SnapshotManager) monitorSnapshotBuildForKey(ctx context.Context, version, instanceName, workloadKey string) {
@@ -1316,9 +1294,9 @@ func (sm *SnapshotManager) monitorSnapshotBuildForKey(ctx context.Context, versi
 				}
 				sm.UpdateSnapshotStatus(ctx, version, "validating")
 
-				// Check if auto-rollout is enabled for this workload key
+				// Check if auto-rollout is enabled for this workload key.
 				var autoRollout bool
-				err := sm.db.QueryRowContext(ctx, `SELECT auto_rollout FROM snapshot_configs WHERE workload_key = $1`, workloadKey).Scan(&autoRollout)
+				err := sm.db.QueryRowContext(ctx, `SELECT auto_rollout FROM layered_configs WHERE leaf_workload_key = $1`, workloadKey).Scan(&autoRollout)
 				if err != nil {
 					sm.logger.WithError(err).Warn("Failed to check auto_rollout setting")
 					return
