@@ -158,8 +158,8 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 		INSERT INTO layered_configs (config_id, display_name, config_json, leaf_layer_hash, leaf_workload_key,
 			tier, ci_system, github_app_id, github_app_secret, start_command,
 			runner_ttl_seconds, session_max_age_seconds, auto_pause, auto_rollout,
-			max_concurrent_runners, build_schedule)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			max_concurrent_runners, build_schedule, network_policy_preset, network_policy)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		ON CONFLICT (config_id) DO UPDATE SET
 			display_name = EXCLUDED.display_name,
 			config_json = EXCLUDED.config_json,
@@ -176,11 +176,13 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 			auto_rollout = EXCLUDED.auto_rollout,
 			max_concurrent_runners = EXCLUDED.max_concurrent_runners,
 			build_schedule = EXCLUDED.build_schedule,
+			network_policy_preset = EXCLUDED.network_policy_preset,
+			network_policy = EXCLUDED.network_policy,
 			updated_at = NOW()
 	`, configID, cfg.DisplayName, string(cfgJSON), leafLayer.LayerHash, leafWorkloadKey,
 		tierName, cfg.Config.CISystem, cfg.GitHubAppID, cfg.GitHubAppSecret, startCommandJSON,
 		cfg.Config.TTL, cfg.Config.SessionMaxAgeSeconds, cfg.Config.AutoPause, cfg.Config.AutoRollout,
-		0, "")
+		0, "", cfg.Config.NetworkPolicyPreset, networkPolicyVal(cfg.Config.NetworkPolicy))
 
 	if err != nil {
 		return "", "", fmt.Errorf("failed to insert layered config: %w", err)
@@ -212,6 +214,10 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 
 	// Update in-memory workload config cache
 	if r.configCache != nil {
+		npJSON := ""
+		if len(cfg.Config.NetworkPolicy) > 0 && string(cfg.Config.NetworkPolicy) != "null" {
+			npJSON = string(cfg.Config.NetworkPolicy)
+		}
 		r.configCache.PutWorkloadConfig(&WorkloadConfig{
 			WorkloadKey:          leafWorkloadKey,
 			Tier:                 tierName,
@@ -221,6 +227,8 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 			SessionMaxAgeSeconds: cfg.Config.SessionMaxAgeSeconds,
 			AutoPause:            cfg.Config.AutoPause,
 			MaxConcurrentRunners: 0,
+			NetworkPolicyPreset:  cfg.Config.NetworkPolicyPreset,
+			NetworkPolicyJSON:    npJSON,
 		})
 	}
 
@@ -668,4 +676,14 @@ func (r *LayeredConfigRegistry) handleRefreshLayer(w http.ResponseWriter, req *h
 		"layer_name": layerName,
 		"status":     "refresh_enqueued",
 	})
+}
+
+// networkPolicyVal converts a json.RawMessage to a *string for DB storage.
+// Returns nil (SQL NULL) when the policy is empty/null.
+func networkPolicyVal(policy json.RawMessage) *string {
+	if len(policy) == 0 || string(policy) == "null" {
+		return nil
+	}
+	s := string(policy)
+	return &s
 }

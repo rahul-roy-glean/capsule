@@ -132,6 +132,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	var startCmd *snapshot.StartCommand
 	var runnerTTLSeconds int
 	var autoPause bool
+	var configNetworkPolicyPreset string
+	var configNetworkPolicyJSON string
 	if workloadKey != "" {
 		var wc *WorkloadConfig
 		if s.configCache != nil {
@@ -143,6 +145,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			startCmd = wc.StartCommand
 			runnerTTLSeconds = wc.RunnerTTLSeconds
 			autoPause = wc.AutoPause
+			configNetworkPolicyPreset = wc.NetworkPolicyPreset
+			configNetworkPolicyJSON = wc.NetworkPolicyJSON
 			if wc.MaxConcurrentRunners > 0 && s.db != nil {
 				var currentCount int
 				_ = s.db.QueryRowContext(ctx, `
@@ -159,8 +163,10 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			var tierCol sql.NullString
 			var ttlCol sql.NullInt64
 			var autoPauseCol sql.NullBool
+			var npPreset sql.NullString
+			var npJSON sql.NullString
 
-			err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, ci_system, start_command, tier, runner_ttl_seconds, auto_pause FROM layered_configs WHERE leaf_workload_key = $1`, workloadKey).Scan(&maxConcurrent, &ciSystem, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol)
+			err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, ci_system, start_command, tier, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy FROM layered_configs WHERE leaf_workload_key = $1`, workloadKey).Scan(&maxConcurrent, &ciSystem, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON)
 			if err == nil {
 				if tierCol.Valid && tierCol.String != "" {
 					tierName = tierCol.String
@@ -186,6 +192,12 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 				}
 				if autoPauseCol.Valid {
 					autoPause = autoPauseCol.Bool
+				}
+				if npPreset.Valid {
+					configNetworkPolicyPreset = npPreset.String
+				}
+				if npJSON.Valid {
+					configNetworkPolicyJSON = npJSON.String
 				}
 			}
 		}
@@ -332,15 +344,24 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	}
 	// Pass network policy fields via labels (proto fields 17-18 not in
 	// generated wire descriptor; labels are serialized reliably).
-	if req.NetworkPolicyPreset != "" || req.NetworkPolicyJSON != "" {
+	// Explicit request values take precedence; fall back to the config-stored policy.
+	effectiveNPPreset := req.NetworkPolicyPreset
+	if effectiveNPPreset == "" {
+		effectiveNPPreset = configNetworkPolicyPreset
+	}
+	effectiveNPJSON := req.NetworkPolicyJSON
+	if effectiveNPJSON == "" {
+		effectiveNPJSON = configNetworkPolicyJSON
+	}
+	if effectiveNPPreset != "" || effectiveNPJSON != "" {
 		if protoReq.Labels == nil {
 			protoReq.Labels = make(map[string]string)
 		}
-		if req.NetworkPolicyPreset != "" {
-			protoReq.Labels["_network_policy_preset"] = req.NetworkPolicyPreset
+		if effectiveNPPreset != "" {
+			protoReq.Labels["_network_policy_preset"] = effectiveNPPreset
 		}
-		if req.NetworkPolicyJSON != "" {
-			protoReq.Labels["_network_policy_json"] = req.NetworkPolicyJSON
+		if effectiveNPJSON != "" {
+			protoReq.Labels["_network_policy_json"] = effectiveNPJSON
 		}
 	}
 	// Populate resources from tier (overrides request-level values)

@@ -500,6 +500,9 @@ func initSchema(db *sql.DB) error {
 		// Indexes for layered_configs lookups
 		`CREATE INDEX IF NOT EXISTS idx_layered_configs_leaf_wk ON layered_configs(leaf_workload_key)`,
 		`CREATE INDEX IF NOT EXISTS idx_layered_configs_leaf_hash ON layered_configs(leaf_layer_hash)`,
+		// Network policy columns on layered_configs
+		`ALTER TABLE layered_configs ADD COLUMN IF NOT EXISTS network_policy JSONB DEFAULT NULL`,
+		`ALTER TABLE layered_configs ADD COLUMN IF NOT EXISTS network_policy_preset VARCHAR(64) DEFAULT ''`,
 		// Mapping table: repo → workload_key for CI webhook routing.
 		// This is a CI integration concern, not part of the core config model.
 		`CREATE TABLE IF NOT EXISTS repo_workload_mappings (
