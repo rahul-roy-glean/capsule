@@ -201,7 +201,8 @@ fi
 # ---------------------------------------------------------------------------
 header "3. Allocate runner without policy (unrestricted)"
 # ---------------------------------------------------------------------------
-RUNNER_ID=$(allocate_and_wait "{\"ci_system\":\"none\", \"workload_key\":\"$WORKLOAD_KEY\"}")
+# Allocate without a workload_key so no config-stored policy is looked up.
+RUNNER_ID=$(allocate_and_wait '{"ci_system":"none"}')
 if [ "$RUNNER_ID" != "ALLOC_FAILED" ]; then
   pass "Runner allocated (no policy)"
 else
