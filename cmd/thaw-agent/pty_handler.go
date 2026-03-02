@@ -88,6 +88,7 @@ func ptyHandler(w http.ResponseWriter, r *http.Request) {
 		Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
 		Setsid:     true,
 	}
+	cgroupMgr.applyCgroup(cmd.SysProcAttr)
 	cmd.Env = []string{
 		"TERM=xterm-256color",
 		"HOME=" + runnerUser.HomeDir,

@@ -108,6 +108,10 @@ func (b *WarmupLogBuffer) Since(afterSeq int64) ([]string, int64) {
 
 var globalWarmupLogs = &WarmupLogBuffer{}
 
+// cgroupMgr is the cgroup v2 manager for user process isolation. Nil if cgroup
+// v2 is not available (graceful degradation).
+var cgroupMgr *cgroupManager
+
 // globalLogBuffer captures all logrus log entries for the /logs HTTP endpoint.
 // This allows debugging thaw-agent behavior from the host via:
 //
@@ -261,6 +265,11 @@ func main() {
 	bootTimer = telemetry.NewTimer()
 
 	log.Info("Thaw agent starting...")
+
+	// Initialize cgroup v2 isolation for user processes. This creates agent/
+	// and user/ sub-cgroups and moves the thaw-agent into agent/. User commands
+	// from /exec and /pty are placed into user/ to prevent resource starvation.
+	cgroupMgr = initCgroup()
 
 	// Track progress for debugging
 	currentStep := "starting"
@@ -2576,6 +2585,7 @@ func execHandler(w http.ResponseWriter, r *http.Request) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
 	}
+	cgroupMgr.applyCgroup(cmd.SysProcAttr)
 	cmd.Env = append(cmd.Env, "HOME="+runnerUser.HomeDir)
 
 	// Create pipes
