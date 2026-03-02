@@ -514,6 +514,8 @@ func initSchema(db *sql.DB) error {
 		// Reattach build support: track old layer hash/version for drive reuse
 		`ALTER TABLE snapshot_builds ADD COLUMN IF NOT EXISTS old_layer_hash VARCHAR(64)`,
 		`ALTER TABLE snapshot_builds ADD COLUMN IF NOT EXISTS old_layer_version VARCHAR(255)`,
+		// config_id links a build to the owning layered_configs row for tier/credential lookups
+		`ALTER TABLE snapshot_builds ADD COLUMN IF NOT EXISTS config_id VARCHAR(64)`,
 		// All-chain drives: union of drives across all layers in a config
 		`ALTER TABLE snapshot_layers ADD COLUMN IF NOT EXISTS all_chain_drives JSONB DEFAULT '[]'`,
 		// Re-activate layers that are referenced by a config but were incorrectly deactivated.
