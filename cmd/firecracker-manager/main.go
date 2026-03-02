@@ -1572,9 +1572,21 @@ func handlePTYProxy(w http.ResponseWriter, r *http.Request, mgr *runner.Manager,
 	<-done
 }
 
-// handleFileOp proxies a POST /files/{op} request to a runner's thaw-agent.
+// handleFileOp proxies a /files/{op} request to a runner's thaw-agent.
+// For download/upload ops, it uses streaming (raw bytes, no timeout).
+// For metadata ops (read/write/list/stat/remove/mkdir), it uses JSON with a 30s timeout.
 func handleFileOp(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID, fileOp string) {
-	if r.Method != http.MethodPost {
+	// download is GET, everything else is POST
+	isDownload := fileOp == "download"
+	isUpload := fileOp == "upload"
+	isStreaming := isDownload || isUpload
+
+	if isDownload {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+	} else if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -1605,6 +1617,10 @@ func handleFileOp(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, l
 	}
 
 	targetURL := fmt.Sprintf("http://%s:%d/files/%s", rn.InternalIP.String(), snapshot.ThawAgentDebugPort, fileOp)
+	// Forward query string for download/upload (path, mode, perm params).
+	if r.URL.RawQuery != "" {
+		targetURL += "?" + r.URL.RawQuery
+	}
 
 	log.WithFields(logrus.Fields{
 		"runner_id": runnerID,
@@ -1615,14 +1631,33 @@ func handleFileOp(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, l
 	mgr.IncrementActiveExecs(runnerID)
 	defer mgr.DecrementActiveExecs(runnerID)
 
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, r.Body)
+	method := r.Method
+	var body io.Reader
+	if !isDownload {
+		body = r.Body
+	}
+
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), method, targetURL, body)
 	if err != nil {
 		http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
 		return
 	}
-	upstreamReq.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	if isUpload {
+		// Forward the original content type for uploads (may be application/octet-stream).
+		if ct := r.Header.Get("Content-Type"); ct != "" {
+			upstreamReq.Header.Set("Content-Type", ct)
+		}
+	} else if !isDownload {
+		upstreamReq.Header.Set("Content-Type", "application/json")
+	}
+
+	// Streaming ops get no timeout (large files). Metadata ops keep 30s.
+	timeout := 30 * time.Second
+	if isStreaming {
+		timeout = 0
+	}
+	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(upstreamReq)
 	if err != nil {
 		log.WithError(err).WithField("runner_id", runnerID).Warn("Failed to reach thaw-agent for file op")
@@ -1631,7 +1666,17 @@ func handleFileOp(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, l
 	}
 	defer resp.Body.Close()
 
-	w.Header().Set("Content-Type", "application/json")
+	// Copy all response headers for streaming ops (Content-Type, Content-Length,
+	// Content-Range, Last-Modified, etc. from http.ServeFile).
+	if isStreaming {
+		for key, vals := range resp.Header {
+			for _, v := range vals {
+				w.Header().Add(key, v)
+			}
+		}
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }
