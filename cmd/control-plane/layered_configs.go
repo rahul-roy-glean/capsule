@@ -372,9 +372,9 @@ func (r *LayeredConfigRegistry) GetLayerStatuses(ctx context.Context, configID s
 // DeleteLayeredConfig deletes a layered config. Layers shared by other configs are preserved;
 // orphaned layers (not referenced by any remaining config) are deactivated and their builds cancelled.
 func (r *LayeredConfigRegistry) DeleteLayeredConfig(ctx context.Context, configID string) error {
-	// Load the config's layer hashes before deleting
-	var configJSON string
-	err := r.db.QueryRowContext(ctx, `SELECT config_json FROM layered_configs WHERE config_id = $1`, configID).Scan(&configJSON)
+	// Load the config's layer hashes and workload key before deleting
+	var configJSON, leafWorkloadKey string
+	err := r.db.QueryRowContext(ctx, `SELECT config_json, leaf_workload_key FROM layered_configs WHERE config_id = $1`, configID).Scan(&configJSON, &leafWorkloadKey)
 	if err != nil {
 		return fmt.Errorf("layered config not found: %s", configID)
 	}
@@ -393,6 +393,13 @@ func (r *LayeredConfigRegistry) DeleteLayeredConfig(ctx context.Context, configI
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
 		return fmt.Errorf("layered config not found: %s", configID)
+	}
+
+	// Invalidate the workload config cache so the next allocation re-reads from DB.
+	// If another config shares the same leaf_workload_key, the cache will be
+	// repopulated on the next cache miss.
+	if r.configCache != nil && leafWorkloadKey != "" {
+		r.configCache.InvalidateWorkloadConfig(leafWorkloadKey)
 	}
 
 	// For each layer, check if it's still referenced by another config.

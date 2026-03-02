@@ -174,7 +174,7 @@ CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "netpol-test",
-    "layers": [{"name": "base", "init_commands": [{"type":"shell","command":"echo netpol-test-nopolicy"}]}],
+    "layers": [{"name": "base", "init_commands": [{"type":"shell","args":["echo","netpol-test-nopolicy"]}]}],
     "config": {"runner_ttl_seconds": 120, "auto_pause": false}
   }')
 CONFIG_ID=$(echo "$CONFIG_RESP" | jq -r '.config_id')
@@ -204,7 +204,7 @@ CONFIG_PRESET_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "netpol-ci-test",
-    "layers": [{"name": "base", "init_commands": [{"type":"shell","command":"echo netpol-ci"}]}],
+    "layers": [{"name": "base", "init_commands": [{"type":"shell","args":["echo","netpol-ci"]}]}],
     "config": {"runner_ttl_seconds": 120, "auto_pause": false, "network_policy_preset": "ci-standard"}
   }')
 CONFIG_PRESET_ID=$(echo "$CONFIG_PRESET_RESP" | jq -r '.config_id')
