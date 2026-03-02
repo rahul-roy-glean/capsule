@@ -355,7 +355,11 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	}
 	cm.fuseExtensionDisks[runnerID] = make(map[string]*fuse.ChunkedDisk)
 	for driveID, extDrive := range meta.ExtensionDrives {
-		if extDrive.ReadOnly && len(extDrive.Chunks) > 0 {
+		if len(extDrive.Chunks) > 0 {
+			// FUSE-mount drives that have chunked content to preserve filesystem
+			// state from the snapshot. This applies to both read-only and writable
+			// drives — the kernel's cached inodes/dentries must match the on-disk
+			// content for correct snapshot restore.
 			fuseExtMountDir := filepath.Join(cm.config.WorkspaceDir, runnerID, "fuse-ext-"+driveID)
 			if err := os.MkdirAll(fuseExtMountDir, 0755); err != nil {
 				cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
@@ -385,9 +389,9 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 			}
 			cm.fuseExtensionDisks[runnerID][driveID] = extFUSE
 			extensionDrivePaths[driveID] = extFUSE.DiskImagePath()
-			cm.chunkedLogger.WithFields(logrus.Fields{"runner_id": runnerID, "drive_id": driveID}).Info("Mounted FUSE-backed read-only extension drive")
+			cm.chunkedLogger.WithFields(logrus.Fields{"runner_id": runnerID, "drive_id": driveID}).Info("Mounted FUSE-backed extension drive")
 		} else {
-			// Writable extension drive: create fresh ext4 image
+			// No chunks: create fresh ext4 image (e.g. overlay drives)
 			imgPath := filepath.Join(cm.config.WorkspaceDir, runnerID, driveID+"-upper.img")
 			if mkErr := os.MkdirAll(filepath.Dir(imgPath), 0755); mkErr != nil {
 				cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
