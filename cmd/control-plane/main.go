@@ -237,7 +237,7 @@ func main() {
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *httpPort),
-		Handler: httpMux,
+		Handler: apiLoggingMiddleware(logger, httpMux),
 	}
 
 	go func() {
@@ -271,6 +271,59 @@ func main() {
 	httpServer.Shutdown(shutdownCtx)
 
 	log.Info("Shutdown complete")
+}
+
+// statusRecorder wraps http.ResponseWriter to capture the status code.
+type statusRecorder struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.statusCode = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+// apiLoggingMiddleware logs every API request on completion with method, path,
+// status code, duration, and optional identifiers from query parameters.
+func apiLoggingMiddleware(logger *logrus.Logger, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip /health and /metrics — too noisy
+		if r.URL.Path == "/health" || r.URL.Path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, statusCode: 200}
+		next.ServeHTTP(rec, r)
+		duration := time.Since(start)
+
+		fields := logrus.Fields{
+			"method":      r.Method,
+			"path":        r.URL.Path,
+			"status":      rec.statusCode,
+			"duration_ms": duration.Milliseconds(),
+			"remote_addr": r.RemoteAddr,
+		}
+
+		// Extract identifiers from query string (GET endpoints)
+		if v := r.URL.Query().Get("runner_id"); v != "" {
+			fields["runner_id"] = v
+		}
+		if v := r.URL.Query().Get("workload_key"); v != "" {
+			fields["workload_key"] = v
+		}
+
+		entry := logger.WithFields(fields)
+		if rec.statusCode >= 500 {
+			entry.Error("API request completed with server error")
+		} else if rec.statusCode >= 400 {
+			entry.Warn("API request completed with client error")
+		} else {
+			entry.Info("API request completed")
+		}
+	})
 }
 
 func initSchema(db *sql.DB) error {
