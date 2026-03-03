@@ -754,10 +754,12 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		"workload_key": metadata.WorkloadKey,
 	}).Info("Resuming runner from session snapshot")
 
-	// Get golden snapshot paths
-	snapshotPaths, err := m.snapshotCache.GetSnapshotPaths()
+	// Kernel path is always needed; full snapshot paths (rootfs, mem) are only
+	// needed for the local-resume fallback.  Defer GetSnapshotPaths() to the
+	// local branch so GCS-backed resumes don't fail on missing rootfs.img.
+	kernelPath, err := m.snapshotCache.GetKernelPath()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get snapshot paths: %w", err)
+		return nil, fmt.Errorf("failed to get kernel path: %w", err)
 	}
 
 	m.mu.Lock()
@@ -932,6 +934,15 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		}).Info("Resuming from GCS-backed session (UFFD chunked)")
 	} else {
 		// Local fallback: LayeredHandler uses golden snapshot.mem on this host.
+		// Full snapshot paths (including rootfs, mem) are required for local resume.
+		snapshotPaths, spErr := m.snapshotCache.GetSnapshotPaths()
+		if spErr != nil {
+			m.mu.Lock()
+			m.cleanupNetworkOnly(runnerID, tap.Name)
+			m.mu.Unlock()
+			return nil, fmt.Errorf("failed to get snapshot paths for local resume: %w", spErr)
+		}
+
 		// Build diff layer paths (oldest first).
 		var diffLayers []string
 		for i := 0; i < metadata.Layers; i++ {
@@ -976,7 +987,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		VMID:           runnerID,
 		SocketDir:      m.config.SocketDir,
 		FirecrackerBin: m.config.FirecrackerBin,
-		KernelPath:     snapshotPaths.Kernel,
+		KernelPath:     kernelPath,
 		RootfsPath:     overlayPath,
 		VCPUs:          metadata.VCPUs,
 		MemoryMB:       metadata.MemoryMB,
@@ -1076,7 +1087,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		InternalIP:      internalIP,
 		TapDevice:       tap.Name,
 		MAC:             tap.MAC,
-		SnapshotVersion: snapshotPaths.Version,
+		SnapshotVersion: m.snapshotCache.CurrentVersion(),
 		WorkloadKey:     metadata.WorkloadKey,
 		Resources: Resources{
 			VCPUs:    metadata.VCPUs,

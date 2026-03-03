@@ -82,7 +82,10 @@ metadata:
   namespace: firecracker-runner
   labels:
     app: otel-collector
+  annotations:
+    networking.gke.io/load-balancer-type: "Internal"
 spec:
+  type: LoadBalancer
   ports:
   - port: 4317
     name: otlp-grpc
