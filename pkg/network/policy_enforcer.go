@@ -16,14 +16,14 @@ import (
 // PolicyEnforcer manages iptables/ipset rules for a single VM's network policy
 // inside its network namespace.
 type PolicyEnforcer struct {
-	vmID      string // full VM ID
-	id8       string // first 8 chars of vmID (for ipset naming)
-	nsName    string // network namespace name
-	vethVM    string // namespace-side veth interface name
+	vmID       string // full VM ID
+	id8        string // first 8 chars of vmID (for ipset naming)
+	nsName     string // network namespace name
+	vethVM     string // namespace-side veth interface name
 	hostVethIP net.IP // host-side veth IP (10.200.{slot}.1)
-	policy    *NetworkPolicy
-	mu        sync.Mutex
-	logger    *logrus.Entry
+	policy     *NetworkPolicy
+	mu         sync.Mutex
+	logger     *logrus.Entry
 
 	// ingressPorts tracks all forwarded ports for POLICY-INGRESS chain
 	ingressPorts []int

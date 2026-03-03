@@ -8,6 +8,7 @@ package snapshot
 // Inline copies exist (with omitempty JSON tags for MMDS serialisation) in:
 //   - cmd/thaw-agent/main.go   — MMDSData.Latest.StartCommand (×2: waitForMMDS + fetchMMDSData)
 //   - pkg/runner/types.go      — MMDSData.Latest.StartCommand
+//
 // Keep all copies in sync when adding/removing fields.
 type StartCommand struct {
 	Command    []string          `json:"command"`

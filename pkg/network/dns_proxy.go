@@ -20,16 +20,16 @@ import (
 // enforces domain allow/block lists, and populates ipsets with resolved IPs.
 // One proxy runs per VM that needs domain filtering.
 type DNSProxy struct {
-	config   DNSProxyConfig
-	server   *dns.Server
-	client   *dns.Client
-	mu       sync.RWMutex
-	allowed  map[string]bool // lowercase domain -> allowed (wildcard-expanded on query)
-	blocked  map[string]bool // lowercase domain -> blocked
-	logger   *logrus.Entry
-	running  atomic.Bool
-	stopCh   chan struct{}
-	ipCount  atomic.Int64 // approximate total IPs in ipset
+	config  DNSProxyConfig
+	server  *dns.Server
+	client  *dns.Client
+	mu      sync.RWMutex
+	allowed map[string]bool // lowercase domain -> allowed (wildcard-expanded on query)
+	blocked map[string]bool // lowercase domain -> blocked
+	logger  *logrus.Entry
+	running atomic.Bool
+	stopCh  chan struct{}
+	ipCount atomic.Int64 // approximate total IPs in ipset
 }
 
 // DNSProxyConfig configures the DNS proxy.

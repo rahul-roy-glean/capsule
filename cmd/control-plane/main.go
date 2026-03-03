@@ -782,10 +782,10 @@ func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Req
 		for _, ri := range runnerInfos {
 			allRunners = append(allRunners, map[string]interface{}{
 				"runner_id":    ri.RunnerID,
-				"host_id":     h.ID,
-				"host_name":   h.InstanceName,
+				"host_id":      h.ID,
+				"host_name":    h.InstanceName,
 				"workload_key": ri.WorkloadKey,
-				"status":      ri.State,
+				"status":       ri.State,
 			})
 		}
 	}
