@@ -46,6 +46,10 @@ var (
 	gcpProject  = flag.String("gcp-project", "", "GCP project for telemetry and snapshot builder VMs")
 	gcpZone     = flag.String("gcp-zone", "us-central1-a", "GCP zone for snapshot builder VMs")
 	environment = flag.String("environment", "dev", "Environment name for telemetry labels")
+
+	// MCP server
+	mcpPort      = flag.Int("mcp-port", 0, "MCP server port (0 = disabled)")
+	mcpAuthToken = flag.String("mcp-auth-token", "", "Bearer token for MCP authentication (or MCP_AUTH_TOKEN env var)")
 )
 
 func main() {
@@ -77,6 +81,9 @@ func main() {
 	}
 	if v := os.Getenv("LOG_LEVEL"); v != "" && *logLevel == "info" {
 		*logLevel = v
+	}
+	if v := os.Getenv("MCP_AUTH_TOKEN"); v != "" && *mcpAuthToken == "" {
+		*mcpAuthToken = v
 	}
 
 	// Setup logger
@@ -259,6 +266,36 @@ func main() {
 		}
 	}()
 
+	// Optionally start MCP server on dedicated port
+	var mcpServer *http.Server
+	if *mcpPort > 0 {
+		deps := &mcpDeps{
+			scheduler:    scheduler,
+			hostRegistry: hostRegistry,
+			db:           db,
+			logger:       logger.WithField("component", "mcp"),
+		}
+		mcpHandler := newMCPHandler(deps, *mcpAuthToken)
+
+		mcpMux := http.NewServeMux()
+		mcpMux.Handle("/mcp", mcpHandler)
+		mcpMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("OK"))
+		})
+
+		mcpServer = &http.Server{
+			Addr:    fmt.Sprintf(":%d", *mcpPort),
+			Handler: mcpMux,
+		}
+		go func() {
+			log.WithField("port", *mcpPort).Info("Starting MCP server")
+			if err := mcpServer.ListenAndServe(); err != http.ErrServerClosed {
+				log.WithError(err).Error("MCP server error")
+			}
+		}()
+	}
+
 	// Start background workers
 	go hostRegistry.HealthCheckLoop(ctx)
 	go startDownscaler(ctx, db, hostRegistry, scheduler, logger)
@@ -283,6 +320,9 @@ func main() {
 
 	grpcServer.GracefulStop()
 	httpServer.Shutdown(shutdownCtx)
+	if mcpServer != nil {
+		mcpServer.Shutdown(shutdownCtx)
+	}
 
 	log.Info("Shutdown complete")
 }
