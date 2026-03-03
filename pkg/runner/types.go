@@ -4,6 +4,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
@@ -118,6 +119,7 @@ type AllocateRequest struct {
 	SnapshotTag         string                 // optional: named tag to resolve snapshot version
 	NetworkPolicyPreset string                 // optional: named preset (e.g., "ci-standard")
 	NetworkPolicy       *network.NetworkPolicy // optional: full policy override
+	AuthConfig          *authproxy.AuthConfig  // optional: auth proxy configuration
 }
 
 // MMDSData represents data to inject into the microVM via MMDS

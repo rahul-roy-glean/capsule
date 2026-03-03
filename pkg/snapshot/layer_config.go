@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
 )
 
 // PlatformLayerName is the reserved name for the auto-injected platform layer.
@@ -37,6 +39,7 @@ type LayeredConfig struct {
 		WorkspaceSizeGB      int             `json:"workspace_size_gb,omitempty" yaml:"workspace_size_gb"` // auto-injected workspace drive size (default 50)
 		NetworkPolicyPreset  string          `json:"network_policy_preset,omitempty" yaml:"network_policy_preset"`
 		NetworkPolicy        json.RawMessage `json:"network_policy,omitempty" yaml:"network_policy"`
+		Auth                 *authproxy.AuthConfig `json:"auth,omitempty" yaml:"auth"`
 	} `json:"config" yaml:"config"`
 	StartCommand    *StartCommand `json:"start_command,omitempty" yaml:"start_command"`
 	GitHubAppID     string        `json:"github_app_id,omitempty" yaml:"github_app_id"`
