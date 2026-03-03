@@ -500,7 +500,6 @@ func main() {
 		incrementalExtChunks[driveID] = chunks
 		extDisk.Unmount()
 	}
-	fuseExtDisks = nil
 
 	// Copy kernel to output
 	kernelOutput := filepath.Join(*outputDir, "kernel.bin")

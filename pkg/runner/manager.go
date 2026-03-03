@@ -383,7 +383,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	// Otherwise, use the legacy slot-based TAP allocation on the shared bridge.
 	var tap *network.TapDevice
 	var nsInfo *network.VMNamespace
-	var slot int = -1
+	var slot int
 	useNetNS := m.netnsNetwork != nil
 
 	if useNetNS {

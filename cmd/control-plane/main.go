@@ -1141,7 +1141,7 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 		client := pb.NewHostAgentClient(conn)
 		resp, err := client.ResumeRunner(r.Context(), &pb.ResumeRunnerRequest{SessionId: sessionID})
 		if err != nil || resp.Error != "" {
-			errMsg := "resume failed"
+			var errMsg string
 			if err != nil {
 				errMsg = err.Error()
 			} else {
@@ -1319,9 +1319,13 @@ func (s *ControlPlaneServer) HandleCanaryReport(w http.ResponseWriter, r *http.R
 	}).Info("Received canary report")
 
 	if report.Status == "success" {
-		s.canarySuccessCounter.Add(r.Context(), 1)
+		if s.canarySuccessCounter != nil {
+			s.canarySuccessCounter.Add(r.Context(), 1)
+		}
 	} else {
-		s.canaryFailureCounter.Add(r.Context(), 1)
+		if s.canaryFailureCounter != nil {
+			s.canaryFailureCounter.Add(r.Context(), 1)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

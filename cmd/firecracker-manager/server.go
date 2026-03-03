@@ -73,7 +73,7 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		Repo:                req.Repo,
 		Branch:              req.Branch,
 		Commit:              req.Commit,
-		GitHubRunnerToken:   req.GithubRunnerToken,
+		GitHubRunnerToken:   req.GetCiRunnerToken(),
 		Labels:              req.Labels,
 		WorkloadKey:         req.WorkloadKey,
 		SnapshotVersion:     req.SnapshotVersion,

@@ -499,6 +499,8 @@ shutdown -h now
 }
 
 // launchSnapshotBuilderVMForKey creates a GCE instance to build a snapshot from commands JSON.
+//
+//nolint:unused // will be wired up when per-key snapshot builds are enabled
 func (sm *SnapshotManager) launchSnapshotBuilderVMForKey(ctx context.Context, instanceName, workloadKey, commandsJSON, version, githubAppID, githubAppSecret string, buildType string, snapshotVCPUs, snapshotMemoryMB int) error {
 	if sm.gcpProject == "" {
 		sm.logger.Warn("GCP project not configured, skipping VM launch")
@@ -1302,6 +1304,8 @@ func (sm *SnapshotManager) SetActiveSnapshotForKey(ctx context.Context, workload
 
 // monitorSnapshotBuildForKey monitors a repo-scoped snapshot build.
 // After build completes, it auto-validates and optionally auto-rolls out.
+//
+//nolint:unused // will be wired up when per-key snapshot builds are enabled
 func (sm *SnapshotManager) monitorSnapshotBuildForKey(ctx context.Context, version, instanceName, workloadKey string) {
 	sm.logger.WithFields(logrus.Fields{
 		"version":      version,

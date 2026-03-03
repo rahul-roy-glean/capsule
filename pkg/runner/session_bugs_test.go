@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -51,7 +52,7 @@ func TestWorkloadKeyEmptyBreaksResume(t *testing.T) {
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
-	_, err := m.ResumeFromSession(nil, "sess-empty-wk", "real-key-123")
+	_, err := m.ResumeFromSession(context.TODO(), "sess-empty-wk", "real-key-123")
 	if err == nil {
 		t.Fatal("ResumeFromSession should fail when session has empty workload_key but request has a key")
 	}

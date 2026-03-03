@@ -800,7 +800,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	// Allocate network
 	var tap *network.TapDevice
 	var nsInfo *network.VMNamespace
-	var slot int = -1
+	var slot int
 	useNetNS := m.netnsNetwork != nil
 
 	if useNetNS {

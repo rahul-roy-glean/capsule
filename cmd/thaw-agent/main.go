@@ -2583,16 +2583,6 @@ func getWorkspaceRepoPath(data *MMDSData) string {
 	return ""
 }
 
-func safePrefix(s string, n int) string {
-	if len(s) == 0 {
-		return "<empty>"
-	}
-	if len(s) <= n {
-		return s + "..."
-	}
-	return s[:n] + "..."
-}
-
 // verifyConnectivity checks that the microVM can reach the target host before
 // attempting long-running network operations like git clone. Fails fast instead
 // of waiting for a 10-minute git timeout.
