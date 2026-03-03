@@ -395,6 +395,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			Command:    startCmd.Command,
 			Port:       int32(startCmd.Port),
 			HealthPath: startCmd.HealthPath,
+			Env:        startCmd.Env,
 		}
 	}
 
