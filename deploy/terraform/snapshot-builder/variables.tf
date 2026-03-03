@@ -106,7 +106,7 @@ variable "bazelrc" {
 variable "firecracker_version" {
   description = "Firecracker binary version (must match across snapshot-builder and hosts)"
   type        = string
-  default     = "1.14.1"
+  default     = "1.14.2"
 }
 
 variable "incremental" {

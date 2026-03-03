@@ -22,7 +22,7 @@ apt-get update
 apt-get install -y --no-install-recommends \
   ca-certificates curl wget gnupg lsb-release \
   e2fsprogs qemu-utils \
-  bridge-utils iptables iproute2 \
+  bridge-utils iptables iproute2 ipset \
   jq git make build-essential \
   docker.io docker-buildx \
   postgresql postgresql-client
@@ -40,8 +40,8 @@ fi
 echo 'export PATH=/usr/local/go/bin:$PATH' > /etc/profile.d/golang.sh
 export PATH=/usr/local/go/bin:$PATH
 
-# --- Firecracker 1.14.1 ---
-FC_VERSION=1.14.1
+# --- Firecracker 1.14.2 ---
+FC_VERSION=1.14.2
 if [ ! -f /usr/local/bin/firecracker ]; then
   curl -fsSL "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-${ARCH}.tgz" \
     -o /tmp/fc.tgz

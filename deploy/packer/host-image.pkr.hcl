@@ -20,7 +20,7 @@ variable "zone" {
 
 variable "firecracker_version" {
   type        = string
-  default     = "1.14.1"
+  default     = "1.14.2"
   description = "Firecracker version to install"
 }
 
@@ -151,6 +151,14 @@ build {
       "curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg",
       "echo 'deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main' | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list",
       "sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y google-cloud-cli"
+    ]
+  }
+
+  # Install Docker (needed for layer builder --base-image rootfs builds)
+  provisioner "shell" {
+    inline = [
+      "curl -fsSL https://get.docker.com | sudo sh",
+      "sudo systemctl enable docker"
     ]
   }
 

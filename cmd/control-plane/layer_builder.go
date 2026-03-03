@@ -44,10 +44,15 @@ func (s *LayerBuildScheduler) Run(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
+	gcTicker := time.NewTicker(5 * time.Minute)
+	defer gcTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-gcTicker.C:
+			s.snapshotManager.GCTerminatedBuilderVMs(ctx)
 		case <-ticker.C:
 			s.processWaitingBuilds(ctx)
 			s.processQueuedBuilds(ctx)
@@ -385,6 +390,8 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 		if err != nil {
 			s.logger.WithError(err).WithField("build_id", b.buildID).Error("Failed to launch layer build VM")
 			s.db.ExecContext(ctx, `UPDATE snapshot_builds SET status='failed', failure_reason=$2 WHERE build_id=$1`, b.buildID, err.Error())
+			// Clean up VM if it was partially created before the error
+			s.snapshotManager.cleanupBuilderVM(ctx, instanceName)
 			continue
 		}
 
@@ -625,7 +632,7 @@ func (s *LayerBuildScheduler) onBuildFailed(ctx context.Context, buildID, layerH
 	// Don't retry builds for inactive/orphaned layers
 	var layerStatus sql.NullString
 	s.db.QueryRowContext(ctx, `SELECT status FROM snapshot_layers WHERE layer_hash=$1`, layerHash).Scan(&layerStatus)
-	if layerStatus.Valid && layerStatus.String != "active" {
+	if layerStatus.Valid && layerStatus.String == "inactive" {
 		s.logger.WithFields(logrus.Fields{
 			"build_id":   buildID,
 			"layer_hash": layerHash[:16],
@@ -973,27 +980,8 @@ exec > >(tee /var/log/snapshot-builder.log) 2>&1
 trap 'echo "Build failed, shutting down..."; shutdown -h now' ERR
 echo "Starting layer build setup..."
 
-# Install Firecracker
-ARCH=$(uname -m)
-FC_VERSION="1.14.1"
-echo "Installing Firecracker v${FC_VERSION}..."
-cd /tmp
-curl -fSL "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-${ARCH}.tgz" -o firecracker.tgz
-tar xzf firecracker.tgz
-mv "release-v${FC_VERSION}-${ARCH}/firecracker-v${FC_VERSION}-${ARCH}" /usr/local/bin/firecracker
-chmod +x /usr/local/bin/firecracker
-rm -rf firecracker.tgz "release-v${FC_VERSION}-${ARCH}"
-
-# Setup KVM
-modprobe kvm_intel || modprobe kvm_amd || true
-chmod 666 /dev/kvm || true
-
-# Install Docker (needed for --base-image rootfs builds)
-if ! command -v docker &>/dev/null; then
-    echo "Installing Docker..."
-    curl -fsSL https://get.docker.com | sh
-    systemctl start docker
-fi
+# Start Docker (pre-installed in Packer image)
+systemctl start docker
 
 # Authenticate Docker to Artifact Registry
 gcloud auth configure-docker us-central1-docker.pkg.dev --quiet 2>/dev/null || true
@@ -1006,17 +994,13 @@ gcloud storage cp "gs://%s/%s/%s/rootfs.img" /opt/firecracker/rootfs.img 2>/dev/
     || gcloud storage cp "gs://%s/%s/rootfs.img" /opt/firecracker/rootfs.img 2>/dev/null \
     || echo "INFO: rootfs.img not in GCS (expected for child/reattach layers)"
 
-# Download snapshot-builder binary
-if [ ! -f /usr/local/bin/snapshot-builder ]; then
-    gcloud storage cp gs://%s/%s/snapshot-builder /usr/local/bin/snapshot-builder
-    chmod +x /usr/local/bin/snapshot-builder
-fi
+# Download snapshot-builder binary (always download fresh to pick up new deploys)
+gcloud storage cp gs://%s/%s/snapshot-builder /usr/local/bin/snapshot-builder
+chmod +x /usr/local/bin/snapshot-builder
 
 # Download thaw-agent binary (needed for platform shim injection)
-if [ ! -f /usr/local/bin/thaw-agent ]; then
-    gcloud storage cp gs://%s/%s/thaw-agent /usr/local/bin/thaw-agent
-    chmod +x /usr/local/bin/thaw-agent
-fi
+gcloud storage cp gs://%s/%s/thaw-agent /usr/local/bin/thaw-agent
+chmod +x /usr/local/bin/thaw-agent
 
 # Decode snapshot commands from base64 to avoid shell quoting issues
 SNAPSHOT_COMMANDS=$(echo '%s' | base64 -d)
@@ -1056,8 +1040,9 @@ shutdown -h now
 		Project: sm.gcpProject,
 		Zone:    sm.gcpZone,
 		InstanceResource: &computepb.Instance{
-			Name:        proto.String(instanceName),
-			MachineType: proto.String(machineType),
+			Name:         proto.String(instanceName),
+			MachineType:  proto.String(machineType),
+			CanIpForward: proto.Bool(true),
 			Disks: []*computepb.AttachedDisk{
 				{
 					Boot:       proto.Bool(true),

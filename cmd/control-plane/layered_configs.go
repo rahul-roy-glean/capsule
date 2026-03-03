@@ -62,6 +62,8 @@ type StoredLayeredConfig struct {
 	AutoRollout          bool                   `json:"auto_rollout"`
 	MaxConcurrentRunners int                    `json:"max_concurrent_runners"`
 	BuildSchedule        string                 `json:"build_schedule"`
+	NetworkPolicyPreset  string                 `json:"network_policy_preset,omitempty"`
+	NetworkPolicy        json.RawMessage        `json:"network_policy,omitempty"`
 	CreatedAt            time.Time              `json:"created_at"`
 	UpdatedAt            time.Time              `json:"updated_at"`
 }
@@ -137,7 +139,10 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 			ON CONFLICT (layer_hash) DO UPDATE SET
 				config_name = EXCLUDED.config_name,
+				refresh_commands = EXCLUDED.refresh_commands,
+				refresh_interval = EXCLUDED.refresh_interval,
 				all_chain_drives = EXCLUDED.all_chain_drives,
+				status = CASE WHEN snapshot_layers.status = 'inactive' THEN 'pending' ELSE snapshot_layers.status END,
 				updated_at = NOW()
 		`, layer.LayerHash, parentHash, layer.Name, layer.Depth,
 			string(initCmdsJSON), string(refreshCmdsJSON), string(drivesJSON), string(allChainDrivesJSON), layer.RefreshInterval)
@@ -158,8 +163,8 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 		INSERT INTO layered_configs (config_id, display_name, config_json, leaf_layer_hash, leaf_workload_key,
 			tier, ci_system, github_app_id, github_app_secret, start_command,
 			runner_ttl_seconds, session_max_age_seconds, auto_pause, auto_rollout,
-			max_concurrent_runners, build_schedule)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			max_concurrent_runners, build_schedule, network_policy_preset, network_policy)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		ON CONFLICT (config_id) DO UPDATE SET
 			display_name = EXCLUDED.display_name,
 			config_json = EXCLUDED.config_json,
@@ -176,11 +181,13 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 			auto_rollout = EXCLUDED.auto_rollout,
 			max_concurrent_runners = EXCLUDED.max_concurrent_runners,
 			build_schedule = EXCLUDED.build_schedule,
+			network_policy_preset = EXCLUDED.network_policy_preset,
+			network_policy = EXCLUDED.network_policy,
 			updated_at = NOW()
 	`, configID, cfg.DisplayName, string(cfgJSON), leafLayer.LayerHash, leafWorkloadKey,
 		tierName, cfg.Config.CISystem, cfg.GitHubAppID, cfg.GitHubAppSecret, startCommandJSON,
 		cfg.Config.TTL, cfg.Config.SessionMaxAgeSeconds, cfg.Config.AutoPause, cfg.Config.AutoRollout,
-		0, "")
+		0, "", cfg.Config.NetworkPolicyPreset, networkPolicyVal(cfg.Config.NetworkPolicy))
 
 	if err != nil {
 		return "", "", fmt.Errorf("failed to insert layered config: %w", err)
@@ -212,6 +219,10 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 
 	// Update in-memory workload config cache
 	if r.configCache != nil {
+		npJSON := ""
+		if len(cfg.Config.NetworkPolicy) > 0 && string(cfg.Config.NetworkPolicy) != "null" {
+			npJSON = string(cfg.Config.NetworkPolicy)
+		}
 		r.configCache.PutWorkloadConfig(&WorkloadConfig{
 			WorkloadKey:          leafWorkloadKey,
 			Tier:                 tierName,
@@ -221,6 +232,8 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 			SessionMaxAgeSeconds: cfg.Config.SessionMaxAgeSeconds,
 			AutoPause:            cfg.Config.AutoPause,
 			MaxConcurrentRunners: 0,
+			NetworkPolicyPreset:  cfg.Config.NetworkPolicyPreset,
+			NetworkPolicyJSON:    npJSON,
 		})
 	}
 
@@ -232,17 +245,21 @@ func (r *LayeredConfigRegistry) GetLayeredConfig(ctx context.Context, configID s
 	var sc StoredLayeredConfig
 	var startCommandJSON sql.NullString
 	var githubAppID, githubAppSecret sql.NullString
+	var npPreset sql.NullString
+	var npJSON sql.NullString
 
 	err := r.db.QueryRowContext(ctx, `
 		SELECT config_id, display_name, leaf_layer_hash, leaf_workload_key,
 		       tier, ci_system, github_app_id, github_app_secret, start_command,
 		       runner_ttl_seconds, session_max_age_seconds, auto_pause, auto_rollout,
-		       max_concurrent_runners, build_schedule, created_at, updated_at
+		       max_concurrent_runners, build_schedule, network_policy_preset, network_policy,
+		       created_at, updated_at
 		FROM layered_configs WHERE config_id = $1
 	`, configID).Scan(&sc.ConfigID, &sc.DisplayName, &sc.LeafLayerHash, &sc.LeafWorkloadKey,
 		&sc.Tier, &sc.CISystem, &githubAppID, &githubAppSecret, &startCommandJSON,
 		&sc.RunnerTTLSeconds, &sc.SessionMaxAgeSeconds, &sc.AutoPause, &sc.AutoRollout,
-		&sc.MaxConcurrentRunners, &sc.BuildSchedule, &sc.CreatedAt, &sc.UpdatedAt)
+		&sc.MaxConcurrentRunners, &sc.BuildSchedule, &npPreset, &npJSON,
+		&sc.CreatedAt, &sc.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("layered config not found: %s", configID)
 	}
@@ -258,6 +275,12 @@ func (r *LayeredConfigRegistry) GetLayeredConfig(ctx context.Context, configID s
 	if startCommandJSON.Valid && startCommandJSON.String != "" {
 		sc.StartCommand = &snapshot.StartCommand{}
 		json.Unmarshal([]byte(startCommandJSON.String), sc.StartCommand)
+	}
+	if npPreset.Valid {
+		sc.NetworkPolicyPreset = npPreset.String
+	}
+	if npJSON.Valid && npJSON.String != "" && npJSON.String != "null" {
+		sc.NetworkPolicy = json.RawMessage(npJSON.String)
 	}
 	return &sc, nil
 }
@@ -352,9 +375,9 @@ func (r *LayeredConfigRegistry) GetLayerStatuses(ctx context.Context, configID s
 // DeleteLayeredConfig deletes a layered config. Layers shared by other configs are preserved;
 // orphaned layers (not referenced by any remaining config) are deactivated and their builds cancelled.
 func (r *LayeredConfigRegistry) DeleteLayeredConfig(ctx context.Context, configID string) error {
-	// Load the config's layer hashes before deleting
-	var configJSON string
-	err := r.db.QueryRowContext(ctx, `SELECT config_json FROM layered_configs WHERE config_id = $1`, configID).Scan(&configJSON)
+	// Load the config's layer hashes and workload key before deleting
+	var configJSON, leafWorkloadKey string
+	err := r.db.QueryRowContext(ctx, `SELECT config_json, leaf_workload_key FROM layered_configs WHERE config_id = $1`, configID).Scan(&configJSON, &leafWorkloadKey)
 	if err != nil {
 		return fmt.Errorf("layered config not found: %s", configID)
 	}
@@ -373,6 +396,13 @@ func (r *LayeredConfigRegistry) DeleteLayeredConfig(ctx context.Context, configI
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
 		return fmt.Errorf("layered config not found: %s", configID)
+	}
+
+	// Invalidate the workload config cache so the next allocation re-reads from DB.
+	// If another config shares the same leaf_workload_key, the cache will be
+	// repopulated on the next cache miss.
+	if r.configCache != nil && leafWorkloadKey != "" {
+		r.configCache.InvalidateWorkloadConfig(leafWorkloadKey)
 	}
 
 	// For each layer, check if it's still referenced by another config.
@@ -668,4 +698,14 @@ func (r *LayeredConfigRegistry) handleRefreshLayer(w http.ResponseWriter, req *h
 		"layer_name": layerName,
 		"status":     "refresh_enqueued",
 	})
+}
+
+// networkPolicyVal converts a json.RawMessage to a *string for DB storage.
+// Returns nil (SQL NULL) when the policy is empty/null.
+func networkPolicyVal(policy json.RawMessage) *string {
+	if len(policy) == 0 || string(policy) == "null" {
+		return nil
+	}
+	s := string(policy)
+	return &s
 }

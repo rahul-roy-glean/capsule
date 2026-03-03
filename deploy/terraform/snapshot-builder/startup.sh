@@ -10,7 +10,7 @@ meta() {
 }
 
 SNAPSHOT_BUCKET=$(meta snapshot-bucket "")
-FIRECRACKER_VERSION=$(meta firecracker-version "1.14.1")
+FIRECRACKER_VERSION=$(meta firecracker-version "1.14.2")
 DEBUG_MODE=$(meta debug-mode "false")
 REPO_URL=$(meta repo-url "")
 REPO_BRANCH=$(meta repo-branch "main")

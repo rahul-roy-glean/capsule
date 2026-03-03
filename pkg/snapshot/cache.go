@@ -211,6 +211,20 @@ func (c *Cache) loadLocalMetadata() error {
 	return nil
 }
 
+// GetKernelPath returns the path to kernel.bin, verifying it exists.
+// Use this when only the kernel is needed (e.g. GCS-backed resume where
+// rootfs is provided via FUSE).
+func (c *Cache) GetKernelPath() (string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	kernelPath := filepath.Join(c.localPath, "kernel.bin")
+	if _, err := os.Stat(kernelPath); err != nil {
+		return "", fmt.Errorf("required snapshot file not found: %s", kernelPath)
+	}
+	return kernelPath, nil
+}
+
 // GetSnapshotPaths returns the paths to snapshot files.
 // Kernel and rootfs are required; repo-cache-seed, mem/state are optional.
 func (c *Cache) GetSnapshotPaths() (*SnapshotPaths, error) {

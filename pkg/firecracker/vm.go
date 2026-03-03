@@ -319,6 +319,19 @@ func (vm *VM) CreateDiffSnapshot(ctx context.Context, snapshotPath, memDiffPath 
 	return nil
 }
 
+// CreateDiffSnapshotNonDestructive creates a diff snapshot and then resumes the VM,
+// allowing the snapshot to be taken without killing the running session.
+func (vm *VM) CreateDiffSnapshotNonDestructive(ctx context.Context, snapshotPath, memDiffPath string) error {
+	if err := vm.CreateDiffSnapshot(ctx, snapshotPath, memDiffPath); err != nil {
+		return err
+	}
+	if err := vm.client.ResumeVM(ctx); err != nil {
+		return fmt.Errorf("failed to resume VM after checkpoint: %w", err)
+	}
+	vm.logger.Info("VM resumed after non-destructive checkpoint")
+	return nil
+}
+
 // Pause pauses the microVM
 func (vm *VM) Pause(ctx context.Context) error {
 	return vm.client.PauseVM(ctx)
