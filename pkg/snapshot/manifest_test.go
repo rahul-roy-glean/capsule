@@ -66,7 +66,7 @@ func TestSnapshotManifest_DiskOmittedWhenEmpty(t *testing.T) {
 	json.Unmarshal(raw["disk"], &disk)
 
 	if string(disk["mode"]) != `""` && string(disk["mode"]) != "" {
-		// mode is omitempty, should be absent or empty
+		t.Errorf("mode should be omitted or empty, got %s", string(disk["mode"]))
 	}
 }
 

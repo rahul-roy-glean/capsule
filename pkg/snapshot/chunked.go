@@ -22,12 +22,13 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/klauspost/compress/zstd"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 	"golang.org/x/time/rate"
 	"google.golang.org/api/googleapi"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/metrics"
+	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/util/boundedstack"
 )
 
@@ -94,12 +95,19 @@ type ChunkedSnapshotMetadata struct {
 	// file-backed mem_backend instead of UFFD lazy loading.
 	// MemChunks will be empty/nil for new-style snapshots.
 	MemFilePath string `json:"mem_file_path,omitempty"`
-	// RepoCacheSeedChunks holds chunks for the shared Bazel repo cache seed image
-	RepoCacheSeedChunks []ChunkRef `json:"repo_cache_seed_chunks,omitempty"`
+	// ExtensionDrives holds chunks for extension block devices, keyed by DriveID.
+	// Replaces the old RepoCacheSeedChunks field.
+	ExtensionDrives map[string]ExtensionDrive `json:"extension_drives,omitempty"`
 	// RootfsSourceHash is the SHA-256 hash of the original base rootfs.img used
 	// to build this snapshot. Used by incremental builds to detect rootfs changes
 	// and fall back to cold boot when the base image has been updated.
 	RootfsSourceHash string `json:"rootfs_source_hash,omitempty"`
+	// Layer fields for layered snapshot builds.
+	LayerHash       string `json:"layer_hash,omitempty"`
+	ParentLayerHash string `json:"parent_layer_hash,omitempty"`
+	ParentVersion   string `json:"parent_version,omitempty"`
+	LayerDepth      int    `json:"layer_depth,omitempty"`
+	LayerName       string `json:"layer_name,omitempty"`
 }
 
 // ChunkRef references a single chunk by its content hash
@@ -143,6 +151,12 @@ type ChunkStore struct {
 	eagerFetchCancel  context.CancelFunc
 	eagerFetchWg      sync.WaitGroup
 	eagerFetchStarted bool
+
+	// OTel instruments (nil-safe: callers that don't provide a Meter get no-ops)
+	chunkFetchHist    metric.Float64Histogram
+	chunkFetchBytes   metric.Int64Counter
+	chunkNegCacheHits metric.Int64Counter
+	chunkSFDedup      metric.Int64Counter
 }
 
 // ChunkStoreConfig holds configuration for the chunk store
@@ -170,6 +184,10 @@ type ChunkStoreConfig struct {
 	// caches, refetched once, and if still corrupt ErrChunkCorruption is
 	// returned. Set to true only for benchmarks or trusted environments.
 	DisableVerifyOnRead bool
+
+	// Meter is an OTel metric.Meter used to create chunk-level instruments.
+	// If nil, no metrics are recorded.
+	Meter metric.Meter
 }
 
 // NewChunkStore creates a new chunk store
@@ -226,7 +244,7 @@ func NewChunkStore(ctx context.Context, cfg ChunkStoreConfig) (*ChunkStore, erro
 		fetchTimeout = defaultGCSFetchTimeout
 	}
 
-	return &ChunkStore{
+	cs := &ChunkStore{
 		gcsBucket:        cfg.GCSBucket,
 		gcsPrefix:        cfg.GCSPrefix,
 		gcsClient:        client,
@@ -242,7 +260,17 @@ func NewChunkStore(ctx context.Context, cfg ChunkStoreConfig) (*ChunkStore, erro
 		eagerFetchStack:  eagerFetchStack,
 		eagerFetchCtx:    eagerCtx,
 		eagerFetchCancel: eagerCancel,
-	}, nil
+	}
+
+	// Initialize OTel instruments if a Meter was provided.
+	if cfg.Meter != nil {
+		cs.chunkFetchHist, _ = fcrotel.NewHistogram(cfg.Meter, fcrotel.ChunkFetchDuration)
+		cs.chunkFetchBytes, _ = fcrotel.NewCounter(cfg.Meter, fcrotel.ChunkFetchBytes)
+		cs.chunkNegCacheHits, _ = fcrotel.NewCounter(cfg.Meter, fcrotel.ChunkNegCacheHits)
+		cs.chunkSFDedup, _ = fcrotel.NewCounter(cfg.Meter, fcrotel.ChunkSingleflightDedup)
+	}
+
+	return cs, nil
 }
 
 // StoreChunk stores a chunk and returns its hash.
@@ -316,22 +344,30 @@ func (cs *ChunkStore) GetChunk(ctx context.Context, hash string) ([]byte, error)
 
 	// 1. Check in-memory LRU cache first (fastest)
 	if data, ok := cs.chunkCache.Get(hash); ok {
-		metrics.ChunkFetchSeconds.WithLabelValues("lru_cache").Observe(time.Since(start).Seconds())
+		if cs.chunkFetchHist != nil {
+			cs.chunkFetchHist.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(fcrotel.AttrSource.String("lru_cache")))
+		}
 		return data, nil
 	}
 
 	// 2. Check local file cache (sharded path)
 	if data, compressed, ok := cs.readLocalCache(hash); ok {
 		cs.chunkCache.Put(hash, data)
-		metrics.ChunkFetchSeconds.WithLabelValues("disk_cache").Observe(time.Since(start).Seconds())
-		metrics.ChunkFetchBytesTotal.WithLabelValues("disk_cache").Add(float64(len(compressed)))
+		if cs.chunkFetchHist != nil {
+			cs.chunkFetchHist.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(fcrotel.AttrSource.String("disk_cache")))
+		}
+		if cs.chunkFetchBytes != nil {
+			cs.chunkFetchBytes.Add(ctx, int64(len(compressed)), metric.WithAttributes(fcrotel.AttrSource.String("disk_cache")))
+		}
 		return data, nil
 	}
 
 	// 3. Check negative cache (known-missing hashes)
 	if expiry, ok := cs.negCache.Load(hash); ok {
 		if time.Now().Before(expiry.(time.Time)) {
-			metrics.ChunkNegCacheHits.Inc()
+			if cs.chunkNegCacheHits != nil {
+				cs.chunkNegCacheHits.Add(ctx, 1)
+			}
 			return nil, fmt.Errorf("chunk %s: %w (negative cached)", hash[:12], ErrChunkNotFound)
 		}
 		// Expired entry, remove it
@@ -388,14 +424,20 @@ func (cs *ChunkStore) GetChunk(ctx context.Context, hash string) ([]byte, error)
 		cs.writeLocalCache(hash, compressed)
 		cs.chunkCache.Put(hash, data)
 
-		metrics.ChunkFetchSeconds.WithLabelValues("gcs").Observe(time.Since(start).Seconds())
-		metrics.ChunkFetchBytesTotal.WithLabelValues("gcs").Add(float64(len(compressed)))
+		if cs.chunkFetchHist != nil {
+			cs.chunkFetchHist.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(fcrotel.AttrSource.String("gcs")))
+		}
+		if cs.chunkFetchBytes != nil {
+			cs.chunkFetchBytes.Add(ctx, int64(len(compressed)), metric.WithAttributes(fcrotel.AttrSource.String("gcs")))
+		}
 
 		return &fetchResult{data: data, compressed: compressed}, nil
 	})
 
 	if shared {
-		metrics.SingleflightDedupTotal.Inc()
+		if cs.chunkSFDedup != nil {
+			cs.chunkSFDedup.Add(ctx, 1)
+		}
 	}
 
 	// Check caller context after singleflight returns — even if the fetch
@@ -1139,7 +1181,9 @@ func (b *ChunkedSnapshotBuilder) getMemStore() *ChunkStore {
 
 // BuildChunkedSnapshot creates a chunked snapshot from traditional snapshot files.
 // workloadKey is used for scoping GCS paths under {workloadKey}/snapshot_state/{version}/.
-func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths *SnapshotPaths, version, workloadKey string) (*ChunkedSnapshotMetadata, error) {
+// driveSpecs lists extension drives to chunk; each spec's image is expected at
+// paths.ExtensionDriveImages[spec.DriveID].
+func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths *SnapshotPaths, driveSpecs []DriveSpec, version, workloadKey string) (*ChunkedSnapshotMetadata, error) {
 	b.logger.WithField("version", version).Info("Building chunked snapshot")
 	start := time.Now()
 
@@ -1217,23 +1261,39 @@ func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths
 	rootfsStat, _ := os.Stat(paths.Rootfs)
 	meta.TotalDiskSize = rootfsStat.Size()
 
-	// Chunk repo cache seed if present
-	if paths.RepoCacheSeed != "" {
-		b.logger.Info("Chunking repo cache seed...")
-		seedChunks, err := b.store.ChunkFile(ctx, paths.RepoCacheSeed, DefaultChunkSize)
-		if err != nil {
-			return nil, fmt.Errorf("failed to chunk repo cache seed: %w", err)
+	// Chunk extension drives
+	if len(driveSpecs) > 0 {
+		meta.ExtensionDrives = make(map[string]ExtensionDrive, len(driveSpecs))
+		for _, spec := range driveSpecs {
+			imgPath, ok := paths.ExtensionDriveImages[spec.DriveID]
+			if !ok || imgPath == "" {
+				continue
+			}
+			b.logger.WithField("drive_id", spec.DriveID).Info("Chunking extension drive...")
+			driveChunks, err := b.store.ChunkFile(ctx, imgPath, DefaultChunkSize)
+			if err != nil {
+				return nil, fmt.Errorf("failed to chunk extension drive %s: %w", spec.DriveID, err)
+			}
+			driveStat, _ := os.Stat(imgPath)
+			var driveSize int64
+			if driveStat != nil {
+				driveSize = driveStat.Size()
+			}
+			meta.ExtensionDrives[spec.DriveID] = ExtensionDrive{
+				Chunks:    driveChunks,
+				ReadOnly:  spec.ReadOnly,
+				SizeBytes: driveSize,
+			}
 		}
-		meta.RepoCacheSeedChunks = seedChunks
 	}
 
 	duration := time.Since(start)
 	b.logger.WithFields(logrus.Fields{
-		"version":       version,
-		"duration":      duration,
-		"mem_file_path": meta.MemFilePath,
-		"disk_chunks":   len(meta.RootfsChunks),
-		"total_chunks":  len(meta.RootfsChunks) + len(meta.RepoCacheSeedChunks) + 2,
+		"version":          version,
+		"duration":         duration,
+		"mem_file_path":    meta.MemFilePath,
+		"disk_chunks":      len(meta.RootfsChunks),
+		"extension_drives": len(meta.ExtensionDrives),
 	}).Info("Chunked snapshot built successfully")
 
 	return meta, nil

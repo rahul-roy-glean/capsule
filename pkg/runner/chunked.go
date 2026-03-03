@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -33,9 +34,9 @@ type ChunkedManager struct {
 	chunkedMetas  map[string]*snapshot.ChunkedSnapshotMetadata // keyed by workloadKey
 
 	// Per-runner UFFD handlers and FUSE disks
-	uffdHandlers  map[string]*uffd.Handler
-	fuseDisks     map[string]*fuse.ChunkedDisk // rootfs FUSE disks per runner
-	fuseSeedDisks map[string]*fuse.ChunkedDisk // repo-cache-seed FUSE disks per runner
+	uffdHandlers       map[string]*uffd.Handler
+	fuseDisks          map[string]*fuse.ChunkedDisk            // rootfs FUSE disks per runner
+	fuseExtensionDisks map[string]map[string]*fuse.ChunkedDisk // extension drive FUSE disks: runnerID → driveID → disk
 
 	// Network namespace manager (alternative to slot-based TAPs)
 	netnsNetwork *network.NetNSNetwork
@@ -99,15 +100,15 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 	}
 
 	cm := &ChunkedManager{
-		Manager:       baseManager,
-		chunkedMetas:  make(map[string]*snapshot.ChunkedSnapshotMetadata),
-		uffdHandlers:  make(map[string]*uffd.Handler),
-		fuseDisks:     make(map[string]*fuse.ChunkedDisk),
-		fuseSeedDisks: make(map[string]*fuse.ChunkedDisk),
-		useNetNS:      cfg.UseNetNS,
-		memBackend:    cfg.MemBackend,
-		readyTimeout:  cfg.ReadyTimeout,
-		chunkedLogger: logger.WithField("component", "chunked-manager"),
+		Manager:            baseManager,
+		chunkedMetas:       make(map[string]*snapshot.ChunkedSnapshotMetadata),
+		uffdHandlers:       make(map[string]*uffd.Handler),
+		fuseDisks:          make(map[string]*fuse.ChunkedDisk),
+		fuseExtensionDisks: make(map[string]map[string]*fuse.ChunkedDisk),
+		useNetNS:           cfg.UseNetNS,
+		memBackend:         cfg.MemBackend,
+		readyTimeout:       cfg.ReadyTimeout,
+		chunkedLogger:      logger.WithField("component", "chunked-manager"),
 	}
 
 	// Setup chunked snapshot infrastructure if enabled
@@ -167,8 +168,10 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 		// goldenChunkedMeta is set later by SyncManifest when the first heartbeat arrives.
 		if cfg.SessionChunkBucket != "" {
 			baseManager.SetSessionStores(memChunkStore, chunkStore, nil)
-			baseManager.getDirtyDiskChunks = cm.getDirtyDiskChunksForRunner
-			baseManager.setupFUSEDisk = cm.setupFUSEDiskForRunner
+			baseManager.getDirtyExtensionDiskChunks = cm.getAllDirtyExtensionDiskChunks
+			baseManager.setupExtensionFUSEDisk = cm.setupExtensionFUSEDiskForRunner
+			baseManager.getDirtyRootfsDiskChunks = cm.getDirtyRootfsDiskChunksCallback
+			baseManager.setupRootfsFUSEDisk = cm.setupRootfsFUSEDiskForRunner
 			cm.chunkedLogger.Info("GCS-backed session pause/resume enabled (stores wired)")
 		}
 
@@ -344,44 +347,67 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	}
 	cm.fuseDisks[runnerID] = fuseDisk
 
-	// Setup FUSE disk for lazy repo-cache-seed loading (if chunks are available).
-	// This avoids downloading the full ~20GB repo cache seed image.
-	var fuseSeedDisk *fuse.ChunkedDisk
-	if len(meta.RepoCacheSeedChunks) > 0 {
-		fuseSeedMountDir := filepath.Join(cm.config.WorkspaceDir, runnerID, "fuse-seed")
-		if err := os.MkdirAll(fuseSeedMountDir, 0755); err != nil {
-			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
-			return nil, fmt.Errorf("failed to create FUSE seed mount dir: %w", err)
-		}
-
-		// Compute total repo-cache-seed size from chunks
-		var totalSeedSize int64
-		for _, c := range meta.RepoCacheSeedChunks {
-			end := c.Offset + c.Size
-			if end > totalSeedSize {
-				totalSeedSize = end
+	// Setup FUSE/writable disks for extension drives (from meta.ExtensionDrives).
+	// Read-only drives get a FUSE-backed lazy disk; writable drives get a fresh ext4 image.
+	extensionDrivePaths := make(map[string]string)
+	if cm.fuseExtensionDisks == nil {
+		cm.fuseExtensionDisks = make(map[string]map[string]*fuse.ChunkedDisk)
+	}
+	cm.fuseExtensionDisks[runnerID] = make(map[string]*fuse.ChunkedDisk)
+	for driveID, extDrive := range meta.ExtensionDrives {
+		if len(extDrive.Chunks) > 0 {
+			// FUSE-mount drives that have chunked content to preserve filesystem
+			// state from the snapshot. This applies to both read-only and writable
+			// drives — the kernel's cached inodes/dentries must match the on-disk
+			// content for correct snapshot restore.
+			fuseExtMountDir := filepath.Join(cm.config.WorkspaceDir, runnerID, "fuse-ext-"+driveID)
+			if err := os.MkdirAll(fuseExtMountDir, 0755); err != nil {
+				cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
+				return nil, fmt.Errorf("failed to create FUSE ext dir for %s: %w", driveID, err)
 			}
+			var totalExtSize int64
+			for _, c := range extDrive.Chunks {
+				if end := c.Offset + c.Size; end > totalExtSize {
+					totalExtSize = end
+				}
+			}
+			extFUSE, fuseErr := fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
+				ChunkStore: cm.chunkStore,
+				Chunks:     extDrive.Chunks,
+				TotalSize:  totalExtSize,
+				ChunkSize:  meta.ChunkSize,
+				MountPoint: fuseExtMountDir,
+				Logger:     cm.logger.Logger,
+			})
+			if fuseErr != nil {
+				cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
+				return nil, fmt.Errorf("failed to create FUSE ext disk %s: %w", driveID, fuseErr)
+			}
+			if err := extFUSE.Mount(); err != nil {
+				cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
+				return nil, fmt.Errorf("failed to mount FUSE ext disk %s: %w", driveID, err)
+			}
+			cm.fuseExtensionDisks[runnerID][driveID] = extFUSE
+			extensionDrivePaths[driveID] = extFUSE.DiskImagePath()
+			cm.chunkedLogger.WithFields(logrus.Fields{"runner_id": runnerID, "drive_id": driveID}).Info("Mounted FUSE-backed extension drive")
+		} else {
+			// No chunks: create fresh ext4 image (e.g. overlay drives)
+			imgPath := filepath.Join(cm.config.WorkspaceDir, runnerID, driveID+"-upper.img")
+			if mkErr := os.MkdirAll(filepath.Dir(imgPath), 0755); mkErr != nil {
+				cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
+				return nil, fmt.Errorf("failed to create dir for ext drive %s: %w", driveID, mkErr)
+			}
+			sizeGB := int(extDrive.SizeBytes / (1024 * 1024 * 1024))
+			if sizeGB <= 0 {
+				sizeGB = 10
+			}
+			if mkErr := createExt4Image(imgPath, sizeGB, "EXT_"+driveID); mkErr != nil {
+				cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
+				return nil, fmt.Errorf("failed to create ext drive image %s: %w", driveID, mkErr)
+			}
+			extensionDrivePaths[driveID] = imgPath
+			cm.chunkedLogger.WithFields(logrus.Fields{"runner_id": runnerID, "drive_id": driveID}).Info("Created writable extension drive image")
 		}
-
-		fuseSeedDisk, err = fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
-			ChunkStore: cm.chunkStore,
-			Chunks:     meta.RepoCacheSeedChunks,
-			TotalSize:  totalSeedSize,
-			ChunkSize:  meta.ChunkSize,
-			MountPoint: fuseSeedMountDir,
-			Logger:     cm.logger.Logger,
-		})
-		if err != nil {
-			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
-			return nil, fmt.Errorf("failed to create FUSE seed disk: %w", err)
-		}
-
-		if err := fuseSeedDisk.Mount(); err != nil {
-			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
-			return nil, fmt.Errorf("failed to mount FUSE seed disk: %w", err)
-		}
-		cm.fuseSeedDisks[runnerID] = fuseSeedDisk
-		cm.chunkedLogger.WithField("runner_id", runnerID).Info("Mounted FUSE-backed repo-cache-seed")
 	}
 
 	// Setup memory backend: flag overrides metadata when set, otherwise fall
@@ -464,7 +490,10 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		prefetchCtx, prefetchCancel := context.WithTimeout(ctx, 30*time.Second)
 		defer prefetchCancel()
 
-		prefetchDone := make(chan error, 2)
+		// Collect all read-only extension FUSE disks to prefetch.
+		extFUSEDisks := cm.fuseExtensionDisks[runnerID]
+		nPrefetch := 1 + len(extFUSEDisks)
+		prefetchDone := make(chan error, nPrefetch)
 		go func() {
 			err := fuseDisk.PrefetchHead(prefetchCtx, 16)
 			if err != nil {
@@ -472,19 +501,19 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 			}
 			prefetchDone <- err
 		}()
-		go func() {
-			if fuseSeedDisk != nil {
-				err := fuseSeedDisk.PrefetchHead(prefetchCtx, 2)
+		for did, ed := range extFUSEDisks {
+			did, ed := did, ed
+			go func() {
+				err := ed.PrefetchHead(prefetchCtx, 2)
 				if err != nil {
-					cm.chunkedLogger.WithError(err).WithField("runner_id", runnerID).Warn("Seed disk prefetch incomplete (non-fatal)")
+					cm.chunkedLogger.WithError(err).WithFields(logrus.Fields{"runner_id": runnerID, "drive_id": did}).Warn("Extension disk prefetch incomplete (non-fatal)")
 				}
 				prefetchDone <- err
-			} else {
-				prefetchDone <- nil
-			}
-		}()
-		<-prefetchDone
-		<-prefetchDone
+			}()
+		}
+		for i := 0; i < nPrefetch; i++ {
+			<-prefetchDone
+		}
 		cm.chunkedLogger.WithField("runner_id", runnerID).Debug("Pre-resume disk prefetch complete")
 	}
 
@@ -515,12 +544,27 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 
 	// In chunked mode, rootfs and repo-cache-seed are served via FUSE, memory
 	// via UFFD, and state was eagerly fetched above. The only traditional local
-	// file we need is the kernel, which was fetched by SyncManifest when the
-	// first heartbeat arrived. The kernel is shared across workloads.
+	// file we need is the kernel. It is normally fetched by SyncManifest on the
+	// first heartbeat, but if allocation races ahead we fetch it on demand here.
 	kernelPath := filepath.Join(cm.config.SnapshotCachePath, "kernel.bin")
-	if _, err := os.Stat(kernelPath); err != nil {
+	if _, err := os.Stat(kernelPath); err != nil && meta.KernelHash != "" && cm.chunkStore != nil {
+		cm.chunkedLogger.WithField("kernel_hash", meta.KernelHash).Info("Fetching kernel on demand during allocation")
+		kernelData, fetchErr := cm.chunkStore.GetChunk(ctx, meta.KernelHash)
+		if fetchErr != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+			return nil, fmt.Errorf("failed to fetch kernel chunk on demand: %w", fetchErr)
+		}
+		if writeErr := os.WriteFile(kernelPath, kernelData, 0644); writeErr != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+			return nil, fmt.Errorf("failed to write kernel to %s: %w", kernelPath, writeErr)
+		}
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"kernel_size": len(kernelData),
+			"path":        kernelPath,
+		}).Info("Kernel fetched on demand during allocation")
+	} else if err != nil {
 		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
-		return nil, fmt.Errorf("kernel not found at %s (should have been fetched by SyncManifest): %w", kernelPath, err)
+		return nil, fmt.Errorf("kernel not found at %s and no KernelHash in metadata to fetch it: %w", kernelPath, err)
 	}
 
 	// Create runner record.
@@ -557,27 +601,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	bootArgs := fmt.Sprintf("console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off",
 		guestIP, netCfg.Gateway, netCfg.Netmask)
 
-	// For repo-cache-seed drive: use FUSE-backed path if available,
-	// otherwise fall back to a placeholder (should not happen in chunked mode).
-	var repoCacheSeedPath string
-	if fuseSeedDisk != nil {
-		repoCacheSeedPath = fuseSeedDisk.DiskImagePath()
-	} else {
-		repoCacheSeedPath = filepath.Join(cm.config.SnapshotCachePath, "repo-cache-seed.img")
-	}
-
-	// Build drives to match the snapshot's drive layout.
-	// Create per-runner writable repo cache upper image.
-	repoCacheUpperPath := filepath.Join(cm.config.WorkspaceDir, runnerID, "repo-cache-upper.img")
-	if err := os.MkdirAll(filepath.Dir(repoCacheUpperPath), 0755); err != nil {
-		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
-		return nil, fmt.Errorf("failed to create repo-cache-upper directory: %w", err)
-	}
-	if err := createExt4Image(repoCacheUpperPath, cm.config.Bazel.RepoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
-		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
-		return nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
-	}
-	drives := cm.buildDrives(repoCacheSeedPath, repoCacheUpperPath)
+	drives := cm.buildDrives(extensionDrivePaths)
 
 	// Create VM configuration
 	vmCfg := firecracker.VMConfig{
@@ -623,8 +647,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	// recorded in the snapshot state file during LoadSnapshot.
 	symlinkCleanup, err := cm.setupChunkedSymlinks(
 		fuseDisk.DiskImagePath(),
-		repoCacheSeedPath,
-		repoCacheUpperPath,
+		extensionDrivePaths,
 	)
 	if err != nil {
 		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
@@ -803,14 +826,17 @@ func (cm *ChunkedManager) ReleaseRunnerChunked(ctx context.Context, runnerID str
 		delete(cm.uffdHandlers, runnerID)
 	}
 
-	// Cleanup FUSE disks
+	// Cleanup rootfs FUSE disk
 	if disk, exists := cm.fuseDisks[runnerID]; exists {
 		disk.Unmount()
 		delete(cm.fuseDisks, runnerID)
 	}
-	if disk, exists := cm.fuseSeedDisks[runnerID]; exists {
-		disk.Unmount()
-		delete(cm.fuseSeedDisks, runnerID)
+	// Cleanup extension drive FUSE disks
+	if extDisks, exists := cm.fuseExtensionDisks[runnerID]; exists {
+		for _, disk := range extDisks {
+			disk.Unmount()
+		}
+		delete(cm.fuseExtensionDisks, runnerID)
 	}
 
 	// Cleanup network
@@ -853,10 +879,12 @@ func (cm *ChunkedManager) cleanupChunkedRunner(
 	if fuseDisk != nil {
 		fuseDisk.Unmount()
 	}
-	// Also clean up repo-cache-seed FUSE disk if it was mounted
-	if seedDisk, ok := cm.fuseSeedDisks[runnerID]; ok {
-		seedDisk.Unmount()
-		delete(cm.fuseSeedDisks, runnerID)
+	// Also clean up extension FUSE disks if they were mounted
+	if extDisks, ok := cm.fuseExtensionDisks[runnerID]; ok {
+		for _, disk := range extDisks {
+			disk.Unmount()
+		}
+		delete(cm.fuseExtensionDisks, runnerID)
 	}
 	if cm.useNetNS && cm.netnsNetwork != nil && netns != nil {
 		cm.netnsNetwork.ReleaseNamespace(runnerID)
@@ -876,15 +904,9 @@ func (cm *ChunkedManager) cleanupChunkedRunner(
 // Firecracker opens drive backing files during LoadSnapshot at the paths recorded
 // in the snapshot state file. Returns a cleanup function to remove the symlinks
 // after restore (Firecracker holds open fds, so symlinks can be removed).
-func (cm *ChunkedManager) setupChunkedSymlinks(rootfsPath, repoCacheSeedPath, repoCacheUpperPath string) (func(), error) {
+func (cm *ChunkedManager) setupChunkedSymlinks(rootfsPath string, extensionDrivePaths map[string]string) (func(), error) {
 	if err := os.MkdirAll(snapshotSymlinkDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create snapshot symlink dir: %w", err)
-	}
-
-	// Resolve git-cache image path
-	gitCacheImg := cm.gitCacheImage
-	if gitCacheImg == "" {
-		gitCacheImg = cm.getOrCreateGitCachePlaceholder()
 	}
 
 	symlinks := []struct {
@@ -892,10 +914,12 @@ func (cm *ChunkedManager) setupChunkedSymlinks(rootfsPath, repoCacheSeedPath, re
 		target string
 	}{
 		{"rootfs.img", rootfsPath},
-		{"repo-cache-seed.img", repoCacheSeedPath},
-		{"repo-cache-upper.img", repoCacheUpperPath},
 		{"credentials.img", cm.credentialsImage},
-		{"git-cache.img", gitCacheImg},
+	}
+	// Add extension drives by driveID (e.g. "repo_cache_seed" → "repo-cache-seed.img")
+	for driveID, path := range extensionDrivePaths {
+		name := strings.ReplaceAll(driveID, "_", "-") + ".img"
+		symlinks = append(symlinks, struct{ name, target string }{name, path})
 	}
 
 	var created []string
@@ -955,11 +979,13 @@ func (cm *ChunkedManager) GetChunkedStats() ChunkedStats {
 		stats.TotalDiskWrites += ds.Writes
 		stats.TotalDirtyChunks += ds.DirtyChunks
 	}
-	for _, disk := range cm.fuseSeedDisks {
-		ds := disk.Stats()
-		stats.TotalDiskReads += ds.Reads
-		stats.TotalDiskWrites += ds.Writes
-		stats.TotalDirtyChunks += ds.DirtyChunks
+	for _, perRunner := range cm.fuseExtensionDisks {
+		for _, disk := range perRunner {
+			ds := disk.Stats()
+			stats.TotalDiskReads += ds.Reads
+			stats.TotalDiskWrites += ds.Writes
+			stats.TotalDirtyChunks += ds.DirtyChunks
+		}
 	}
 
 	return stats
@@ -1006,9 +1032,11 @@ func (cm *ChunkedManager) Close() error {
 		disk.Unmount()
 		delete(cm.fuseDisks, id)
 	}
-	for id, disk := range cm.fuseSeedDisks {
-		disk.Unmount()
-		delete(cm.fuseSeedDisks, id)
+	for id, perRunner := range cm.fuseExtensionDisks {
+		for _, disk := range perRunner {
+			disk.Unmount()
+		}
+		delete(cm.fuseExtensionDisks, id)
 	}
 
 	// Cleanup network namespaces
@@ -1169,25 +1197,34 @@ func (cm *ChunkedManager) GetSubnet() *net.IPNet {
 	return cm.network.GetSubnet()
 }
 
-// getDirtyDiskChunksForRunner returns the dirty FUSE disk chunks for a runner,
-// or nil if the runner has no FUSE disk. Used as a callback by Manager.PauseRunner
-// to include disk changes in the session upload.
-func (cm *ChunkedManager) getDirtyDiskChunksForRunner(runnerID string) map[int][]byte {
+// getAllDirtyExtensionDiskChunks returns all dirty FUSE extension disk chunks for a runner.
+// Returns driveID → (chunkIndex → data). Used as a callback by Manager.PauseRunner.
+func (cm *ChunkedManager) getAllDirtyExtensionDiskChunks(runnerID string) map[string]map[int][]byte {
 	cm.mu.RLock()
-	disk, ok := cm.fuseDisks[runnerID]
+	perRunner, ok := cm.fuseExtensionDisks[runnerID]
 	cm.mu.RUnlock()
-	if !ok || disk == nil {
+	if !ok || len(perRunner) == 0 {
 		return nil
 	}
-	return disk.GetDirtyChunks()
+	result := make(map[string]map[int][]byte, len(perRunner))
+	for driveID, disk := range perRunner {
+		dirty := disk.GetDirtyChunks()
+		if len(dirty) > 0 {
+			result[driveID] = dirty
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }
 
-// setupFUSEDiskForRunner creates and mounts a FUSE-backed disk from chunk refs.
+// setupExtensionFUSEDiskForRunner creates and mounts a FUSE-backed extension disk.
 // Used by Manager.ResumeFromSession for GCS-backed cross-host resume.
-func (cm *ChunkedManager) setupFUSEDiskForRunner(runnerID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (string, error) {
-	fuseMountDir := filepath.Join(cm.config.WorkspaceDir, runnerID, "fuse")
+func (cm *ChunkedManager) setupExtensionFUSEDiskForRunner(runnerID, driveID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (string, error) {
+	fuseMountDir := filepath.Join(cm.config.WorkspaceDir, runnerID, "fuse-ext-"+driveID)
 	if err := os.MkdirAll(fuseMountDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create FUSE mount dir: %w", err)
+		return "", fmt.Errorf("failed to create FUSE ext mount dir for %s: %w", driveID, err)
 	}
 
 	fuseDisk, err := fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
@@ -1199,11 +1236,63 @@ func (cm *ChunkedManager) setupFUSEDiskForRunner(runnerID string, chunks []snaps
 		Logger:     cm.logger.Logger,
 	})
 	if err != nil {
-		return "", fmt.Errorf("failed to create FUSE disk: %w", err)
+		return "", fmt.Errorf("failed to create FUSE ext disk %s: %w", driveID, err)
 	}
 
 	if err := fuseDisk.Mount(); err != nil {
-		return "", fmt.Errorf("failed to mount FUSE disk: %w", err)
+		return "", fmt.Errorf("failed to mount FUSE ext disk %s: %w", driveID, err)
+	}
+
+	cm.mu.Lock()
+	if cm.fuseExtensionDisks[runnerID] == nil {
+		cm.fuseExtensionDisks[runnerID] = make(map[string]*fuse.ChunkedDisk)
+	}
+	cm.fuseExtensionDisks[runnerID][driveID] = fuseDisk
+	cm.mu.Unlock()
+
+	cm.chunkedLogger.WithFields(logrus.Fields{
+		"runner_id": runnerID,
+		"drive_id":  driveID,
+		"chunks":    len(chunks),
+	}).Info("FUSE extension disk mounted for session resume")
+
+	return fuseDisk.DiskImagePath(), nil
+}
+
+// getDirtyRootfsDiskChunksCallback returns dirty FUSE rootfs disk chunks for a runner.
+// Used as a callback by Manager.PauseRunner for GCS-backed rootfs upload.
+func (cm *ChunkedManager) getDirtyRootfsDiskChunksCallback(runnerID string) map[int][]byte {
+	cm.mu.RLock()
+	disk, ok := cm.fuseDisks[runnerID]
+	cm.mu.RUnlock()
+	if !ok || disk == nil {
+		return nil
+	}
+	return disk.GetDirtyChunks()
+}
+
+// setupRootfsFUSEDiskForRunner creates and mounts a FUSE-backed rootfs disk.
+// Used by Manager.ResumeFromSession for GCS-backed cross-host resume.
+func (cm *ChunkedManager) setupRootfsFUSEDiskForRunner(runnerID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (string, error) {
+	fuseMountDir := filepath.Join(cm.config.WorkspaceDir, runnerID, "fuse-rootfs")
+	if err := os.MkdirAll(fuseMountDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create FUSE rootfs mount dir: %w", err)
+	}
+
+	fuseDisk, err := fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
+		ChunkStore: cm.chunkStore,
+		Chunks:     chunks,
+		TotalSize:  totalSize,
+		ChunkSize:  chunkSize,
+		MountPoint: fuseMountDir,
+		Logger:     cm.logger.Logger,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create FUSE rootfs disk: %w", err)
+	}
+
+	if err := fuseDisk.Mount(); err != nil {
+		return "", fmt.Errorf("failed to mount FUSE rootfs disk: %w", err)
 	}
 
 	cm.mu.Lock()
@@ -1211,10 +1300,9 @@ func (cm *ChunkedManager) setupFUSEDiskForRunner(runnerID string, chunks []snaps
 	cm.mu.Unlock()
 
 	cm.chunkedLogger.WithFields(logrus.Fields{
-		"runner_id":  runnerID,
-		"chunks":     len(chunks),
-		"total_size": totalSize,
-	}).Info("FUSE disk mounted for session resume")
+		"runner_id": runnerID,
+		"chunks":    len(chunks),
+	}).Info("FUSE rootfs disk mounted for session resume")
 
 	return fuseDisk.DiskImagePath(), nil
 }

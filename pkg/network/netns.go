@@ -622,10 +622,10 @@ func (n *NetNSNetwork) ForwardPorts(vmID string, ports []int) error {
 	return nil
 }
 
-// BlockEgress blocks all network egress for a VM by inserting DROP rules on
-// the host FORWARD chain matching the VM's veth interface. This is used for
-// quarantine and works regardless of the VM's internal IP address.
-func (n *NetNSNetwork) BlockEgress(vmID string) error {
+// EmergencyBlockEgress blocks all network egress for a VM by inserting DROP rules on
+// the host FORWARD chain matching the VM's veth interface. This is the host-level
+// emergency kill switch, independent of any namespace-level policy enforcement.
+func (n *NetNSNetwork) EmergencyBlockEgress(vmID string) error {
 	n.mu.Lock()
 	nsInfo, exists := n.namespaces[vmID]
 	n.mu.Unlock()
@@ -652,8 +652,8 @@ func (n *NetNSNetwork) BlockEgress(vmID string) error {
 	return nil
 }
 
-// UnblockEgress removes the egress block rules for a VM.
-func (n *NetNSNetwork) UnblockEgress(vmID string) error {
+// EmergencyUnblockEgress removes the egress block rules for a VM.
+func (n *NetNSNetwork) EmergencyUnblockEgress(vmID string) error {
 	n.mu.Lock()
 	nsInfo, exists := n.namespaces[vmID]
 	n.mu.Unlock()

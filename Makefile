@@ -2,9 +2,14 @@
 .PHONY: packer-init packer-validate packer-build firecracker-manager-linux release-host-image mig-rolling-update
 .PHONY: onboard onboard-validate bin-onboard
 .PHONY: firecracker-manager control-plane snapshot-builder thaw-agent
-.PHONY: git-cache-builder git-cache-freshness data-snapshot-builder snapshot-converter
+.PHONY: git-cache-builder git-cache-freshness data-snapshot-builder snapshot-converter derive-snapshot
 .PHONY: test-unit test-race test-cover test-integration test-all check
-.PHONY: dev-up dev-build dev-snapshot dev-stack dev-test-exec dev-test-pause-resume dev-stop
+.PHONY: sdk-python-lint sdk-python-test sdk-python-typecheck
+.PHONY: dev-build dev-snapshot dev-stack dev-test-exec dev-test-pause-resume dev-test-multi-pause-dedup dev-stop
+.PHONY: dev-test-derive-snapshot dev-test-extension-drives dev-test-gcs-pause-resume
+.PHONY: dev-test-gcs-rootfs-durability dev-test-file-ops dev-test-pty dev-test-checkpoint
+.PHONY: dev-test-auto-resume dev-test-template-tags dev-test-network-policy
+.PHONY: dev-agent-rootfs dev-agent-snapshot dev-test-agent-sessions dev-test-agent-e2e
 .PHONY: dev-setup dev-provision
 
 # Variables
@@ -23,7 +28,7 @@ GOARCH_TARGET ?= amd64
 export PATH := /usr/local/go/bin:$(PATH)
 
 # Binaries
-BINARIES := firecracker-manager control-plane snapshot-builder thaw-agent git-cache-builder git-cache-freshness data-snapshot-builder snapshot-converter bin-onboard
+BINARIES := firecracker-manager control-plane snapshot-builder thaw-agent git-cache-builder git-cache-freshness data-snapshot-builder snapshot-converter derive-snapshot bin-onboard
 
 all: build
 
@@ -55,6 +60,9 @@ data-snapshot-builder:
 
 snapshot-converter:
 	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/snapshot-converter ./cmd/snapshot-converter
+
+derive-snapshot:
+	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/derive-snapshot ./cmd/derive-snapshot
 
 bin-onboard:
 	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/onboard ./cmd/onboard
@@ -334,23 +342,20 @@ help:
 	@echo "  ENV                - Environment name (default: dev)"
 	@echo "  GIT_CACHE_REPOS    - Repos for git-cache (e.g., github.com/org/repo:name)"
 	@echo ""
-	@echo "Local Development (macOS + Lima):"
-	@echo "  dev-up               - Start Lima VM with KVM, Firecracker, Postgres"
-	@echo "  dev-build            - Build binaries + minimal rootfs inside Lima VM"
-	@echo "  dev-snapshot         - Build full snapshot (mem+state) for restore testing"
-	@echo "  dev-stack            - Start control-plane + firecracker-manager"
-	@echo "  dev-test-exec        - Run E2E exec test (allocate->exec->release)"
-	@echo "  dev-stop             - Stop the stack (keeps VM and rootfs)"
-	@echo "  dev-down             - Stop Lima VM (fast resume with dev-up)"
-	@echo "  dev-clean            - Delete VM + all artifacts"
-	@echo ""
-	@echo "Local Development (Linux / GCE — no Lima):"
+	@echo "Local Development (Linux with KVM):"
 	@echo "  dev-provision        - Install prerequisites (run once, needs sudo)"
-	@echo "  dev-build-local      - Build binaries + minimal rootfs"
-	@echo "  dev-snapshot-local   - Build full snapshot for restore testing"
-	@echo "  dev-stack-local      - Start control-plane + firecracker-manager"
-	@echo "  dev-test-exec-local  - Run E2E exec test"
-	@echo "  dev-stop-local       - Stop the stack"
+	@echo "  dev-build            - Build binaries + minimal rootfs"
+	@echo "  dev-snapshot         - Build full snapshot for restore testing"
+	@echo "  dev-stack            - Start control-plane + firecracker-manager"
+	@echo "  dev-test-exec        - Run E2E exec test"
+	@echo "  dev-test-file-ops    - Run E2E file operations test (WS2)"
+	@echo "  dev-test-pty         - Run E2E PTY terminal test (WS3)"
+	@echo "  dev-test-template-tags - Run E2E template tags test (WS6)"
+	@echo "  dev-test-network-policy - Run E2E network policy test"
+	@echo "  dev-test-checkpoint  - Run E2E checkpoint test (WS4, needs GCS)"
+	@echo "  dev-test-auto-resume - Run E2E auto-resume test (WS5, needs GCS)"
+	@echo "  dev-test-gcs-rootfs-durability - Run E2E rootfs durability test (WS1, needs GCS)"
+	@echo "  dev-stop             - Stop the stack"
 	@echo ""
 	@echo "Example workflow (disk snapshots):"
 	@echo "  1. make packer-build PROJECT_ID=my-project"
@@ -360,82 +365,101 @@ help:
 	@echo "  5. make mig-rolling-update PROJECT_ID=my-project"
 
 # === Local Development ===
-# Two modes:
-#   macOS + Lima: make dev-up → make dev-build → make dev-stack → make dev-test-exec
-#   Linux (GCE): make dev-setup → make dev-build-local → make dev-stack-local → make dev-test-exec-local
-DEV_VM    := fc-dev
-LIMA      := limactl
-LIMA_EXEC := $(LIMA) shell $(DEV_VM) --
-
-# --- macOS + Lima targets ---
-
-# Start Lima VM (one-time, ~3 min)
-dev-up:
-	$(LIMA) start ./dev/lima.yaml --name=$(DEV_VM) --tty=false
-	@echo "Lima VM '$(DEV_VM)' is running."
-
-# Build binaries + dev rootfs inside Lima VM (~2 min)
-dev-build:
-	$(LIMA_EXEC) bash -c 'GOARCH_TARGET=$$(uname -m | sed "s/x86_64/amd64/;s/aarch64/arm64/") make build'
-	$(LIMA_EXEC) bash dev/build-dev-rootfs.sh
-
-# Build a full snapshot inside Lima VM
-dev-snapshot:
-	$(LIMA_EXEC) bash dev/build-snapshot.sh
-
-# Start the full stack inside Lima VM
-dev-stack:
-	$(LIMA_EXEC) bash dev/run-stack.sh
-
-# Run E2E exec test via Lima VM
-dev-test-exec:
-	$(LIMA_EXEC) bash dev/test-exec.sh
-
-# Run E2E pause/resume test via Lima VM
-dev-test-pause-resume:
-	$(LIMA_EXEC) bash dev/test-pause-resume.sh
-
-# Stop the stack inside Lima VM
-dev-stop:
-	$(LIMA_EXEC) bash dev/stop-stack.sh
-
-# Stop Lima VM (preserves disk — fast restart with `dev-up`)
-dev-down:
-	-$(LIMA) stop $(DEV_VM)
-
-# Full cleanup: stop VM, remove disk, remove all dev artifacts
-dev-clean:
-	-$(LIMA) stop $(DEV_VM) 2>/dev/null
-	-$(LIMA) delete $(DEV_VM) 2>/dev/null
-	@echo "Lima VM deleted. Run 'make dev-up' to recreate."
-
-# --- Linux (GCE) targets — run directly, no Lima ---
+# Requires a Linux host with KVM. Run on bare-metal or a GCE VM with nested virt.
+# Workflow: make dev-provision → make dev-build → make dev-snapshot → make dev-stack → make dev-test-exec
+# --- Linux dev targets (run directly on a Linux host with KVM) ---
 
 # Install prerequisites on a fresh Linux host (Ubuntu/Debian)
 dev-provision:
 	sudo bash dev/setup-linux.sh
 
-# Build binaries + dev rootfs directly on Linux
-dev-build-local:
+# Build binaries + dev rootfs
+dev-build:
 	make build
 	bash dev/build-dev-rootfs.sh
 
-# Build a full snapshot directly on Linux
-dev-snapshot-local:
+# Build a full snapshot
+dev-snapshot:
 	bash dev/build-snapshot.sh
 
-# Start the full stack directly on Linux
-dev-stack-local:
+# Start the full stack (control-plane + firecracker-manager)
+dev-stack:
 	bash dev/run-stack.sh
 
-# Run E2E exec test directly on Linux
-dev-test-exec-local:
+# Stop the stack
+dev-stop:
+	bash dev/stop-stack.sh
+
+# Run E2E exec test
+dev-test-exec:
 	bash dev/test-exec.sh
 
-# Run E2E pause/resume test directly on Linux
-dev-test-pause-resume-local:
+# Run E2E pause/resume test
+dev-test-pause-resume:
 	bash dev/test-pause-resume.sh
 
-# Stop the stack directly on Linux
-dev-stop-local:
-	bash dev/stop-stack.sh
+# Run E2E multi-pause chunk dedup test
+dev-test-multi-pause-dedup:
+	bash dev/test-multi-pause-dedup.sh
+
+# Run E2E derive-snapshot test
+dev-test-derive-snapshot:
+	bash dev/test-derive-snapshot.sh
+
+# Run E2E extension drives test
+dev-test-extension-drives:
+	bash dev/test-extension-drives.sh
+
+# Run E2E GCS pause/resume test
+dev-test-gcs-pause-resume:
+	bash dev/test-gcs-pause-resume.sh
+
+# Run E2E GCS rootfs durability test (WS1)
+dev-test-gcs-rootfs-durability:
+	bash dev/test-gcs-rootfs-durability.sh
+
+# Run E2E file operations test (WS2)
+dev-test-file-ops:
+	bash dev/test-file-ops.sh
+
+# Run E2E PTY terminal test (WS3)
+dev-test-pty:
+	bash dev/test-pty.sh
+
+# Run E2E non-destructive checkpoint test (WS4)
+dev-test-checkpoint:
+	bash dev/test-checkpoint.sh
+
+# Run E2E auto-resume test (WS5)
+dev-test-auto-resume:
+	bash dev/test-auto-resume.sh
+
+# Run E2E template tags test (WS6)
+dev-test-template-tags:
+	bash dev/test-template-tags.sh
+
+dev-test-network-policy:
+	bash dev/test-network-policy.sh
+
+# AI Agent Sandbox E2E tests
+dev-agent-rootfs:
+	bash dev/build-agent-rootfs.sh
+
+dev-agent-snapshot:
+	bash dev/test-agent-onboard.sh
+
+dev-test-agent-sessions:
+	bash dev/test-agent-sessions.sh
+
+dev-test-agent-e2e:
+	bash dev/test-agent-e2e.sh
+
+# ── Python SDK ──────────────────────────────────────────────────────────────
+sdk-python-lint:
+	cd sdk/python && python -m ruff check src/bf_sdk/ tests/
+
+sdk-python-test:
+	cd sdk/python && python -m pytest tests/ -v
+
+sdk-python-typecheck:
+	cd sdk/python && python -m pyright src/bf_sdk/

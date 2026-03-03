@@ -1,0 +1,116 @@
+# Extended dev rootfs for AI agent sandbox testing.
+# Contains Python3, Node.js, git, Claude Code on top of the minimal dev rootfs.
+# Used by: dev/build-agent-rootfs.sh
+# Size: ~1GB (vs 512MB for the minimal dev rootfs)
+
+# --- Stage 1: build thaw-agent ---
+FROM golang:1.24 AS builder
+
+WORKDIR /build
+COPY go.mod go.sum ./
+COPY cmd/thaw-agent/ ./cmd/thaw-agent/
+COPY pkg/ ./pkg/
+
+RUN CGO_ENABLED=0 GOOS=linux go build -o /thaw-agent ./cmd/thaw-agent
+
+# --- Stage 2: agent rootfs ---
+FROM debian:bookworm-slim
+
+# Base packages (same as dev rootfs)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    systemd \
+    systemd-sysv \
+    dbus \
+    iproute2 \
+    iputils-ping \
+    curl \
+    jq \
+    procps \
+    sudo \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Development tools — Python + Node.js + git
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    python3 \
+    python3-pip \
+    python3-venv \
+    nodejs \
+    npm \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create runner user with NOPASSWD sudo
+RUN useradd -m -s /bin/bash -G sudo runner \
+    && echo "runner ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/runner
+
+# Claude Code — install as runner user so it goes into /home/runner/.claude/
+# The install script uses $HOME to determine the install location.
+RUN su - runner -c "curl -fsSL https://claude.ai/install.sh | bash"
+
+# Ensure claude is on PATH for all users (thaw-agent execs as runner)
+RUN echo 'export PATH="/home/runner/.claude/bin:/home/runner/.local/bin:$PATH"' >> /home/runner/.bashrc \
+    && echo 'PATH="/home/runner/.claude/bin:/home/runner/.local/bin:$PATH"' >> /etc/environment
+
+# Claude Code settings for headless Vertex AI usage
+RUN mkdir -p /home/runner/.claude && \
+    chown -R runner:runner /home/runner/.claude
+COPY dev/claude-settings.json /home/runner/.claude/settings.json
+RUN chown runner:runner /home/runner/.claude/settings.json
+
+# Create workspace directory
+RUN mkdir -p /workspace /var/run/thaw-agent /var/log/thaw-agent \
+    && chown -R runner:runner /workspace
+
+# Configure systemd
+RUN systemctl set-default multi-user.target \
+    && systemctl mask \
+        systemd-resolved.service \
+        systemd-networkd-wait-online.service \
+        systemd-timesyncd.service \
+        systemd-journald-audit.socket \
+        sys-kernel-debug.mount \
+        sys-kernel-tracing.mount
+
+# Configure network (static IP set by thaw-agent via MMDS)
+COPY images/microvm/rootfs/etc/systemd/network/10-eth0.network /etc/systemd/network/
+RUN systemctl enable systemd-networkd
+
+# Install thaw-agent binary
+COPY --from=builder /thaw-agent /usr/local/bin/thaw-agent
+
+# Thaw-agent systemd service — use runner user, skip features not needed for dev
+RUN printf '[Unit]\n\
+Description=Thaw Agent\n\
+After=network.target\n\
+Wants=network.target\n\
+\n\
+[Service]\n\
+Type=simple\n\
+ExecStart=/usr/local/bin/thaw-agent --skip-runner --skip-repo-cache --skip-buildbarn-certs --skip-credentials --skip-git-cache\n\
+Restart=on-failure\n\
+RestartSec=2\n\
+StandardOutput=journal\n\
+StandardError=journal\n\
+Environment=LOG_LEVEL=debug\n\
+Environment=HOME=/root\n\
+\n\
+[Install]\n\
+WantedBy=multi-user.target\n' > /etc/systemd/system/thaw-agent.service \
+    && systemctl enable thaw-agent.service
+
+# Serial console
+RUN echo "ttyS0" >> /etc/securetty \
+    && systemctl enable serial-getty@ttyS0.service
+
+# Hostname
+RUN echo "agent-runner" > /etc/hostname
+
+# DNS
+RUN echo "nameserver 8.8.8.8" > /etc/resolv.conf.default
+
+# Init symlink for Firecracker boot
+RUN ln -sf /lib/systemd/systemd /init
+
+# Cleanup
+RUN apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*

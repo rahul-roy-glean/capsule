@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
@@ -25,8 +26,9 @@ const sessionChunkUploadConcurrency = 16
 // uploads them to GCS, producing self-contained ChunkIndex objects that can
 // be used by the UFFD handler on any host (no golden snapshot.mem required).
 type SessionChunkUploader struct {
-	memStore  *ChunkStore // chunks/mem/<p0>/<hash>
-	diskStore *ChunkStore // chunks/disk/<p0>/<hash>; may be nil
+	memStore  ChunkStorer     // chunks/mem/<p0>/<hash>
+	diskStore ChunkStorer     // chunks/disk/<p0>/<hash>; may be nil
+	gcsClient *storage.Client // for GCS-specific operations (upload/download manifests, state, etc.)
 	gcsBucket string
 	gcsPrefix string // e.g. "v1"
 	logger    *logrus.Entry
@@ -40,13 +42,16 @@ func NewSessionChunkUploader(memStore, diskStore *ChunkStore, logger *logrus.Log
 	}
 	gcsBucket := ""
 	gcsPrefix := ""
+	var gcsClient *storage.Client
 	if memStore != nil {
 		gcsBucket = memStore.gcsBucket
 		gcsPrefix = memStore.gcsPrefix
+		gcsClient = memStore.gcsClient
 	}
 	return &SessionChunkUploader{
 		memStore:  memStore,
 		diskStore: diskStore,
+		gcsClient: gcsClient,
 		gcsBucket: gcsBucket,
 		gcsPrefix: gcsPrefix,
 		logger:    logger.WithField("component", "session-chunk-uploader"),
@@ -398,8 +403,8 @@ func (u *SessionChunkUploader) MergeAndUploadDisk(ctx context.Context, dirtyChun
 // the mem chunk store's GCS client. The state file is uploaded uncompressed
 // (Firecracker opens it directly and it's typically < 1 MB).
 func (u *SessionChunkUploader) UploadVMState(ctx context.Context, localPath, gcsObjectPath string) error {
-	if u.memStore == nil {
-		return fmt.Errorf("mem chunk store not configured")
+	if u.gcsClient == nil {
+		return fmt.Errorf("GCS client not configured")
 	}
 
 	f, err := os.Open(localPath)
@@ -408,7 +413,7 @@ func (u *SessionChunkUploader) UploadVMState(ctx context.Context, localPath, gcs
 	}
 	defer f.Close()
 
-	bucket := u.memStore.gcsClient.Bucket(u.gcsBucket)
+	bucket := u.gcsClient.Bucket(u.gcsBucket)
 	obj := bucket.Object(gcsObjectPath)
 	w := obj.NewWriter(ctx)
 	w.ContentType = "application/octet-stream"
@@ -426,11 +431,11 @@ func (u *SessionChunkUploader) UploadVMState(ctx context.Context, localPath, gcs
 
 // DownloadVMState downloads a GCS object to a local file path.
 func (u *SessionChunkUploader) DownloadVMState(ctx context.Context, gcsObjectPath, localPath string) error {
-	if u.memStore == nil {
-		return fmt.Errorf("mem chunk store not configured")
+	if u.gcsClient == nil {
+		return fmt.Errorf("GCS client not configured")
 	}
 
-	bucket := u.memStore.gcsClient.Bucket(u.gcsBucket)
+	bucket := u.gcsClient.Bucket(u.gcsBucket)
 	reader, err := bucket.Object(gcsObjectPath).NewReader(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to open vmstate GCS object %s: %w", gcsObjectPath, err)
@@ -466,11 +471,11 @@ func (u *SessionChunkUploader) WriteManifest(
 	manifest *SnapshotManifest,
 	memIndex, diskIndex *ChunkIndex,
 ) error {
-	if u.memStore == nil {
-		return fmt.Errorf("mem chunk store not configured")
+	if u.gcsClient == nil {
+		return fmt.Errorf("GCS client not configured")
 	}
 
-	bucket := u.memStore.gcsClient.Bucket(u.gcsBucket)
+	bucket := u.gcsClient.Bucket(u.gcsBucket)
 
 	uploadJSON := func(objPath string, v any) error {
 		data, err := json.MarshalIndent(v, "", "  ")
@@ -512,13 +517,69 @@ func (u *SessionChunkUploader) WriteManifest(
 	return nil
 }
 
-// DownloadChunkIndex downloads and unmarshals a ChunkIndex from a GCS object path.
-func (u *SessionChunkUploader) DownloadChunkIndex(ctx context.Context, gcsObjectPath string) (*ChunkIndex, error) {
-	if u.memStore == nil {
-		return nil, fmt.Errorf("mem chunk store not configured")
+// WriteManifestWithExtensions uploads SnapshotManifest and all ChunkIndex JSON files to GCS.
+// extDiskIndexes maps driveID to ChunkIndex for each dirty extension drive.
+// Per-drive disk indexes are stored at {gcsBase}/{driveID}-disk.json.
+func (u *SessionChunkUploader) WriteManifestWithExtensions(
+	ctx context.Context,
+	gcsBase string,
+	manifest *SnapshotManifest,
+	memIndex *ChunkIndex,
+	extDiskIndexes map[string]*ChunkIndex,
+) error {
+	if u.gcsClient == nil {
+		return fmt.Errorf("GCS client not configured")
 	}
 
-	bucket := u.memStore.gcsClient.Bucket(u.gcsBucket)
+	bucket := u.gcsClient.Bucket(u.gcsBucket)
+
+	uploadJSON := func(objPath string, v any) error {
+		data, err := json.MarshalIndent(v, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshal %s: %w", objPath, err)
+		}
+		w := bucket.Object(objPath).NewWriter(ctx)
+		w.ContentType = "application/json"
+		if _, err := w.Write(data); err != nil {
+			w.Close()
+			return fmt.Errorf("write %s: %w", objPath, err)
+		}
+		return w.Close()
+	}
+
+	memIdxPath := u.prefixedPath(gcsBase + "/chunked-metadata.json")
+	if err := uploadJSON(memIdxPath, memIndex); err != nil {
+		return fmt.Errorf("failed to upload mem chunk index: %w", err)
+	}
+
+	for driveID, diskIdx := range extDiskIndexes {
+		diskIdxPath := u.prefixedPath(gcsBase + "/" + driveID + "-disk.json")
+		if err := uploadJSON(diskIdxPath, diskIdx); err != nil {
+			return fmt.Errorf("failed to upload disk chunk index for drive %s: %w", driveID, err)
+		}
+	}
+
+	manifestPath := u.prefixedPath(gcsBase + "/snapshot_manifest.json")
+	if err := uploadJSON(manifestPath, manifest); err != nil {
+		return fmt.Errorf("failed to upload snapshot manifest: %w", err)
+	}
+
+	u.logger.WithFields(logrus.Fields{
+		"gcs_base": gcsBase,
+		"mem_idx":  memIdxPath,
+		"manifest": manifestPath,
+	}).Info("WriteManifestWithExtensions complete")
+
+	return nil
+}
+
+// DownloadChunkIndex downloads and unmarshals a ChunkIndex from a GCS object path.
+func (u *SessionChunkUploader) DownloadChunkIndex(ctx context.Context, gcsObjectPath string) (*ChunkIndex, error) {
+	if u.gcsClient == nil {
+		return nil, fmt.Errorf("GCS client not configured")
+	}
+
+	bucket := u.gcsClient.Bucket(u.gcsBucket)
 	reader, err := bucket.Object(gcsObjectPath).NewReader(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open chunk index %s: %w", gcsObjectPath, err)
@@ -535,11 +596,11 @@ func (u *SessionChunkUploader) DownloadChunkIndex(ctx context.Context, gcsObject
 
 // DownloadManifest downloads and unmarshals a SnapshotManifest from a GCS object path.
 func (u *SessionChunkUploader) DownloadManifest(ctx context.Context, gcsObjectPath string) (*SnapshotManifest, error) {
-	if u.memStore == nil {
-		return nil, fmt.Errorf("mem chunk store not configured")
+	if u.gcsClient == nil {
+		return nil, fmt.Errorf("GCS client not configured")
 	}
 
-	bucket := u.memStore.gcsClient.Bucket(u.gcsBucket)
+	bucket := u.gcsClient.Bucket(u.gcsBucket)
 	reader, err := bucket.Object(gcsObjectPath).NewReader(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open manifest %s: %w", gcsObjectPath, err)

@@ -7,7 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
+	gonet "net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -107,6 +107,10 @@ func (b *WarmupLogBuffer) Since(afterSeq int64) ([]string, int64) {
 }
 
 var globalWarmupLogs = &WarmupLogBuffer{}
+
+// cgroupMgr is the cgroup v2 manager for user process isolation. Nil if cgroup
+// v2 is not available (graceful degradation).
+var cgroupMgr *cgroupManager
 
 // globalLogBuffer captures all logrus log entries for the /logs HTTP endpoint.
 // This allows debugging thaw-agent behavior from the host via:
@@ -217,10 +221,13 @@ type MMDSData struct {
 		Warmup struct {
 			Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
 		} `json:"warmup,omitempty"`
+		// Mirrors snapshot.StartCommand — keep in sync with pkg/snapshot/start_command.go.
 		StartCommand struct {
-			Command    []string `json:"command,omitempty"`
-			Port       int      `json:"port,omitempty"`
-			HealthPath string   `json:"health_path,omitempty"`
+			Command    []string          `json:"command,omitempty"`
+			Port       int               `json:"port,omitempty"`
+			HealthPath string            `json:"health_path,omitempty"`
+			Env        map[string]string `json:"env,omitempty"`
+			RunAs      string            `json:"run_as,omitempty"`
 		} `json:"start_command,omitempty"`
 	} `json:"latest"`
 }
@@ -262,6 +269,18 @@ func main() {
 
 	log.Info("Thaw agent starting...")
 
+	// Load Docker image ENV variables from /etc/environment into the current
+	// process environment. The snapshot-builder writes these during the
+	// Docker-to-rootfs conversion so that start_command, shell commands, and
+	// other child processes inherit the PATH, PYTHONPATH, etc. that the
+	// Docker image defined via ENV directives.
+	loadDockerEnv()
+
+	// Initialize cgroup v2 isolation for user processes. This creates agent/
+	// and user/ sub-cgroups and moves the thaw-agent into agent/. User commands
+	// from /exec and /pty are placed into user/ to prevent resource starvation.
+	cgroupMgr = initCgroup()
+
 	// Track progress for debugging
 	currentStep := "starting"
 	var stepMutex sync.Mutex
@@ -294,7 +313,9 @@ func main() {
 			}
 		})
 		http.HandleFunc("/exec", execHandler)
+		http.HandleFunc("/pty", ptyHandler)
 		http.HandleFunc("/service-logs", serviceLogsHandler)
+		registerFileHandlers()
 		if err := http.ListenAndServe(":10501", nil); err != nil {
 			log.WithError(err).Debug("Early health server failed")
 		}
@@ -498,6 +519,20 @@ func main() {
 					// Incremental re-warmup: runner_id changed but mode still warmup
 					mmdsData.Latest = newData.Latest
 					log.WithField("new_runner_id", newData.Latest.Meta.RunnerID).Info("Re-warmup: incremental snapshot build detected")
+
+					// Reconfigure network before running warmup commands.
+					// The snapshot's network state may be stale (empty resolv.conf, broken routes).
+					if !*skipNetwork {
+						tempData := &MMDSData{}
+						tempData.Latest = newData.Latest
+						log.Info("Re-warmup: reconfiguring network...")
+						if err := configureNetwork(tempData); err != nil {
+							log.WithError(err).Error("Re-warmup: network reconfig failed")
+						} else {
+							log.Info("Re-warmup: network reconfigured successfully")
+						}
+					}
+
 					globalWarmupState = &WarmupState{StartedAt: time.Now()}
 					if err := runWarmupMode(mmdsData); err != nil {
 						globalWarmupState.Error = err.Error()
@@ -1051,10 +1086,13 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 				Warmup struct {
 					Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
 				} `json:"warmup,omitempty"`
+				// Mirrors snapshot.StartCommand — keep in sync with pkg/snapshot/start_command.go.
 				StartCommand struct {
-					Command    []string `json:"command,omitempty"`
-					Port       int      `json:"port,omitempty"`
-					HealthPath string   `json:"health_path,omitempty"`
+					Command    []string          `json:"command,omitempty"`
+					Port       int               `json:"port,omitempty"`
+					HealthPath string            `json:"health_path,omitempty"`
+					Env        map[string]string `json:"env,omitempty"`
+					RunAs      string            `json:"run_as,omitempty"`
 				} `json:"start_command,omitempty"`
 			}
 			if err := json.Unmarshal(body, &inner); err != nil {
@@ -1190,19 +1228,111 @@ func configureNetwork(data *MMDSData) error {
 		}
 	}
 
+	// Fix nsswitch.conf: remove systemd-resolve references so glibc uses /etc/resolv.conf directly.
+	// Ubuntu 24.04 ships "hosts: files resolve [!UNAVAIL=return] dns" which breaks DNS
+	// when systemd-resolved is masked (as in Firecracker VMs).
+	if nssData, err := os.ReadFile("/etc/nsswitch.conf"); err == nil {
+		nss := string(nssData)
+		if strings.Contains(nss, "resolve") {
+			nss = strings.ReplaceAll(nss, "resolve [!UNAVAIL=return]", "")
+			nss = strings.ReplaceAll(nss, "resolve", "")
+			os.WriteFile("/etc/nsswitch.conf", []byte(nss), 0644)
+			log.Info("Fixed nsswitch.conf: removed systemd-resolve references")
+		}
+	}
+
 	// Check if kernel already configured the network (via ip= boot parameter)
-	// If so, skip IP reconfiguration but still ensure DNS is configured
-	out, _ := exec.Command("ip", "addr", "show", "dev", iface).Output()
+	// Use Go's net package since the guest rootfs may not have the `ip` command.
 	expectedIP := strings.Split(net.IP, "/")[0]
-	if strings.Contains(string(out), expectedIP) {
-		log.WithField("ip", expectedIP).Info("Network IP already configured by kernel, ensuring DNS is set")
-		// Still configure DNS since kernel ip= parameter doesn't set it
+	ipAlreadyConfigured := false
+	if goIface, err := gonet.InterfaceByName(iface); err == nil {
+		addrs, _ := goIface.Addrs()
+		for _, addr := range addrs {
+			if strings.Contains(addr.String(), expectedIP) {
+				ipAlreadyConfigured = true
+				break
+			}
+		}
+		log.WithFields(logrus.Fields{"iface": iface, "addrs": fmt.Sprintf("%v", addrs), "found": ipAlreadyConfigured}).Info("configureNetwork: checked interface via Go net package")
+	} else {
+		log.WithError(err).Warn("configureNetwork: could not get interface by name, falling back to ip command")
+		// Fallback to ip command
+		out, _ := exec.Command("ip", "addr", "show", "dev", iface).CombinedOutput()
+		ipAlreadyConfigured = strings.Contains(string(out), expectedIP)
+	}
+	if ipAlreadyConfigured {
+		log.WithField("ip", expectedIP).Info("Network IP already configured by kernel, ensuring DNS and routes are set")
+
+		// Ensure interface is up (check via /sys/class/net, no ip command needed)
+		if operState, err := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/operstate", iface)); err == nil {
+			log.WithField("operstate", strings.TrimSpace(string(operState))).Info("configureNetwork: interface operstate")
+			if strings.TrimSpace(string(operState)) != "up" {
+				// Try ip command if available, otherwise interface should come up on its own
+				exec.Command("ip", "link", "set", iface, "up").Run()
+			}
+		}
+
+		// Check default route via /proc/net/route (no ip command needed)
+		// Format: Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+		// Default route has Destination=00000000
+		if net.Gateway != "" {
+			routeData, routeErr := os.ReadFile("/proc/net/route")
+			log.WithFields(logrus.Fields{"routes": string(routeData), "err": routeErr}).Info("configureNetwork: /proc/net/route")
+			hasDefaultRoute := false
+			if routeErr == nil {
+				for _, line := range strings.Split(string(routeData), "\n") {
+					fields := strings.Fields(line)
+					if len(fields) >= 3 && fields[1] == "00000000" {
+						hasDefaultRoute = true
+						break
+					}
+				}
+			}
+			if hasDefaultRoute {
+				log.Info("configureNetwork: default route already exists")
+			} else {
+				log.WithField("gateway", net.Gateway).Warn("configureNetwork: no default route found, trying to add via ip command")
+				exec.Command("ip", "route", "add", "default", "via", net.Gateway).Run()
+			}
+		} else {
+			log.Warn("configureNetwork: no gateway in MMDS data!")
+		}
+
+		// Configure DNS since kernel ip= parameter doesn't set it
 		if net.DNS != "" {
+			// Remove symlink if present (Ubuntu uses symlink to systemd-resolved stub)
+			if linkTarget, err := os.Readlink("/etc/resolv.conf"); err == nil {
+				log.WithField("target", linkTarget).Info("configureNetwork: resolv.conf is symlink, removing")
+				os.Remove("/etc/resolv.conf")
+			}
 			resolv := fmt.Sprintf("nameserver %s\n", net.DNS)
 			if err := os.WriteFile("/etc/resolv.conf", []byte(resolv), 0644); err != nil {
 				log.WithError(err).Warn("Failed to write resolv.conf")
+			} else {
+				log.WithField("dns", net.DNS).Info("configureNetwork: wrote resolv.conf")
 			}
+		} else {
+			log.Warn("configureNetwork: no DNS in MMDS data!")
 		}
+
+		// Verify after config
+		resolvCheck, _ := os.ReadFile("/etc/resolv.conf")
+		routeCheck, _ := os.ReadFile("/proc/net/route")
+		log.WithFields(logrus.Fields{
+			"resolv_conf": strings.TrimSpace(string(resolvCheck)),
+			"routes":      strings.TrimSpace(string(routeCheck)),
+		}).Info("configureNetwork: post-config state")
+
+		// Quick connectivity test using Go's net.DialTimeout (no ping needed)
+		testConn, testErr := gonet.DialTimeout("tcp", net.Gateway+":80", 2*time.Second)
+		if testErr != nil {
+			// TCP to gateway:80 won't work, try UDP DNS instead
+			log.WithField("gateway_test_err", testErr.Error()).Info("configureNetwork: gateway TCP test (expected to fail, not a real service)")
+		} else {
+			testConn.Close()
+			log.Info("configureNetwork: gateway reachable")
+		}
+
 		return nil
 	}
 
@@ -1857,6 +1987,10 @@ func dispatchCommand(cmd snapshot.SnapshotCommand, data *MMDSData) error {
 		return runGCPAuthCommand(data)
 	case "shell":
 		return runShellCommand(cmd.Args, cmd.RunAsRoot, data)
+	case "base-image", "platform-setup", "platform-user":
+		// Declarative markers used for layer hash computation only;
+		// the snapshot-builder handles these during rootfs setup before VM boot.
+		return nil
 	default:
 		return fmt.Errorf("unknown command type: %q", cmd.Type)
 	}
@@ -2449,16 +2583,6 @@ func getWorkspaceRepoPath(data *MMDSData) string {
 	return ""
 }
 
-func safePrefix(s string, n int) string {
-	if len(s) == 0 {
-		return "<empty>"
-	}
-	if len(s) <= n {
-		return s + "..."
-	}
-	return s[:n] + "..."
-}
-
 // verifyConnectivity checks that the microVM can reach the target host before
 // attempting long-running network operations like git clone. Fails fast instead
 // of waiting for a 10-minute git timeout.
@@ -2472,15 +2596,74 @@ func verifyConnectivity(repoURL string) error {
 		}
 	}
 
-	// Check DNS resolution using getent (available on all Linux systems)
+	// Check DNS resolution - try Go's resolver first, then getent as fallback
 	log.WithField("host", host).Info("Checking DNS resolution...")
-	if output, err := exec.Command("getent", "hosts", host).CombinedOutput(); err != nil {
-		return fmt.Errorf("DNS resolution failed for %s: %s", host, strings.TrimSpace(string(output)))
+
+	// Try Go's built-in resolver (uses /etc/resolv.conf directly, bypasses nsswitch)
+	addrs, goErr := gonet.LookupHost(host)
+	if goErr != nil {
+		// Go resolver failed - collect diagnostics
+		var diag strings.Builder
+		diag.WriteString(fmt.Sprintf("Go LookupHost error: %v. ", goErr))
+
+		if nssData, err := os.ReadFile("/etc/nsswitch.conf"); err == nil {
+			for _, line := range strings.Split(string(nssData), "\n") {
+				if strings.HasPrefix(strings.TrimSpace(line), "hosts:") {
+					diag.WriteString(fmt.Sprintf("nsswitch: %s. ", strings.TrimSpace(line)))
+					break
+				}
+			}
+		}
+		if resolvData, err := os.ReadFile("/etc/resolv.conf"); err == nil {
+			diag.WriteString(fmt.Sprintf("resolv.conf: [%s]. ", strings.TrimSpace(string(resolvData))))
+		} else {
+			diag.WriteString(fmt.Sprintf("resolv.conf read err: %v. ", err))
+		}
+		if linkTarget, err := os.Readlink("/etc/resolv.conf"); err == nil {
+			diag.WriteString(fmt.Sprintf("resolv.conf symlink->%s. ", linkTarget))
+		}
+		// ip addr
+		if addrOut, err := exec.Command("ip", "addr").CombinedOutput(); err == nil {
+			diag.WriteString(fmt.Sprintf("ip_addr: [%s]. ", strings.TrimSpace(string(addrOut))))
+		} else {
+			diag.WriteString(fmt.Sprintf("ip_addr err: %v. ", err))
+			// fallback: read /proc/net/if_inet6 or /sys
+			if ifData, err2 := os.ReadFile("/proc/net/dev"); err2 == nil {
+				diag.WriteString(fmt.Sprintf("proc_net_dev: [%s]. ", strings.TrimSpace(string(ifData))))
+			}
+		}
+		// Routes
+		if routeOut, err := exec.Command("ip", "route").CombinedOutput(); err == nil {
+			diag.WriteString(fmt.Sprintf("routes: [%s]. ", strings.TrimSpace(string(routeOut))))
+		} else {
+			diag.WriteString(fmt.Sprintf("ip_route err: %v. ", err))
+			// fallback: /proc/net/route
+			if procRoute, err2 := os.ReadFile("/proc/net/route"); err2 == nil {
+				diag.WriteString(fmt.Sprintf("proc_route: [%s]. ", strings.TrimSpace(string(procRoute))))
+			}
+		}
+		// Ping gateway
+		pingGW, pingGWErr := exec.Command("ping", "-c", "1", "-W", "2", "172.16.0.1").CombinedOutput()
+		if pingGWErr != nil {
+			diag.WriteString(fmt.Sprintf("ping_gw(172.16.0.1) failed: %s. ", strings.TrimSpace(string(pingGW))))
+		} else {
+			diag.WriteString("ping_gw OK. ")
+		}
+		// Ping 8.8.8.8
+		ping8, ping8Err := exec.Command("ping", "-c", "1", "-W", "2", "8.8.8.8").CombinedOutput()
+		if ping8Err != nil {
+			diag.WriteString(fmt.Sprintf("ping_8888 failed: %s", strings.TrimSpace(string(ping8))))
+		} else {
+			diag.WriteString("ping_8888 OK")
+		}
+
+		return fmt.Errorf("DNS resolution failed for %s: %s", host, diag.String())
 	}
+	log.WithFields(logrus.Fields{"host": host, "addrs": addrs}).Info("DNS resolution succeeded")
 
 	// Check TCP connectivity to HTTPS port
 	log.WithField("host", host).Info("Checking TCP connectivity to port 443...")
-	conn, err := net.DialTimeout("tcp", host+":443", 10*time.Second)
+	conn, err := gonet.DialTimeout("tcp", host+":443", 10*time.Second)
 	if err != nil {
 		// Log diagnostic info
 		log.WithError(err).Error("TCP connection failed")
@@ -2553,11 +2736,8 @@ func execHandler(w http.ResponseWriter, r *http.Request) {
 		cmd.Dir = *workspaceDir
 	}
 
-	// Environment: inherit current env + merge provided env
-	cmd.Env = os.Environ()
-	for k, v := range req.Env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
+	// Environment: inherit current env + merge provided env (deduped)
+	cmd.Env = mergeEnv(os.Environ(), req.Env)
 
 	// Run as runner user
 	runnerUser, err := user.Lookup(*runnerUsername)
@@ -2570,6 +2750,7 @@ func execHandler(w http.ResponseWriter, r *http.Request) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
 	}
+	cgroupMgr.applyCgroup(cmd.SysProcAttr)
 	cmd.Env = append(cmd.Env, "HOME="+runnerUser.HomeDir)
 
 	// Create pipes
@@ -2660,6 +2841,36 @@ func runStartCommand(mmdsData *MMDSData) error {
 	cmd := exec.Command(sc.Command[0], sc.Command[1:]...)
 	cmd.Dir = *workspaceDir
 
+	// Set environment: inherit current process env + merge start_command overrides
+	cmd.Env = mergeEnv(os.Environ(), sc.Env)
+	if len(sc.Env) > 0 {
+		log.WithField("env_count", len(sc.Env)).Info("Injected start_command env vars")
+	}
+
+	// Run as the specified user (or default to --runner-user flag)
+	runAsUser := sc.RunAs
+	if runAsUser == "" {
+		runAsUser = *runnerUsername
+	}
+	targetUser, err := user.Lookup(runAsUser)
+	if err != nil {
+		return fmt.Errorf("run_as user %q not found: %w", runAsUser, err)
+	}
+	rUID, _ := strconv.ParseUint(targetUser.Uid, 10, 32)
+	rGID, _ := strconv.ParseUint(targetUser.Gid, 10, 32)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
+		Setsid:     true,
+	}
+	cgroupMgr.applyCgroup(cmd.SysProcAttr)
+	cmd.Env = append(cmd.Env, "HOME="+targetUser.HomeDir)
+
+	log.WithFields(logrus.Fields{
+		"run_as": runAsUser,
+		"uid":    rUID,
+		"gid":    rGID,
+	}).Info("start_command will run as user")
+
 	// Open log file for stdout+stderr
 	logFile, err := os.OpenFile(serviceLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
@@ -2688,7 +2899,7 @@ func runStartCommand(mmdsData *MMDSData) error {
 
 	// Poll health endpoint if configured
 	if sc.Port > 0 && sc.HealthPath != "" {
-		healthURL := fmt.Sprintf("http://localhost:%d%s", sc.Port, sc.HealthPath)
+		healthURL := fmt.Sprintf("http://127.0.0.1:%d%s", sc.Port, sc.HealthPath)
 		client := &http.Client{Timeout: 2 * time.Second}
 
 		deadline := time.Now().Add(2 * time.Minute)
@@ -2918,7 +3129,7 @@ func startHealthServer(mmdsData *MMDSData) {
 
 	// Check if :10500 is already bound (from warmup mode). If so, skip —
 	// the warmup health server is already running and has the same endpoints.
-	ln, err := net.Listen("tcp", ":10500")
+	ln, err := gonet.Listen("tcp", ":10500")
 	if err != nil {
 		log.Info("Health server :10500 already running (from warmup), skipping")
 		return
@@ -2931,4 +3142,140 @@ func startHealthServer(mmdsData *MMDSData) {
 	} else {
 		log.Info("Health server on :10500 stopped gracefully")
 	}
+}
+
+// loadDockerEnv reads /etc/environment and sets any variables not already
+// present in the current process environment. The snapshot-builder writes
+// Docker image ENV directives here during rootfs creation. This ensures
+// child processes (start_command, shell warmup commands, etc.) inherit
+// PATH, PYTHONPATH, and other vars the Docker image defined.
+func loadDockerEnv() {
+	f, err := os.Open("/etc/environment")
+	if err != nil {
+		return // file doesn't exist on non-Docker-based images
+	}
+	defer f.Close()
+
+	loaded := 0
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		idx := strings.Index(line, "=")
+		if idx <= 0 {
+			continue
+		}
+		key := line[:idx]
+		val := line[idx+1:]
+		if key == "PATH" {
+			// Merge Docker PATH with existing PATH: prepend Docker-specific
+			// directories that aren't already present (e.g., /opt/venv/bin).
+			existing := os.Getenv("PATH")
+			existingDirs := make(map[string]bool)
+			for _, d := range strings.Split(existing, ":") {
+				existingDirs[d] = true
+			}
+			var newDirs []string
+			for _, d := range strings.Split(val, ":") {
+				if !existingDirs[d] {
+					newDirs = append(newDirs, d)
+				}
+			}
+			if len(newDirs) > 0 {
+				merged := strings.Join(newDirs, ":") + ":" + existing
+				os.Setenv("PATH", merged)
+				loaded++
+			}
+		} else if os.Getenv(key) == "" {
+			// Don't override vars already set (e.g., by systemd unit Environment=)
+			os.Setenv(key, val)
+			loaded++
+		}
+	}
+	if loaded > 0 && log != nil {
+		log.WithField("count", loaded).Info("Loaded Docker ENV from /etc/environment")
+	}
+}
+
+// mergeEnv merges override env vars into a base env slice (as returned by
+// os.Environ()). For PATH, override directories not already present are
+// appended. For all other variables, the override replaces any existing value.
+// Returns a clean, deduplicated slice.
+func mergeEnv(baseEnv []string, overrides map[string]string) []string {
+	if len(overrides) == 0 {
+		return baseEnv
+	}
+
+	// Parse base into ordered key→value map, preserving insertion order via keys slice.
+	type entry struct {
+		key string
+		val string
+	}
+	seen := make(map[string]int) // key → index in entries
+	entries := make([]entry, 0, len(baseEnv))
+	for _, e := range baseEnv {
+		idx := strings.Index(e, "=")
+		if idx < 0 {
+			continue
+		}
+		k := e[:idx]
+		v := e[idx+1:]
+		if i, ok := seen[k]; ok {
+			entries[i].val = v // last wins for duplicates in base
+		} else {
+			seen[k] = len(entries)
+			entries = append(entries, entry{k, v})
+		}
+	}
+
+	// Apply overrides.
+	for k, v := range overrides {
+		if k == "PATH" {
+			// Append override PATH dirs not already present.
+			existing := ""
+			if i, ok := seen["PATH"]; ok {
+				existing = entries[i].val
+			}
+			existingDirs := make(map[string]bool)
+			for _, d := range strings.Split(existing, ":") {
+				if d != "" {
+					existingDirs[d] = true
+				}
+			}
+			var extra []string
+			for _, d := range strings.Split(v, ":") {
+				if d != "" && !existingDirs[d] {
+					extra = append(extra, d)
+				}
+			}
+			if len(extra) > 0 {
+				merged := existing
+				if merged != "" {
+					merged += ":"
+				}
+				merged += strings.Join(extra, ":")
+				if i, ok := seen["PATH"]; ok {
+					entries[i].val = merged
+				} else {
+					seen["PATH"] = len(entries)
+					entries = append(entries, entry{"PATH", merged})
+				}
+			}
+		} else {
+			if i, ok := seen[k]; ok {
+				entries[i].val = v
+			} else {
+				seen[k] = len(entries)
+				entries = append(entries, entry{k, v})
+			}
+		}
+	}
+
+	result := make([]string, len(entries))
+	for i, e := range entries {
+		result[i] = e.key + "=" + e.val
+	}
+	return result
 }

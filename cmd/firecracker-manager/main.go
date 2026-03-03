@@ -17,24 +17,28 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel/metric"
+
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/ci"
 	cigithub "github.com/rahul-roy-glean/bazel-firecracker/pkg/ci/github"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/metrics"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
+	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
 )
 
 var (
@@ -79,17 +83,13 @@ var (
 	githubAppSecret       = flag.String("github-app-secret", "", "Secret Manager secret name containing GitHub App private key")
 	gcpProject            = flag.String("gcp-project", "", "GCP project for Secret Manager")
 
-	// Telemetry flags
-	telemetryEnabled = flag.Bool("telemetry-enabled", true, "Enable GCP Cloud Monitoring telemetry")
-	telemetryPrefix  = flag.String("telemetry-prefix", "custom.googleapis.com/firecracker", "Custom metric prefix for Cloud Monitoring")
-
 	// Chunked snapshot flags (BuildBuddy-style lazy loading)
 	useChunkedSnapshots = flag.Bool("use-chunked-snapshots", false, "Enable chunked snapshot restore with UFFD (lazy memory) and FUSE (lazy disk)")
 	chunkCacheSizeGB    = flag.Int("chunk-cache-size-gb", 2, "Size in GB of disk chunk LRU cache (FUSE)")
 	memCacheSizeGB      = flag.Int("mem-cache-size-gb", 2, "Size in GB of memory chunk LRU cache (UFFD)")
 	memBackend          = flag.String("mem-backend", "chunked", "Memory restore backend: 'chunked' (UFFD lazy loading, default) or 'file' (download full snapshot.mem at startup). Overrides the backend recorded in snapshot metadata.")
 	gcsPrefix           = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
-	enableSessionChunks = flag.Bool("enable-session-chunks", false, "Enable cloud-backed session pause/resume. Uses --snapshot-bucket for chunk storage. When enabled, PauseRunner uploads chunks to GCS and ResumeFromSession fetches lazily via UFFD+FUSE.")
+	enableSessionChunks = flag.Bool("enable-session-chunks", true, "Enable cloud-backed session pause/resume. Uses --snapshot-bucket for chunk storage. When enabled, PauseRunner uploads chunks to GCS and ResumeFromSession fetches lazily via UFFD+FUSE.")
 
 	// Network namespace mode (alternative to slot-based TAPs)
 	useNetNS = flag.Bool("use-netns", false, "Use network namespaces instead of slot-based TAP devices (simplifies snapshot restore)")
@@ -104,8 +104,10 @@ var (
 	poolMaxRunnerMemoryGB = flag.Int("pool-max-runner-memory-gb", 2, "Max memory per pooled runner in GB")
 	poolMaxRunnerDiskGB   = flag.Int("pool-max-runner-disk-gb", 16, "Max disk per pooled runner in GB")
 	poolRecycleTimeout    = flag.Int("pool-recycle-timeout-secs", 30, "Timeout for recycling operations in seconds")
-
 )
+
+// resumeGates prevents thundering-herd on concurrent auto-resume for the same runner.
+var resumeGates sync.Map // runnerID -> *singleflight.Group
 
 func main() {
 	flag.Parse()
@@ -223,24 +225,24 @@ func main() {
 
 	// Create runner manager config
 	cfg := runner.HostConfig{
-		HostID:                    hostID,
-		InstanceName:              instanceName,
-		Zone:                      zone,
-		MaxRunners:                *maxRunners,
-		IdleTarget:                *idleTarget,
-		FirecrackerBin:            *firecrackerBin,
-		SocketDir:                 *socketDir,
-		WorkspaceDir:              *workspaceDir,
-		LogDir:                    *logDir,
-		SnapshotBucket:            *snapshotBucket,
-		SnapshotCachePath:         *snapshotCache,
-		QuarantineDir:             *quarantineDir,
-		MicroVMSubnet:             *microVMSubnet,
-		ExternalInterface:         *extInterface,
-		BridgeName:                *bridgeName,
-		Environment:               *environment,
-		ControlPlaneAddr:          *controlPlane,
-		GCPProject:                gcpProjectVal,
+		HostID:            hostID,
+		InstanceName:      instanceName,
+		Zone:              zone,
+		MaxRunners:        *maxRunners,
+		IdleTarget:        *idleTarget,
+		FirecrackerBin:    *firecrackerBin,
+		SocketDir:         *socketDir,
+		WorkspaceDir:      *workspaceDir,
+		LogDir:            *logDir,
+		SnapshotBucket:    *snapshotBucket,
+		SnapshotCachePath: *snapshotCache,
+		QuarantineDir:     *quarantineDir,
+		MicroVMSubnet:     *microVMSubnet,
+		ExternalInterface: *extInterface,
+		BridgeName:        *bridgeName,
+		Environment:       *environment,
+		ControlPlaneAddr:  *controlPlane,
+		GCPProject:        gcpProjectVal,
 		// Runner pooling configuration
 		PoolEnabled:            *poolEnabled,
 		PoolMaxRunners:         *poolMaxRunners,
@@ -391,39 +393,74 @@ func main() {
 	// Reconcile orphaned resources from previous incarnation
 	go mgr.ReconcileOrphans(ctx)
 
-	// Initialize telemetry
-	telemetryCfg := telemetry.Config{
-		Enabled:      *telemetryEnabled,
-		ProjectID:    gcpProjectVal,
-		MetricPrefix: *telemetryPrefix,
-		Component:    "firecracker-manager",
-		Environment:  *environment,
-		InstanceID:   hostID,
-		InstanceName: instanceName,
-		Zone:         zone,
+	// Initialize OpenTelemetry
+	otelCfg := fcrotel.ConfigFromEnv("firecracker-manager")
+	otelClient, otelErr := fcrotel.Init(ctx, otelCfg)
+	if otelErr != nil {
+		log.WithError(otelErr).Warn("Failed to initialize OpenTelemetry, continuing without telemetry")
+		otelClient, _ = fcrotel.Init(ctx, fcrotel.Config{ServiceName: "firecracker-manager"})
 	}
-	// Override from metadata if set
-	if v := getMetadataAttribute("telemetry-enabled"); v != "" {
-		telemetryCfg.Enabled = strings.ToLower(v) == "true"
-	}
+	defer otelClient.Shutdown(ctx)
 
-	var metricsClient *telemetry.Client
-	if telemetryCfg.Enabled && telemetryCfg.ProjectID != "" {
-		var telErr error
-		metricsClient, telErr = telemetry.NewClient(ctx, telemetryCfg, logger)
-		if telErr != nil {
-			log.WithError(telErr).Warn("Failed to initialize telemetry, continuing without metrics")
-		} else {
-			defer metricsClient.Close()
-			log.Info("GCP Cloud Monitoring telemetry initialized")
-		}
-	}
+	logger.AddHook(&fcrotel.TraceCorrelationHook{})
 
-	// Register Prometheus metrics (legacy, for Prometheus scraping if still needed)
-	metrics.RegisterHostMetrics()
+	// Create OTel instruments
+	meter := otelClient.Meter("firecracker-manager")
+
+	// Host metrics
+	hostCPUTotalGauge, _ := fcrotel.NewGauge(meter, fcrotel.HostCPUTotal)
+	hostCPUUsedGauge, _ := fcrotel.NewGauge(meter, fcrotel.HostCPUUsed)
+	hostMemTotalGauge, _ := fcrotel.NewGauge(meter, fcrotel.HostMemTotal)
+	hostMemUsedGauge, _ := fcrotel.NewGauge(meter, fcrotel.HostMemUsed)
+	hostRunnersIdleGauge, _ := fcrotel.NewUpDownCounter(meter, fcrotel.HostRunnersIdle)
+	hostRunnersBusyGauge, _ := fcrotel.NewUpDownCounter(meter, fcrotel.HostRunnersBusy)
+
+	// VM metrics
+	vmAllocCounter, _ := fcrotel.NewCounter(meter, fcrotel.VMAllocations)
+	vmBootHist, _ := fcrotel.NewHistogram(meter, fcrotel.VMBootDuration)
+
+	// Chunked metrics (gauges for absolute values reported each iteration)
+	diskCacheSizeGauge, _ := fcrotel.NewGauge(meter, fcrotel.ChunkedDiskCacheSize)
+	diskCacheMaxGauge, _ := fcrotel.NewGauge(meter, fcrotel.ChunkedDiskCacheMax)
+	diskCacheItemsGauge, _ := fcrotel.NewGauge(meter, fcrotel.ChunkedDiskCacheItems)
+	memCacheSizeGauge, _ := fcrotel.NewGauge(meter, fcrotel.ChunkedMemCacheSize)
+	memCacheMaxGauge, _ := fcrotel.NewGauge(meter, fcrotel.ChunkedMemCacheMax)
+	memCacheItemsGauge, _ := fcrotel.NewGauge(meter, fcrotel.ChunkedMemCacheItems)
+	dirtyChunksGauge, _ := fcrotel.NewGauge(meter, fcrotel.ChunkedDirtyChunks)
+	cacheHitRatioGauge, _ := fcrotel.NewFloat64Gauge(meter, fcrotel.ChunkedCacheHitRatio)
+	// Cumulative counters reported as absolute values from GetChunkedStats - use gauges
+	pageFaultsGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedPageFaults))
+	cacheHitsGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedCacheHits))
+	chunkFetchesGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedChunkFetches))
+	diskReadsGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedDiskReads))
+	diskWritesGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedDiskWrites))
+
+	// Pool metrics (gauges for absolute values reported each iteration)
+	poolRunnersGauge, _ := fcrotel.NewGauge(meter, fcrotel.PoolRunners)
+	poolMemUsedGauge, _ := fcrotel.NewGauge(meter, fcrotel.PoolMemoryUsed)
+	poolMemMaxGauge, _ := fcrotel.NewGauge(meter, fcrotel.PoolMemoryMax)
+	poolHitRatioGauge, _ := fcrotel.NewFloat64Gauge(meter, fcrotel.PoolHitRatio)
+	// Cumulative counters reported as absolute values from GetPoolStats - use gauges
+	poolHitsGauge, _ := meter.Int64Gauge(string(fcrotel.PoolHits))
+	poolMissesGauge, _ := meter.Int64Gauge(string(fcrotel.PoolMisses))
+	poolEvictionsGauge, _ := meter.Int64Gauge(string(fcrotel.PoolEvictions))
+	poolRecycleFailsGauge, _ := meter.Int64Gauge(string(fcrotel.PoolRecycleFailures))
+
+	// Heartbeat
+	hbLatencyHist, _ := fcrotel.NewHistogram(meter, fcrotel.HostHeartbeatLatency)
+
+	// Session metrics for server.go
+	sessionPauseHist, _ := fcrotel.NewHistogram(meter, fcrotel.SessionPauseDuration)
+	sessionPauseCounter, _ := fcrotel.NewCounter(meter, fcrotel.SessionPauseTotal)
+	sessionResumeHist, _ := fcrotel.NewHistogram(meter, fcrotel.SessionResumeDuration)
+	sessionResumeCounter, _ := fcrotel.NewCounter(meter, fcrotel.SessionResumeTotal)
 
 	// Create gRPC server
 	grpcServer := grpc.NewServer(
+		grpc.StatsHandler(otelgrpc.NewServerHandler(
+			otelgrpc.WithTracerProvider(otelClient.TracerProvider),
+			otelgrpc.WithMeterProvider(otelClient.MeterProvider),
+		)),
 		grpc.UnaryInterceptor(loggingInterceptor(logger)),
 	)
 
@@ -435,9 +472,7 @@ func main() {
 		hostAgentServer = NewHostAgentServer(mgr, logger)
 	}
 	pb.RegisterHostAgentServer(grpcServer, hostAgentServer)
-	if metricsClient != nil {
-		hostAgentServer.SetMetricsClient(metricsClient)
-	}
+	hostAgentServer.SetOTelInstruments(sessionPauseHist, sessionPauseCounter, sessionResumeHist, sessionResumeCounter)
 
 	// Register health service
 	healthServer := health.NewServer()
@@ -464,9 +499,18 @@ func main() {
 	httpMux := http.NewServeMux()
 	httpMux.HandleFunc("/health", healthHandler(mgr))
 	httpMux.HandleFunc("/ready", readyHandler(mgr))
-	httpMux.Handle("/metrics", promhttp.Handler())
 	httpMux.HandleFunc("/api/v1/runners/quarantine", drainingGuard(mgr, quarantineRunnerHandler(mgr, logger)))
 	httpMux.HandleFunc("/api/v1/runners/unquarantine", drainingGuard(mgr, unquarantineRunnerHandler(mgr, logger)))
+	httpMux.HandleFunc("/api/v1/runners/network-policy", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			getNetworkPolicyHandler(mgr, logger)(w, r)
+		case http.MethodPost:
+			updateNetworkPolicyHandler(mgr, logger)(w, r)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
 	httpMux.HandleFunc("/snapshot/sync", snapshotSyncHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/gc", gcHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/pool/flush", poolFlushHandler(mgr, logger))
@@ -486,11 +530,41 @@ func main() {
 	}()
 
 	// Start autoscaler loop
-	go autoscaleLoop(ctx, mgr, chunkedMgr, *idleTarget, logger, metricsClient)
+	go autoscaleLoop(ctx, mgr, chunkedMgr, *idleTarget, logger, autoscaleInstruments{
+		vmAllocCounter:   vmAllocCounter,
+		vmBootHist:       vmBootHist,
+		hostCPUTotal:     hostCPUTotalGauge,
+		hostCPUUsed:      hostCPUUsedGauge,
+		hostMemTotal:     hostMemTotalGauge,
+		hostMemUsed:      hostMemUsedGauge,
+		hostRunnersIdle:  hostRunnersIdleGauge,
+		hostRunnersBusy:  hostRunnersBusyGauge,
+		diskCacheSize:    diskCacheSizeGauge,
+		diskCacheMax:     diskCacheMaxGauge,
+		diskCacheItems:   diskCacheItemsGauge,
+		memCacheSize:     memCacheSizeGauge,
+		memCacheMax:      memCacheMaxGauge,
+		memCacheItems:    memCacheItemsGauge,
+		pageFaults:       pageFaultsGauge,
+		cacheHits:        cacheHitsGauge,
+		chunkFetches:     chunkFetchesGauge,
+		diskReads:        diskReadsGauge,
+		diskWrites:       diskWritesGauge,
+		dirtyChunks:      dirtyChunksGauge,
+		cacheHitRatio:    cacheHitRatioGauge,
+		poolRunners:      poolRunnersGauge,
+		poolHits:         poolHitsGauge,
+		poolMisses:       poolMissesGauge,
+		poolEvictions:    poolEvictionsGauge,
+		poolRecycleFails: poolRecycleFailsGauge,
+		poolMemUsed:      poolMemUsedGauge,
+		poolMemMax:       poolMemMaxGauge,
+		poolHitRatio:     poolHitRatioGauge,
+	})
 
 	// Start heartbeat loop if control plane is configured
 	if *controlPlane != "" {
-		go heartbeatLoop(ctx, mgr, chunkedMgr, *controlPlane, instanceName, zone, *grpcPort, *httpPort, logger, metricsClient)
+		go heartbeatLoop(ctx, mgr, chunkedMgr, *controlPlane, instanceName, zone, *grpcPort, *httpPort, logger, hbLatencyHist)
 	}
 
 	// Wait for shutdown signal
@@ -607,10 +681,46 @@ func snapshotSyncHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handle
 	}
 }
 
-func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, idleTarget int, logger *logrus.Logger, metricsClient *telemetry.Client) {
+// autoscaleInstruments holds OTel instruments used by the autoscale loop.
+type autoscaleInstruments struct {
+	vmAllocCounter   metric.Int64Counter
+	vmBootHist       metric.Float64Histogram
+	hostCPUTotal     metric.Int64Gauge
+	hostCPUUsed      metric.Int64Gauge
+	hostMemTotal     metric.Int64Gauge
+	hostMemUsed      metric.Int64Gauge
+	hostRunnersIdle  metric.Int64UpDownCounter
+	hostRunnersBusy  metric.Int64UpDownCounter
+	diskCacheSize    metric.Int64Gauge
+	diskCacheMax     metric.Int64Gauge
+	diskCacheItems   metric.Int64Gauge
+	memCacheSize     metric.Int64Gauge
+	memCacheMax      metric.Int64Gauge
+	memCacheItems    metric.Int64Gauge
+	pageFaults       metric.Int64Gauge
+	cacheHits        metric.Int64Gauge
+	chunkFetches     metric.Int64Gauge
+	diskReads        metric.Int64Gauge
+	diskWrites       metric.Int64Gauge
+	dirtyChunks      metric.Int64Gauge
+	cacheHitRatio    metric.Float64Gauge
+	poolRunners      metric.Int64Gauge
+	poolHits         metric.Int64Gauge
+	poolMisses       metric.Int64Gauge
+	poolEvictions    metric.Int64Gauge
+	poolRecycleFails metric.Int64Gauge
+	poolMemUsed      metric.Int64Gauge
+	poolMemMax       metric.Int64Gauge
+	poolHitRatio     metric.Float64Gauge
+}
+
+func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, idleTarget int, logger *logrus.Logger, instruments autoscaleInstruments) {
 	log := logger.WithField("component", "autoscaler")
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
+
+	// Track previous values of UpDownCounters to compute deltas
+	var prevIdle, prevBusy int
 
 	for {
 		select {
@@ -632,81 +742,72 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				log.Warn("Disk usage exceeds 85%, skipping runner allocation")
 			} else if !mgr.IsDraining() && status.IdleRunners < idleTarget && mgr.CanAddRunner(0, 0) {
 				log.Debug("Adding runner to maintain idle pool")
-				allocTimer := telemetry.NewStopwatch()
+				allocStart := time.Now()
 				_, err := mgr.AllocateRunner(ctx, runner.AllocateRequest{})
 				if err != nil {
 					log.WithError(err).Warn("Failed to allocate idle runner")
-					if metricsClient != nil {
-						metricsClient.IncrementCounter(ctx, telemetry.MetricVMAllocations, telemetry.Labels{
-							telemetry.LabelResult: telemetry.ResultFailure,
-							telemetry.LabelReason: "idle_pool",
-						})
-					}
+					instruments.vmAllocCounter.Add(ctx, 1, metric.WithAttributes(
+						fcrotel.AttrResult.String(fcrotel.ResultFailure),
+						fcrotel.AttrReason.String("idle_pool"),
+					))
 				} else {
-					if metricsClient != nil {
-						metricsClient.RecordDuration(ctx, telemetry.MetricVMBootDuration, allocTimer.Elapsed(), telemetry.Labels{
-							telemetry.LabelReason: "idle_pool",
-						})
-						metricsClient.IncrementCounter(ctx, telemetry.MetricVMAllocations, telemetry.Labels{
-							telemetry.LabelResult: telemetry.ResultSuccess,
-							telemetry.LabelReason: "idle_pool",
-						})
-					}
+					instruments.vmBootHist.Record(ctx, time.Since(allocStart).Seconds(), metric.WithAttributes(
+						fcrotel.AttrReason.String("idle_pool"),
+					))
+					instruments.vmAllocCounter.Add(ctx, 1, metric.WithAttributes(
+						fcrotel.AttrResult.String(fcrotel.ResultSuccess),
+						fcrotel.AttrReason.String("idle_pool"),
+					))
 				}
 			}
 
-			// Update Prometheus metrics
-			metrics.UpdateHostMetrics(
-				status.TotalCPUMillicores,
-				status.UsedCPUMillicores,
-				status.TotalMemoryMB,
-				status.UsedMemoryMB,
-				status.IdleRunners,
-				status.BusyRunners,
-			)
+			// Record host metrics
+			instruments.hostCPUTotal.Record(ctx, int64(status.TotalCPUMillicores))
+			instruments.hostCPUUsed.Record(ctx, int64(status.UsedCPUMillicores))
+			instruments.hostMemTotal.Record(ctx, int64(status.TotalMemoryMB))
+			instruments.hostMemUsed.Record(ctx, int64(status.UsedMemoryMB))
 
-			// Record GCP Cloud Monitoring metrics
-			if metricsClient != nil {
-				metricsClient.RecordHostMetrics(ctx, telemetry.HostMetrics{
-					TotalCPUMillicores: status.TotalCPUMillicores,
-					UsedCPUMillicores:  status.UsedCPUMillicores,
-					TotalMemoryMB:      status.TotalMemoryMB,
-					UsedMemoryMB:       status.UsedMemoryMB,
-					IdleRunners:        status.IdleRunners,
-					BusyRunners:        status.BusyRunners,
-				})
+			// UpDownCounters need delta from previous value
+			idleDelta := int64(status.IdleRunners - prevIdle)
+			busyDelta := int64(status.BusyRunners - prevBusy)
+			instruments.hostRunnersIdle.Add(ctx, idleDelta)
+			instruments.hostRunnersBusy.Add(ctx, busyDelta)
+			prevIdle = status.IdleRunners
+			prevBusy = status.BusyRunners
 
-				// Record chunked snapshot metrics
-				if chunkedMgr != nil {
-					cs := chunkedMgr.GetChunkedStats()
-					metricsClient.RecordChunkedMetrics(ctx, telemetry.ChunkedMetrics{
-						DiskCacheSize:    cs.DiskCacheSize,
-						DiskCacheMaxSize: cs.DiskCacheMaxSize,
-						DiskCacheItems:   cs.DiskCacheItems,
-						MemCacheSize:     cs.MemCacheSize,
-						MemCacheMaxSize:  cs.MemCacheMaxSize,
-						MemCacheItems:    cs.MemCacheItems,
-						PageFaults:       cs.TotalPageFaults,
-						CacheHits:        cs.TotalCacheHits,
-						ChunkFetches:     cs.TotalChunkFetches,
-						DiskReads:        cs.TotalDiskReads,
-						DiskWrites:       cs.TotalDiskWrites,
-						DirtyChunks:      cs.TotalDirtyChunks,
-					})
+			// Record chunked snapshot metrics
+			if chunkedMgr != nil {
+				cs := chunkedMgr.GetChunkedStats()
+				instruments.diskCacheSize.Record(ctx, cs.DiskCacheSize)
+				instruments.diskCacheMax.Record(ctx, cs.DiskCacheMaxSize)
+				instruments.diskCacheItems.Record(ctx, int64(cs.DiskCacheItems))
+				instruments.memCacheSize.Record(ctx, cs.MemCacheSize)
+				instruments.memCacheMax.Record(ctx, cs.MemCacheMaxSize)
+				instruments.memCacheItems.Record(ctx, int64(cs.MemCacheItems))
+				instruments.pageFaults.Record(ctx, int64(cs.TotalPageFaults))
+				instruments.cacheHits.Record(ctx, int64(cs.TotalCacheHits))
+				instruments.chunkFetches.Record(ctx, int64(cs.TotalChunkFetches))
+				instruments.diskReads.Record(ctx, int64(cs.TotalDiskReads))
+				instruments.diskWrites.Record(ctx, int64(cs.TotalDiskWrites))
+				instruments.dirtyChunks.Record(ctx, int64(cs.TotalDirtyChunks))
+				if cs.TotalPageFaults > 0 {
+					instruments.cacheHitRatio.Record(ctx, float64(cs.TotalCacheHits)/float64(cs.TotalPageFaults))
 				}
+			}
 
-				// Record runner pool metrics
-				if pool := mgr.GetPool(); pool != nil {
-					ps := pool.Stats()
-					metricsClient.RecordPoolMetrics(ctx, telemetry.PoolMetrics{
-						PooledRunners:   ps.PooledRunners,
-						PoolHits:        ps.PoolHits,
-						PoolMisses:      ps.PoolMisses,
-						Evictions:       ps.Evictions,
-						RecycleFailures: ps.RecycleFailures,
-						MemoryUsedBytes: ps.MemoryUsageBytes,
-						MemoryMaxBytes:  ps.MaxMemoryBytes,
-					})
+			// Record runner pool metrics
+			if pool := mgr.GetPool(); pool != nil {
+				ps := pool.Stats()
+				instruments.poolRunners.Record(ctx, int64(ps.PooledRunners))
+				instruments.poolHits.Record(ctx, ps.PoolHits)
+				instruments.poolMisses.Record(ctx, ps.PoolMisses)
+				instruments.poolEvictions.Record(ctx, ps.Evictions)
+				instruments.poolRecycleFails.Record(ctx, ps.RecycleFailures)
+				instruments.poolMemUsed.Record(ctx, ps.MemoryUsageBytes)
+				instruments.poolMemMax.Record(ctx, ps.MaxMemoryBytes)
+				totalPoolLookups := ps.PoolHits + ps.PoolMisses
+				if totalPoolLookups > 0 {
+					instruments.poolHitRatio.Record(ctx, float64(ps.PoolHits)/float64(totalPoolLookups))
 				}
 			}
 		}
@@ -741,7 +842,7 @@ type hostHeartbeatResponse struct {
 	Error              string            `json:"error,omitempty"`
 }
 
-func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, controlPlane, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger, metricsClient *telemetry.Client) {
+func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, controlPlane, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger, hbLatencyHist metric.Float64Histogram) {
 	log := logger.WithField("component", "heartbeat")
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -765,7 +866,7 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			hbTimer := telemetry.NewStopwatch()
+			hbStart := time.Now()
 			status := mgr.GetStatus()
 			reqBody := hostHeartbeatRequest{
 				InstanceName:       instanceName,
@@ -803,9 +904,7 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			resp.Body.Close()
 
 			// Record heartbeat latency
-			if metricsClient != nil {
-				metricsClient.RecordDuration(ctx, telemetry.MetricHostHeartbeatLatency, hbTimer.Elapsed(), nil)
-			}
+			hbLatencyHist.Record(ctx, time.Since(hbStart).Seconds())
 
 			if resp.StatusCode >= 400 {
 				log.WithFields(logrus.Fields{
@@ -1257,6 +1356,13 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 			return
 		}
 
+		// Handle /api/v1/runners/{id}/pty (interactive terminal via WebSocket)
+		if ptyParts := strings.SplitN(suffix, "/pty", 2); len(ptyParts) == 2 && (ptyParts[1] == "" || ptyParts[1][0] == '?') {
+			runnerID := strings.TrimSuffix(ptyParts[0], "/")
+			handlePTYProxy(w, r, mgr, log, runnerID)
+			return
+		}
+
 		// Handle /api/v1/runners/{id}/service-logs (proxy to thaw-agent's service-logs)
 		if slParts := strings.SplitN(suffix, "/service-logs", 2); len(slParts) == 2 {
 			runnerID := strings.TrimSuffix(slParts[0], "/")
@@ -1272,11 +1378,27 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 			return
 		}
 
+		// Handle /api/v1/runners/{id}/checkpoint (non-destructive checkpoint, VM keeps running)
+		if cpParts := strings.SplitN(suffix, "/checkpoint", 2); len(cpParts) == 2 && cpParts[1] == "" {
+			runnerID := cpParts[0]
+			runnerID = strings.TrimSuffix(runnerID, "/")
+			handleCheckpointRunner(w, r, mgr, log, runnerID)
+			return
+		}
+
 		// Handle /api/v1/runners/{id}/connect (extend TTL or resume)
 		if connectParts := strings.SplitN(suffix, "/connect", 2); len(connectParts) == 2 && connectParts[1] == "" {
 			runnerID := connectParts[0]
 			runnerID = strings.TrimSuffix(runnerID, "/")
 			handleConnectRunner(w, r, mgr, log, runnerID)
+			return
+		}
+
+		// Handle /api/v1/runners/{id}/files/{op} (file operations in VM)
+		if filesParts := strings.SplitN(suffix, "/files/", 2); len(filesParts) == 2 {
+			runnerID := strings.TrimSuffix(filesParts[0], "/")
+			fileOp := filesParts[1]
+			handleFileOp(w, r, mgr, log, runnerID, fileOp)
 			return
 		}
 
@@ -1295,6 +1417,17 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Runner not found: %s", runnerID), http.StatusNotFound)
 			return
+		}
+
+		// Auto-resume suspended runners on proxy traffic
+		if rn.State == runner.StateSuspended {
+			resumed, resumeErr := autoResumeIfSuspended(r.Context(), mgr, log, runnerID, rn)
+			if resumeErr != nil {
+				log.WithError(resumeErr).WithField("runner_id", runnerID).Warn("Auto-resume failed for proxy")
+				http.Error(w, "auto-resume failed: "+resumeErr.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			rn = resumed
 		}
 
 		if rn.InternalIP == nil {
@@ -1363,6 +1496,17 @@ func handleExecCommand(w http.ResponseWriter, r *http.Request, mgr *runner.Manag
 		return
 	}
 
+	// Auto-resume if suspended
+	if rn.State == runner.StateSuspended {
+		resumed, err := autoResumeIfSuspended(r.Context(), mgr, log, runnerID, rn)
+		if err != nil {
+			log.WithError(err).WithField("runner_id", runnerID).Warn("Auto-resume failed for exec")
+			http.Error(w, "auto-resume failed: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		rn = resumed
+	}
+
 	// Build target URL to thaw-agent's /exec on debug port
 	targetURL := fmt.Sprintf("http://%s:%d/exec", rn.InternalIP.String(), snapshot.ThawAgentDebugPort)
 
@@ -1413,6 +1557,277 @@ func handleExecCommand(w http.ResponseWriter, r *http.Request, mgr *runner.Manag
 		w.Write([]byte("\n"))
 		flusher.Flush()
 	}
+}
+
+// handlePTYProxy upgrades the client connection to WebSocket, dials the
+// thaw-agent's /pty endpoint inside the VM, and pumps frames bidirectionally.
+func handlePTYProxy(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string) {
+	// Look up runner
+	rn, err := mgr.GetRunner(runnerID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("runner not found: %s", runnerID), http.StatusNotFound)
+		return
+	}
+	if rn.InternalIP == nil {
+		http.Error(w, "runner has no internal IP", http.StatusServiceUnavailable)
+		return
+	}
+	if rn.State == runner.StateQuarantined || rn.State == runner.StateTerminated {
+		http.Error(w, fmt.Sprintf("runner is %s", rn.State), http.StatusConflict)
+		return
+	}
+
+	// Auto-resume if suspended
+	if rn.State == runner.StateSuspended {
+		resumed, err := autoResumeIfSuspended(r.Context(), mgr, log, runnerID, rn)
+		if err != nil {
+			log.WithError(err).WithField("runner_id", runnerID).Warn("Auto-resume failed for pty")
+			http.Error(w, "auto-resume failed: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		rn = resumed
+	}
+
+	// Track active execs for TTL enforcement
+	mgr.IncrementActiveExecs(runnerID)
+	defer mgr.DecrementActiveExecs(runnerID)
+
+	// Build backend WebSocket URL (thaw-agent debug port)
+	backendURL := fmt.Sprintf("ws://%s:%d/pty?%s", rn.InternalIP.String(), snapshot.ThawAgentDebugPort, r.URL.RawQuery)
+	log.WithFields(logrus.Fields{
+		"runner_id":   runnerID,
+		"backend_url": backendURL,
+	}).Debug("Proxying PTY WebSocket to thaw-agent")
+
+	// Upgrade client-side to WebSocket
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+	clientConn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.WithError(err).Warn("Client WebSocket upgrade failed")
+		return
+	}
+	defer clientConn.Close()
+
+	// Dial backend WebSocket to thaw-agent
+	dialer := websocket.Dialer{}
+	backendConn, _, err := dialer.Dial(backendURL, nil)
+	if err != nil {
+		log.WithError(err).Warn("Backend WebSocket dial failed")
+		clientConn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "backend connect failed"))
+		return
+	}
+	defer backendConn.Close()
+
+	// Bidirectional frame pump
+	done := make(chan struct{}, 2)
+
+	// Client -> Backend
+	go func() {
+		defer func() { done <- struct{}{} }()
+		for {
+			msgType, msg, err := clientConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if err := backendConn.WriteMessage(msgType, msg); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Backend -> Client
+	go func() {
+		defer func() { done <- struct{}{} }()
+		for {
+			msgType, msg, err := backendConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if err := clientConn.WriteMessage(msgType, msg); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Wait for either side to disconnect
+	<-done
+}
+
+// handleFileOp proxies a /files/{op} request to a runner's thaw-agent.
+// For download/upload ops, it uses streaming (raw bytes, no timeout).
+// For metadata ops (read/write/list/stat/remove/mkdir), it uses JSON with a 30s timeout.
+func handleFileOp(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID, fileOp string) {
+	// download is GET, everything else is POST
+	isDownload := fileOp == "download"
+	isUpload := fileOp == "upload"
+	isStreaming := isDownload || isUpload
+
+	if isDownload {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+	} else if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	rn, err := mgr.GetRunner(runnerID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("runner not found: %s", runnerID), http.StatusNotFound)
+		return
+	}
+	if rn.InternalIP == nil {
+		http.Error(w, "runner has no internal IP", http.StatusServiceUnavailable)
+		return
+	}
+	if rn.State == runner.StateQuarantined || rn.State == runner.StateTerminated {
+		http.Error(w, fmt.Sprintf("runner is %s", rn.State), http.StatusConflict)
+		return
+	}
+
+	// Auto-resume if suspended
+	if rn.State == runner.StateSuspended {
+		resumed, err := autoResumeIfSuspended(r.Context(), mgr, log, runnerID, rn)
+		if err != nil {
+			log.WithError(err).WithField("runner_id", runnerID).Warn("Auto-resume failed for file op")
+			http.Error(w, "auto-resume failed: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		rn = resumed
+	}
+
+	targetURL := fmt.Sprintf("http://%s:%d/files/%s", rn.InternalIP.String(), snapshot.ThawAgentDebugPort, fileOp)
+	// Forward query string for download/upload (path, mode, perm params).
+	if r.URL.RawQuery != "" {
+		targetURL += "?" + r.URL.RawQuery
+	}
+
+	log.WithFields(logrus.Fields{
+		"runner_id": runnerID,
+		"file_op":   fileOp,
+		"target":    targetURL,
+	}).Debug("Proxying file op request to thaw-agent")
+
+	mgr.IncrementActiveExecs(runnerID)
+	defer mgr.DecrementActiveExecs(runnerID)
+
+	method := r.Method
+	var body io.Reader
+	if !isDownload {
+		body = r.Body
+	}
+
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), method, targetURL, body)
+	if err != nil {
+		http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
+		return
+	}
+
+	if isUpload {
+		// Forward the original content type for uploads (may be application/octet-stream).
+		if ct := r.Header.Get("Content-Type"); ct != "" {
+			upstreamReq.Header.Set("Content-Type", ct)
+		}
+	} else if !isDownload {
+		upstreamReq.Header.Set("Content-Type", "application/json")
+	}
+
+	// Streaming ops get no timeout (large files). Metadata ops keep 30s.
+	timeout := 30 * time.Second
+	if isStreaming {
+		timeout = 0
+	}
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(upstreamReq)
+	if err != nil {
+		log.WithError(err).WithField("runner_id", runnerID).Warn("Failed to reach thaw-agent for file op")
+		http.Error(w, "bad gateway: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy all response headers for streaming ops (Content-Type, Content-Length,
+	// Content-Range, Last-Modified, etc. from http.ServeFile).
+	if isStreaming {
+		for key, vals := range resp.Header {
+			for _, v := range vals {
+				w.Header().Add(key, v)
+			}
+		}
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+// autoResumeIfSuspended checks if a runner is suspended and auto-resumes it.
+// Returns the updated runner or an error. If the runner is not suspended, it
+// returns the original runner unchanged.
+func autoResumeIfSuspended(ctx context.Context, mgr *runner.Manager, log *logrus.Entry, runnerID string, rn *runner.Runner) (*runner.Runner, error) {
+	if rn.State != runner.StateSuspended || rn.SessionID == "" {
+		return rn, nil
+	}
+
+	log.WithFields(logrus.Fields{
+		"runner_id":  runnerID,
+		"session_id": rn.SessionID,
+	}).Info("Auto-resuming suspended runner")
+
+	// Use singleflight to prevent thundering-herd on concurrent requests
+	val, _ := resumeGates.LoadOrStore(runnerID, &singleflight.Group{})
+	group := val.(*singleflight.Group)
+
+	result, err, _ := group.Do(runnerID, func() (interface{}, error) {
+		resumed, err := mgr.ResumeFromSession(ctx, rn.SessionID, rn.WorkloadKey)
+		if err != nil {
+			return nil, fmt.Errorf("auto-resume failed: %w", err)
+		}
+
+		// Wait for thaw-agent exec readiness — /alive responds before /exec
+		// is fully functional after snapshot restore, so probe with a real exec.
+		if err := waitForThawAgentExec(resumed.InternalIP, 30*time.Second); err != nil {
+			return nil, fmt.Errorf("thaw-agent not ready after resume: %w", err)
+		}
+
+		return resumed, nil
+	})
+
+	// Clean up the gate after resume completes
+	resumeGates.Delete(runnerID)
+
+	if err != nil {
+		return nil, err
+	}
+	return result.(*runner.Runner), nil
+}
+
+// waitForThawAgentExec polls the thaw-agent by sending a trivial exec command
+// until it responds successfully. This is more reliable than checking /alive
+// after snapshot restore, because /alive can respond before the exec handler
+// is fully functional.
+func waitForThawAgentExec(ip net.IP, timeout time.Duration) error {
+	execURL := fmt.Sprintf("http://%s:%d/exec", ip.String(), snapshot.ThawAgentDebugPort)
+	client := &http.Client{Timeout: 5 * time.Second}
+	deadline := time.Now().Add(timeout)
+	body := []byte(`{"command":["echo","ready"],"timeout_seconds":3}`)
+
+	for time.Now().Before(deadline) {
+		resp, err := client.Post(execURL, "application/json", bytes.NewReader(body))
+		if err == nil {
+			respBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK && strings.Contains(string(respBody), "ready") {
+				return nil
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("thaw-agent at %s not ready after %s", ip.String(), timeout)
 }
 
 // handleServiceLogs proxies GET /runners/{id}/service-logs to the thaw-agent's
@@ -1560,6 +1975,32 @@ func handlePauseRunner(w http.ResponseWriter, r *http.Request, mgr *runner.Manag
 		"session_id":          result.SessionID,
 		"layer":               result.Layer,
 		"snapshot_size_bytes": result.SnapshotSizeBytes,
+	})
+}
+
+// handleCheckpointRunner handles POST /api/v1/runners/{id}/checkpoint
+// Creates a non-destructive snapshot without stopping the VM.
+func handleCheckpointRunner(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	result, err := mgr.CheckpointRunner(r.Context(), runnerID)
+	if err != nil {
+		log.WithError(err).WithField("runner_id", runnerID).Error("Failed to checkpoint runner")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"session_id":          result.SessionID,
+		"layer":               result.Layer,
+		"snapshot_size_bytes": result.SnapshotSizeBytes,
+		"running":             result.Running,
 	})
 }
 

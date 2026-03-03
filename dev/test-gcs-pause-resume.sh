@@ -99,6 +99,83 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+header "3b. TTL auto-pause behavioral test"
+# ---------------------------------------------------------------------------
+# Regression test for the TTL propagation bug: the scheduler used to store
+# runner_ttl_seconds and auto_pause in the DB but never forward them during
+# allocation. Now we test behaviorally: allocate a runner with a short TTL,
+# wait for it to expire, and verify the runner was auto-paused.
+#
+# We allocate a SEPARATE short-lived runner for this test so we don't
+# disturb the main test runner.
+TTL_SESSION="ttl-test-$(date +%s)"
+
+# Register a snapshot config with a 3-second TTL
+TTL_CONFIG_RESP=$(curl -s -X POST "$CP/api/v1/snapshot-configs" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "display_name": "ttl-auto-pause-test",
+    "commands": '"$SNAPSHOT_COMMANDS"',
+    "runner_ttl_seconds": 3,
+    "auto_pause": true,
+    "session_max_age_seconds": 3600
+  }')
+TTL_WORKLOAD_KEY=$(echo "$TTL_CONFIG_RESP" | jq -r '.workload_key')
+echo "  TTL test workload_key=$TTL_WORKLOAD_KEY"
+
+TTL_ALLOC_RESP=$(curl -s -X POST "$CP/api/v1/runners/allocate" \
+  -H 'Content-Type: application/json' \
+  -d "{\"ci_system\":\"none\", \"workload_key\":\"$TTL_WORKLOAD_KEY\", \"session_id\":\"$TTL_SESSION\"}")
+TTL_RUNNER_ID=$(echo "$TTL_ALLOC_RESP" | jq -r '.runner_id')
+echo "  TTL runner: $TTL_RUNNER_ID"
+
+if [ -z "$TTL_RUNNER_ID" ] || [ "$TTL_RUNNER_ID" = "null" ]; then
+  fail "TTL test: failed to allocate runner"
+else
+  # Wait for it to become ready
+  echo -n "  Waiting for ready..."
+  for i in $(seq 1 60); do
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+      "$CP/api/v1/runners/status?runner_id=$TTL_RUNNER_ID")
+    if [ "$HTTP_CODE" = "200" ]; then
+      echo " ready (${i}s)"
+      break
+    fi
+    echo -n "."
+    sleep 1
+  done
+
+  # Now wait for TTL to expire. The autoscale loop ticks every 2s, and the
+  # control plane learns the state via heartbeats (every 5s by default).
+  # With TTL=3s: idle for 3s + up to 2s autoscale tick + up to 5s heartbeat = ~10s max.
+  # We wait 15s to be safe.
+  echo "  Waiting 15s for TTL (3s) + autoscale tick + heartbeat propagation..."
+  sleep 15
+
+  # Check runner state on the control plane — should be paused or gone.
+  TTL_STATUS_RESP=$(curl -s "$CP/api/v1/runners/status?runner_id=$TTL_RUNNER_ID")
+  TTL_STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    "$CP/api/v1/runners/status?runner_id=$TTL_RUNNER_ID")
+  TTL_STATE=$(echo "$TTL_STATUS_RESP" | jq -r '.state // "unknown"')
+  echo "  TTL runner state: $TTL_STATE (HTTP $TTL_STATUS_CODE)"
+
+  # Also check the manager's view of the runner
+  MGR_RUNNERS=$(curl -s "$MGR/api/v1/runners" 2>/dev/null || echo '[]')
+  TTL_MGR_STATE=$(echo "$MGR_RUNNERS" | jq -r ".[] | select(.id == \"$TTL_RUNNER_ID\") | .state" 2>/dev/null || echo "not_found")
+  echo "  Manager view: $TTL_MGR_STATE"
+
+  if [ "$TTL_STATE" = "paused" ] || [ "$TTL_STATE" = "suspended" ] || \
+     [ "$TTL_MGR_STATE" = "paused" ] || [ "$TTL_MGR_STATE" = "suspended" ] || \
+     [ "$TTL_STATUS_CODE" = "404" ]; then
+    pass "TTL auto-pause: runner was paused/removed after 3s TTL"
+  else
+    fail "TTL auto-pause: runner still $TTL_STATE after 15s (expected paused)"
+    echo "  Manager log (TTL entries):"
+    grep -i "ttl\|auto.pause" /tmp/fc-dev/logs/firecracker-manager.log 2>/dev/null | tail -5 || echo "  (none)"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 header "4. Create state inside VM (memory + disk + process)"
 # ---------------------------------------------------------------------------
 
@@ -387,11 +464,130 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-header "10. Cleanup: release runner"
+header "10. Multi-pause GCS chain: write more data → pause → verify GCS chaining"
+# ---------------------------------------------------------------------------
+# This tests the disk index carry-forward fix: pause 2 must carry forward
+# disk index objects from pause 1 for drives that weren't dirty this time.
+echo "  --- Writing new data before second pause ---"
+OUT=$(vm_exec_resumed "echo gcs-chain-test-data > /tmp/gcs-chain.txt && cat /tmp/gcs-chain.txt")
+if echo "$OUT" | grep -q 'gcs-chain-test-data'; then
+  pass "New data written before second pause"
+else
+  fail "Failed to write data before second pause"
+fi
+
+PAUSE2_RESP=$(curl -s -X POST "$CP/api/v1/runners/pause" \
+  -H 'Content-Type: application/json' \
+  -d "{\"runner_id\":\"$RESUME_RUNNER_ID\"}")
+echo "  Response: $PAUSE2_RESP"
+
+PAUSE2_SESSION=$(echo "$PAUSE2_RESP" | jq -r '.session_id // empty')
+PAUSE2_LAYER=$(echo "$PAUSE2_RESP" | jq -r '.layer // empty')
+echo "  Layer: $PAUSE2_LAYER"
+
+if [ "$PAUSE2_LAYER" = "1" ]; then
+  pass "Second GCS pause is layer 1"
+else
+  fail "Expected layer 1, got $PAUSE2_LAYER"
+fi
+
+# Verify GCS disk index carry-forward in metadata
+if [ -f "$SESSION_DIR/metadata.json" ]; then
+  META2_GCS_DISK=$(jq -c '.gcs_disk_index_objects // {}' "$SESSION_DIR/metadata.json")
+  META2_GCS_MEM=$(jq -r '.gcs_mem_index_object // "none"' "$SESSION_DIR/metadata.json")
+  echo "  GCS disk indexes after pause 2: $META2_GCS_DISK"
+  echo "  GCS mem index after pause 2: $META2_GCS_MEM"
+  pass "GCS session metadata updated for layer 1"
+fi
+
+# Delete local layers again (simulate cross-host)
+rm -rf "$SESSION_DIR/layer_"*
+if [ ! -d "$SESSION_DIR/layer_0" ] && [ ! -d "$SESSION_DIR/layer_1" ]; then
+  pass "Local layer files deleted for cross-host resume"
+else
+  fail "Failed to delete local layer files"
+fi
+
+# Resume from layer 1
+RESUME2_RESP=$(curl -s -X POST "$CP/api/v1/runners/allocate" \
+  -H 'Content-Type: application/json' \
+  -d "{\"ci_system\":\"none\", \"workload_key\":\"$WORKLOAD_KEY\", \"session_id\":\"$SESSION_ID\"}")
+RESUME2_RUNNER_ID=$(echo "$RESUME2_RESP" | jq -r '.runner_id')
+RESUME2_RESUMED=$(echo "$RESUME2_RESP" | jq -r '.resumed // false')
+echo "  Runner ID: $RESUME2_RUNNER_ID"
+echo "  Resumed: $RESUME2_RESUMED"
+
+if [ "$RESUME2_RESUMED" = "true" ]; then
+  pass "Resumed from GCS layer 1"
+else
+  fail "Expected resumed=true for GCS layer 1 resume"
+fi
+
+# Wait for ready
+echo -n "  Waiting..."
+for i in $(seq 1 60); do
+  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    "$CP/api/v1/runners/status?runner_id=$RESUME2_RUNNER_ID")
+  if [ "$HTTP_CODE" = "200" ]; then
+    echo " ready (${i}s)"
+    break
+  fi
+  echo -n "."
+  sleep 1
+done
+
+# Wait for exec
+echo -n "  Waiting for exec..."
+for i in $(seq 1 30); do
+  PRECHECK2=$(curl -s --no-buffer --max-time 5 -X POST "$MGR/api/v1/runners/$RESUME2_RUNNER_ID/exec" \
+    -H 'Content-Type: application/json' \
+    -d '{"command":["echo","alive2"],"timeout_seconds":3}' 2>&1 || echo "TIMEOUT")
+  if echo "$PRECHECK2" | grep -q 'alive2'; then
+    echo " responsive (${i}s)"
+    break
+  fi
+  echo -n "."
+  sleep 1
+done
+
+# Verify ALL data survived 2 GCS pause/resume cycles
+vm_exec_chain() {
+  local cmd="$1"
+  curl -s --no-buffer --max-time 30 -X POST "$MGR/api/v1/runners/$RESUME2_RUNNER_ID/exec" \
+    -H 'Content-Type: application/json' \
+    -d "{\"command\":[\"sh\",\"-c\",\"$cmd\"],\"timeout_seconds\":20}" 2>&1 || echo "EXEC_TIMEOUT"
+}
+
+echo "  --- Verify layer 0 data (original tmpfs marker) ---"
+OUT=$(vm_exec_chain "cat /tmp/gcs-test.txt")
+if echo "$OUT" | grep -q 'gcs-mem-marker-12345'; then
+  pass "Original tmpfs marker preserved through 2 GCS cycles"
+else
+  fail "Original tmpfs marker LOST after 2 GCS cycles"
+fi
+
+echo "  --- Verify layer 0 data (rootfs marker) ---"
+OUT=$(vm_exec_chain "cat /var/tmp/gcs-disk-test.txt")
+if echo "$OUT" | grep -q 'gcs-disk-marker-67890'; then
+  pass "Original rootfs marker preserved through 2 GCS cycles"
+else
+  fail "Original rootfs marker LOST after 2 GCS cycles"
+fi
+
+echo "  --- Verify layer 1 data (chain test) ---"
+OUT=$(vm_exec_chain "cat /tmp/gcs-chain.txt")
+if echo "$OUT" | grep -q 'gcs-chain-test-data'; then
+  pass "Layer 1 data preserved through GCS resume"
+else
+  fail "Layer 1 data LOST after GCS resume"
+fi
+
+# ---------------------------------------------------------------------------
+header "11. Cleanup: release runner"
 # ---------------------------------------------------------------------------
 RELEASE_RESP=$(curl -s -X POST "$CP/api/v1/runners/release" \
   -H 'Content-Type: application/json' \
-  -d "{\"runner_id\":\"$RESUME_RUNNER_ID\"}")
+  -d "{\"runner_id\":\"$RESUME2_RUNNER_ID\"}")
 
 if echo "$RELEASE_RESP" | jq -e '.success' > /dev/null 2>&1; then
   pass "Runner released"

@@ -123,10 +123,12 @@ func (u *IncrementalUploader) UploadIncrementalSnapshot(
 		}).Debug("Uploaded dirty memory chunk")
 	}
 
-	// Copy repo cache seed chunks (unchanged)
-	if len(baseMeta.RepoCacheSeedChunks) > 0 {
-		newMeta.RepoCacheSeedChunks = make([]ChunkRef, len(baseMeta.RepoCacheSeedChunks))
-		copy(newMeta.RepoCacheSeedChunks, baseMeta.RepoCacheSeedChunks)
+	// Copy extension drives (unchanged)
+	if len(baseMeta.ExtensionDrives) > 0 {
+		newMeta.ExtensionDrives = make(map[string]ExtensionDrive, len(baseMeta.ExtensionDrives))
+		for driveID, ext := range baseMeta.ExtensionDrives {
+			newMeta.ExtensionDrives[driveID] = ext
+		}
 	}
 
 	duration := time.Since(start)
@@ -344,9 +346,11 @@ func collectReferencedHashes(meta *ChunkedSnapshotMetadata, hashes map[string]bo
 			hashes[chunk.Hash] = true
 		}
 	}
-	for _, chunk := range meta.RepoCacheSeedChunks {
-		if chunk.Hash != "" && chunk.Hash != ZeroChunkHash {
-			hashes[chunk.Hash] = true
+	for _, ext := range meta.ExtensionDrives {
+		for _, chunk := range ext.Chunks {
+			if chunk.Hash != "" && chunk.Hash != ZeroChunkHash {
+				hashes[chunk.Hash] = true
+			}
 		}
 	}
 }

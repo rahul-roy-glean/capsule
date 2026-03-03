@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -76,15 +77,26 @@ type Manager struct {
 	// for session pause uploads. Only populated when sessionMemStore is non-nil.
 	goldenChunkedMeta *snapshot.ChunkedSnapshotMetadata
 
-	// getDirtyDiskChunks is a callback set by ChunkedManager that returns
-	// the dirty FUSE disk chunks for a runner. Nil when FUSE disks are not in use.
-	getDirtyDiskChunks func(runnerID string) map[int][]byte
+	// getDirtyExtensionDiskChunks returns all dirty FUSE extension disk chunks for a runner.
+	// Returns a map of driveID → dirty chunks. Nil when FUSE disks are not in use.
+	getDirtyExtensionDiskChunks func(runnerID string) map[string]map[int][]byte
 
-	// setupFUSEDisk is a callback set by ChunkedManager that creates and mounts
-	// a FUSE-backed disk from chunk refs. Returns the disk image path.
-	// Used by ResumeFromSession for GCS-backed cross-host resume where the
-	// local rootfs overlay doesn't exist.
-	setupFUSEDisk func(runnerID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (diskImagePath string, err error)
+	// setupExtensionFUSEDisk is a callback set by ChunkedManager that creates
+	// and mounts a FUSE-backed disk for a specific extension drive.
+	// Returns the disk image path. Used by ResumeFromSession.
+	setupExtensionFUSEDisk func(runnerID, driveID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (diskImagePath string, err error)
+
+	// getDirtyRootfsDiskChunks returns dirty FUSE rootfs disk chunks for a runner.
+	// Nil when FUSE rootfs disks are not in use (non-chunked mode).
+	getDirtyRootfsDiskChunks func(runnerID string) map[int][]byte
+
+	// setupRootfsFUSEDisk creates and mounts a FUSE-backed rootfs disk from
+	// ChunkRefs during GCS-backed session resume. Returns the disk image path.
+	setupRootfsFUSEDisk func(runnerID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (diskImagePath string, err error)
+
+	// policyEnforcers tracks per-VM PolicyEnforcers for network policy enforcement.
+	// Key is runner ID. nil map when no policies are in use.
+	policyEnforcers map[string]*network.PolicyEnforcer
 }
 
 type QuarantineOptions struct {
@@ -167,6 +179,7 @@ func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logge
 		ciAdapter:        ciAdapter,
 		slotToRunner:     make(map[int]string),
 		runnerToSlot:     make(map[string]int),
+		policyEnforcers:  make(map[string]*network.PolicyEnforcer),
 		logger:           logger.WithField("component", "runner-manager"),
 	}
 
@@ -370,7 +383,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	// Otherwise, use the legacy slot-based TAP allocation on the shared bridge.
 	var tap *network.TapDevice
 	var nsInfo *network.VMNamespace
-	var slot int = -1
+	var slot int
 	useNetNS := m.netnsNetwork != nil
 
 	if useNetNS {
@@ -432,14 +445,17 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 
 	// Create per-runner writable repo cache layer image (upperdir/workdir lives here)
 	repoCacheStart := time.Now()
-	repoCacheUpperPath := filepath.Join(m.config.WorkspaceDir, runnerID, "repo-cache-upper.img")
-	if err := os.MkdirAll(filepath.Dir(repoCacheUpperPath), 0755); err != nil {
-		m.cleanupRunner(runnerID, tap.Name, overlayPath, "")
-		return nil, fmt.Errorf("failed to create repo-cache-upper directory: %w", err)
-	}
-	if err := createExt4Image(repoCacheUpperPath, m.config.Bazel.RepoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
-		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
-		return nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
+	var repoCacheUpperPath string
+	if m.config.Bazel.RepoCacheUpperSizeGB > 0 {
+		repoCacheUpperPath = filepath.Join(m.config.WorkspaceDir, runnerID, "repo-cache-upper.img")
+		if err := os.MkdirAll(filepath.Dir(repoCacheUpperPath), 0755); err != nil {
+			m.cleanupRunner(runnerID, tap.Name, overlayPath, "")
+			return nil, fmt.Errorf("failed to create repo-cache-upper directory: %w", err)
+		}
+		if err := createExt4Image(repoCacheUpperPath, m.config.Bazel.RepoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
+			m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+			return nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
+		}
 	}
 	repoCacheDur := time.Since(repoCacheStart)
 
@@ -459,6 +475,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		TapDevice:       tap.Name,
 		MAC:             tap.MAC,
 		SnapshotVersion: snapshotPaths.Version,
+		WorkloadKey:     req.WorkloadKey,
 		GitHubRepo:      req.Repo, // For pool key matching
 		Resources:       req.Resources,
 		CreatedAt:       time.Now(),
@@ -489,7 +506,14 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		"netmask":  netmask,
 	}).Debug("Configuring kernel network boot args")
 
-	// Create VM configuration
+	// Create VM configuration — resolve extension drives dynamically from snapshot
+	extensionPaths := make(map[string]string)
+	for driveID, path := range snapshotPaths.ExtensionDriveImages {
+		extensionPaths[driveID] = path
+	}
+	if repoCacheUpperPath != "" {
+		extensionPaths["repo_cache_upper"] = repoCacheUpperPath
+	}
 	vmCfg := firecracker.VMConfig{
 		VMID:           runnerID,
 		SocketDir:      m.config.SocketDir,
@@ -508,7 +532,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 			Version:           "V1", // V1 for simple GET requests (thaw-agent uses V1 protocol)
 			NetworkInterfaces: []string{"eth0"},
 		},
-		Drives:      m.buildDrives(snapshotPaths.RepoCacheSeed, repoCacheUpperPath),
+		Drives:      m.buildDrives(extensionPaths),
 		LogPath:     runner.LogPath,
 		MetricsPath: runner.MetricsPath,
 	}
@@ -546,7 +570,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		// for LoadSnapshot, then rename it back. Running VMs are unaffected
 		// because they hold TAP FDs (kernel tracks by ifindex, not name).
 		restoreOK := false
-		cleanup, symlinkErr := m.setupSnapshotSymlinks(overlayPath, repoCacheUpperPath, snapshotPaths)
+		cleanup, symlinkErr := m.setupSnapshotSymlinks(overlayPath, extensionPaths)
 		if symlinkErr != nil {
 			m.logger.WithError(symlinkErr).Warn("Failed to setup snapshot symlinks, falling back to cold boot")
 		} else if useNetNS {
@@ -733,6 +757,7 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 	// Set exec mode when explicitly requested via ci_system=none
 	if req.CISystem == "none" {
 		data.Latest.Meta.Mode = "exec"
+		data.Latest.Runner.CISystem = "none"
 	}
 
 	// Populate start_command for user service startup
@@ -740,6 +765,8 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 		data.Latest.StartCommand.Command = req.StartCommand.Command
 		data.Latest.StartCommand.Port = req.StartCommand.Port
 		data.Latest.StartCommand.HealthPath = req.StartCommand.HealthPath
+		data.Latest.StartCommand.Env = req.StartCommand.Env
+		data.Latest.StartCommand.RunAs = req.StartCommand.RunAs
 	}
 
 	return data
@@ -777,6 +804,12 @@ func (m *Manager) ReleaseRunner(runnerID string, destroy bool) error {
 	if handler, ok := m.uffdHandlers[runnerID]; ok {
 		handler.Stop()
 		delete(m.uffdHandlers, runnerID)
+	}
+
+	// Remove policy enforcer if one exists
+	if enforcer, ok := m.policyEnforcers[runnerID]; ok {
+		enforcer.Remove()
+		delete(m.policyEnforcers, runnerID)
 	}
 
 	// Suspended runners already had network released during pause; only clean up overlay/files
@@ -880,7 +913,7 @@ func (m *Manager) QuarantineRunner(ctx context.Context, runnerID string, opts Qu
 		var blockErr error
 		if m.netnsNetwork != nil {
 			// Per-VM namespace mode: block by veth interface name
-			blockErr = m.netnsNetwork.BlockEgress(runnerID)
+			blockErr = m.netnsNetwork.EmergencyBlockEgress(runnerID)
 		} else {
 			// Legacy bridge mode: block by VM IP
 			blockErr = m.network.BlockEgress(net.IP(ip))
@@ -970,7 +1003,7 @@ func (m *Manager) UnquarantineRunner(ctx context.Context, runnerID string, opts 
 	if unblockEgress && egressWasBlocked {
 		var unblockErr error
 		if m.netnsNetwork != nil {
-			unblockErr = m.netnsNetwork.UnblockEgress(runnerID)
+			unblockErr = m.netnsNetwork.EmergencyUnblockEgress(runnerID)
 		} else {
 			unblockErr = m.network.UnblockEgress(net.IP(ip))
 		}
@@ -1022,6 +1055,167 @@ func (m *Manager) UnquarantineRunner(ctx context.Context, runnerID string, opts 
 	if len(errs) > 0 {
 		return joinErrors(errs)
 	}
+	return nil
+}
+
+// ApplyNetworkPolicy resolves and applies a network policy for a runner.
+// Called during allocation after the namespace is created.
+func (m *Manager) ApplyNetworkPolicy(runnerID string, req AllocateRequest) error {
+	policy := network.ResolvePolicy(req.NetworkPolicyPreset, req.NetworkPolicy)
+	if policy == nil {
+		return nil // unrestricted, no enforcement needed
+	}
+
+	if err := policy.Validate(); err != nil {
+		return fmt.Errorf("invalid network policy: %w", err)
+	}
+
+	m.mu.RLock()
+	r, ok := m.runners[runnerID]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("runner not found: %s", runnerID)
+	}
+
+	if m.netnsNetwork == nil {
+		m.logger.WithField("runner_id", runnerID).Warn("Network policy requested but netns mode not enabled; skipping enforcement")
+		// Store policy on runner for observability even without enforcement
+		m.mu.Lock()
+		r.NetworkPolicy = policy
+		r.NetworkPolicyVersion = 1
+		m.mu.Unlock()
+		return nil
+	}
+
+	ns, err := m.netnsNetwork.GetNamespace(runnerID)
+	if err != nil {
+		return fmt.Errorf("get namespace for policy: %w", err)
+	}
+
+	enforcer := network.NewPolicyEnforcer(network.PolicyEnforcerConfig{
+		VMID:       runnerID,
+		NSName:     ns.Name,
+		VethVM:     ns.VethVM,
+		HostVethIP: net.IPv4(10, 200, byte(ns.Slot), 1),
+		Policy:     policy,
+		Logger:     m.logger.Logger,
+	})
+
+	// Set initial ingress ports
+	var ports []int
+	if r.ServicePort > 0 {
+		ports = append(ports, r.ServicePort)
+	}
+	ports = append(ports, 10500, 10501) // thaw-agent health + debug
+	enforcer.SetInitialIngressPorts(ports)
+
+	if err := enforcer.Apply(); err != nil {
+		return fmt.Errorf("apply network policy: %w", err)
+	}
+
+	// Start DNS proxy if needed
+	if err := enforcer.StartDNSProxy(func(fn func() error) error {
+		return m.netnsNetwork.RunInNamespace(runnerID, fn)
+	}); err != nil {
+		enforcer.Remove()
+		return fmt.Errorf("start dns proxy: %w", err)
+	}
+
+	m.mu.Lock()
+	r.NetworkPolicy = policy
+	r.NetworkPolicyVersion = 1
+	m.policyEnforcers[runnerID] = enforcer
+	m.mu.Unlock()
+
+	m.logger.WithFields(logrus.Fields{
+		"runner_id": runnerID,
+		"policy":    policy.Name,
+	}).Info("Network policy applied")
+
+	return nil
+}
+
+// UpdateNetworkPolicy updates the network policy for a running VM.
+func (m *Manager) UpdateNetworkPolicy(runnerID string, newPolicy *network.NetworkPolicy) error {
+	if newPolicy == nil {
+		return fmt.Errorf("policy cannot be nil for update")
+	}
+	if err := newPolicy.Validate(); err != nil {
+		return fmt.Errorf("invalid network policy: %w", err)
+	}
+
+	m.mu.Lock()
+	r, ok := m.runners[runnerID]
+	enforcer := m.policyEnforcers[runnerID]
+	m.mu.Unlock()
+
+	if !ok {
+		return fmt.Errorf("runner not found: %s", runnerID)
+	}
+
+	if enforcer != nil {
+		// Existing enforcer: update in place
+		if err := enforcer.Update(newPolicy); err != nil {
+			return fmt.Errorf("update policy: %w", err)
+		}
+	} else if m.netnsNetwork != nil {
+		// No enforcer yet but netns available: create and apply
+		req := AllocateRequest{NetworkPolicy: newPolicy}
+		if err := m.ApplyNetworkPolicy(runnerID, req); err != nil {
+			return fmt.Errorf("apply policy on update: %w", err)
+		}
+		return nil // ApplyNetworkPolicy already sets version to 1
+	}
+
+	// Store policy on runner (either enforcer updated or no netns)
+	m.mu.Lock()
+	r.NetworkPolicy = newPolicy
+	r.NetworkPolicyVersion++
+	m.mu.Unlock()
+
+	return nil
+}
+
+// GetNetworkPolicy returns the effective policy for a runner.
+func (m *Manager) GetNetworkPolicy(runnerID string) (*network.NetworkPolicy, int, error) {
+	m.mu.RLock()
+	r, ok := m.runners[runnerID]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, 0, fmt.Errorf("runner not found: %s", runnerID)
+	}
+	return r.NetworkPolicy, r.NetworkPolicyVersion, nil
+}
+
+// EmergencyBlockEgress blocks all egress for a VM at the host level (independent of namespace policy).
+func (m *Manager) EmergencyBlockEgress(runnerID string) error {
+	if m.netnsNetwork == nil {
+		return fmt.Errorf("netns mode not enabled")
+	}
+	if err := m.netnsNetwork.EmergencyBlockEgress(runnerID); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if r, ok := m.runners[runnerID]; ok {
+		r.EmergencyEgressBlocked = true
+	}
+	m.mu.Unlock()
+	return nil
+}
+
+// EmergencyUnblockEgress removes the host-level egress block.
+func (m *Manager) EmergencyUnblockEgress(runnerID string) error {
+	if m.netnsNetwork == nil {
+		return fmt.Errorf("netns mode not enabled")
+	}
+	if err := m.netnsNetwork.EmergencyUnblockEgress(runnerID); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if r, ok := m.runners[runnerID]; ok {
+		r.EmergencyEgressBlocked = false
+	}
+	m.mu.Unlock()
 	return nil
 }
 
@@ -1101,21 +1295,10 @@ func (m *Manager) findAvailableSlot() int {
 }
 
 // buildDrives constructs the list of block devices to attach to a microVM.
-// All drives must be present to match the snapshot's drive layout for restore to work.
-func (m *Manager) buildDrives(repoCacheSeedPath, repoCacheUpperPath string) []firecracker.Drive {
+// extensionDrivePaths maps driveID to host path for extension drives.
+// The credentials drive is always included.
+func (m *Manager) buildDrives(extensionDrivePaths map[string]string) []firecracker.Drive {
 	drives := []firecracker.Drive{
-		{
-			DriveID:      "repo_cache_seed",
-			PathOnHost:   repoCacheSeedPath,
-			IsRootDevice: false,
-			IsReadOnly:   true,
-		},
-		{
-			DriveID:      "repo_cache_upper",
-			PathOnHost:   repoCacheUpperPath,
-			IsRootDevice: false,
-			IsReadOnly:   false,
-		},
 		{
 			DriveID:      "credentials",
 			PathOnHost:   m.credentialsImage,
@@ -1124,19 +1307,18 @@ func (m *Manager) buildDrives(repoCacheSeedPath, repoCacheUpperPath string) []fi
 		},
 	}
 
-	// Always add git-cache drive to match snapshot drive layout.
-	// If no real git-cache image exists, use a placeholder.
-	// This is required for snapshot restore to work (drive IDs must match).
-	gitCacheImg := m.gitCacheImage
-	if gitCacheImg == "" {
-		gitCacheImg = m.getOrCreateGitCachePlaceholder()
+	// Append extension drives in deterministic order (sorted by driveID).
+	driveIDs := make([]string, 0, len(extensionDrivePaths))
+	for id := range extensionDrivePaths {
+		driveIDs = append(driveIDs, id)
 	}
-	if gitCacheImg != "" {
+	sort.Strings(driveIDs)
+	for _, id := range driveIDs {
 		drives = append(drives, firecracker.Drive{
-			DriveID:      "git_cache",
-			PathOnHost:   gitCacheImg,
+			DriveID:      id,
+			PathOnHost:   extensionDrivePaths[id],
 			IsRootDevice: false,
-			IsReadOnly:   true,
+			IsReadOnly:   false,
 		})
 	}
 
@@ -1164,15 +1346,9 @@ const snapshotTAPName = "tap-slot-0"
 // Returns a cleanup function that removes the symlinks. The cleanup should be
 // called after LoadSnapshot returns, as Firecracker holds open file descriptors
 // and no longer needs the symlink paths.
-func (m *Manager) setupSnapshotSymlinks(overlayPath, repoCacheUpperPath string, snapshotPaths *snapshot.SnapshotPaths) (func(), error) {
+func (m *Manager) setupSnapshotSymlinks(overlayPath string, extensionDrivePaths map[string]string) (func(), error) {
 	if err := os.MkdirAll(snapshotSymlinkDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create snapshot symlink dir: %w", err)
-	}
-
-	// Resolve git-cache image path (same logic as buildDrives)
-	gitCacheImg := m.gitCacheImage
-	if gitCacheImg == "" {
-		gitCacheImg = m.getOrCreateGitCachePlaceholder()
 	}
 
 	// Map snapshot filenames to actual host paths.
@@ -1182,10 +1358,12 @@ func (m *Manager) setupSnapshotSymlinks(overlayPath, repoCacheUpperPath string, 
 		target string // actual path on host
 	}{
 		{"rootfs.img", overlayPath},
-		{"repo-cache-seed.img", snapshotPaths.RepoCacheSeed},
-		{"repo-cache-upper.img", repoCacheUpperPath},
 		{"credentials.img", m.credentialsImage},
-		{"git-cache.img", gitCacheImg},
+	}
+	// Add extension drives by driveID (e.g. "repo_cache_seed" → "repo-cache-seed.img")
+	for driveID, path := range extensionDrivePaths {
+		name := strings.ReplaceAll(driveID, "_", "-") + ".img"
+		symlinks = append(symlinks, struct{ name, target string }{name, path})
 	}
 
 	var created []string
@@ -1281,32 +1459,6 @@ func (m *Manager) setupSnapshotTAPRename(currentTAP string) (func(), error) {
 	}
 
 	return restore, nil
-}
-
-// getOrCreateGitCachePlaceholder ensures a placeholder git-cache image exists for snapshot restore compatibility.
-func (m *Manager) getOrCreateGitCachePlaceholder() string {
-	sharedDir := filepath.Join(m.config.WorkspaceDir, "_shared")
-	placeholderPath := filepath.Join(sharedDir, "git-cache-placeholder.img")
-
-	// Check if already exists
-	if _, err := os.Stat(placeholderPath); err == nil {
-		return placeholderPath
-	}
-
-	// Create placeholder directory
-	if err := os.MkdirAll(sharedDir, 0755); err != nil {
-		m.logger.WithError(err).Warn("Failed to create shared dir for git-cache placeholder")
-		return ""
-	}
-
-	// Create small placeholder image (64MB is minimum for ext4)
-	if err := createExt4ImageMB(placeholderPath, 64, "GIT_CACHE"); err != nil {
-		m.logger.WithError(err).Warn("Failed to create git-cache placeholder image")
-		return ""
-	}
-
-	m.logger.WithField("path", placeholderPath).Info("Created git-cache placeholder image for snapshot compatibility")
-	return placeholderPath
 }
 
 func createExt4Image(path string, sizeGB int, label string) error {

@@ -42,6 +42,14 @@ type PauseResult struct {
 	SnapshotSizeBytes int64  `json:"snapshot_size_bytes"`
 }
 
+// CheckpointResult contains the result of a CheckpointRunner operation.
+type CheckpointResult struct {
+	SessionID         string `json:"session_id"`
+	Layer             int    `json:"layer"`
+	SnapshotSizeBytes int64  `json:"snapshot_size_bytes"`
+	Running           bool   `json:"running"`
+}
+
 // SessionMetadata is written to each session directory as metadata.json.
 type SessionMetadata struct {
 	SessionID   string    `json:"session_id"`
@@ -65,9 +73,9 @@ type SessionMetadata struct {
 	// GCS-backed session fields (populated when SessionChunkBucket is configured).
 	// When GCSManifestPath is non-empty, ResumeFromSession uses UFFD-backed
 	// GCS chunk loading instead of the host-local LayeredHandler.
-	GCSManifestPath    string `json:"gcs_manifest_path,omitempty"`
-	GCSMemIndexObject  string `json:"gcs_mem_index_object,omitempty"`
-	GCSDiskIndexObject string `json:"gcs_disk_index_object,omitempty"`
+	GCSManifestPath     string            `json:"gcs_manifest_path,omitempty"`
+	GCSMemIndexObject   string            `json:"gcs_mem_index_object,omitempty"`
+	GCSDiskIndexObjects map[string]string `json:"gcs_disk_index_objects,omitempty"` // driveID → GCS path
 }
 
 // PauseRunner creates a diff snapshot of the runner's VM, saves session state,
@@ -147,13 +155,15 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 	// Write metadata.json
 	sessionDir := filepath.Join(m.sessionBaseDir(), sessionID)
 
-	// Load the previous metadata if it exists — we need GCSMemIndexObject
-	// from a prior pause to use as the base for multi-pause chain dedup.
+	// Load the previous metadata if it exists — we need GCSMemIndexObject and
+	// GCSDiskIndexObjects from a prior pause to use as the base for multi-pause chain dedup.
 	var prevGCSMemIndex string
+	var prevGCSDiskIndexObjects map[string]string
 	if prevData, readErr := os.ReadFile(filepath.Join(sessionDir, "metadata.json")); readErr == nil {
 		var prev SessionMetadata
 		if json.Unmarshal(prevData, &prev) == nil {
 			prevGCSMemIndex = prev.GCSMemIndexObject
+			prevGCSDiskIndexObjects = prev.GCSDiskIndexObjects
 		}
 	}
 
@@ -224,17 +234,79 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 			if uploadErr := uploader.UploadVMState(ctx, stateFile, vmStateGCSPath); uploadErr != nil {
 				m.logger.WithError(uploadErr).Warn("GCS vmstate upload failed; falling back to local-only session")
 			} else {
-				// Upload dirty FUSE disk chunks if available.
-				var newDiskIndex *snapshot.ChunkIndex
-				if m.getDirtyDiskChunks != nil && m.sessionDiskStore != nil && goldenMeta != nil {
-					dirtyDisk := m.getDirtyDiskChunks(runnerID)
-					if len(dirtyDisk) > 0 {
-						baseDiskIndex := buildBaseDiskIndex(goldenMeta)
-						diskIdx, diskErr := uploader.MergeAndUploadDisk(ctx, dirtyDisk, baseDiskIndex)
+				// Upload dirty FUSE extension disk chunks if available (per-drive).
+				newExtDiskIndexes := map[string]*snapshot.ChunkIndex{}
+				if m.getDirtyExtensionDiskChunks != nil && m.sessionDiskStore != nil {
+					allDirty := m.getDirtyExtensionDiskChunks(runnerID)
+					for driveID, dirtyChunks := range allDirty {
+						if len(dirtyChunks) == 0 {
+							continue
+						}
+						// Chain: use previous session's ChunkIndex as base when available,
+						// falling back to the extension drive's chunks from the golden metadata.
+						var baseDiskIndex *snapshot.ChunkIndex
+						if prevGCSDiskIndexObjects != nil {
+							if prevPath := prevGCSDiskIndexObjects[driveID]; prevPath != "" {
+								prevIdx, dlErr := uploader.DownloadChunkIndex(ctx, prevPath)
+								if dlErr != nil {
+									m.logger.WithError(dlErr).Warnf("Failed to download previous disk index for drive %s; falling back to golden base", driveID)
+								} else {
+									baseDiskIndex = prevIdx
+								}
+							}
+						}
+						if baseDiskIndex == nil {
+							baseDiskIndex = buildExtensionDriveBaseIndex(goldenMeta, driveID)
+						}
+						diskIdx, diskErr := uploader.MergeAndUploadDisk(ctx, dirtyChunks, baseDiskIndex)
 						if diskErr != nil {
-							m.logger.WithError(diskErr).Warn("GCS disk chunk upload failed; disk not included in session")
+							m.logger.WithError(diskErr).Warnf("GCS disk chunk upload failed for drive %s; drive not included in session", driveID)
 						} else {
-							newDiskIndex = diskIdx
+							newExtDiskIndexes[driveID] = diskIdx
+						}
+					}
+				}
+
+				// Include non-dirty extension drives from golden metadata so the
+				// manifest is self-contained. The snapshot state references these
+				// drives, so resume needs their ChunkIndex to create FUSE disks.
+				// No chunk upload needed — just carry forward the golden index.
+				if goldenMeta != nil {
+					for driveID, extDrive := range goldenMeta.ExtensionDrives {
+						if _, already := newExtDiskIndexes[driveID]; already {
+							continue
+						}
+						if len(extDrive.Chunks) == 0 {
+							continue
+						}
+						newExtDiskIndexes[driveID] = buildExtensionDriveBaseIndex(goldenMeta, driveID)
+					}
+				}
+
+				// Upload dirty FUSE rootfs disk chunks if available.
+				var newRootfsDiskIndex *snapshot.ChunkIndex
+				if m.getDirtyRootfsDiskChunks != nil && m.sessionDiskStore != nil {
+					dirtyRootfs := m.getDirtyRootfsDiskChunks(runnerID)
+					if len(dirtyRootfs) > 0 {
+						var baseRootfsIndex *snapshot.ChunkIndex
+						if prevGCSDiskIndexObjects != nil {
+							if prevPath := prevGCSDiskIndexObjects["__rootfs__"]; prevPath != "" {
+								prevIdx, dlErr := uploader.DownloadChunkIndex(ctx, prevPath)
+								if dlErr != nil {
+									m.logger.WithError(dlErr).Warn("Failed to download previous rootfs disk index; falling back to golden base")
+								} else {
+									baseRootfsIndex = prevIdx
+								}
+							}
+						}
+						if baseRootfsIndex == nil {
+							baseRootfsIndex = buildRootfsDriveBaseIndex(goldenMeta)
+						}
+						rootfsIdx, rootfsErr := uploader.MergeAndUploadDisk(ctx, dirtyRootfs, baseRootfsIndex)
+						if rootfsErr != nil {
+							m.logger.WithError(rootfsErr).Warn("GCS rootfs disk chunk upload failed; rootfs not included in session")
+						} else {
+							newRootfsDiskIndex = rootfsIdx
 						}
 					}
 				}
@@ -252,19 +324,58 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 				man.Memory.ChunkIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
 				man.Integrity.Algo = "sha256"
 
-				if newDiskIndex != nil {
-					man.Disk.Mode = "chunked"
-					man.Disk.TotalSizeBytes = newDiskIndex.Region.LogicalSizeBytes
-					man.Disk.ChunkIndexObject = uploader.FullGCSPath(gcsBase + "/disk-chunked-metadata.json")
+				// Populate rootfs disk section if dirty rootfs chunks were uploaded.
+				if newRootfsDiskIndex != nil {
+					man.Disk = snapshot.DiskSection{
+						Mode:             "chunked",
+						TotalSizeBytes:   newRootfsDiskIndex.Region.LogicalSizeBytes,
+						ChunkIndexObject: uploader.FullGCSPath(gcsBase + "/__rootfs__-disk.json"),
+					}
 				}
 
-				if writeErr := uploader.WriteManifest(ctx, gcsBase, man, newMemIndex, newDiskIndex); writeErr != nil {
+				if len(newExtDiskIndexes) > 0 {
+					man.ExtensionDisks = make(map[string]snapshot.DiskSection)
+					for driveID, diskIdx := range newExtDiskIndexes {
+						man.ExtensionDisks[driveID] = snapshot.DiskSection{
+							Mode:             "chunked",
+							TotalSizeBytes:   diskIdx.Region.LogicalSizeBytes,
+							ChunkIndexObject: uploader.FullGCSPath(gcsBase + "/" + driveID + "-disk.json"),
+						}
+					}
+				}
+
+				// Include rootfs disk index in the extension indexes map so it gets
+				// uploaded alongside extension drive indexes by WriteManifestWithExtensions.
+				allDiskIndexes := make(map[string]*snapshot.ChunkIndex, len(newExtDiskIndexes)+1)
+				for k, v := range newExtDiskIndexes {
+					allDiskIndexes[k] = v
+				}
+				if newRootfsDiskIndex != nil {
+					allDiskIndexes["__rootfs__"] = newRootfsDiskIndex
+				}
+
+				if writeErr := uploader.WriteManifestWithExtensions(ctx, gcsBase, man, newMemIndex, allDiskIndexes); writeErr != nil {
 					m.logger.WithError(writeErr).Warn("GCS manifest write failed; falling back to local-only session")
 				} else {
 					metadata.GCSManifestPath = uploader.FullGCSPath(gcsBase + "/snapshot_manifest.json")
 					metadata.GCSMemIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
-					if newDiskIndex != nil {
-						metadata.GCSDiskIndexObject = uploader.FullGCSPath(gcsBase + "/disk-chunked-metadata.json")
+					// Carry forward previous disk index objects for drives
+					// that weren't dirty this pause so the chain is never
+					// broken. Without this, a drive dirty in pause 1 but
+					// clean in pause 2 loses its index reference, forcing
+					// a full re-upload when it's dirty again in pause 3.
+					if len(prevGCSDiskIndexObjects) > 0 || len(allDiskIndexes) > 0 {
+						if metadata.GCSDiskIndexObjects == nil {
+							metadata.GCSDiskIndexObjects = make(map[string]string)
+						}
+						for driveID, path := range prevGCSDiskIndexObjects {
+							if _, dirty := allDiskIndexes[driveID]; !dirty {
+								metadata.GCSDiskIndexObjects[driveID] = path
+							}
+						}
+						for driveID := range allDiskIndexes {
+							metadata.GCSDiskIndexObjects[driveID] = uploader.FullGCSPath(gcsBase + "/" + driveID + "-disk.json")
+						}
 					}
 					m.logger.WithFields(logrus.Fields{
 						"runner_id":    runnerID,
@@ -330,6 +441,294 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 	}, nil
 }
 
+// CheckpointRunner creates a non-destructive snapshot: the VM is paused briefly
+// while the diff snapshot is taken, then resumed. The session state is uploaded
+// to GCS (if configured) so it can be used for cross-host resume later, but the
+// VM keeps running and the runner stays in its current state.
+func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*CheckpointResult, error) {
+	m.mu.Lock()
+	runner, exists := m.runners[runnerID]
+	if !exists {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("runner not found: %s", runnerID)
+	}
+
+	if runner.SessionID == "" {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("runner %s has no session_id, cannot checkpoint", runnerID)
+	}
+
+	if runner.State != StateIdle && runner.State != StateBusy {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("runner %s is in state %s, cannot checkpoint", runnerID, runner.State)
+	}
+
+	vm := m.vms[runnerID]
+	if vm == nil {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("VM not found for runner %s", runnerID)
+	}
+
+	sessionID := runner.SessionID
+	layerN := runner.SessionLayers
+	goldenMeta := m.goldenChunkedMeta
+	m.mu.Unlock()
+
+	m.logger.WithFields(logrus.Fields{
+		"runner_id":  runnerID,
+		"session_id": sessionID,
+		"layer":      layerN,
+	}).Info("Checkpointing runner (non-destructive snapshot)")
+
+	// Create checkpoint layer directory
+	layerDir := filepath.Join(m.sessionBaseDir(), sessionID, fmt.Sprintf("layer_%d", layerN))
+	if err := os.MkdirAll(layerDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create checkpoint layer dir: %w", err)
+	}
+
+	stateFile := filepath.Join(layerDir, "snapshot.state")
+	memDiffFile := filepath.Join(layerDir, "mem_diff.sparse")
+
+	// Create non-destructive diff snapshot (pauses VM, takes snapshot, resumes VM)
+	if err := vm.CreateDiffSnapshotNonDestructive(ctx, stateFile, memDiffFile); err != nil {
+		return nil, fmt.Errorf("failed to create checkpoint snapshot: %w", err)
+	}
+
+	// Calculate snapshot size
+	var snapshotSize int64
+	if info, err := os.Stat(memDiffFile); err == nil {
+		snapshotSize += info.Size()
+	}
+	if info, err := os.Stat(stateFile); err == nil {
+		snapshotSize += info.Size()
+	}
+
+	// Write metadata.json (same format as PauseRunner but runner stays active)
+	sessionDir := filepath.Join(m.sessionBaseDir(), sessionID)
+
+	var prevGCSMemIndex string
+	var prevGCSDiskIndexObjects map[string]string
+	if prevData, readErr := os.ReadFile(filepath.Join(sessionDir, "metadata.json")); readErr == nil {
+		var prev SessionMetadata
+		if json.Unmarshal(prevData, &prev) == nil {
+			prevGCSMemIndex = prev.GCSMemIndexObject
+			prevGCSDiskIndexObjects = prev.GCSDiskIndexObjects
+		}
+	}
+
+	metadata := SessionMetadata{
+		SessionID:          sessionID,
+		WorkloadKey:        runner.WorkloadKey,
+		RunnerID:           runnerID,
+		HostID:             m.config.HostID,
+		Layers:             layerN + 1,
+		CreatedAt:          runner.CreatedAt,
+		PausedAt:           time.Now(),
+		RootfsPath:         runner.RootfsOverlay,
+		RepoCacheUpperPath: runner.RepoCacheUpper,
+		VCPUs:              runner.Resources.VCPUs,
+		MemoryMB:           runner.Resources.MemoryMB,
+		TTLSeconds:         runner.TTLSeconds,
+		AutoPause:          runner.AutoPause,
+	}
+
+	// GCS-backed upload (same logic as PauseRunner)
+	if m.sessionMemStore != nil {
+		gcsBase := fmt.Sprintf("%s/runner_state/%s", runner.WorkloadKey, runnerID)
+		uploader := snapshot.NewSessionChunkUploader(m.sessionMemStore, m.sessionDiskStore, m.logger.Logger)
+
+		var baseMemIndex *snapshot.ChunkIndex
+		if prevGCSMemIndex != "" {
+			prevIdx, dlErr := uploader.DownloadChunkIndex(ctx, prevGCSMemIndex)
+			if dlErr != nil {
+				m.logger.WithError(dlErr).Warn("Checkpoint: failed to download previous session ChunkIndex")
+			} else {
+				baseMemIndex = prevIdx
+			}
+		}
+		if baseMemIndex == nil && goldenMeta != nil {
+			baseMemIndex = snapshot.ChunkIndexFromMeta(goldenMeta)
+		}
+		if baseMemIndex == nil {
+			baseMemIndex = &snapshot.ChunkIndex{
+				Version:        "1",
+				CreatedAt:      time.Now(),
+				ChunkSizeBytes: snapshot.DefaultChunkSize,
+			}
+			baseMemIndex.CAS.Algo = "sha256"
+			baseMemIndex.CAS.Layout = "chunks/mem/{p0}/{hash}"
+			baseMemIndex.CAS.Kind = "mem"
+			baseMemIndex.Region.Name = "vm_memory"
+			baseMemIndex.Region.LogicalSizeBytes = int64(runner.Resources.MemoryMB) * 1024 * 1024
+			baseMemIndex.Region.Coverage = "sparse"
+			baseMemIndex.Region.DefaultFill = "zero"
+		}
+
+		newMemIndex, err := uploader.MergeAndUploadMem(ctx, memDiffFile, baseMemIndex)
+		if err != nil {
+			m.logger.WithError(err).Warn("Checkpoint: GCS mem chunk upload failed")
+		} else {
+			vmStateGCSPath := uploader.FullGCSPath(gcsBase + "/snapshot.state")
+			if uploadErr := uploader.UploadVMState(ctx, stateFile, vmStateGCSPath); uploadErr != nil {
+				m.logger.WithError(uploadErr).Warn("Checkpoint: GCS vmstate upload failed")
+			} else {
+				// Upload extension disk chunks
+				newExtDiskIndexes := map[string]*snapshot.ChunkIndex{}
+				if m.getDirtyExtensionDiskChunks != nil && m.sessionDiskStore != nil {
+					allDirty := m.getDirtyExtensionDiskChunks(runnerID)
+					for driveID, dirtyChunks := range allDirty {
+						if len(dirtyChunks) == 0 {
+							continue
+						}
+						var baseDiskIndex *snapshot.ChunkIndex
+						if prevGCSDiskIndexObjects != nil {
+							if prevPath := prevGCSDiskIndexObjects[driveID]; prevPath != "" {
+								prevIdx, dlErr := uploader.DownloadChunkIndex(ctx, prevPath)
+								if dlErr == nil {
+									baseDiskIndex = prevIdx
+								}
+							}
+						}
+						if baseDiskIndex == nil {
+							baseDiskIndex = buildExtensionDriveBaseIndex(goldenMeta, driveID)
+						}
+						diskIdx, diskErr := uploader.MergeAndUploadDisk(ctx, dirtyChunks, baseDiskIndex)
+						if diskErr == nil {
+							newExtDiskIndexes[driveID] = diskIdx
+						}
+					}
+				}
+
+				// Include non-dirty extension drives from golden metadata so the
+				// manifest is self-contained.
+				if goldenMeta != nil {
+					for driveID, extDrive := range goldenMeta.ExtensionDrives {
+						if _, already := newExtDiskIndexes[driveID]; already {
+							continue
+						}
+						if len(extDrive.Chunks) == 0 {
+							continue
+						}
+						newExtDiskIndexes[driveID] = buildExtensionDriveBaseIndex(goldenMeta, driveID)
+					}
+				}
+
+				// Upload rootfs disk chunks
+				var newRootfsDiskIndex *snapshot.ChunkIndex
+				if m.getDirtyRootfsDiskChunks != nil && m.sessionDiskStore != nil {
+					dirtyRootfs := m.getDirtyRootfsDiskChunks(runnerID)
+					if len(dirtyRootfs) > 0 {
+						var baseRootfsIndex *snapshot.ChunkIndex
+						if prevGCSDiskIndexObjects != nil {
+							if prevPath := prevGCSDiskIndexObjects["__rootfs__"]; prevPath != "" {
+								prevIdx, dlErr := uploader.DownloadChunkIndex(ctx, prevPath)
+								if dlErr == nil {
+									baseRootfsIndex = prevIdx
+								}
+							}
+						}
+						if baseRootfsIndex == nil {
+							baseRootfsIndex = buildRootfsDriveBaseIndex(goldenMeta)
+						}
+						rootfsIdx, rootfsErr := uploader.MergeAndUploadDisk(ctx, dirtyRootfs, baseRootfsIndex)
+						if rootfsErr == nil {
+							newRootfsDiskIndex = rootfsIdx
+						}
+					}
+				}
+
+				snapshotID := uuid.New().String()
+				man := &snapshot.SnapshotManifest{
+					Version:     "1",
+					SnapshotID:  snapshotID,
+					CreatedAt:   time.Now(),
+					WorkloadKey: runner.WorkloadKey,
+				}
+				man.Firecracker.VMStateObject = vmStateGCSPath
+				man.Memory.Mode = "chunked"
+				man.Memory.TotalSizeBytes = baseMemIndex.Region.LogicalSizeBytes
+				man.Memory.ChunkIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
+				man.Integrity.Algo = "sha256"
+
+				if newRootfsDiskIndex != nil {
+					man.Disk = snapshot.DiskSection{
+						Mode:             "chunked",
+						TotalSizeBytes:   newRootfsDiskIndex.Region.LogicalSizeBytes,
+						ChunkIndexObject: uploader.FullGCSPath(gcsBase + "/__rootfs__-disk.json"),
+					}
+				}
+
+				if len(newExtDiskIndexes) > 0 {
+					man.ExtensionDisks = make(map[string]snapshot.DiskSection)
+					for driveID, diskIdx := range newExtDiskIndexes {
+						man.ExtensionDisks[driveID] = snapshot.DiskSection{
+							Mode:             "chunked",
+							TotalSizeBytes:   diskIdx.Region.LogicalSizeBytes,
+							ChunkIndexObject: uploader.FullGCSPath(gcsBase + "/" + driveID + "-disk.json"),
+						}
+					}
+				}
+
+				allDiskIndexes := make(map[string]*snapshot.ChunkIndex, len(newExtDiskIndexes)+1)
+				for k, v := range newExtDiskIndexes {
+					allDiskIndexes[k] = v
+				}
+				if newRootfsDiskIndex != nil {
+					allDiskIndexes["__rootfs__"] = newRootfsDiskIndex
+				}
+
+				if writeErr := uploader.WriteManifestWithExtensions(ctx, gcsBase, man, newMemIndex, allDiskIndexes); writeErr != nil {
+					m.logger.WithError(writeErr).Warn("Checkpoint: GCS manifest write failed")
+				} else {
+					metadata.GCSManifestPath = uploader.FullGCSPath(gcsBase + "/snapshot_manifest.json")
+					metadata.GCSMemIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
+					if len(prevGCSDiskIndexObjects) > 0 || len(allDiskIndexes) > 0 {
+						if metadata.GCSDiskIndexObjects == nil {
+							metadata.GCSDiskIndexObjects = make(map[string]string)
+						}
+						for driveID, path := range prevGCSDiskIndexObjects {
+							if _, dirty := allDiskIndexes[driveID]; !dirty {
+								metadata.GCSDiskIndexObjects[driveID] = path
+							}
+						}
+						for driveID := range allDiskIndexes {
+							metadata.GCSDiskIndexObjects[driveID] = uploader.FullGCSPath(gcsBase + "/" + driveID + "-disk.json")
+						}
+					}
+					m.logger.WithFields(logrus.Fields{
+						"runner_id":    runnerID,
+						"gcs_manifest": metadata.GCSManifestPath,
+					}).Info("Checkpoint uploaded to GCS successfully")
+				}
+			}
+		}
+	}
+
+	metadataBytes, _ := json.MarshalIndent(metadata, "", "  ")
+	if err := os.WriteFile(filepath.Join(sessionDir, "metadata.json"), metadataBytes, 0644); err != nil {
+		m.logger.WithError(err).Warn("Failed to write checkpoint metadata")
+	}
+
+	// Increment session layers (VM stays running)
+	m.mu.Lock()
+	runner.SessionLayers = layerN + 1
+	m.mu.Unlock()
+
+	m.logger.WithFields(logrus.Fields{
+		"runner_id":     runnerID,
+		"session_id":    sessionID,
+		"layer":         layerN,
+		"snapshot_size": snapshotSize,
+	}).Info("Runner checkpointed successfully (VM still running)")
+
+	return &CheckpointResult{
+		SessionID:         sessionID,
+		Layer:             layerN,
+		SnapshotSizeBytes: snapshotSize,
+		Running:           true,
+	}, nil
+}
+
 // ResumeFromSession restores a runner from a session snapshot using layered UFFD.
 func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey string) (*Runner, error) {
 	sessionDir := filepath.Join(m.sessionBaseDir(), sessionID)
@@ -385,10 +784,12 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		"workload_key": metadata.WorkloadKey,
 	}).Info("Resuming runner from session snapshot")
 
-	// Get golden snapshot paths
-	snapshotPaths, err := m.snapshotCache.GetSnapshotPaths()
+	// Kernel path is always needed; full snapshot paths (rootfs, mem) are only
+	// needed for the local-resume fallback.  Defer GetSnapshotPaths() to the
+	// local branch so GCS-backed resumes don't fail on missing rootfs.img.
+	kernelPath, err := m.snapshotCache.GetKernelPath()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get snapshot paths: %w", err)
+		return nil, fmt.Errorf("failed to get kernel path: %w", err)
 	}
 
 	m.mu.Lock()
@@ -399,7 +800,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	// Allocate network
 	var tap *network.TapDevice
 	var nsInfo *network.VMNamespace
-	var slot int = -1
+	var slot int
 	useNetNS := m.netnsNetwork != nil
 
 	if useNetNS {
@@ -440,6 +841,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	// available (metadata.GCSManifestPath is set) or falling back to the local
 	// LayeredHandler (requires golden snapshot.mem on this host).
 	uffdSocketPath := filepath.Join(m.config.SocketDir, runnerID+"-uffd.sock")
+	extensionDrivePaths := map[string]string{}
 	var uffdHandler uffdStopper
 	var latestStateFile string
 
@@ -504,28 +906,55 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 			return nil, fmt.Errorf("failed to download VM state from GCS: %w", dlErr)
 		}
 
-		// Set up FUSE disk for rootfs if the manifest includes a disk ChunkIndex.
-		if man.Disk.Mode == "chunked" && man.Disk.ChunkIndexObject != "" && m.setupFUSEDisk != nil {
-			diskIdx, diskDlErr := uploader.DownloadChunkIndex(ctx, man.Disk.ChunkIndexObject)
+		// Set up FUSE disks for extension drives if the manifest includes extension disk ChunkIndexes.
+		if m.setupExtensionFUSEDisk != nil {
+			for driveID, diskSection := range man.ExtensionDisks {
+				if diskSection.Mode != "chunked" || diskSection.ChunkIndexObject == "" {
+					continue
+				}
+				diskIdx, diskDlErr := uploader.DownloadChunkIndex(ctx, diskSection.ChunkIndexObject)
+				if diskDlErr != nil {
+					gcsHandler.Stop()
+					m.mu.Lock()
+					m.cleanupNetworkOnly(runnerID, tap.Name)
+					m.mu.Unlock()
+					return nil, fmt.Errorf("failed to download disk chunk index for drive %s: %w", driveID, diskDlErr)
+				}
+				// Convert ChunkIndex extents to dense ChunkRef slice for FUSE.
+				diskRefs := snapshot.ChunkIndexToRefs(diskIdx)
+				fusePath, fuseErr := m.setupExtensionFUSEDisk(runnerID, driveID, diskRefs, diskIdx.Region.LogicalSizeBytes, diskIdx.ChunkSizeBytes)
+				if fuseErr != nil {
+					gcsHandler.Stop()
+					m.mu.Lock()
+					m.cleanupNetworkOnly(runnerID, tap.Name)
+					m.mu.Unlock()
+					return nil, fmt.Errorf("failed to setup FUSE disk for drive %s session resume: %w", driveID, fuseErr)
+				}
+				extensionDrivePaths[driveID] = fusePath
+			}
+		}
+
+		// Set up FUSE disk for rootfs if the manifest includes a rootfs disk ChunkIndex.
+		if m.setupRootfsFUSEDisk != nil && man.Disk.Mode == "chunked" && man.Disk.ChunkIndexObject != "" {
+			rootfsDiskIdx, diskDlErr := uploader.DownloadChunkIndex(ctx, man.Disk.ChunkIndexObject)
 			if diskDlErr != nil {
 				gcsHandler.Stop()
 				m.mu.Lock()
 				m.cleanupNetworkOnly(runnerID, tap.Name)
 				m.mu.Unlock()
-				return nil, fmt.Errorf("failed to download disk chunk index: %w", diskDlErr)
+				return nil, fmt.Errorf("failed to download rootfs disk chunk index: %w", diskDlErr)
 			}
-
-			// Convert ChunkIndex extents to dense ChunkRef slice for FUSE.
-			diskRefs := snapshot.ChunkIndexToRefs(diskIdx)
-			fusePath, fuseErr := m.setupFUSEDisk(runnerID, diskRefs, diskIdx.Region.LogicalSizeBytes, diskIdx.ChunkSizeBytes)
+			rootfsRefs := snapshot.ChunkIndexToRefs(rootfsDiskIdx)
+			rootfsFusePath, fuseErr := m.setupRootfsFUSEDisk(runnerID, rootfsRefs, rootfsDiskIdx.Region.LogicalSizeBytes, rootfsDiskIdx.ChunkSizeBytes)
 			if fuseErr != nil {
 				gcsHandler.Stop()
 				m.mu.Lock()
 				m.cleanupNetworkOnly(runnerID, tap.Name)
 				m.mu.Unlock()
-				return nil, fmt.Errorf("failed to setup FUSE disk for session resume: %w", fuseErr)
+				return nil, fmt.Errorf("failed to setup FUSE rootfs disk for session resume: %w", fuseErr)
 			}
-			overlayPath = fusePath
+			overlayPath = rootfsFusePath
+			m.logger.WithField("rootfs_fuse_path", rootfsFusePath).Info("Using FUSE-backed rootfs for cross-host session resume")
 		}
 
 		m.logger.WithFields(logrus.Fields{
@@ -535,6 +964,15 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		}).Info("Resuming from GCS-backed session (UFFD chunked)")
 	} else {
 		// Local fallback: LayeredHandler uses golden snapshot.mem on this host.
+		// Full snapshot paths (including rootfs, mem) are required for local resume.
+		snapshotPaths, spErr := m.snapshotCache.GetSnapshotPaths()
+		if spErr != nil {
+			m.mu.Lock()
+			m.cleanupNetworkOnly(runnerID, tap.Name)
+			m.mu.Unlock()
+			return nil, fmt.Errorf("failed to get snapshot paths for local resume: %w", spErr)
+		}
+
 		// Build diff layer paths (oldest first).
 		var diffLayers []string
 		for i := 0; i < metadata.Layers; i++ {
@@ -579,7 +1017,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		VMID:           runnerID,
 		SocketDir:      m.config.SocketDir,
 		FirecrackerBin: m.config.FirecrackerBin,
-		KernelPath:     snapshotPaths.Kernel,
+		KernelPath:     kernelPath,
 		RootfsPath:     overlayPath,
 		VCPUs:          metadata.VCPUs,
 		MemoryMB:       metadata.MemoryMB,
@@ -588,7 +1026,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 			HostDevName: tap.Name,
 			GuestMAC:    tap.MAC,
 		},
-		Drives:  m.buildDrives(snapshotPaths.RepoCacheSeed, repoCacheUpperPath),
+		Drives:  m.buildDrives(extensionDrivePaths),
 		LogPath: filepath.Join(m.config.LogDir, runnerID+".log"),
 	}
 
@@ -605,9 +1043,14 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
+	// Include the repo-cache-upper drive in the symlink map so Firecracker can find it.
+	if repoCacheUpperPath != "" {
+		extensionDrivePaths["repo_cache_upper"] = repoCacheUpperPath
+	}
+
 	// Setup symlinks for snapshot restore
 	m.mu.Lock()
-	cleanup, symlinkErr := m.setupSnapshotSymlinks(overlayPath, repoCacheUpperPath, snapshotPaths)
+	cleanup, symlinkErr := m.setupSnapshotSymlinks(overlayPath, extensionDrivePaths)
 	m.mu.Unlock()
 	if symlinkErr != nil {
 		uffdHandler.Stop()
@@ -674,7 +1117,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		InternalIP:      internalIP,
 		TapDevice:       tap.Name,
 		MAC:             tap.MAC,
-		SnapshotVersion: snapshotPaths.Version,
+		SnapshotVersion: m.snapshotCache.CurrentVersion(),
 		WorkloadKey:     metadata.WorkloadKey,
 		Resources: Resources{
 			VCPUs:    metadata.VCPUs,
@@ -737,19 +1180,62 @@ func (m *Manager) cleanupNetworkOnly(runnerID, _ string) {
 	os.Remove(filepath.Join(m.config.SocketDir, runnerID+".sock"))
 }
 
-// buildBaseDiskIndex constructs a ChunkIndex for disk from golden CI metadata.
-func buildBaseDiskIndex(meta *snapshot.ChunkedSnapshotMetadata) *snapshot.ChunkIndex {
+// buildExtensionDriveBaseIndex constructs a ChunkIndex for an extension drive
+// from the golden CI metadata's ExtensionDrives map. If the drive is not found
+// in the metadata (or metadata is nil), an empty base is returned.
+func buildExtensionDriveBaseIndex(meta *snapshot.ChunkedSnapshotMetadata, driveID string) *snapshot.ChunkIndex {
 	idx := &snapshot.ChunkIndex{
 		Version:        "1",
-		ChunkSizeBytes: meta.ChunkSize,
+		ChunkSizeBytes: snapshot.DefaultChunkSize,
 	}
 	idx.CAS.Algo = "sha256"
 	idx.CAS.Layout = "chunks/disk/{p0}/{hash}"
 	idx.CAS.Kind = "disk"
-	idx.Region.Name = "vm_disk"
-	idx.Region.LogicalSizeBytes = meta.TotalDiskSize
+	idx.Region.Name = driveID
 	idx.Region.Coverage = "sparse"
 	idx.Region.DefaultFill = "zero"
+
+	if meta == nil {
+		return idx
+	}
+	if extDrive, ok := meta.ExtensionDrives[driveID]; ok {
+		idx.ChunkSizeBytes = meta.ChunkSize
+		idx.Region.LogicalSizeBytes = extDrive.SizeBytes
+		for _, ref := range extDrive.Chunks {
+			if ref.Hash == snapshot.ZeroChunkHash {
+				continue
+			}
+			idx.Region.Extents = append(idx.Region.Extents, snapshot.ManifestChunkRef{
+				Offset:       ref.Offset,
+				Length:       ref.Size,
+				Hash:         ref.Hash,
+				StoredLength: ref.CompressedSize,
+			})
+		}
+	}
+	return idx
+}
+
+// buildRootfsDriveBaseIndex constructs a ChunkIndex for the rootfs drive
+// from the golden CI metadata. If metadata is nil, an empty base is returned.
+func buildRootfsDriveBaseIndex(meta *snapshot.ChunkedSnapshotMetadata) *snapshot.ChunkIndex {
+	idx := &snapshot.ChunkIndex{
+		Version:        "1",
+		ChunkSizeBytes: snapshot.DefaultChunkSize,
+	}
+	idx.CAS.Algo = "sha256"
+	idx.CAS.Layout = "chunks/disk/{p0}/{hash}"
+	idx.CAS.Kind = "disk"
+	idx.Region.Name = "__rootfs__"
+	idx.Region.Coverage = "sparse"
+	idx.Region.DefaultFill = "zero"
+
+	if meta == nil {
+		return idx
+	}
+
+	idx.ChunkSizeBytes = meta.ChunkSize
+	idx.Region.LogicalSizeBytes = meta.TotalDiskSize
 	for _, ref := range meta.RootfsChunks {
 		if ref.Hash == snapshot.ZeroChunkHash {
 			continue
@@ -761,6 +1247,7 @@ func buildBaseDiskIndex(meta *snapshot.ChunkedSnapshotMetadata) *snapshot.ChunkI
 			StoredLength: ref.CompressedSize,
 		})
 	}
+
 	return idx
 }
 

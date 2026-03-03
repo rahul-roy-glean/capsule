@@ -16,13 +16,13 @@ var lookPath = exec.LookPath
 // Design principle (mirrors pkg/runner/types.go): the platform core handles generic
 // VM snapshot/restore lifecycle. CI and Bazel are optional add-ons that layer on top.
 //
-//   platform + microvm + hosts  →  always required
-//   workload                    →  required when ci.system is "none"
-//   session                     →  optional; enables persistent cross-host sessions
-//   ci                          →  add-on: CI system integration (default: "none")
-//   bazel                       →  add-on: Bazel-specific snapshot warmup settings
-//   repository                  →  required when snapshot uses git-clone commands
-//   credentials                 →  optional: secrets and host dirs injected into VMs
+//	platform + microvm + hosts  →  always required
+//	workload                    →  required when ci.system is "none"
+//	session                     →  optional; enables persistent cross-host sessions
+//	ci                          →  add-on: CI system integration (default: "none")
+//	bazel                       →  add-on: Bazel-specific snapshot warmup settings
+//	repository                  →  required when snapshot uses git-clone commands
+//	credentials                 →  optional: secrets and host dirs injected into VMs
 type Config struct {
 	Platform    PlatformConfig    `yaml:"platform"`
 	MicroVM     MicroVMConfig     `yaml:"microvm"`

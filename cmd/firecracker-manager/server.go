@@ -2,26 +2,32 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
+	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
 )
 
 // HostAgentServer implements the HostAgent gRPC service
 type HostAgentServer struct {
 	pb.UnimplementedHostAgentServer
-	manager       *runner.Manager
-	chunkedMgr    *runner.ChunkedManager // Optional, for chunked snapshot support
-	metricsClient *telemetry.Client      // Optional, for GCP Cloud Monitoring
-	logger        *logrus.Entry
+	manager              *runner.Manager
+	chunkedMgr           *runner.ChunkedManager // Optional, for chunked snapshot support
+	sessionPauseHist     metric.Float64Histogram
+	sessionPauseCounter  metric.Int64Counter
+	sessionResumeHist    metric.Float64Histogram
+	sessionResumeCounter metric.Int64Counter
+	logger               *logrus.Entry
 }
 
 // NewHostAgentServer creates a new HostAgentServer
@@ -41,9 +47,12 @@ func NewHostAgentServerWithChunked(mgr *runner.Manager, chunkedMgr *runner.Chunk
 	}
 }
 
-// SetMetricsClient attaches a telemetry client for GCP Cloud Monitoring.
-func (s *HostAgentServer) SetMetricsClient(c *telemetry.Client) {
-	s.metricsClient = c
+// SetOTelInstruments attaches OTel instruments for session pause/resume metrics.
+func (s *HostAgentServer) SetOTelInstruments(pauseHist metric.Float64Histogram, pauseCounter metric.Int64Counter, resumeHist metric.Float64Histogram, resumeCounter metric.Int64Counter) {
+	s.sessionPauseHist = pauseHist
+	s.sessionPauseCounter = pauseCounter
+	s.sessionResumeHist = resumeHist
+	s.sessionResumeCounter = resumeCounter
 }
 
 // AllocateRunner allocates a new runner
@@ -60,16 +69,37 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 	}
 
 	allocReq := runner.AllocateRequest{
-		RequestID:         req.RequestId,
-		Repo:              req.Repo,
-		Branch:            req.Branch,
-		Commit:            req.Commit,
-		GitHubRunnerToken: req.GithubRunnerToken,
-		Labels:            req.Labels,
-		WorkloadKey:       req.WorkloadKey,
-		SnapshotVersion:   req.SnapshotVersion,
-		CISystem:          req.CiSystem,
-		SessionID:         req.SessionId,
+		RequestID:           req.RequestId,
+		Repo:                req.Repo,
+		Branch:              req.Branch,
+		Commit:              req.Commit,
+		GitHubRunnerToken:   req.GetCiRunnerToken(),
+		Labels:              req.Labels,
+		WorkloadKey:         req.WorkloadKey,
+		SnapshotVersion:     req.SnapshotVersion,
+		CISystem:            req.CiSystem,
+		SessionID:           req.SessionId,
+		TTLSeconds:          int(req.TtlSeconds),
+		AutoPause:           req.AutoPause,
+		NetworkPolicyPreset: req.NetworkPolicyPreset,
+	}
+
+	// Extract network policy from labels (control plane packs them here
+	// because manually-added proto fields 17-18 aren't in the wire descriptor).
+	if v, ok := req.Labels["_network_policy_preset"]; ok && v != "" {
+		allocReq.NetworkPolicyPreset = v
+	}
+	if v, ok := req.Labels["_network_policy_json"]; ok && v != "" {
+		req.NetworkPolicyJson = v
+	}
+
+	// Parse network policy JSON if provided
+	if req.NetworkPolicyJson != "" {
+		var np network.NetworkPolicy
+		if err := json.Unmarshal([]byte(req.NetworkPolicyJson), &np); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid network_policy_json: %v", err)
+		}
+		allocReq.NetworkPolicy = &np
 	}
 
 	if req.Resources != nil {
@@ -84,6 +114,8 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 			Command:    req.StartCommand.Command,
 			Port:       int(req.StartCommand.Port),
 			HealthPath: req.StartCommand.HealthPath,
+			Env:        req.StartCommand.Env,
+			RunAs:      req.StartCommand.RunAs,
 		}
 	}
 
@@ -114,26 +146,28 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 
 				// Determine routing type: GCS-backed or local
 				meta, _ := s.manager.GetSessionMetadata(allocReq.SessionID)
-				routing := telemetry.RoutingLocal
+				routing := fcrotel.RoutingLocal
 				if meta != nil && meta.GCSManifestPath != "" {
-					routing = telemetry.RoutingGCS
+					routing = fcrotel.RoutingGCS
 				}
 
-				if s.metricsClient != nil {
-					s.metricsClient.RecordDuration(ctx, telemetry.MetricSessionResumeDuration, resumeDuration, telemetry.Labels{
-						telemetry.LabelRouting: routing,
-					})
-					s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionResumeTotal, telemetry.Labels{
-						telemetry.LabelResult:  telemetry.ResultSuccess,
-						telemetry.LabelRouting: routing,
-					})
+				if s.sessionResumeHist != nil {
+					s.sessionResumeHist.Record(ctx, resumeDuration.Seconds(), metric.WithAttributes(
+						fcrotel.AttrRouting.String(routing),
+					))
+				}
+				if s.sessionResumeCounter != nil {
+					s.sessionResumeCounter.Add(ctx, 1, metric.WithAttributes(
+						fcrotel.AttrResult.String(fcrotel.ResultSuccess),
+						fcrotel.AttrRouting.String(routing),
+					))
 				}
 			} else {
 				s.logger.WithError(err).Warn("Failed to resume from session, falling back to fresh allocation")
-				if s.metricsClient != nil {
-					s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionResumeTotal, telemetry.Labels{
-						telemetry.LabelResult: telemetry.ResultFailure,
-					})
+				if s.sessionResumeCounter != nil {
+					s.sessionResumeCounter.Add(ctx, 1, metric.WithAttributes(
+						fcrotel.AttrResult.String(fcrotel.ResultFailure),
+					))
 				}
 				err = nil // Reset error for fresh allocation
 			}
@@ -168,6 +202,13 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		return &pb.AllocateRunnerResponse{
 			Error: err.Error(),
 		}, nil
+	}
+
+	// Apply network policy if requested
+	if allocReq.NetworkPolicyPreset != "" || allocReq.NetworkPolicy != nil {
+		if policyErr := s.manager.ApplyNetworkPolicy(r.ID, allocReq); policyErr != nil {
+			s.logger.WithError(policyErr).WithField("runner_id", r.ID).Warn("Failed to apply network policy (non-fatal)")
+		}
 	}
 
 	return &pb.AllocateRunnerResponse{
@@ -364,10 +405,10 @@ func (s *HostAgentServer) PauseRunner(ctx context.Context, req *pb.PauseRunnerRe
 
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to pause runner")
-		if s.metricsClient != nil {
-			s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionPauseTotal, telemetry.Labels{
-				telemetry.LabelResult: telemetry.ResultFailure,
-			})
+		if s.sessionPauseCounter != nil {
+			s.sessionPauseCounter.Add(ctx, 1, metric.WithAttributes(
+				fcrotel.AttrResult.String(fcrotel.ResultFailure),
+			))
 		}
 		return &pb.PauseRunnerResponse{
 			Success: false,
@@ -375,11 +416,13 @@ func (s *HostAgentServer) PauseRunner(ctx context.Context, req *pb.PauseRunnerRe
 		}, nil
 	}
 
-	if s.metricsClient != nil {
-		s.metricsClient.RecordDuration(ctx, telemetry.MetricSessionPauseDuration, duration, nil)
-		s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionPauseTotal, telemetry.Labels{
-			telemetry.LabelResult: telemetry.ResultSuccess,
-		})
+	if s.sessionPauseHist != nil {
+		s.sessionPauseHist.Record(ctx, duration.Seconds())
+	}
+	if s.sessionPauseCounter != nil {
+		s.sessionPauseCounter.Add(ctx, 1, metric.WithAttributes(
+			fcrotel.AttrResult.String(fcrotel.ResultSuccess),
+		))
 	}
 
 	return &pb.PauseRunnerResponse{

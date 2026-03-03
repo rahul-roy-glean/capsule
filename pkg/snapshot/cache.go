@@ -44,6 +44,9 @@ type SnapshotPaths struct {
 	State         string
 	RepoCacheSeed string
 	Version       string
+	// ExtensionDriveImages maps DriveID to the local path of the extension drive image.
+	// Used by BuildChunkedSnapshot to chunk extension drives.
+	ExtensionDriveImages map[string]string
 }
 
 // Cache manages local snapshot cache with GCS sync
@@ -208,8 +211,22 @@ func (c *Cache) loadLocalMetadata() error {
 	return nil
 }
 
+// GetKernelPath returns the path to kernel.bin, verifying it exists.
+// Use this when only the kernel is needed (e.g. GCS-backed resume where
+// rootfs is provided via FUSE).
+func (c *Cache) GetKernelPath() (string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	kernelPath := filepath.Join(c.localPath, "kernel.bin")
+	if _, err := os.Stat(kernelPath); err != nil {
+		return "", fmt.Errorf("required snapshot file not found: %s", kernelPath)
+	}
+	return kernelPath, nil
+}
+
 // GetSnapshotPaths returns the paths to snapshot files.
-// Kernel, rootfs, and repo-cache-seed are required; mem/state are optional (fresh boot if missing).
+// Kernel and rootfs are required; repo-cache-seed, mem/state are optional.
 func (c *Cache) GetSnapshotPaths() (*SnapshotPaths, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -221,7 +238,7 @@ func (c *Cache) GetSnapshotPaths() (*SnapshotPaths, error) {
 	repoCacheSeedPath := filepath.Join(c.localPath, "repo-cache-seed.img")
 
 	// Required files for any boot mode
-	for _, path := range []string{kernelPath, rootfsPath, repoCacheSeedPath} {
+	for _, path := range []string{kernelPath, rootfsPath} {
 		if _, err := os.Stat(path); err != nil {
 			return nil, fmt.Errorf("required snapshot file not found: %s", path)
 		}
@@ -229,10 +246,14 @@ func (c *Cache) GetSnapshotPaths() (*SnapshotPaths, error) {
 
 	// Snapshot files are optional - if missing, caller will use fresh boot
 	paths := &SnapshotPaths{
-		Kernel:        kernelPath,
-		Rootfs:        rootfsPath,
-		RepoCacheSeed: repoCacheSeedPath,
-		Version:       c.currentVer,
+		Kernel:  kernelPath,
+		Rootfs:  rootfsPath,
+		Version: c.currentVer,
+	}
+
+	// repo-cache-seed is optional — new workloads use extension drives instead.
+	if _, err := os.Stat(repoCacheSeedPath); err == nil {
+		paths.RepoCacheSeed = repoCacheSeedPath
 	}
 
 	// Only include mem/state if BOTH exist (partial snapshot is invalid)
@@ -241,6 +262,28 @@ func (c *Cache) GetSnapshotPaths() (*SnapshotPaths, error) {
 			paths.Mem = memPath
 			paths.State = statePath
 		}
+	}
+
+	// Scan for extension drive images: any .img file that isn't a known
+	// infrastructure file. This handles both legacy drives (repo-cache-seed.img)
+	// and new layered drives (workspace.img, etc.).
+	paths.ExtensionDriveImages = make(map[string]string)
+	knownFiles := map[string]bool{
+		"kernel.bin":            true,
+		"rootfs.img":            true,
+		"snapshot.mem":          true,
+		"snapshot.state":        true,
+		"metadata.json":         true,
+		"chunked-metadata.json": true,
+	}
+	entries, _ := os.ReadDir(c.localPath)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".img") || knownFiles[e.Name()] {
+			continue
+		}
+		driveID := strings.TrimSuffix(e.Name(), ".img")
+		driveID = strings.ReplaceAll(driveID, "-", "_")
+		paths.ExtensionDriveImages[driveID] = filepath.Join(c.localPath, e.Name())
 	}
 
 	return paths, nil

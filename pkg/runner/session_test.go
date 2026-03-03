@@ -181,14 +181,14 @@ func TestSessionMetadata_JSON(t *testing.T) {
 
 func TestSessionMetadata_GCSFields(t *testing.T) {
 	meta := SessionMetadata{
-		SessionID:          "sess-gcs",
-		WorkloadKey:        "wk123",
-		RunnerID:           "runner-1",
-		HostID:             "host-1",
-		Layers:             1,
-		GCSManifestPath:    "v1/wk123/runner_state/runner-1/snapshot_manifest.json",
-		GCSMemIndexObject:  "v1/wk123/runner_state/runner-1/chunked-metadata.json",
-		GCSDiskIndexObject: "v1/wk123/runner_state/runner-1/disk-chunked-metadata.json",
+		SessionID:           "sess-gcs",
+		WorkloadKey:         "wk123",
+		RunnerID:            "runner-1",
+		HostID:              "host-1",
+		Layers:              1,
+		GCSManifestPath:     "v1/wk123/runner_state/runner-1/snapshot_manifest.json",
+		GCSMemIndexObject:   "v1/wk123/runner_state/runner-1/chunked-metadata.json",
+		GCSDiskIndexObjects: map[string]string{"rootfs": "v1/wk123/runner_state/runner-1/disk-chunked-metadata.json"},
 	}
 
 	data, err := json.Marshal(meta)
@@ -207,8 +207,8 @@ func TestSessionMetadata_GCSFields(t *testing.T) {
 	if decoded.GCSMemIndexObject != meta.GCSMemIndexObject {
 		t.Errorf("GCSMemIndexObject = %q, want %q", decoded.GCSMemIndexObject, meta.GCSMemIndexObject)
 	}
-	if decoded.GCSDiskIndexObject != meta.GCSDiskIndexObject {
-		t.Errorf("GCSDiskIndexObject = %q, want %q", decoded.GCSDiskIndexObject, meta.GCSDiskIndexObject)
+	if decoded.GCSDiskIndexObjects["rootfs"] != meta.GCSDiskIndexObjects["rootfs"] {
+		t.Errorf("GCSDiskIndexObjects[rootfs] = %q, want %q", decoded.GCSDiskIndexObjects["rootfs"], meta.GCSDiskIndexObjects["rootfs"])
 	}
 }
 
@@ -629,6 +629,7 @@ func TestResumeFromSession_SuspendedNotCountedForCapacity(t *testing.T) {
 			if r := recover(); r != nil {
 				// Expected: nil pointer on snapshotCache.GetSnapshotPaths()
 				// This proves we got PAST the capacity check.
+				t.Logf("Got expected panic past capacity check: %v", r)
 			}
 		}()
 		_, err = m.ResumeFromSession(context.Background(), "sess-1", "")

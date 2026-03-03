@@ -11,13 +11,13 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
 	_ "github.com/lib/pq"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
@@ -25,7 +25,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
+	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/tiers"
 )
 
@@ -43,10 +43,9 @@ var (
 	logLevel   = flag.String("log-level", "info", "Log level")
 
 	// Telemetry
-	telemetryEnabled = flag.Bool("telemetry-enabled", true, "Enable GCP Cloud Monitoring telemetry")
-	gcpProject       = flag.String("gcp-project", "", "GCP project for telemetry and snapshot builder VMs")
-	gcpZone          = flag.String("gcp-zone", "us-central1-a", "GCP zone for snapshot builder VMs")
-	environment      = flag.String("environment", "dev", "Environment name for telemetry labels")
+	gcpProject  = flag.String("gcp-project", "", "GCP project for telemetry and snapshot builder VMs")
+	gcpZone     = flag.String("gcp-zone", "us-central1-a", "GCP zone for snapshot builder VMs")
+	environment = flag.String("environment", "dev", "Environment name for telemetry labels")
 )
 
 func main() {
@@ -116,11 +115,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Initialize telemetry
-	telemetryEnabledVal := *telemetryEnabled
-	if v := os.Getenv("TELEMETRY_ENABLED"); v != "" {
-		telemetryEnabledVal = strings.ToLower(v) == "true"
-	}
+	// Initialize OpenTelemetry
 	gcpProjectVal := *gcpProject
 	if v := os.Getenv("GCP_PROJECT_ID"); v != "" {
 		gcpProjectVal = v
@@ -134,35 +129,51 @@ func main() {
 		envVal = v
 	}
 
-	var metricsClient *telemetry.Client
-	if telemetryEnabledVal && gcpProjectVal != "" {
-		telemetryCfg := telemetry.Config{
-			Enabled:       true,
-			ProjectID:     gcpProjectVal,
-			MetricPrefix:  "custom.googleapis.com/firecracker",
-			Component:     "control-plane",
-			Environment:   envVal,
-			FlushInterval: 10 * time.Second,
-		}
-		var telErr error
-		metricsClient, telErr = telemetry.NewClient(ctx, telemetryCfg, logger)
-		if telErr != nil {
-			log.WithError(telErr).Warn("Failed to initialize telemetry, continuing without metrics")
-		} else {
-			defer metricsClient.Close()
-			log.Info("GCP Cloud Monitoring telemetry initialized")
-		}
+	otelCfg := fcrotel.ConfigFromEnv("control-plane")
+	if envVal != "" {
+		otelCfg.Environment = envVal
 	}
+	otelClient, otelErr := fcrotel.Init(ctx, otelCfg)
+	if otelErr != nil {
+		log.WithError(otelErr).Warn("Failed to initialize OpenTelemetry, continuing without telemetry")
+		otelClient, _ = fcrotel.Init(ctx, fcrotel.Config{ServiceName: "control-plane"})
+	}
+	defer otelClient.Shutdown(ctx)
+
+	// Add trace correlation to logrus
+	logger.AddHook(&fcrotel.TraceCorrelationHook{})
+
+	// Create OTel instruments
+	meter := otelClient.Meter("control-plane")
+	cpHostsGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPHostsTotal)
+	cpRunnersGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPRunnersTotal)
+	cpQueueDepthGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPQueueDepth)
+	cpFleetCPUTotalGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetCPUTotal)
+	cpFleetCPUUsedGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetCPUUsed)
+	cpFleetCPUFreeGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetCPUFree)
+	cpFleetMemTotalGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetMemTotal)
+	cpFleetMemUsedGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetMemUsed)
+	cpFleetMemFreeGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetMemFree)
+	cpFleetUtilGauge, _ := fcrotel.NewFloat64Gauge(meter, fcrotel.CPFleetUtilization)
+	snapshotAgeGauge, _ := fcrotel.NewGauge(meter, fcrotel.SnapshotAge)
+	canarySuccessCounter, _ := fcrotel.NewCounter(meter, fcrotel.E2ECanarySuccess)
+	canaryFailureCounter, _ := fcrotel.NewCounter(meter, fcrotel.E2ECanaryFailure)
+	sessionResumeRoutingCounter, _ := fcrotel.NewCounter(meter, fcrotel.SessionResumeRouting)
 
 	// Create services
 	hostRegistry := NewHostRegistry(db, logger)
 	snapshotManager := NewSnapshotManager(ctx, db, *gcsBucket, *gcsPrefix, gcpProjectVal, gcpZoneVal, logger)
-	scheduler := NewScheduler(hostRegistry, db, snapshotManager, logger)
-	if metricsClient != nil {
-		scheduler.SetMetricsClient(metricsClient)
-	}
+	configCache := NewConfigCache(db, logger)
+	tagRegistry := NewSnapshotTagRegistry(db, logger)
+	scheduler := NewScheduler(hostRegistry, db, snapshotManager, tagRegistry, logger)
+	scheduler.SetConfigCache(configCache)
+	scheduler.SetOTel(otelClient, sessionResumeRoutingCounter)
 	jobQueue := NewJobQueue(db, scheduler, hostRegistry, logger)
-	snapshotConfigRegistry := NewSnapshotConfigRegistry(db, snapshotManager, logger)
+	jobQueue.SetConfigCache(configCache)
+	layeredConfigRegistry := NewLayeredConfigRegistry(db, snapshotManager, logger)
+	layeredConfigRegistry.SetConfigCache(configCache)
+	layerBuildScheduler := NewLayerBuildScheduler(db, snapshotManager, logger, 4)
+	layeredConfigRegistry.SetLayerBuilder(layerBuildScheduler)
 
 	// Load existing state from DB (best-effort)
 	if err := hostRegistry.LoadFromDB(ctx); err != nil {
@@ -170,10 +181,15 @@ func main() {
 	}
 
 	// Create gRPC server
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		grpc.StatsHandler(otelgrpc.NewServerHandler(
+			otelgrpc.WithTracerProvider(otelClient.TracerProvider),
+			otelgrpc.WithMeterProvider(otelClient.MeterProvider),
+		)),
+	)
 
 	// Register services
-	controlPlaneServer := NewControlPlaneServer(scheduler, hostRegistry, snapshotManager, jobQueue, metricsClient, logger)
+	controlPlaneServer := NewControlPlaneServer(scheduler, hostRegistry, snapshotManager, jobQueue, canarySuccessCounter, canaryFailureCounter, logger)
 	pb.RegisterControlPlaneServer(grpcServer, controlPlaneServer)
 
 	// Register health service
@@ -202,7 +218,10 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	})
-	httpMux.Handle("/metrics", promhttp.Handler())
+	httpMux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("metrics served via OTel Collector"))
+	})
 	httpMux.HandleFunc("/api/v1/runners", controlPlaneServer.HandleGetRunners)
 	httpMux.HandleFunc("/api/v1/runners/allocate", controlPlaneServer.HandleAllocateRunner)
 	httpMux.HandleFunc("/api/v1/runners/status", controlPlaneServer.HandleRunnerStatus)
@@ -214,9 +233,9 @@ func main() {
 	httpMux.HandleFunc("/api/v1/hosts", controlPlaneServer.HandleGetHosts)
 	httpMux.HandleFunc("/api/v1/hosts/heartbeat", controlPlaneServer.HandleHostHeartbeat)
 	httpMux.HandleFunc("/api/v1/snapshots", controlPlaneServer.HandleGetSnapshots)
-	// Snapshot config registry endpoints
-	httpMux.HandleFunc("/api/v1/snapshot-configs/", snapshotConfigRegistry.HandleSnapshotConfigs)
-	httpMux.HandleFunc("/api/v1/snapshot-configs", snapshotConfigRegistry.HandleSnapshotConfigs)
+	// Layered config registry endpoints
+	httpMux.HandleFunc("/api/v1/layered-configs/", layeredConfigRegistry.HandleLayeredConfigs)
+	httpMux.HandleFunc("/api/v1/layered-configs", layeredConfigRegistry.HandleLayeredConfigs)
 	// Version/rollout endpoints (Phase 4)
 	httpMux.HandleFunc("/api/v1/versions/desired", controlPlaneServer.HandleGetDesiredVersions)
 	httpMux.HandleFunc("/api/v1/versions/fleet", controlPlaneServer.HandleGetFleetConvergence)
@@ -230,7 +249,7 @@ func main() {
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *httpPort),
-		Handler: httpMux,
+		Handler: apiLoggingMiddleware(logger, httpMux),
 	}
 
 	go func() {
@@ -242,13 +261,15 @@ func main() {
 
 	// Start background workers
 	go hostRegistry.HealthCheckLoop(ctx)
-	go snapshotFreshnessLoop(ctx, snapshotManager, snapshotConfigRegistry, logger)
 	go startDownscaler(ctx, db, hostRegistry, scheduler, logger)
 	go jobQueue.jobRetryLoop(ctx)
 	go controlPlaneServer.startTTLEnforcement(ctx)
-	if metricsClient != nil {
-		go controlPlaneMetricsLoop(ctx, hostRegistry, scheduler, snapshotManager, metricsClient, logger)
-	}
+	go layerBuildScheduler.Run(ctx)
+	go controlPlaneMetricsLoop(ctx, hostRegistry, scheduler, snapshotManager,
+		cpHostsGauge, cpRunnersGauge, cpQueueDepthGauge,
+		cpFleetCPUTotalGauge, cpFleetCPUUsedGauge, cpFleetCPUFreeGauge,
+		cpFleetMemTotalGauge, cpFleetMemUsedGauge, cpFleetMemFreeGauge,
+		cpFleetUtilGauge, snapshotAgeGauge, logger)
 
 	// Wait for shutdown
 	sigCh := make(chan os.Signal, 1)
@@ -264,6 +285,59 @@ func main() {
 	httpServer.Shutdown(shutdownCtx)
 
 	log.Info("Shutdown complete")
+}
+
+// statusRecorder wraps http.ResponseWriter to capture the status code.
+type statusRecorder struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.statusCode = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+// apiLoggingMiddleware logs every API request on completion with method, path,
+// status code, duration, and optional identifiers from query parameters.
+func apiLoggingMiddleware(logger *logrus.Logger, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip /health and /metrics — too noisy
+		if r.URL.Path == "/health" || r.URL.Path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, statusCode: 200}
+		next.ServeHTTP(rec, r)
+		duration := time.Since(start)
+
+		fields := logrus.Fields{
+			"method":      r.Method,
+			"path":        r.URL.Path,
+			"status":      rec.statusCode,
+			"duration_ms": duration.Milliseconds(),
+			"remote_addr": r.RemoteAddr,
+		}
+
+		// Extract identifiers from query string (GET endpoints)
+		if v := r.URL.Query().Get("runner_id"); v != "" {
+			fields["runner_id"] = v
+		}
+		if v := r.URL.Query().Get("workload_key"); v != "" {
+			fields["workload_key"] = v
+		}
+
+		entry := logger.WithFields(fields)
+		if rec.statusCode >= 500 {
+			entry.Error("API request completed with server error")
+		} else if rec.statusCode >= 400 {
+			entry.Warn("API request completed with client error")
+		} else {
+			entry.Info("API request completed")
+		}
+	})
 }
 
 func initSchema(db *sql.DB) error {
@@ -368,39 +442,16 @@ func initSchema(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_version_assignments_repo ON version_assignments(repo_slug)`,
 		`CREATE INDEX IF NOT EXISTS idx_version_assignments_host ON version_assignments(host_id)`,
-		// workload_key migration: add snapshot_configs table
-		`CREATE TABLE IF NOT EXISTS snapshot_configs (
-			workload_key              VARCHAR(16) PRIMARY KEY,
-			display_name           VARCHAR(255),
-			commands               TEXT NOT NULL DEFAULT '[]',
-			build_schedule         VARCHAR(64) DEFAULT '',
-			max_concurrent_runners INT DEFAULT 0,
-			current_version        VARCHAR(255),
-			auto_rollout           BOOLEAN DEFAULT true,
-			created_at             TIMESTAMP DEFAULT NOW()
-		)`,
 		// Rename chunk_key -> workload_key in existing tables (idempotent: no-op if column doesn't exist or target already exists)
-		`DO $$ BEGIN ALTER TABLE snapshot_configs RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
 		`DO $$ BEGIN ALTER TABLE snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
 		`DO $$ BEGIN ALTER TABLE version_assignments RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
 		`DO $$ BEGIN ALTER TABLE session_snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
 		// Add workload_key column to snapshots (for fresh installs without chunk_key)
 		`ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshots_workload_key ON snapshots(workload_key)`,
-		// GitHub App credentials for snapshot configs
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS github_app_id VARCHAR(255) DEFAULT ''`,
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS github_app_secret VARCHAR(255) DEFAULT ''`,
-		// Add ci_system column to snapshot_configs (defaults to empty string = no CI system)
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS ci_system VARCHAR(64) DEFAULT ''`,
-		// Add start_command column to snapshot_configs (JSON-encoded StartCommand)
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS start_command TEXT DEFAULT ''`,
 		// Add workload_key column to version_assignments
 		`ALTER TABLE version_assignments ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_version_assignments_workload ON version_assignments(workload_key)`,
-		// Session pause/resume: TTL and auto-pause config
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS runner_ttl_seconds INT DEFAULT 0`,
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS session_max_age_seconds INT DEFAULT 86400`,
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS auto_pause BOOLEAN DEFAULT false`,
 		// Session snapshots tracking for pause/resume
 		`CREATE TABLE IF NOT EXISTS session_snapshots (
 			session_id    TEXT PRIMARY KEY,
@@ -435,10 +486,6 @@ func initSchema(db *sql.DB) error {
 		// Add workload_key column to runners
 		`ALTER TABLE runners ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_runners_workload_key ON runners(workload_key)`,
-		// Incremental commands for snapshot configs
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS incremental_commands JSONB DEFAULT '[]'`,
-		// Tier-based resource sizing
-		`ALTER TABLE snapshot_configs ADD COLUMN IF NOT EXISTS tier VARCHAR(8) DEFAULT 'm'`,
 		// Host resource tracking for bin-packing scheduler
 		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS total_cpu_millicores INT DEFAULT 0`,
 		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS used_cpu_millicores INT DEFAULT 0`,
@@ -462,34 +509,198 @@ func initSchema(db *sql.DB) error {
 		// Drop unused repo/branch columns from runners
 		`ALTER TABLE runners DROP COLUMN IF EXISTS repo`,
 		`ALTER TABLE runners DROP COLUMN IF EXISTS branch`,
+		// Layered snapshot pipeline tables
+		`CREATE TABLE IF NOT EXISTS snapshot_layers (
+			layer_hash           VARCHAR(64) PRIMARY KEY,
+			parent_layer_hash    VARCHAR(64) REFERENCES snapshot_layers(layer_hash),
+			config_name          VARCHAR(255) NOT NULL,
+			depth                INT NOT NULL DEFAULT 0,
+			init_commands        JSONB NOT NULL DEFAULT '[]',
+			refresh_commands     JSONB DEFAULT '[]',
+			drives               JSONB DEFAULT '[]',
+			refresh_interval     VARCHAR(64) DEFAULT '',
+			current_version      VARCHAR(255),
+			status               VARCHAR(32) DEFAULT 'pending',
+			created_at           TIMESTAMP DEFAULT NOW(),
+			updated_at           TIMESTAMP DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_layers_parent ON snapshot_layers(parent_layer_hash)`,
+		`CREATE INDEX IF NOT EXISTS idx_layers_status ON snapshot_layers(status)`,
+		`CREATE TABLE IF NOT EXISTS snapshot_builds (
+			build_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			layer_hash        VARCHAR(64) NOT NULL REFERENCES snapshot_layers(layer_hash),
+			version           VARCHAR(255) NOT NULL,
+			status            VARCHAR(32) DEFAULT 'queued',
+			build_type        VARCHAR(16) DEFAULT 'init',
+			instance_name     VARCHAR(255),
+			parent_version    VARCHAR(255),
+			started_at        TIMESTAMP,
+			completed_at      TIMESTAMP,
+			failure_reason    TEXT,
+			retry_count       INT DEFAULT 0,
+			max_retries       INT DEFAULT 3,
+			created_at        TIMESTAMP DEFAULT NOW(),
+			UNIQUE(layer_hash, version)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_builds_status ON snapshot_builds(status, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_builds_layer ON snapshot_builds(layer_hash)`,
+		`CREATE TABLE IF NOT EXISTS layered_configs (
+			config_id              VARCHAR(64) PRIMARY KEY,
+			display_name           VARCHAR(255) NOT NULL,
+			config_json            TEXT NOT NULL,
+			leaf_layer_hash        VARCHAR(64),
+			leaf_workload_key      VARCHAR(16),
+			tier                   VARCHAR(8) DEFAULT 'm',
+			ci_system              VARCHAR(64) DEFAULT '',
+			github_app_id          VARCHAR(255) DEFAULT '',
+			github_app_secret      VARCHAR(255) DEFAULT '',
+			start_command          TEXT DEFAULT '',
+			runner_ttl_seconds     INT DEFAULT 0,
+			session_max_age_seconds INT DEFAULT 86400,
+			auto_pause             BOOLEAN DEFAULT false,
+			auto_rollout           BOOLEAN DEFAULT true,
+			max_concurrent_runners INT DEFAULT 0,
+			build_schedule         VARCHAR(64) DEFAULT '',
+			created_at             TIMESTAMP DEFAULT NOW(),
+			updated_at             TIMESTAMP DEFAULT NOW()
+		)`,
+		// Indexes for layered_configs lookups
+		`CREATE INDEX IF NOT EXISTS idx_layered_configs_leaf_wk ON layered_configs(leaf_workload_key)`,
+		`CREATE INDEX IF NOT EXISTS idx_layered_configs_leaf_hash ON layered_configs(leaf_layer_hash)`,
+		// Network policy columns on layered_configs
+		`ALTER TABLE layered_configs ADD COLUMN IF NOT EXISTS network_policy JSONB DEFAULT NULL`,
+		`ALTER TABLE layered_configs ADD COLUMN IF NOT EXISTS network_policy_preset VARCHAR(64) DEFAULT ''`,
+		// Mapping table: repo → workload_key for CI webhook routing.
+		// This is a CI integration concern, not part of the core config model.
+		`CREATE TABLE IF NOT EXISTS repo_workload_mappings (
+			repo          VARCHAR(512) PRIMARY KEY,
+			workload_key  VARCHAR(16) NOT NULL,
+			source        VARCHAR(32) DEFAULT 'auto',
+			created_at    TIMESTAMP DEFAULT NOW()
+		)`,
+		// Reattach build support: track old layer hash/version for drive reuse
+		`ALTER TABLE snapshot_builds ADD COLUMN IF NOT EXISTS old_layer_hash VARCHAR(64)`,
+		`ALTER TABLE snapshot_builds ADD COLUMN IF NOT EXISTS old_layer_version VARCHAR(255)`,
+		// config_id links a build to the owning layered_configs row for tier/credential lookups
+		`ALTER TABLE snapshot_builds ADD COLUMN IF NOT EXISTS config_id VARCHAR(64)`,
+		// All-chain drives: union of drives across all layers in a config
+		`ALTER TABLE snapshot_layers ADD COLUMN IF NOT EXISTS all_chain_drives JSONB DEFAULT '[]'`,
+		// Re-activate layers that are referenced by a config but were incorrectly deactivated.
+		`UPDATE snapshot_layers SET status='active' WHERE status='inactive'
+			AND layer_hash IN (
+				WITH RECURSIVE config_layers AS (
+					SELECT sl.layer_hash, sl.parent_layer_hash
+					FROM snapshot_layers sl
+					JOIN layered_configs lc ON lc.leaf_layer_hash = sl.layer_hash
+					UNION ALL
+					SELECT sl.layer_hash, sl.parent_layer_hash
+					FROM snapshot_layers sl
+					JOIN config_layers cl ON cl.parent_layer_hash = sl.layer_hash
+				)
+				SELECT layer_hash FROM config_layers
+			)`,
+		// Deactivate orphaned layers not referenced by any config and cancel their active builds.
+		// Walk the parent chain from each config's leaf_layer_hash to find all referenced layers.
+		`UPDATE snapshot_layers SET status='inactive' WHERE status IN ('active', 'pending')
+			AND layer_hash NOT IN (
+				WITH RECURSIVE config_layers AS (
+					SELECT sl.layer_hash, sl.parent_layer_hash
+					FROM snapshot_layers sl
+					JOIN layered_configs lc ON lc.leaf_layer_hash = sl.layer_hash
+					UNION ALL
+					SELECT sl.layer_hash, sl.parent_layer_hash
+					FROM snapshot_layers sl
+					JOIN config_layers cl ON cl.parent_layer_hash = sl.layer_hash
+				)
+				SELECT layer_hash FROM config_layers
+			)`,
+		`UPDATE snapshot_builds SET status='cancelled' WHERE status IN ('queued','waiting_parent','running')
+			AND layer_hash IN (SELECT layer_hash FROM snapshot_layers WHERE status='inactive')`,
+		// Snapshot tags for template versioning (WS6)
+		`CREATE TABLE IF NOT EXISTS snapshot_tags (
+			tag           VARCHAR(64) NOT NULL,
+			workload_key  VARCHAR(16) NOT NULL,
+			version       VARCHAR(255) NOT NULL,
+			description   TEXT DEFAULT '',
+			created_at    TIMESTAMP DEFAULT NOW(),
+			PRIMARY KEY (tag, workload_key)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_snapshot_tags_workload ON snapshot_tags(workload_key)`,
+		// Denormalize config_id into snapshot_builds for efficient query joins
+		`ALTER TABLE snapshot_builds ADD COLUMN IF NOT EXISTS config_id VARCHAR(64) DEFAULT ''`,
+		// Prevent duplicate active builds per layer
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_builds_one_active_per_layer
+			ON snapshot_builds (layer_hash) WHERE status IN ('queued', 'waiting_parent', 'running')`,
 	}
-	for _, stmt := range migrations {
-		if _, err := db.Exec(stmt); err != nil {
+	logger := logrus.WithField("component", "migrations")
+	for i, stmt := range migrations {
+		result, err := db.Exec(stmt)
+		if err != nil {
 			return err
 		}
+		if n, _ := result.RowsAffected(); n > 0 {
+			logger.WithFields(logrus.Fields{
+				"migration": i,
+				"rows":      n,
+			}).Info("Migration applied")
+		}
 	}
+
+	// Log layer statuses for debugging
+	rows, err := db.Query(`SELECT layer_hash, config_name, status FROM snapshot_layers ORDER BY config_name`)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var hash, name, status string
+			rows.Scan(&hash, &name, &status)
+			logger.WithFields(logrus.Fields{
+				"layer_hash": hash[:16],
+				"name":       name,
+				"status":     status,
+			}).Info("Layer status at startup")
+		}
+	}
+
+	// Log active builds
+	rows2, err := db.Query(`SELECT build_id, layer_hash, status, build_type FROM snapshot_builds WHERE status IN ('queued','waiting_parent','running') ORDER BY created_at`)
+	if err == nil {
+		defer rows2.Close()
+		for rows2.Next() {
+			var bid, hash, status, btype string
+			rows2.Scan(&bid, &hash, &status, &btype)
+			logger.WithFields(logrus.Fields{
+				"build_id":   bid,
+				"layer_hash": hash[:16],
+				"status":     status,
+				"build_type": btype,
+			}).Info("Active build at startup")
+		}
+	}
+
 	return nil
 }
 
 // ControlPlaneServer implements the ControlPlane gRPC service
 type ControlPlaneServer struct {
 	pb.UnimplementedControlPlaneServer
-	scheduler       *Scheduler
-	hostRegistry    *HostRegistry
-	snapshotManager *SnapshotManager
-	jobQueue        *JobQueue
-	metricsClient   *telemetry.Client
-	logger          *logrus.Entry
+	scheduler            *Scheduler
+	hostRegistry         *HostRegistry
+	snapshotManager      *SnapshotManager
+	jobQueue             *JobQueue
+	canarySuccessCounter metric.Int64Counter
+	canaryFailureCounter metric.Int64Counter
+	logger               *logrus.Entry
 }
 
-func NewControlPlaneServer(s *Scheduler, h *HostRegistry, sm *SnapshotManager, jq *JobQueue, mc *telemetry.Client, l *logrus.Logger) *ControlPlaneServer {
+func NewControlPlaneServer(s *Scheduler, h *HostRegistry, sm *SnapshotManager, jq *JobQueue, canarySuccess, canaryFailure metric.Int64Counter, l *logrus.Logger) *ControlPlaneServer {
 	return &ControlPlaneServer{
-		scheduler:       s,
-		hostRegistry:    h,
-		snapshotManager: sm,
-		jobQueue:        jq,
-		metricsClient:   mc,
-		logger:          l.WithField("service", "control-plane"),
+		scheduler:            s,
+		hostRegistry:         h,
+		snapshotManager:      sm,
+		jobQueue:             jq,
+		canarySuccessCounter: canarySuccess,
+		canaryFailureCounter: canaryFailure,
+		logger:               l.WithField("service", "control-plane"),
 	}
 }
 
@@ -564,12 +775,17 @@ func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Req
 	var allRunners []map[string]interface{}
 
 	for _, h := range hosts {
-		// For now, return basic host runner info
-		for i := 0; i < h.IdleRunners+h.BusyRunners; i++ {
+		s.hostRegistry.mu.RLock()
+		runnerInfos := h.RunnerInfos
+		s.hostRegistry.mu.RUnlock()
+
+		for _, ri := range runnerInfos {
 			allRunners = append(allRunners, map[string]interface{}{
-				"host_id":   h.ID,
-				"host_name": h.InstanceName,
-				"status":    "running",
+				"runner_id":    ri.RunnerID,
+				"host_id":      h.ID,
+				"host_name":    h.InstanceName,
+				"workload_key": ri.WorkloadKey,
+				"status":       ri.State,
 			})
 		}
 	}
@@ -591,10 +807,13 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 	}
 
 	var req struct {
-		RequestID   string            `json:"request_id"`
-		WorkloadKey string            `json:"workload_key"`
-		Labels      map[string]string `json:"labels"`
-		SessionID   string            `json:"session_id"`
+		RequestID           string            `json:"request_id"`
+		WorkloadKey         string            `json:"workload_key"`
+		Labels              map[string]string `json:"labels"`
+		SessionID           string            `json:"session_id"`
+		SnapshotTag         string            `json:"snapshot_tag"`
+		NetworkPolicyPreset string            `json:"network_policy_preset"`
+		NetworkPolicyJSON   string            `json:"network_policy_json"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
@@ -615,10 +834,13 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 	}).Info("Manual runner allocation request")
 
 	resp, err := s.scheduler.AllocateRunner(r.Context(), AllocateRunnerRequest{
-		RequestID:   req.RequestID,
-		WorkloadKey: req.WorkloadKey,
-		Labels:      req.Labels,
-		SessionID:   req.SessionID,
+		RequestID:           req.RequestID,
+		WorkloadKey:         req.WorkloadKey,
+		Labels:              req.Labels,
+		SessionID:           req.SessionID,
+		SnapshotTag:         req.SnapshotTag,
+		NetworkPolicyPreset: req.NetworkPolicyPreset,
+		NetworkPolicyJSON:   req.NetworkPolicyJSON,
 	})
 	if err != nil {
 		s.logger.WithError(err).Error("Manual allocation failed")
@@ -816,14 +1038,16 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 
 	// Update session_snapshots table
 	if resp.SessionId != "" {
-		_, _ = s.scheduler.db.ExecContext(r.Context(), `
+		if _, dbErr := s.scheduler.db.ExecContext(r.Context(), `
 			INSERT INTO session_snapshots (session_id, runner_id, workload_key, host_id, status, layer_count, paused_at)
 			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW())
 			ON CONFLICT (session_id) DO UPDATE SET
 				status = 'suspended',
 				layer_count = EXCLUDED.layer_count,
 				paused_at = NOW()
-		`, resp.SessionId, req.RunnerID, runner.WorkloadKey, host.ID, resp.Layer+1)
+		`, resp.SessionId, req.RunnerID, runner.WorkloadKey, host.ID, resp.Layer+1); dbErr != nil {
+			s.logger.WithError(dbErr).WithField("session_id", resp.SessionId).Error("Failed to update session_snapshots table")
+		}
 	}
 
 	// Roll back optimistic resource reservation — a paused runner no longer
@@ -917,7 +1141,7 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 		client := pb.NewHostAgentClient(conn)
 		resp, err := client.ResumeRunner(r.Context(), &pb.ResumeRunnerRequest{SessionId: sessionID})
 		if err != nil || resp.Error != "" {
-			errMsg := "resume failed"
+			var errMsg string
 			if err != nil {
 				errMsg = err.Error()
 			} else {
@@ -1094,11 +1318,13 @@ func (s *ControlPlaneServer) HandleCanaryReport(w http.ResponseWriter, r *http.R
 		"runner": report.Runner,
 	}).Info("Received canary report")
 
-	if s.metricsClient != nil {
-		if report.Status == "success" {
-			s.metricsClient.IncrementCounter(r.Context(), telemetry.MetricE2ECanarySuccess, nil)
-		} else {
-			s.metricsClient.IncrementCounter(r.Context(), telemetry.MetricE2ECanaryFailure, nil)
+	if report.Status == "success" {
+		if s.canarySuccessCounter != nil {
+			s.canarySuccessCounter.Add(r.Context(), 1)
+		}
+	} else {
+		if s.canaryFailureCounter != nil {
+			s.canaryFailureCounter.Add(r.Context(), 1)
 		}
 	}
 
@@ -1106,8 +1332,14 @@ func (s *ControlPlaneServer) HandleCanaryReport(w http.ResponseWriter, r *http.R
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// controlPlaneMetricsLoop periodically records control plane metrics to GCP Cloud Monitoring
-func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Scheduler, sm *SnapshotManager, mc *telemetry.Client, logger *logrus.Logger) {
+// controlPlaneMetricsLoop periodically records control plane metrics via OpenTelemetry
+func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Scheduler, sm *SnapshotManager,
+	cpHostsGauge, cpRunnersGauge, cpQueueDepthGauge metric.Int64Gauge,
+	cpFleetCPUTotalGauge, cpFleetCPUUsedGauge, cpFleetCPUFreeGauge metric.Int64Gauge,
+	cpFleetMemTotalGauge, cpFleetMemUsedGauge, cpFleetMemFreeGauge metric.Int64Gauge,
+	cpFleetUtilGauge metric.Float64Gauge, snapshotAgeGauge metric.Int64Gauge,
+	logger *logrus.Logger) {
+
 	log := logger.WithField("component", "metrics-loop")
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -1146,29 +1378,29 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 
 			// Record host counts by status
 			for status, count := range statusCounts {
-				mc.RecordInt(ctx, telemetry.MetricCPHostsTotal, count, telemetry.Labels{
-					telemetry.LabelStatus: status,
-				})
+				cpHostsGauge.Record(ctx, count, metric.WithAttributes(
+					fcrotel.AttrStatus.String(status),
+				))
 			}
 
 			// Record runner totals
-			mc.RecordInt(ctx, telemetry.MetricCPRunnersTotal, totalRunners, telemetry.Labels{
-				telemetry.LabelStatus: "total",
-			})
-			mc.RecordInt(ctx, telemetry.MetricCPRunnersTotal, totalIdle, telemetry.Labels{
-				telemetry.LabelStatus: "idle",
-			})
-			mc.RecordInt(ctx, telemetry.MetricCPRunnersTotal, totalBusy, telemetry.Labels{
-				telemetry.LabelStatus: "busy",
-			})
+			cpRunnersGauge.Record(ctx, totalRunners, metric.WithAttributes(
+				fcrotel.AttrStatus.String("total"),
+			))
+			cpRunnersGauge.Record(ctx, totalIdle, metric.WithAttributes(
+				fcrotel.AttrStatus.String("idle"),
+			))
+			cpRunnersGauge.Record(ctx, totalBusy, metric.WithAttributes(
+				fcrotel.AttrStatus.String("busy"),
+			))
 
 			// Record fleet resource metrics
-			mc.RecordInt(ctx, telemetry.MetricCPFleetCPUTotal, fleetCPUTotal, nil)
-			mc.RecordInt(ctx, telemetry.MetricCPFleetCPUUsed, fleetCPUUsed, nil)
-			mc.RecordInt(ctx, telemetry.MetricCPFleetCPUFree, fleetCPUTotal-fleetCPUUsed, nil)
-			mc.RecordInt(ctx, telemetry.MetricCPFleetMemTotal, fleetMemTotal, nil)
-			mc.RecordInt(ctx, telemetry.MetricCPFleetMemUsed, fleetMemUsed, nil)
-			mc.RecordInt(ctx, telemetry.MetricCPFleetMemFree, fleetMemTotal-fleetMemUsed, nil)
+			cpFleetCPUTotalGauge.Record(ctx, fleetCPUTotal)
+			cpFleetCPUUsedGauge.Record(ctx, fleetCPUUsed)
+			cpFleetCPUFreeGauge.Record(ctx, fleetCPUTotal-fleetCPUUsed)
+			cpFleetMemTotalGauge.Record(ctx, fleetMemTotal)
+			cpFleetMemUsedGauge.Record(ctx, fleetMemUsed)
+			cpFleetMemFreeGauge.Record(ctx, fleetMemTotal-fleetMemUsed)
 
 			// Record slot-based fleet utilization for autoscaler
 			defaultTier, _ := tiers.Lookup(tiers.DefaultTier)
@@ -1196,17 +1428,17 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 			} else if queueDepth > 0 {
 				utilization = 10.0 // no capacity but demand exists — force scale-up
 			}
-			mc.RecordFloat(ctx, telemetry.MetricCPFleetUtilization, utilization, nil)
+			cpFleetUtilGauge.Record(ctx, utilization)
 
 			// Record queue depth
-			mc.RecordInt(ctx, telemetry.MetricCPQueueDepth, int64(queueDepth), nil)
+			cpQueueDepthGauge.Record(ctx, int64(queueDepth))
 
 			// Record snapshot age
 			currentVersion := sm.GetCurrentVersion()
 			if currentVersion != "" {
 				if snapshot, err := sm.GetSnapshot(ctx, currentVersion); err == nil && snapshot != nil {
 					age := time.Since(snapshot.CreatedAt)
-					mc.RecordFloat(ctx, telemetry.MetricSnapshotAge, age.Seconds(), nil)
+					snapshotAgeGauge.Record(ctx, int64(age.Seconds()))
 				}
 			}
 
