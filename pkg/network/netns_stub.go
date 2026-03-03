@@ -67,11 +67,11 @@ func (n *NetNSNetwork) ForwardPorts(_ string, _ []int) error {
 	return fmt.Errorf("network namespaces are only supported on Linux")
 }
 
-func (n *NetNSNetwork) BlockEgress(_ string) error {
+func (n *NetNSNetwork) EmergencyBlockEgress(_ string) error {
 	return fmt.Errorf("network namespaces are only supported on Linux")
 }
 
-func (n *NetNSNetwork) UnblockEgress(_ string) error {
+func (n *NetNSNetwork) EmergencyUnblockEgress(_ string) error {
 	return fmt.Errorf("network namespaces are only supported on Linux")
 }
 

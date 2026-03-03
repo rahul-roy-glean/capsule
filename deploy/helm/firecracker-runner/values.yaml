@@ -1,5 +1,5 @@
 nameOverride: ""
-fullnameOverride: ""
+fullnameOverride: "control-plane"
 
 namespace:
   create: false
@@ -16,14 +16,11 @@ replicaCount: 1
 
 serviceAccount:
   create: true
-  name: ""
+  name: "control-plane"
   annotations:
     iam.gke.io/gcp-service-account: fc-control-plane@scio-ci.iam.gserviceaccount.com
 
-podAnnotations:
-  prometheus.io/scrape: "true"
-  prometheus.io/port: "8080"
-  prometheus.io/path: "/metrics"
+podAnnotations: {}
 
 podLabels: {}
 
@@ -84,11 +81,19 @@ gcp:
   hostMigName: fc-runner-dev-hosts
   hostAutoscalerName: fc-runner-dev-hosts-autoscaler
 
-telemetry:
-  # Enable GCP Cloud Monitoring metrics
+otelCollector:
+  # Deploy OTel Collector as a sidecar alongside the control-plane container
   enabled: true
-  # Custom metric prefix (default: custom.googleapis.com/firecracker)
-  metricPrefix: custom.googleapis.com/firecracker
+  image:
+    repository: otel/opentelemetry-collector-contrib
+    tag: latest
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
 
 downscaler:
   enabled: true
@@ -131,15 +136,4 @@ autoscaling:
 podDisruptionBudget:
   enabled: true
   minAvailable: 1
-
-monitoring:
-  serviceMonitor:
-    enabled: false
-    interval: 15s
-    labels: {}
-
-  prometheusRule:
-    enabled: false
-    labels: {}
-
 

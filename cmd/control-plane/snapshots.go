@@ -536,7 +536,7 @@ echo "Starting snapshot builder setup..."
 
 # Install Firecracker
 ARCH=$(uname -m)
-FC_VERSION="1.14.1"
+FC_VERSION="1.14.2"
 echo "Installing Firecracker v${FC_VERSION}..."
 cd /tmp
 curl -fSL "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-${ARCH}.tgz" -o firecracker.tgz
@@ -847,6 +847,55 @@ func (sm *SnapshotManager) cleanupBuilderVM(ctx context.Context, instanceName st
 
 	if err := op.Wait(ctx); err != nil {
 		sm.logger.WithError(err).Warn("Failed waiting for VM deletion")
+	}
+}
+
+// GCTerminatedBuilderVMs deletes GCE instances matching "layer-builder-*" that
+// are in TERMINATED state. This catches VMs that were partially created but
+// never cleaned up (e.g. launch failed after Insert but before status='running').
+func (sm *SnapshotManager) GCTerminatedBuilderVMs(ctx context.Context) {
+	if sm.gcpProject == "" {
+		return
+	}
+
+	instancesClient, err := compute.NewInstancesRESTClient(ctx)
+	if err != nil {
+		sm.logger.WithError(err).Warn("GC: failed to create compute client")
+		return
+	}
+	defer instancesClient.Close()
+
+	it := instancesClient.List(ctx, &computepb.ListInstancesRequest{
+		Project: sm.gcpProject,
+		Zone:    sm.gcpZone,
+		Filter:  proto.String(`name = "layer-builder-*" AND status = "TERMINATED"`),
+	})
+
+	var deleted int
+	for {
+		instance, err := it.Next()
+		if err != nil {
+			break
+		}
+		name := instance.GetName()
+		sm.logger.WithField("instance", name).Info("GC: deleting terminated builder VM")
+		op, err := instancesClient.Delete(ctx, &computepb.DeleteInstanceRequest{
+			Project:  sm.gcpProject,
+			Zone:     sm.gcpZone,
+			Instance: name,
+		})
+		if err != nil {
+			sm.logger.WithError(err).WithField("instance", name).Warn("GC: failed to delete VM")
+			continue
+		}
+		if err := op.Wait(ctx); err != nil {
+			sm.logger.WithError(err).WithField("instance", name).Warn("GC: failed waiting for deletion")
+			continue
+		}
+		deleted++
+	}
+	if deleted > 0 {
+		sm.logger.WithField("count", deleted).Info("GC: cleaned up terminated builder VMs")
 	}
 }
 

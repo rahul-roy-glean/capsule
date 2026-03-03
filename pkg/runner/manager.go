@@ -93,6 +93,10 @@ type Manager struct {
 	// setupRootfsFUSEDisk creates and mounts a FUSE-backed rootfs disk from
 	// ChunkRefs during GCS-backed session resume. Returns the disk image path.
 	setupRootfsFUSEDisk func(runnerID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (diskImagePath string, err error)
+
+	// policyEnforcers tracks per-VM PolicyEnforcers for network policy enforcement.
+	// Key is runner ID. nil map when no policies are in use.
+	policyEnforcers map[string]*network.PolicyEnforcer
 }
 
 type QuarantineOptions struct {
@@ -175,6 +179,7 @@ func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logge
 		ciAdapter:        ciAdapter,
 		slotToRunner:     make(map[int]string),
 		runnerToSlot:     make(map[string]int),
+		policyEnforcers:  make(map[string]*network.PolicyEnforcer),
 		logger:           logger.WithField("component", "runner-manager"),
 	}
 
@@ -752,6 +757,7 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 	// Set exec mode when explicitly requested via ci_system=none
 	if req.CISystem == "none" {
 		data.Latest.Meta.Mode = "exec"
+		data.Latest.Runner.CISystem = "none"
 	}
 
 	// Populate start_command for user service startup
@@ -759,6 +765,8 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 		data.Latest.StartCommand.Command = req.StartCommand.Command
 		data.Latest.StartCommand.Port = req.StartCommand.Port
 		data.Latest.StartCommand.HealthPath = req.StartCommand.HealthPath
+		data.Latest.StartCommand.Env = req.StartCommand.Env
+		data.Latest.StartCommand.RunAs = req.StartCommand.RunAs
 	}
 
 	return data
@@ -796,6 +804,12 @@ func (m *Manager) ReleaseRunner(runnerID string, destroy bool) error {
 	if handler, ok := m.uffdHandlers[runnerID]; ok {
 		handler.Stop()
 		delete(m.uffdHandlers, runnerID)
+	}
+
+	// Remove policy enforcer if one exists
+	if enforcer, ok := m.policyEnforcers[runnerID]; ok {
+		enforcer.Remove()
+		delete(m.policyEnforcers, runnerID)
 	}
 
 	// Suspended runners already had network released during pause; only clean up overlay/files
@@ -899,7 +913,7 @@ func (m *Manager) QuarantineRunner(ctx context.Context, runnerID string, opts Qu
 		var blockErr error
 		if m.netnsNetwork != nil {
 			// Per-VM namespace mode: block by veth interface name
-			blockErr = m.netnsNetwork.BlockEgress(runnerID)
+			blockErr = m.netnsNetwork.EmergencyBlockEgress(runnerID)
 		} else {
 			// Legacy bridge mode: block by VM IP
 			blockErr = m.network.BlockEgress(net.IP(ip))
@@ -989,7 +1003,7 @@ func (m *Manager) UnquarantineRunner(ctx context.Context, runnerID string, opts 
 	if unblockEgress && egressWasBlocked {
 		var unblockErr error
 		if m.netnsNetwork != nil {
-			unblockErr = m.netnsNetwork.UnblockEgress(runnerID)
+			unblockErr = m.netnsNetwork.EmergencyUnblockEgress(runnerID)
 		} else {
 			unblockErr = m.network.UnblockEgress(net.IP(ip))
 		}
@@ -1041,6 +1055,167 @@ func (m *Manager) UnquarantineRunner(ctx context.Context, runnerID string, opts 
 	if len(errs) > 0 {
 		return joinErrors(errs)
 	}
+	return nil
+}
+
+// ApplyNetworkPolicy resolves and applies a network policy for a runner.
+// Called during allocation after the namespace is created.
+func (m *Manager) ApplyNetworkPolicy(runnerID string, req AllocateRequest) error {
+	policy := network.ResolvePolicy(req.NetworkPolicyPreset, req.NetworkPolicy)
+	if policy == nil {
+		return nil // unrestricted, no enforcement needed
+	}
+
+	if err := policy.Validate(); err != nil {
+		return fmt.Errorf("invalid network policy: %w", err)
+	}
+
+	m.mu.RLock()
+	r, ok := m.runners[runnerID]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("runner not found: %s", runnerID)
+	}
+
+	if m.netnsNetwork == nil {
+		m.logger.WithField("runner_id", runnerID).Warn("Network policy requested but netns mode not enabled; skipping enforcement")
+		// Store policy on runner for observability even without enforcement
+		m.mu.Lock()
+		r.NetworkPolicy = policy
+		r.NetworkPolicyVersion = 1
+		m.mu.Unlock()
+		return nil
+	}
+
+	ns, err := m.netnsNetwork.GetNamespace(runnerID)
+	if err != nil {
+		return fmt.Errorf("get namespace for policy: %w", err)
+	}
+
+	enforcer := network.NewPolicyEnforcer(network.PolicyEnforcerConfig{
+		VMID:       runnerID,
+		NSName:     ns.Name,
+		VethVM:     ns.VethVM,
+		HostVethIP: net.IPv4(10, 200, byte(ns.Slot), 1),
+		Policy:     policy,
+		Logger:     m.logger.Logger,
+	})
+
+	// Set initial ingress ports
+	var ports []int
+	if r.ServicePort > 0 {
+		ports = append(ports, r.ServicePort)
+	}
+	ports = append(ports, 10500, 10501) // thaw-agent health + debug
+	enforcer.SetInitialIngressPorts(ports)
+
+	if err := enforcer.Apply(); err != nil {
+		return fmt.Errorf("apply network policy: %w", err)
+	}
+
+	// Start DNS proxy if needed
+	if err := enforcer.StartDNSProxy(func(fn func() error) error {
+		return m.netnsNetwork.RunInNamespace(runnerID, fn)
+	}); err != nil {
+		enforcer.Remove()
+		return fmt.Errorf("start dns proxy: %w", err)
+	}
+
+	m.mu.Lock()
+	r.NetworkPolicy = policy
+	r.NetworkPolicyVersion = 1
+	m.policyEnforcers[runnerID] = enforcer
+	m.mu.Unlock()
+
+	m.logger.WithFields(logrus.Fields{
+		"runner_id": runnerID,
+		"policy":    policy.Name,
+	}).Info("Network policy applied")
+
+	return nil
+}
+
+// UpdateNetworkPolicy updates the network policy for a running VM.
+func (m *Manager) UpdateNetworkPolicy(runnerID string, newPolicy *network.NetworkPolicy) error {
+	if newPolicy == nil {
+		return fmt.Errorf("policy cannot be nil for update")
+	}
+	if err := newPolicy.Validate(); err != nil {
+		return fmt.Errorf("invalid network policy: %w", err)
+	}
+
+	m.mu.Lock()
+	r, ok := m.runners[runnerID]
+	enforcer := m.policyEnforcers[runnerID]
+	m.mu.Unlock()
+
+	if !ok {
+		return fmt.Errorf("runner not found: %s", runnerID)
+	}
+
+	if enforcer != nil {
+		// Existing enforcer: update in place
+		if err := enforcer.Update(newPolicy); err != nil {
+			return fmt.Errorf("update policy: %w", err)
+		}
+	} else if m.netnsNetwork != nil {
+		// No enforcer yet but netns available: create and apply
+		req := AllocateRequest{NetworkPolicy: newPolicy}
+		if err := m.ApplyNetworkPolicy(runnerID, req); err != nil {
+			return fmt.Errorf("apply policy on update: %w", err)
+		}
+		return nil // ApplyNetworkPolicy already sets version to 1
+	}
+
+	// Store policy on runner (either enforcer updated or no netns)
+	m.mu.Lock()
+	r.NetworkPolicy = newPolicy
+	r.NetworkPolicyVersion++
+	m.mu.Unlock()
+
+	return nil
+}
+
+// GetNetworkPolicy returns the effective policy for a runner.
+func (m *Manager) GetNetworkPolicy(runnerID string) (*network.NetworkPolicy, int, error) {
+	m.mu.RLock()
+	r, ok := m.runners[runnerID]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, 0, fmt.Errorf("runner not found: %s", runnerID)
+	}
+	return r.NetworkPolicy, r.NetworkPolicyVersion, nil
+}
+
+// EmergencyBlockEgress blocks all egress for a VM at the host level (independent of namespace policy).
+func (m *Manager) EmergencyBlockEgress(runnerID string) error {
+	if m.netnsNetwork == nil {
+		return fmt.Errorf("netns mode not enabled")
+	}
+	if err := m.netnsNetwork.EmergencyBlockEgress(runnerID); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if r, ok := m.runners[runnerID]; ok {
+		r.EmergencyEgressBlocked = true
+	}
+	m.mu.Unlock()
+	return nil
+}
+
+// EmergencyUnblockEgress removes the host-level egress block.
+func (m *Manager) EmergencyUnblockEgress(runnerID string) error {
+	if m.netnsNetwork == nil {
+		return fmt.Errorf("netns mode not enabled")
+	}
+	if err := m.netnsNetwork.EmergencyUnblockEgress(runnerID); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if r, ok := m.runners[runnerID]; ok {
+		r.EmergencyEgressBlocked = false
+	}
+	m.mu.Unlock()
 	return nil
 }
 

@@ -40,6 +40,12 @@ service HostAgent {
 
   // ResumeRunner restores a runner from a session snapshot
   rpc ResumeRunner(ResumeRunnerRequest) returns (ResumeRunnerResponse);
+
+  // UpdateNetworkPolicy updates the network policy for a running VM
+  rpc UpdateNetworkPolicy(UpdateNetworkPolicyRequest) returns (UpdateNetworkPolicyResponse);
+
+  // GetNetworkPolicy returns the effective network policy for a runner
+  rpc GetNetworkPolicy(GetNetworkPolicyRequest) returns (GetNetworkPolicyResponse);
 }
 
 // ControlPlane service runs in GKE
@@ -161,6 +167,8 @@ message StartCommand {
   repeated string command = 1;
   int32 port = 2;
   string health_path = 3;
+  map<string, string> env = 4;
+  string run_as = 5;
 }
 
 // AllocateRunnerRequest
@@ -185,6 +193,8 @@ message AllocateRunnerRequest {
   int32 ttl_seconds = 14;         // idle timeout from snapshot config (0 = no timeout)
   bool auto_pause = 15;           // pause on TTL expiry instead of destroy
   string snapshot_tag = 16;       // optional: named tag to resolve snapshot version
+  string network_policy_preset = 17; // optional: named preset (e.g., "ci-standard", "agent-sandbox")
+  string network_policy_json = 18;   // optional: full NetworkPolicy as JSON (overrides preset)
 }
 
 // AllocateRunnerResponse
@@ -341,4 +351,25 @@ message ResumeRunnerResponse {
   Runner runner = 1;
   string error = 2;
   bool resumed_from_session = 3;
+}
+
+message UpdateNetworkPolicyRequest {
+  string runner_id = 1;
+  string network_policy_json = 2; // Full NetworkPolicy as JSON (full replace)
+}
+
+message UpdateNetworkPolicyResponse {
+  bool success = 1;
+  string error = 2;
+  int32 version = 3;
+}
+
+message GetNetworkPolicyRequest {
+  string runner_id = 1;
+}
+
+message GetNetworkPolicyResponse {
+  string network_policy_json = 1;  // Effective policy as JSON
+  int32 version = 2;
+  bool emergency_egress_blocked = 3;
 }

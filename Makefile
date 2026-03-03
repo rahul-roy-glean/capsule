@@ -4,10 +4,12 @@
 .PHONY: firecracker-manager control-plane snapshot-builder thaw-agent
 .PHONY: git-cache-builder git-cache-freshness data-snapshot-builder snapshot-converter derive-snapshot
 .PHONY: test-unit test-race test-cover test-integration test-all check
+.PHONY: sdk-python-lint sdk-python-test sdk-python-typecheck
 .PHONY: dev-build dev-snapshot dev-stack dev-test-exec dev-test-pause-resume dev-test-multi-pause-dedup dev-stop
 .PHONY: dev-test-derive-snapshot dev-test-extension-drives dev-test-gcs-pause-resume
 .PHONY: dev-test-gcs-rootfs-durability dev-test-file-ops dev-test-pty dev-test-checkpoint
-.PHONY: dev-test-auto-resume dev-test-template-tags
+.PHONY: dev-test-auto-resume dev-test-template-tags dev-test-network-policy
+.PHONY: dev-agent-rootfs dev-agent-snapshot dev-test-agent-sessions dev-test-agent-e2e
 .PHONY: dev-setup dev-provision
 
 # Variables
@@ -349,6 +351,7 @@ help:
 	@echo "  dev-test-file-ops    - Run E2E file operations test (WS2)"
 	@echo "  dev-test-pty         - Run E2E PTY terminal test (WS3)"
 	@echo "  dev-test-template-tags - Run E2E template tags test (WS6)"
+	@echo "  dev-test-network-policy - Run E2E network policy test"
 	@echo "  dev-test-checkpoint  - Run E2E checkpoint test (WS4, needs GCS)"
 	@echo "  dev-test-auto-resume - Run E2E auto-resume test (WS5, needs GCS)"
 	@echo "  dev-test-gcs-rootfs-durability - Run E2E rootfs durability test (WS1, needs GCS)"
@@ -434,3 +437,29 @@ dev-test-auto-resume:
 # Run E2E template tags test (WS6)
 dev-test-template-tags:
 	bash dev/test-template-tags.sh
+
+dev-test-network-policy:
+	bash dev/test-network-policy.sh
+
+# AI Agent Sandbox E2E tests
+dev-agent-rootfs:
+	bash dev/build-agent-rootfs.sh
+
+dev-agent-snapshot:
+	bash dev/test-agent-onboard.sh
+
+dev-test-agent-sessions:
+	bash dev/test-agent-sessions.sh
+
+dev-test-agent-e2e:
+	bash dev/test-agent-e2e.sh
+
+# ── Python SDK ──────────────────────────────────────────────────────────────
+sdk-python-lint:
+	cd sdk/python && python -m ruff check src/bf_sdk/ tests/
+
+sdk-python-test:
+	cd sdk/python && python -m pytest tests/ -v
+
+sdk-python-typecheck:
+	cd sdk/python && python -m pyright src/bf_sdk/

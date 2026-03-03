@@ -10,12 +10,14 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
+	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/tiers"
 )
 
@@ -26,8 +28,10 @@ type Scheduler struct {
 	snapshotManager *SnapshotManager
 	tagRegistry     *SnapshotTagRegistry
 	configCache     *ConfigCache
-	metricsClient   *telemetry.Client
 	logger          *logrus.Entry
+
+	sessionResumeRoutingCounter metric.Int64Counter
+	otelClient                  *fcrotel.Client
 
 	// connPool caches gRPC connections to host agents, keyed by address.
 	// gRPC connections are multiplexed and designed to be long-lived, so
@@ -46,9 +50,10 @@ func NewScheduler(hr *HostRegistry, db *sql.DB, sm *SnapshotManager, tr *Snapsho
 	}
 }
 
-// SetMetricsClient attaches a telemetry client for GCP Cloud Monitoring.
-func (s *Scheduler) SetMetricsClient(c *telemetry.Client) {
-	s.metricsClient = c
+// SetOTel attaches OTel instruments for distributed tracing and metrics.
+func (s *Scheduler) SetOTel(c *fcrotel.Client, resumeRouting metric.Int64Counter) {
+	s.otelClient = c
+	s.sessionResumeRoutingCounter = resumeRouting
 }
 
 // SetConfigCache sets the in-memory config cache for fast workload config lookups.
@@ -63,7 +68,16 @@ func (s *Scheduler) getHostConn(address string) (*grpc.ClientConn, error) {
 		return v.(*grpc.ClientConn), nil
 	}
 
-	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	opts := []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	}
+	if s.otelClient != nil {
+		opts = append(opts, grpc.WithStatsHandler(otelgrpc.NewClientHandler(
+			otelgrpc.WithTracerProvider(s.otelClient.TracerProvider),
+			otelgrpc.WithMeterProvider(s.otelClient.MeterProvider),
+		)))
+	}
+	conn, err := grpc.NewClient(address, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to host %s: %w", address, err)
 	}
@@ -91,15 +105,17 @@ func (s *Scheduler) Close() {
 
 // AllocateRunnerRequest represents a request to allocate a runner
 type AllocateRunnerRequest struct {
-	RequestID         string
-	WorkloadKey       string
-	Labels            map[string]string
-	GitHubRunnerToken string
-	CISystem          string
-	SessionID         string
-	VCPUs             int
-	MemoryMB          int
-	SnapshotTag       string
+	RequestID           string
+	WorkloadKey         string
+	Labels              map[string]string
+	GitHubRunnerToken   string
+	CISystem            string
+	SessionID           string
+	VCPUs               int
+	MemoryMB            int
+	SnapshotTag         string
+	NetworkPolicyPreset string
+	NetworkPolicyJSON   string
 }
 
 // AllocateRunnerResponse represents the response from runner allocation
@@ -130,6 +146,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	var startCmd *snapshot.StartCommand
 	var runnerTTLSeconds int
 	var autoPause bool
+	var configNetworkPolicyPreset string
+	var configNetworkPolicyJSON string
 	if workloadKey != "" {
 		var wc *WorkloadConfig
 		if s.configCache != nil {
@@ -141,6 +159,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			startCmd = wc.StartCommand
 			runnerTTLSeconds = wc.RunnerTTLSeconds
 			autoPause = wc.AutoPause
+			configNetworkPolicyPreset = wc.NetworkPolicyPreset
+			configNetworkPolicyJSON = wc.NetworkPolicyJSON
 			if wc.MaxConcurrentRunners > 0 && s.db != nil {
 				var currentCount int
 				_ = s.db.QueryRowContext(ctx, `
@@ -157,8 +177,10 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			var tierCol sql.NullString
 			var ttlCol sql.NullInt64
 			var autoPauseCol sql.NullBool
+			var npPreset sql.NullString
+			var npJSON sql.NullString
 
-			err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, ci_system, start_command, tier, runner_ttl_seconds, auto_pause FROM layered_configs WHERE leaf_workload_key = $1`, workloadKey).Scan(&maxConcurrent, &ciSystem, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol)
+			err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, ci_system, start_command, tier, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy FROM layered_configs WHERE leaf_workload_key = $1`, workloadKey).Scan(&maxConcurrent, &ciSystem, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON)
 			if err == nil {
 				if tierCol.Valid && tierCol.String != "" {
 					tierName = tierCol.String
@@ -184,6 +206,12 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 				}
 				if autoPauseCol.Valid {
 					autoPause = autoPauseCol.Bool
+				}
+				if npPreset.Valid {
+					configNetworkPolicyPreset = npPreset.String
+				}
+				if npJSON.Valid {
+					configNetworkPolicyJSON = npJSON.String
 				}
 			}
 		}
@@ -232,10 +260,10 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 						"session_id": req.SessionID,
 						"host_id":    sessionHostID,
 					}).Info("Session sticky routing: using original host")
-					if s.metricsClient != nil {
-						s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionResumeRouting, telemetry.Labels{
-							telemetry.LabelRouting: telemetry.RoutingSameHost,
-						})
+					if s.sessionResumeRoutingCounter != nil {
+						s.sessionResumeRoutingCounter.Add(ctx, 1, metric.WithAttributes(
+							fcrotel.AttrRouting.String(fcrotel.RoutingSameHost),
+						))
 					}
 					break
 				}
@@ -246,10 +274,10 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 					"original_host":   sessionHostID,
 					"available_hosts": len(eligible),
 				}).Warn("Session sticky host not available, falling back to best-fit")
-				if s.metricsClient != nil {
-					s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionResumeRouting, telemetry.Labels{
-						telemetry.LabelRouting: telemetry.RoutingCrossHost,
-					})
+				if s.sessionResumeRoutingCounter != nil {
+					s.sessionResumeRoutingCounter.Add(ctx, 1, metric.WithAttributes(
+						fcrotel.AttrRouting.String(fcrotel.RoutingCrossHost),
+					))
 				}
 			}
 		}
@@ -328,6 +356,28 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		TtlSeconds:        int32(runnerTTLSeconds),
 		AutoPause:         autoPause,
 	}
+	// Pass network policy fields via labels (proto fields 17-18 not in
+	// generated wire descriptor; labels are serialized reliably).
+	// Explicit request values take precedence; fall back to the config-stored policy.
+	effectiveNPPreset := req.NetworkPolicyPreset
+	if effectiveNPPreset == "" {
+		effectiveNPPreset = configNetworkPolicyPreset
+	}
+	effectiveNPJSON := req.NetworkPolicyJSON
+	if effectiveNPJSON == "" {
+		effectiveNPJSON = configNetworkPolicyJSON
+	}
+	if effectiveNPPreset != "" || effectiveNPJSON != "" {
+		if protoReq.Labels == nil {
+			protoReq.Labels = make(map[string]string)
+		}
+		if effectiveNPPreset != "" {
+			protoReq.Labels["_network_policy_preset"] = effectiveNPPreset
+		}
+		if effectiveNPJSON != "" {
+			protoReq.Labels["_network_policy_json"] = effectiveNPJSON
+		}
+	}
 	// Populate resources from tier (overrides request-level values)
 	protoReq.Resources = &pb.Resources{
 		Vcpus:    int32(tier.VCPUs),
@@ -345,6 +395,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			Command:    startCmd.Command,
 			Port:       int32(startCmd.Port),
 			HealthPath: startCmd.HealthPath,
+			Env:        startCmd.Env,
+			RunAs:      startCmd.RunAs,
 		}
 	}
 
