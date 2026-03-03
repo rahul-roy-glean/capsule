@@ -10,7 +10,7 @@ require (
 	cloud.google.com/go/secretmanager v1.14.7
 	cloud.google.com/go/storage v1.56.0
 	github.com/creack/pty v1.1.24
-	github.com/golang-jwt/jwt/v5 v5.3.0
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/hashicorp/golang-lru/v2 v2.0.7
