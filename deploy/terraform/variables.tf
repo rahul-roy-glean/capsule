@@ -200,6 +200,18 @@ variable "use_chunked_snapshots" {
   default     = true
 }
 
+variable "enable_session_chunks" {
+  description = "Enable cloud-backed session pause/resume. Uses snapshot bucket for chunk storage. When enabled, PauseRunner uploads chunks to GCS and ResumeFromSession fetches lazily via UFFD+FUSE."
+  type        = bool
+  default     = true
+}
+
+variable "otel_collector_addr" {
+  description = "OpenTelemetry Collector OTLP gRPC endpoint reachable from host VMs (e.g. internal LB IP:4317). Leave empty to disable OTel on hosts."
+  type        = string
+  default     = ""
+}
+
 variable "chunk_cache_size_gb" {
   description = "Size in GB of the on-disk LRU chunk cache for FUSE-backed disks. Larger values improve cache hit ratio and reduce GCS fetches."
   type        = number

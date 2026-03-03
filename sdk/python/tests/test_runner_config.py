@@ -7,8 +7,8 @@ import pytest
 
 from bf_sdk._config import ConnectionConfig
 from bf_sdk._http import HttpClient
-from bf_sdk.models.snapshot import BuildResult, SnapshotConfig, SnapshotTag
-from bf_sdk.resources.snapshot_configs import SnapshotConfigs
+from bf_sdk.models.layered_config import BuildResponse, CreateConfigResponse, LayerDef
+from bf_sdk.resources.layered_configs import LayeredConfigs
 from bf_sdk.runner_config import RunnerConfig, RunnerConfigs
 
 
@@ -19,40 +19,39 @@ def http_client() -> HttpClient:
 
 
 @pytest.fixture
-def snapshot_configs(http_client: HttpClient) -> SnapshotConfigs:
-    return SnapshotConfigs(http_client)
+def layered_configs(http_client: HttpClient) -> LayeredConfigs:
+    return LayeredConfigs(http_client)
 
 
 @pytest.fixture
-def runner_configs(snapshot_configs: SnapshotConfigs) -> RunnerConfigs:
-    return RunnerConfigs(snapshot_configs)
+def runner_configs(layered_configs: LayeredConfigs) -> RunnerConfigs:
+    return RunnerConfigs(layered_configs)
 
 
 class TestRunnerConfig:
     def test_basic_construction(self) -> None:
         cfg = RunnerConfig("my-workload")
-        assert cfg.workload_key == "my-workload"
+        assert cfg.display_name == "my-workload"
 
     def test_fluent_builder(self) -> None:
         cfg = (
-            RunnerConfig("wk-1")
-            .with_display_name("My Sandbox")
+            RunnerConfig("My Sandbox")
+            .with_base_image("ubuntu:22.04")
             .with_commands(["pip install -e .", "pytest -q"])
             .with_tier("small")
             .with_ci_system("github-actions")
-            .with_runner_ttl(3600)
+            .with_ttl(3600)
             .with_auto_pause(True)
+            .with_auto_rollout(True)
             .with_network_policy_preset("default")
-            .with_labels({"team": "devprod"})
         )
-        assert cfg.workload_key == "wk-1"
-        assert cfg._display_name == "My Sandbox"
+        assert cfg.display_name == "My Sandbox"
+        assert cfg._base_image == "ubuntu:22.04"
         assert len(cfg._commands) == 2
-        # Commands should be normalized to dicts
         assert cfg._commands[0] == {"command": "pip install -e ."}
         assert cfg._tier == "small"
         assert cfg._auto_pause is True
-        assert cfg._labels == {"team": "devprod"}
+        assert cfg._auto_rollout is True
 
     def test_immutability(self) -> None:
         cfg1 = RunnerConfig("wk-1")
@@ -61,102 +60,72 @@ class TestRunnerConfig:
         assert cfg2._tier == "large"
         assert cfg1 is not cfg2
 
-    def test_to_create_kwargs(self) -> None:
+    def test_to_create_body_simple(self) -> None:
         cfg = (
-            RunnerConfig("wk-1")
-            .with_display_name("Sandbox")
+            RunnerConfig("Sandbox")
+            .with_base_image("ubuntu:22.04")
             .with_commands(["echo hi"])
             .with_tier("small")
-            .with_runner_ttl(1800)
+            .with_ttl(1800)
             .with_auto_pause(True)
         )
-        kw = cfg.to_create_kwargs()
-        assert kw["display_name"] == "Sandbox"
-        assert kw["commands"] == [{"command": "echo hi"}]
-        assert kw["tier"] == "small"
-        assert kw["runner_ttl_seconds"] == 1800
-        assert kw["auto_pause"] is True
-        # Unset fields should not be present
-        assert "ci_system" not in kw
-        assert "network_policy_preset" not in kw
+        body = cfg.to_create_body()
+        assert body["display_name"] == "Sandbox"
+        assert body["base_image"] == "ubuntu:22.04"
+        assert body["layers"] == [{"name": "main", "init_commands": [{"command": "echo hi"}]}]
+        assert body["config"]["tier"] == "small"
+        assert body["config"]["ttl"] == 1800
+        assert body["config"]["auto_pause"] is True
 
-    def test_to_create_kwargs_default_display_name(self) -> None:
-        cfg = RunnerConfig("wk-1").with_commands(["echo hi"])
-        kw = cfg.to_create_kwargs()
-        assert kw["display_name"] == "wk-1"
+    def test_to_create_body_no_config(self) -> None:
+        cfg = RunnerConfig("bare").with_commands(["echo hi"])
+        body = cfg.to_create_body()
+        assert "config" not in body
+        assert body["layers"] == [{"name": "main", "init_commands": [{"command": "echo hi"}]}]
+
+    def test_to_create_body_with_explicit_layers(self) -> None:
+        layers = [
+            LayerDef(name="deps", init_commands=[{"command": "apt install -y curl"}]),
+            LayerDef(name="app", init_commands=[{"command": "pip install ."}]),
+        ]
+        cfg = RunnerConfig("multi").with_layers(layers).with_tier("large")
+        body = cfg.to_create_body()
+        assert len(body["layers"]) == 2
+        assert body["layers"][0]["name"] == "deps"
+        assert body["layers"][1]["name"] == "app"
 
     def test_with_dict_commands(self) -> None:
         cfg = RunnerConfig("wk-1").with_commands([{"command": "echo hi", "timeout": 30}])
         assert cfg._commands == [{"command": "echo hi", "timeout": 30}]
 
-    def test_with_incremental_commands(self) -> None:
-        cfg = RunnerConfig("wk-1").with_commands(["base"]).with_incremental_commands(["update"])
-        kw = cfg.to_create_kwargs()
-        assert kw["incremental_commands"] == [{"command": "update"}]
+    def test_auto_rollout(self) -> None:
+        cfg = RunnerConfig("wk-1").with_commands(["echo"]).with_auto_rollout(True)
+        body = cfg.to_create_body()
+        assert body["config"]["auto_rollout"] is True
 
 
 class TestRunnerConfigs:
     def test_apply(self, runner_configs: RunnerConfigs, http_client: HttpClient) -> None:
-        resp_data = {"workload_key": "wk-abc", "display_name": "Sandbox"}
+        resp_data = {"config_id": "abc123", "leaf_workload_key": "wk-leaf"}
         mock_resp = httpx.Response(201, json=resp_data)
-        cfg = RunnerConfig("wk-abc").with_display_name("Sandbox").with_commands(["echo hi"])
+        cfg = RunnerConfig("Sandbox").with_commands(["echo hi"])
         with patch.object(http_client._client, "request", return_value=mock_resp):
             result = runner_configs.apply(cfg)
-        assert isinstance(result, SnapshotConfig)
-        assert result.workload_key == "wk-abc"
+        assert isinstance(result, CreateConfigResponse)
+        assert result.config_id == "abc123"
 
-    def test_build_without_tag(self, runner_configs: RunnerConfigs, http_client: HttpClient) -> None:
-        build_data = {"workload_key": "wk-1", "version": "v5", "status": "building"}
+    def test_build(self, runner_configs: RunnerConfigs, http_client: HttpClient) -> None:
+        build_data = {"config_id": "c1", "status": "build_enqueued", "force": "false"}
         mock_resp = httpx.Response(202, json=build_data)
         with patch.object(http_client._client, "request", return_value=mock_resp):
-            result = runner_configs.build("wk-1")
-        assert isinstance(result, BuildResult)
-        assert result.version == "v5"
+            result = runner_configs.build("c1")
+        assert isinstance(result, BuildResponse)
+        assert result.status == "build_enqueued"
 
-    def test_build_with_tag(self, runner_configs: RunnerConfigs, http_client: HttpClient) -> None:
-        build_data = {"workload_key": "wk-1", "version": "v5", "status": "building"}
-        tag_data = {"tag": "dev", "workload_key": "wk-1", "version": "v5"}
-        mock_build = httpx.Response(202, json=build_data)
-        mock_tag = httpx.Response(201, json=tag_data)
-        with patch.object(http_client._client, "request", side_effect=[mock_build, mock_tag]):
-            result = runner_configs.build("wk-1", tag="dev")
-        assert result.version == "v5"
-
-    def test_build_with_config_object(self, runner_configs: RunnerConfigs, http_client: HttpClient) -> None:
-        build_data = {"workload_key": "wk-1", "version": "v3", "status": "building"}
+    def test_build_force(self, runner_configs: RunnerConfigs, http_client: HttpClient) -> None:
+        build_data = {"config_id": "c1", "status": "build_enqueued", "force": "true"}
         mock_resp = httpx.Response(202, json=build_data)
-        cfg = RunnerConfig("wk-1")
         with patch.object(http_client._client, "request", return_value=mock_resp):
-            result = runner_configs.build(cfg)
-        assert result.version == "v3"
-
-    def test_promote(self, runner_configs: RunnerConfigs, http_client: HttpClient) -> None:
-        source_tag = {"tag": "dev", "workload_key": "wk-1", "version": "v5"}
-        created_tag = {"tag": "stable", "workload_key": "wk-1", "version": "v5"}
-        mock_get = httpx.Response(200, json=source_tag)
-        mock_create = httpx.Response(201, json=created_tag)
-        with patch.object(http_client._client, "request", side_effect=[mock_get, mock_create]):
-            result = runner_configs.promote("wk-1", tag="dev", to="stable")
-        assert isinstance(result, SnapshotTag)
-        assert result.tag == "stable"
-        assert result.version == "v5"
-
-    def test_get(self, runner_configs: RunnerConfigs, http_client: HttpClient) -> None:
-        resp_data = {"workload_key": "wk-1", "display_name": "Config"}
-        mock_resp = httpx.Response(200, json=resp_data)
-        with patch.object(http_client._client, "request", return_value=mock_resp):
-            result = runner_configs.get("wk-1")
-        assert result.workload_key == "wk-1"
-
-    def test_list_tags(self, runner_configs: RunnerConfigs, http_client: HttpClient) -> None:
-        resp_data = {
-            "tags": [
-                {"tag": "stable", "workload_key": "wk-1", "version": "v1"},
-                {"tag": "dev", "workload_key": "wk-1", "version": "v2"},
-            ],
-            "count": 2,
-        }
-        mock_resp = httpx.Response(200, json=resp_data)
-        with patch.object(http_client._client, "request", return_value=mock_resp):
-            result = runner_configs.list_tags("wk-1")
-        assert len(result) == 2
+            result = runner_configs.build("c1", force=True)
+        assert isinstance(result, BuildResponse)
+        assert result.force == "true"

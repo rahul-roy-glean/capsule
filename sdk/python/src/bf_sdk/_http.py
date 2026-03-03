@@ -58,6 +58,110 @@ class HttpClient:
     def delete(self, url: str) -> dict[str, Any]:
         return self._request("DELETE", url)
 
+    def get_bytes(
+        self,
+        url: str,
+        *,
+        base_url: str | None = None,
+        params: dict[str, str] | None = None,
+    ) -> bytes:
+        """Streaming GET that returns raw bytes (for file download)."""
+        request_id = str(uuid.uuid4())
+        headers = {"X-Request-Id": request_id}
+
+        client = self._client
+        if base_url:
+            client = httpx.Client(
+                base_url=base_url,
+                headers=dict(self._client.headers),
+                timeout=httpx.Timeout(None),
+            )
+
+        try:
+            with client.stream("GET", url, params=params, headers=headers) as resp:
+                if resp.status_code >= 400:
+                    resp.read()
+                    self._raise_for_status(resp, request_id)
+                return resp.read()
+        except httpx.ConnectError as exc:
+            raise BFConnectionError(str(exc)) from exc
+        except httpx.TimeoutException as exc:
+            raise BFTimeoutError(str(exc)) from exc
+        finally:
+            if base_url:
+                client.close()
+
+    def post_bytes(
+        self,
+        url: str,
+        *,
+        data: bytes,
+        base_url: str | None = None,
+        params: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """POST with raw binary body, returns JSON response (for file upload)."""
+        request_id = str(uuid.uuid4())
+        headers = {"X-Request-Id": request_id, "Content-Type": "application/octet-stream"}
+
+        client = self._client
+        if base_url:
+            client = httpx.Client(
+                base_url=base_url,
+                headers=dict(self._client.headers),
+                timeout=httpx.Timeout(None),
+            )
+
+        try:
+            resp = client.post(url, content=data, params=params, headers=headers)
+            if resp.status_code >= 400:
+                self._raise_for_status(resp, request_id)
+            try:
+                return resp.json()  # type: ignore[no-any-return]
+            except (json.JSONDecodeError, ValueError):
+                return {"_raw": resp.text}
+        except httpx.ConnectError as exc:
+            raise BFConnectionError(str(exc)) from exc
+        except httpx.TimeoutException as exc:
+            raise BFTimeoutError(str(exc)) from exc
+        finally:
+            if base_url:
+                client.close()
+
+    def post_to_host(
+        self,
+        url: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        base_url: str | None = None,
+    ) -> dict[str, Any]:
+        """POST to host agent with no timeout. Returns JSON response."""
+        request_id = str(uuid.uuid4())
+        headers = {"X-Request-Id": request_id}
+
+        client = self._client
+        if base_url:
+            client = httpx.Client(
+                base_url=base_url,
+                headers=dict(self._client.headers),
+                timeout=httpx.Timeout(None),
+            )
+
+        try:
+            resp = client.post(url, json=json_body, headers=headers)
+            if resp.status_code >= 400:
+                self._raise_for_status(resp, request_id)
+            try:
+                return resp.json()  # type: ignore[no-any-return]
+            except (json.JSONDecodeError, ValueError):
+                return {"_raw": resp.text}
+        except httpx.ConnectError as exc:
+            raise BFConnectionError(str(exc)) from exc
+        except httpx.TimeoutException as exc:
+            raise BFTimeoutError(str(exc)) from exc
+        finally:
+            if base_url:
+                client.close()
+
     def post_stream_ndjson(
         self,
         url: str,

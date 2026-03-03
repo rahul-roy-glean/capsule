@@ -26,9 +26,10 @@ import (
 	"unsafe"
 
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sys/unix"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/metrics"
+	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
@@ -141,6 +142,9 @@ type Handler struct {
 	faultTimeout           time.Duration
 	maxConsecutiveFailures int
 
+	// OTel instruments
+	faultServiceHist metric.Float64Histogram
+
 	logger *logrus.Entry
 }
 
@@ -161,6 +165,10 @@ type HandlerConfig struct {
 	// the threshold. The caller should cancel the handler's context to
 	// stop the fault loop.
 	OnFatal func(error)
+
+	// Meter is an OTel metric.Meter for fault-service instrumentation.
+	// If nil, no metrics are recorded.
+	Meter metric.Meter
 }
 
 // NewHandler creates a new UFFD handler
@@ -191,6 +199,11 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 		faultTimeout:           faultTimeout,
 		maxConsecutiveFailures: maxConsecutiveFailures,
 		logger:                 cfg.Logger.WithField("component", "uffd-handler"),
+	}
+
+	// Initialize OTel instruments if a Meter was provided.
+	if cfg.Meter != nil {
+		h.faultServiceHist, _ = fcrotel.NewHistogram(cfg.Meter, fcrotel.UFFDFaultServiceDuration)
 	}
 
 	// Chunk lookup is built after receiving memory mappings from Firecracker
@@ -521,7 +534,9 @@ func (h *Handler) handleSingleFault(uffdFd int, address uint64) error {
 		return fmt.Errorf("UFFDIO_COPY failed: %w", errno)
 	}
 
-	metrics.UFFDFaultServiceSeconds.Observe(time.Since(faultStart).Seconds())
+	if h.faultServiceHist != nil {
+		h.faultServiceHist.Record(context.Background(), time.Since(faultStart).Seconds())
+	}
 	return nil
 }
 
