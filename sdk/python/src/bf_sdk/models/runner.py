@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from enum import Enum
 
+from pydantic import ConfigDict
+
 from bf_sdk.models.common import BFModel
 
 
@@ -102,3 +104,19 @@ class ExecEvent(BFModel):
     code: int | None = None
     message: str | None = None
     ts: str | None = None
+
+
+class ExecResult(BFModel):
+    """Structured result from exec_collect."""
+
+    model_config = ConfigDict(extra="ignore", frozen=False)
+
+    stdout: str
+    stderr: str
+    exit_code: int
+    duration_ms: float | None = None
+
+    def __iter__(self):  # type: ignore[override]
+        # Backwards compat: allows `output, code = r.exec_collect(...)`
+        yield self.stdout + self.stderr
+        yield self.exit_code

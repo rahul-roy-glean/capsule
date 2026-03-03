@@ -54,9 +54,22 @@ sudo -u postgres psql -d firecracker_runner -c \
   "UPDATE hosts SET status = 'ready' WHERE status IN ('unhealthy', 'draining');" \
   > /dev/null 2>&1 || true
 
+# --- OpenTelemetry ---
+# Set OTEL_EXPORTER_OTLP_ENDPOINT to enable tracing/metrics.
+# When empty, OTel is no-op (zero overhead).
+# To test locally: run the collector first, then export the endpoint:
+#   docker run --rm -p 4317:4317 \
+#     -v $(pwd)/deploy/otel-collector:/etc/otelcol-contrib \
+#     otel/opentelemetry-collector-contrib:latest \
+#     --config /etc/otelcol-contrib/config-local.yaml
+#   export OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317
+OTEL_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-}"
+
 # --- Start control-plane ---
 echo ""
 echo "=== Starting control-plane ==="
+OTEL_EXPORTER_OTLP_ENDPOINT="$OTEL_ENDPOINT" \
+ENVIRONMENT=dev \
 nohup ./bin/control-plane \
   --db-host=localhost \
   --db-user=postgres \
@@ -65,7 +78,6 @@ nohup ./bin/control-plane \
   --db-ssl-mode=disable \
   --http-port=8080 \
   --grpc-port=50051 \
-  --telemetry-enabled=false \
   > "$LOG_DIR/control-plane.log" 2>&1 &
 CP_PID=$!
 echo "$CP_PID" > "$PID_DIR/control-plane.pid"
@@ -112,7 +124,6 @@ MGR_CMD="$REPO_ROOT/bin/firecracker-manager \
   --workspace-dir=/tmp/fc-dev/workspaces \
   --log-dir=$LOG_DIR \
   --control-plane=http://localhost:8080 \
-  --telemetry-enabled=false \
   --max-runners=8 \
   --idle-target=0 \
   --log-level=debug"
@@ -124,7 +135,7 @@ else
   MGR_CMD="$MGR_CMD --snapshot-bucket=$SNAPSHOT_BUCKET"
 fi
 
-sudo bash -c "nohup $MGR_CMD > $LOG_DIR/firecracker-manager.log 2>&1 &
+sudo bash -c "export OTEL_EXPORTER_OTLP_ENDPOINT='$OTEL_ENDPOINT' ENVIRONMENT=dev; nohup $MGR_CMD > $LOG_DIR/firecracker-manager.log 2>&1 &
 echo \$! > /tmp/fc-dev/pids/firecracker-manager.pid"
 # Give sudo a moment to fork
 sleep 1

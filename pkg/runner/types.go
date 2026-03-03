@@ -180,11 +180,13 @@ type MMDSData struct {
 			WorkingDir string            `json:"working_dir,omitempty"`
 			TimeoutSec int               `json:"timeout_seconds,omitempty"`
 		} `json:"exec,omitempty"`
+		// Mirrors snapshot.StartCommand — keep in sync with pkg/snapshot/start_command.go.
 		StartCommand struct {
 			Command    []string          `json:"command,omitempty"`
 			Port       int               `json:"port,omitempty"`
 			HealthPath string            `json:"health_path,omitempty"`
 			Env        map[string]string `json:"env,omitempty"`
+			RunAs      string            `json:"run_as,omitempty"`
 		} `json:"start_command,omitempty"`
 	} `json:"latest"`
 }

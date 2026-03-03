@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any
 
 from bf_sdk._shell import ShellSession
-from bf_sdk.models.runner import ConnectResult, ExecEvent, PauseResult
+from bf_sdk.models.runner import ConnectResult, ExecEvent, ExecResult, PauseResult
 
 if TYPE_CHECKING:
     from bf_sdk.resources.runners import Runners
@@ -85,20 +86,29 @@ class RunnerSession:
         env: dict[str, str] | None = None,
         working_dir: str | None = None,
         timeout_seconds: int | None = None,
+        on_stdout: Callable[[ExecEvent], Any] | None = None,
+        on_stderr: Callable[[ExecEvent], Any] | None = None,
+        on_exit: Callable[[int], Any] | None = None,
     ) -> Iterator[ExecEvent]:
         """Execute a command in the runner, streaming ndjson events.
 
         Accepts the command as positional args for ergonomics::
 
             r.exec("python", "-c", "print(42)")
+
+        Optional callbacks fire as events stream through; the iterator still
+        yields all events regardless.
         """
-        return self._runners.exec(
+        events = self._runners.exec(
             self._runner_id,
             list(command),
             env=env,
             working_dir=working_dir,
             timeout_seconds=timeout_seconds,
         )
+        if on_stdout or on_stderr or on_exit:
+            return self._iter_with_callbacks(events, on_stdout, on_stderr, on_exit)
+        return events
 
     def exec_collect(
         self,
@@ -106,20 +116,72 @@ class RunnerSession:
         env: dict[str, str] | None = None,
         working_dir: str | None = None,
         timeout_seconds: int | None = None,
-    ) -> tuple[str, int]:
-        """Execute a command and collect all output. Returns (output, exit_code)."""
-        output_parts: list[str] = []
+    ) -> ExecResult:
+        """Execute a command and collect all output.
+
+        Returns an ``ExecResult`` with structured stdout, stderr, exit_code, and
+        duration_ms. Supports tuple unpacking for backwards compatibility::
+
+            output, code = r.exec_collect("echo", "hello")
+        """
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
         exit_code = -1
+        t0 = time.monotonic()
         for event in self.exec(*command, env=env, working_dir=working_dir, timeout_seconds=timeout_seconds):
-            if event.type in ("stdout", "stderr") and event.data:
-                output_parts.append(event.data)
+            if event.type == "stdout" and event.data:
+                stdout_parts.append(event.data)
+            elif event.type == "stderr" and event.data:
+                stderr_parts.append(event.data)
             elif event.type == "exit" and event.code is not None:
                 exit_code = event.code
-        return "".join(output_parts), exit_code
+        duration_ms = (time.monotonic() - t0) * 1000
+        return ExecResult(
+            stdout="".join(stdout_parts),
+            stderr="".join(stderr_parts),
+            exit_code=exit_code,
+            duration_ms=round(duration_ms, 1),
+        )
 
     def shell(self, *, command: str | None = None, cols: int = 80, rows: int = 24) -> ShellSession:
         """Open a PTY shell session. Use as a context manager."""
         return self._runners.shell(self._runner_id, command=command, cols=cols, rows=rows)
+
+    # -- File operations -------------------------------------------------------
+
+    def download(self, path: str) -> bytes:
+        """Download a file from the runner as raw bytes."""
+        return self._runners.file_download(self._runner_id, path)
+
+    def upload(self, path: str, data: bytes | str, *, mode: str = "overwrite", perm: str | None = None) -> dict:
+        """Upload data to a file in the runner. Strings are encoded to UTF-8."""
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        return self._runners.file_upload(self._runner_id, path, data, mode=mode, perm=perm)
+
+    def read_file(self, path: str, *, offset: int = 0, limit: int | None = None) -> dict:
+        """Read a file's content (JSON-based, supports offset/limit)."""
+        return self._runners.file_read(self._runner_id, path, offset=offset, limit=limit)
+
+    def write_file(self, path: str, content: str, *, mode: str = "overwrite") -> dict:
+        """Write string content to a file in the runner."""
+        return self._runners.file_write(self._runner_id, path, content, mode=mode)
+
+    def list_files(self, path: str, *, recursive: bool = False) -> dict:
+        """List files in a directory in the runner."""
+        return self._runners.file_list(self._runner_id, path, recursive=recursive)
+
+    def stat_file(self, path: str) -> dict:
+        """Stat a file in the runner."""
+        return self._runners.file_stat(self._runner_id, path)
+
+    def remove(self, path: str, *, recursive: bool = False) -> dict:
+        """Remove a file or directory in the runner."""
+        return self._runners.file_remove(self._runner_id, path, recursive=recursive)
+
+    def mkdir(self, path: str) -> dict:
+        """Create a directory in the runner."""
+        return self._runners.file_mkdir(self._runner_id, path)
 
     # -- Quarantine (debugging) ------------------------------------------------
 
@@ -128,3 +190,21 @@ class RunnerSession:
 
     def unquarantine(self) -> dict[str, Any]:
         return self._runners.unquarantine(self._runner_id)
+
+    # -- Private helpers -------------------------------------------------------
+
+    @staticmethod
+    def _iter_with_callbacks(
+        events: Iterator[ExecEvent],
+        on_stdout: Callable[[ExecEvent], Any] | None,
+        on_stderr: Callable[[ExecEvent], Any] | None,
+        on_exit: Callable[[int], Any] | None,
+    ) -> Iterator[ExecEvent]:
+        for event in events:
+            if event.type == "stdout" and on_stdout:
+                on_stdout(event)
+            elif event.type == "stderr" and on_stderr:
+                on_stderr(event)
+            elif event.type == "exit" and on_exit and event.code is not None:
+                on_exit(event.code)
+            yield event

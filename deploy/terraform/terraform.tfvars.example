@@ -30,4 +30,7 @@ microvm_subnet    = "172.16.0.0/24"
 container_registry_location  = "us-central1"
 container_registry_repo_name = "firecracker"
 
+# Telemetry
+otel_collector_addr = ""  # Internal LB IP of OTel collector (e.g. "10.0.16.17:4317")
+
 

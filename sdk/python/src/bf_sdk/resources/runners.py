@@ -166,6 +166,93 @@ class Runners:
 
     # -- Host agent operations -------------------------------------------------
 
+    def file_download(self, runner_id: str, path: str) -> bytes:
+        """Download a file from the runner as raw bytes."""
+        host = self._resolve_host(runner_id)
+        return self._http.get_bytes(
+            f"/api/v1/runners/{runner_id}/files/download",
+            base_url=host,
+            params={"path": path},
+        )
+
+    def file_upload(
+        self,
+        runner_id: str,
+        path: str,
+        data: bytes,
+        *,
+        mode: str = "overwrite",
+        perm: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload raw bytes to a file in the runner."""
+        host = self._resolve_host(runner_id)
+        params: dict[str, str] = {"path": path, "mode": mode}
+        if perm is not None:
+            params["perm"] = perm
+        return self._http.post_bytes(
+            f"/api/v1/runners/{runner_id}/files/upload",
+            data=data,
+            base_url=host,
+            params=params,
+        )
+
+    def file_read(self, runner_id: str, path: str, *, offset: int = 0, limit: int | None = None) -> dict[str, Any]:
+        """Read a file's content (JSON-based, supports offset/limit)."""
+        host = self._resolve_host(runner_id)
+        body: dict[str, Any] = {"path": path, "offset": offset}
+        if limit is not None:
+            body["limit"] = limit
+        return self._http.post_to_host(
+            f"/api/v1/runners/{runner_id}/files/read",
+            json_body=body,
+            base_url=host,
+        )
+
+    def file_write(self, runner_id: str, path: str, content: str, *, mode: str = "overwrite") -> dict[str, Any]:
+        """Write string content to a file in the runner."""
+        host = self._resolve_host(runner_id)
+        return self._http.post_to_host(
+            f"/api/v1/runners/{runner_id}/files/write",
+            json_body={"path": path, "content": content, "mode": mode},
+            base_url=host,
+        )
+
+    def file_list(self, runner_id: str, path: str, *, recursive: bool = False) -> dict[str, Any]:
+        """List files in a directory in the runner."""
+        host = self._resolve_host(runner_id)
+        return self._http.post_to_host(
+            f"/api/v1/runners/{runner_id}/files/list",
+            json_body={"path": path, "recursive": recursive},
+            base_url=host,
+        )
+
+    def file_stat(self, runner_id: str, path: str) -> dict[str, Any]:
+        """Stat a file in the runner."""
+        host = self._resolve_host(runner_id)
+        return self._http.post_to_host(
+            f"/api/v1/runners/{runner_id}/files/stat",
+            json_body={"path": path},
+            base_url=host,
+        )
+
+    def file_remove(self, runner_id: str, path: str, *, recursive: bool = False) -> dict[str, Any]:
+        """Remove a file or directory in the runner."""
+        host = self._resolve_host(runner_id)
+        return self._http.post_to_host(
+            f"/api/v1/runners/{runner_id}/files/remove",
+            json_body={"path": path, "recursive": recursive},
+            base_url=host,
+        )
+
+    def file_mkdir(self, runner_id: str, path: str) -> dict[str, Any]:
+        """Create a directory in the runner."""
+        host = self._resolve_host(runner_id)
+        return self._http.post_to_host(
+            f"/api/v1/runners/{runner_id}/files/mkdir",
+            json_body={"path": path},
+            base_url=host,
+        )
+
     def shell(
         self,
         runner_id: str,

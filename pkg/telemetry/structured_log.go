@@ -6,6 +6,15 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// Labels is a convenience type for metric labels.
+type Labels map[string]string
+
+// LabelPhase is the well-known label key for phase names.
+const LabelPhase = "phase"
+
+// MetricVMReadyDuration is the metric name for VM ready duration (used by thaw-agent).
+const MetricVMReadyDuration = "vm/ready_duration_seconds"
+
 // StructuredLogger writes metrics as structured log entries that can be
 // picked up by GCP Ops Agent and converted to log-based metrics.
 // This is useful for components running inside VMs that can't directly
