@@ -135,6 +135,15 @@ type Handler struct {
 	wg        sync.WaitGroup
 	connected chan struct{} // closed when Firecracker connects
 
+	// Concurrent fault handling: when faultSem is non-nil, page faults are
+	// dispatched to goroutines gated by this buffered channel (semaphore).
+	// When nil, faults are handled serially (legacy behavior).
+	faultSem chan struct{}
+
+	// Prefetch tracking: records page fault order for replay on next resume.
+	// nil when tracking is disabled.
+	prefetchTracker *PrefetchTracker
+
 	// Fault policy
 	consecutiveFailures    uint64 // atomic
 	killOnce               sync.Once
@@ -169,6 +178,20 @@ type HandlerConfig struct {
 	// Meter is an OTel metric.Meter for fault-service instrumentation.
 	// If nil, no metrics are recorded.
 	Meter metric.Meter
+
+	// FaultConcurrency controls how many page faults can be serviced in
+	// parallel. 0 or 1 means serial (legacy behavior). Values > 1 enable
+	// concurrent fault dispatch via a bounded goroutine pool, eliminating
+	// head-of-line blocking when one fault is waiting on a GCS fetch.
+	// Recommended: 32.
+	FaultConcurrency int
+
+	// EnablePrefetchTracking enables recording page fault access order.
+	// When true, the handler creates a PrefetchTracker that records the
+	// first access to each page offset. The recorded mapping can be
+	// retrieved via GetPrefetchMapping() and stored in snapshot metadata
+	// for replay on subsequent resumes.
+	EnablePrefetchTracking bool
 }
 
 // NewHandler creates a new UFFD handler
@@ -199,6 +222,16 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 		faultTimeout:           faultTimeout,
 		maxConsecutiveFailures: maxConsecutiveFailures,
 		logger:                 cfg.Logger.WithField("component", "uffd-handler"),
+	}
+
+	// Enable concurrent fault handling if configured.
+	if cfg.FaultConcurrency > 1 {
+		h.faultSem = make(chan struct{}, cfg.FaultConcurrency)
+	}
+
+	// Enable prefetch tracking if configured.
+	if cfg.EnablePrefetchTracking {
+		h.prefetchTracker = NewPrefetchTracker(PageSize)
 	}
 
 	// Initialize OTel instruments if a Meter was provided.
@@ -466,9 +499,24 @@ func (h *Handler) handlePageFaults(uffdFd int) {
 		address := binary.LittleEndian.Uint64(msgBuf[16:24])
 		atomic.AddUint64(&h.pageFaults, 1)
 
-		// Handle the page fault
-		if err := h.handleSingleFault(uffdFd, address); err != nil {
-			h.logger.WithError(err).WithField("address", fmt.Sprintf("0x%x", address)).Error("Failed to handle page fault")
+		if h.faultSem != nil {
+			// Concurrent mode: dispatch to a goroutine gated by semaphore.
+			// Extract address before dispatch to avoid data race on msgBuf.
+			addr := address
+			h.wg.Add(1)
+			h.faultSem <- struct{}{} // blocks when pool is full
+			go func() {
+				defer h.wg.Done()
+				defer func() { <-h.faultSem }()
+				if err := h.handleSingleFault(uffdFd, addr); err != nil {
+					h.logger.WithError(err).WithField("address", fmt.Sprintf("0x%x", addr)).Error("Failed to handle page fault")
+				}
+			}()
+		} else {
+			// Serial mode (legacy): handle inline.
+			if err := h.handleSingleFault(uffdFd, address); err != nil {
+				h.logger.WithError(err).WithField("address", fmt.Sprintf("0x%x", address)).Error("Failed to handle page fault")
+			}
 		}
 	}
 }
@@ -531,12 +579,22 @@ func (h *Handler) handleSingleFault(uffdFd int, address uint64) error {
 
 	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffdFd), UFFDIO_COPY, uintptr(unsafe.Pointer(&cp)))
 	if errno != 0 {
+		// EEXIST means another goroutine already resolved this page — not an error.
+		if errno == unix.EEXIST {
+			return nil
+		}
 		return fmt.Errorf("UFFDIO_COPY failed: %w", errno)
 	}
 
 	if h.faultServiceHist != nil {
 		h.faultServiceHist.Record(context.Background(), time.Since(faultStart).Seconds())
 	}
+
+	// Record access for prefetch replay on subsequent resumes.
+	if h.prefetchTracker != nil {
+		h.prefetchTracker.Add(int64(offset))
+	}
+
 	return nil
 }
 
@@ -554,6 +612,10 @@ func (h *Handler) zeroFault(uffdFd int, pageAddr uint64) error {
 
 	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffdFd), UFFDIO_COPY, uintptr(unsafe.Pointer(&cp)))
 	if errno != 0 {
+		// EEXIST means another goroutine already resolved this page — not an error.
+		if errno == unix.EEXIST {
+			return nil
+		}
 		return fmt.Errorf("UFFDIO_COPY (zero page) failed: %w", errno)
 	}
 
@@ -624,6 +686,21 @@ func (h *Handler) Stop() {
 		h.listener.Close()
 	}
 	h.wg.Wait()
+}
+
+// GetPrefetchMapping stops the prefetch tracker and returns the recorded
+// access-order mapping. Returns nil if tracking was not enabled.
+func (h *Handler) GetPrefetchMapping() *snapshot.PrefetchMapping {
+	if h.prefetchTracker == nil {
+		return nil
+	}
+	return h.prefetchTracker.GetMapping()
+}
+
+// Mappings returns the guest memory region mappings received from Firecracker.
+// These are available after the UFFD connection is established.
+func (h *Handler) Mappings() []GuestRegionUFFDMapping {
+	return h.mappings
 }
 
 // Stats returns handler statistics

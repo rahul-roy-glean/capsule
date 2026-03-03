@@ -108,6 +108,16 @@ type ChunkedSnapshotMetadata struct {
 	ParentVersion   string `json:"parent_version,omitempty"`
 	LayerDepth      int    `json:"layer_depth,omitempty"`
 	LayerName       string `json:"layer_name,omitempty"`
+	// MemPrefetchMapping records the page fault access pattern from a previous
+	// run for replay during subsequent resumes (access-pattern prefetching).
+	MemPrefetchMapping *PrefetchMapping `json:"mem_prefetch_mapping,omitempty"`
+}
+
+// PrefetchMapping records page fault order for replay during subsequent resumes.
+// Stored as part of ChunkedSnapshotMetadata for access-pattern prefetching.
+type PrefetchMapping struct {
+	Offsets   []int64 `json:"offsets"`    // sorted by access order
+	BlockSize int64   `json:"block_size"` // page size used during recording (typically 4096)
 }
 
 // ChunkRef references a single chunk by its content hash

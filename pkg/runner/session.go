@@ -229,6 +229,14 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 		if err != nil {
 			m.logger.WithError(err).Warn("GCS mem chunk upload failed; falling back to local-only session")
 		} else {
+			// Attach prefetch mapping from UFFD handler if available.
+			if handler, ok := m.uffdHandlers[runnerID].(*uffd.Handler); ok {
+				if pm := handler.GetPrefetchMapping(); pm != nil {
+					newMemIndex.PrefetchMapping = pm
+					m.logger.WithField("offsets", len(pm.Offsets)).Info("Attached prefetch mapping to ChunkIndex")
+				}
+			}
+
 			vmStateGCSPath := uploader.FullGCSPath(gcsBase + "/snapshot.state")
 
 			if uploadErr := uploader.UploadVMState(ctx, stateFile, vmStateGCSPath); uploadErr != nil {
@@ -552,6 +560,14 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 		if err != nil {
 			m.logger.WithError(err).Warn("Checkpoint: GCS mem chunk upload failed")
 		} else {
+			// Attach prefetch mapping from UFFD handler if available.
+			if handler, ok := m.uffdHandlers[runnerID].(*uffd.Handler); ok {
+				if pm := handler.GetPrefetchMapping(); pm != nil {
+					newMemIndex.PrefetchMapping = pm
+					m.logger.WithField("offsets", len(pm.Offsets)).Info("Checkpoint: attached prefetch mapping to ChunkIndex")
+				}
+			}
+
 			vmStateGCSPath := uploader.FullGCSPath(gcsBase + "/snapshot.state")
 			if uploadErr := uploader.UploadVMState(ctx, stateFile, vmStateGCSPath); uploadErr != nil {
 				m.logger.WithError(uploadErr).Warn("Checkpoint: GCS vmstate upload failed")
@@ -836,10 +852,12 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 
 		chunkedMeta := snapshot.ChunkIndexToMetadata(memIdx)
 		gcsHandler, handlerErr := uffd.NewHandler(uffd.HandlerConfig{
-			SocketPath: uffdSocketPath,
-			ChunkStore: m.sessionMemStore,
-			Metadata:   chunkedMeta,
-			Logger:     m.logger.Logger,
+			SocketPath:             uffdSocketPath,
+			ChunkStore:             m.sessionMemStore,
+			Metadata:               chunkedMeta,
+			Logger:                 m.logger.Logger,
+			FaultConcurrency:       32,
+			EnablePrefetchTracking: true,
 		})
 		if handlerErr != nil {
 			m.mu.Lock()
@@ -944,10 +962,11 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		latestStateFile = filepath.Join(sessionDir, fmt.Sprintf("layer_%d", metadata.Layers-1), "snapshot.state")
 
 		layeredHandler, handlerErr := uffd.NewLayeredHandler(uffd.LayeredHandlerConfig{
-			SocketPath:    uffdSocketPath,
-			GoldenMemPath: snapshotPaths.Mem,
-			DiffLayers:    diffLayers,
-			Logger:        m.logger.Logger,
+			SocketPath:       uffdSocketPath,
+			GoldenMemPath:    snapshotPaths.Mem,
+			DiffLayers:       diffLayers,
+			Logger:           m.logger.Logger,
+			FaultConcurrency: 32,
 		})
 		if handlerErr != nil {
 			m.mu.Lock()

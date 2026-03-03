@@ -450,10 +450,12 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		// Legacy: UFFD lazy memory loading from dedicated memory chunk store.
 		uffdSocketPath = filepath.Join(cm.config.SocketDir, runnerID+".uffd.sock")
 		uffdHandler, err = uffd.NewHandler(uffd.HandlerConfig{
-			SocketPath: uffdSocketPath,
-			ChunkStore: cm.memChunkStore,
-			Metadata:   meta,
-			Logger:     cm.logger.Logger,
+			SocketPath:             uffdSocketPath,
+			ChunkStore:             cm.memChunkStore,
+			Metadata:               meta,
+			Logger:                 cm.logger.Logger,
+			FaultConcurrency:       32,
+			EnablePrefetchTracking: true,
 		})
 		if err != nil {
 			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)

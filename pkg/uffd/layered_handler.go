@@ -27,6 +27,11 @@ type LayeredHandlerConfig struct {
 	DiffLayers    []string // Paths to diff layer files, oldest first
 	PageCacheSize int      // Max pages to cache (default 50000 = ~200MB)
 	Logger        *logrus.Logger
+
+	// FaultConcurrency controls how many page faults can be serviced in
+	// parallel. 0 or 1 means serial (legacy behavior). Values > 1 enable
+	// concurrent fault dispatch. Recommended: 32.
+	FaultConcurrency int
 }
 
 // LayeredHandler handles UFFD page faults by checking diff layers then golden base.
@@ -46,8 +51,9 @@ type LayeredHandler struct {
 	// Guest memory region mappings received from Firecracker
 	mappings []GuestRegionUFFDMapping
 
-	// LRU page cache
+	// LRU page cache (not goroutine-safe, guarded by pageCacheMu)
 	pageCache     *lru.Cache[uint64, []byte]
+	pageCacheMu   sync.RWMutex
 	pageCacheSize int
 
 	// Stats
@@ -65,6 +71,9 @@ type LayeredHandler struct {
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
 	connected chan struct{}
+
+	// Concurrent fault handling semaphore (nil = serial)
+	faultSem chan struct{}
 
 	logger *logrus.Entry
 }
@@ -95,6 +104,11 @@ func NewLayeredHandler(cfg LayeredHandlerConfig) (*LayeredHandler, error) {
 		cancel:        cancel,
 		connected:     make(chan struct{}),
 		logger:        cfg.Logger.WithField("component", "uffd-layered-handler"),
+	}
+
+	// Enable concurrent fault handling if configured.
+	if cfg.FaultConcurrency > 1 {
+		h.faultSem = make(chan struct{}, cfg.FaultConcurrency)
 	}
 
 	// mmap golden memory file (read-only, shared across all sessions)
@@ -384,8 +398,22 @@ func (h *LayeredHandler) handlePageFaults(uffdFd int) {
 		address := binary.LittleEndian.Uint64(msgBuf[16:24])
 		atomic.AddUint64(&h.pageFaults, 1)
 
-		if err := h.handleSingleFault(uffdFd, address); err != nil {
-			h.logger.WithError(err).WithField("address", fmt.Sprintf("0x%x", address)).Error("Failed to handle page fault")
+		if h.faultSem != nil {
+			// Concurrent mode: dispatch to a goroutine gated by semaphore.
+			addr := address
+			h.wg.Add(1)
+			h.faultSem <- struct{}{}
+			go func() {
+				defer h.wg.Done()
+				defer func() { <-h.faultSem }()
+				if err := h.handleSingleFault(uffdFd, addr); err != nil {
+					h.logger.WithError(err).WithField("address", fmt.Sprintf("0x%x", addr)).Error("Failed to handle page fault")
+				}
+			}()
+		} else {
+			if err := h.handleSingleFault(uffdFd, address); err != nil {
+				h.logger.WithError(err).WithField("address", fmt.Sprintf("0x%x", address)).Error("Failed to handle page fault")
+			}
 		}
 	}
 }
@@ -402,8 +430,11 @@ func (h *LayeredHandler) handleSingleFault(uffdFd int, address uint64) error {
 
 	offset := uint64(uintptr(pageAddr) - mapping.BaseHostVirtAddr + mapping.Offset)
 
-	// Check page cache first
-	if data, ok := h.pageCache.Get(offset); ok {
+	// Check page cache first (guarded by RWMutex for concurrent access)
+	h.pageCacheMu.RLock()
+	data, ok := h.pageCache.Get(offset)
+	h.pageCacheMu.RUnlock()
+	if ok {
 		atomic.AddUint64(&h.cacheHits, 1)
 		return h.copyPage(uffdFd, pageAddr, data)
 	}
@@ -429,7 +460,9 @@ func (h *LayeredHandler) handleSingleFault(uffdFd int, address uint64) error {
 		}
 
 		atomic.AddUint64(&h.layerReads, 1)
+		h.pageCacheMu.Lock()
 		h.pageCache.Add(offset, page)
+		h.pageCacheMu.Unlock()
 		return h.copyPage(uffdFd, pageAddr, page)
 	}
 
@@ -456,6 +489,10 @@ func (h *LayeredHandler) copyPage(uffdFd int, pageAddr uint64, data []byte) erro
 
 	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffdFd), UFFDIO_COPY, uintptr(unsafe.Pointer(&cp)))
 	if errno != 0 {
+		// EEXIST means another goroutine already resolved this page — not an error.
+		if errno == unix.EEXIST {
+			return nil
+		}
 		return fmt.Errorf("UFFDIO_COPY failed: %w", errno)
 	}
 	return nil
