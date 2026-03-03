@@ -69,18 +69,18 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 	}
 
 	allocReq := runner.AllocateRequest{
-		RequestID:         req.RequestId,
-		Repo:              req.Repo,
-		Branch:            req.Branch,
-		Commit:            req.Commit,
-		GitHubRunnerToken: req.GithubRunnerToken,
-		Labels:            req.Labels,
-		WorkloadKey:       req.WorkloadKey,
-		SnapshotVersion:   req.SnapshotVersion,
-		CISystem:          req.CiSystem,
-		SessionID:         req.SessionId,
-		TTLSeconds:        int(req.TtlSeconds),
-		AutoPause:         req.AutoPause,
+		RequestID:           req.RequestId,
+		Repo:                req.Repo,
+		Branch:              req.Branch,
+		Commit:              req.Commit,
+		GitHubRunnerToken:   req.GetCiRunnerToken(),
+		Labels:              req.Labels,
+		WorkloadKey:         req.WorkloadKey,
+		SnapshotVersion:     req.SnapshotVersion,
+		CISystem:            req.CiSystem,
+		SessionID:           req.SessionId,
+		TTLSeconds:          int(req.TtlSeconds),
+		AutoPause:           req.AutoPause,
 		NetworkPolicyPreset: req.NetworkPolicyPreset,
 	}
 
@@ -114,6 +114,8 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 			Command:    req.StartCommand.Command,
 			Port:       int(req.StartCommand.Port),
 			HealthPath: req.StartCommand.HealthPath,
+			Env:        req.StartCommand.Env,
+			RunAs:      req.StartCommand.RunAs,
 		}
 	}
 

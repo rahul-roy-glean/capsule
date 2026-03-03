@@ -31,8 +31,6 @@ import (
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
-var version string // set by -ldflags "-X main.version=..."
-
 var (
 	baseWorkloadKey = flag.String("base-workload-key", "", "Workload key of the base snapshot (required)")
 	driveSpecsJSON  = flag.String("drive-specs", "[]", "JSON array of DriveSpec objects describing extension drives")

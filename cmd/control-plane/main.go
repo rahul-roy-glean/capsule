@@ -775,12 +775,17 @@ func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Req
 	var allRunners []map[string]interface{}
 
 	for _, h := range hosts {
-		// For now, return basic host runner info
-		for i := 0; i < h.IdleRunners+h.BusyRunners; i++ {
+		s.hostRegistry.mu.RLock()
+		runnerInfos := h.RunnerInfos
+		s.hostRegistry.mu.RUnlock()
+
+		for _, ri := range runnerInfos {
 			allRunners = append(allRunners, map[string]interface{}{
-				"host_id":   h.ID,
-				"host_name": h.InstanceName,
-				"status":    "running",
+				"runner_id":    ri.RunnerID,
+				"host_id":      h.ID,
+				"host_name":    h.InstanceName,
+				"workload_key": ri.WorkloadKey,
+				"status":       ri.State,
 			})
 		}
 	}
@@ -1136,7 +1141,7 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 		client := pb.NewHostAgentClient(conn)
 		resp, err := client.ResumeRunner(r.Context(), &pb.ResumeRunnerRequest{SessionId: sessionID})
 		if err != nil || resp.Error != "" {
-			errMsg := "resume failed"
+			var errMsg string
 			if err != nil {
 				errMsg = err.Error()
 			} else {
@@ -1314,9 +1319,13 @@ func (s *ControlPlaneServer) HandleCanaryReport(w http.ResponseWriter, r *http.R
 	}).Info("Received canary report")
 
 	if report.Status == "success" {
-		s.canarySuccessCounter.Add(r.Context(), 1)
+		if s.canarySuccessCounter != nil {
+			s.canarySuccessCounter.Add(r.Context(), 1)
+		}
 	} else {
-		s.canaryFailureCounter.Add(r.Context(), 1)
+		if s.canaryFailureCounter != nil {
+			s.canaryFailureCounter.Add(r.Context(), 1)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

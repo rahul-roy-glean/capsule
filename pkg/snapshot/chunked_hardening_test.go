@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -339,7 +340,7 @@ func TestErrChunkCorruption(t *testing.T) {
 
 // TestCollectSessionRoots tests the stub returns nil.
 func TestCollectSessionRoots(t *testing.T) {
-	roots, err := CollectSessionRoots(nil)
+	roots, err := CollectSessionRoots(context.TODO())
 	if err != nil {
 		t.Errorf("CollectSessionRoots() returned error: %v", err)
 	}

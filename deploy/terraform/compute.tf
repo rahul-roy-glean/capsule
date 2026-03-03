@@ -102,11 +102,12 @@ resource "google_compute_instance_template" "firecracker_host" {
     runner-ephemeral      = var.runner_ephemeral ? "true" : "false"
     # Indicates whether data disk was created from snapshot (fast) or empty (needs GCS download)
     use-data-snapshot     = var.use_data_snapshot ? "true" : "false"
-    use-chunked-snapshots = var.use_chunked_snapshots ? "true" : "false"
-    chunk-cache-size-gb   = var.chunk_cache_size_gb
-    mem-cache-size-gb     = var.mem_cache_size_gb
-    use-netns             = var.use_netns ? "true" : "false"
-    otel-collector-endpoint = var.otel_collector_endpoint
+    use-chunked-snapshots  = var.use_chunked_snapshots ? "true" : "false"
+    enable-session-chunks  = var.enable_session_chunks ? "true" : "false"
+    chunk-cache-size-gb    = var.chunk_cache_size_gb
+    mem-cache-size-gb      = var.mem_cache_size_gb
+    use-netns              = var.use_netns ? "true" : "false"
+    otel-collector-addr    = var.otel_collector_addr
   }
 
   metadata_startup_script = <<-EOF
@@ -398,6 +399,12 @@ LOGROTATE
         http://metadata.google.internal/computeMetadata/v1/instance/attributes/mem-cache-size-gb || echo "2")
       EXEC_START="$EXEC_START --chunk-cache-size-gb=$CHUNK_CACHE_SIZE_GB"
       EXEC_START="$EXEC_START --mem-cache-size-gb=$MEM_CACHE_SIZE_GB"
+
+      ENABLE_SESSION_CHUNKS=$(curl -sf -H "Metadata-Flavor: Google" \
+        http://metadata.google.internal/computeMetadata/v1/instance/attributes/enable-session-chunks || echo "false")
+      if [ "$ENABLE_SESSION_CHUNKS" = "true" ]; then
+        EXEC_START="$EXEC_START --enable-session-chunks"
+      fi
     fi
 
     # Add network namespace flag if enabled

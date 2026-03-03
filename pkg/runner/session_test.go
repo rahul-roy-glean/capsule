@@ -629,6 +629,7 @@ func TestResumeFromSession_SuspendedNotCountedForCapacity(t *testing.T) {
 			if r := recover(); r != nil {
 				// Expected: nil pointer on snapshotCache.GetSnapshotPaths()
 				// This proves we got PAST the capacity check.
+				t.Logf("Got expected panic past capacity check: %v", r)
 			}
 		}()
 		_, err = m.ResumeFromSession(context.Background(), "sess-1", "")

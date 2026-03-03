@@ -499,6 +499,8 @@ shutdown -h now
 }
 
 // launchSnapshotBuilderVMForKey creates a GCE instance to build a snapshot from commands JSON.
+//
+//nolint:unused // will be wired up when per-key snapshot builds are enabled
 func (sm *SnapshotManager) launchSnapshotBuilderVMForKey(ctx context.Context, instanceName, workloadKey, commandsJSON, version, githubAppID, githubAppSecret string, buildType string, snapshotVCPUs, snapshotMemoryMB int) error {
 	if sm.gcpProject == "" {
 		sm.logger.Warn("GCP project not configured, skipping VM launch")
@@ -847,6 +849,55 @@ func (sm *SnapshotManager) cleanupBuilderVM(ctx context.Context, instanceName st
 
 	if err := op.Wait(ctx); err != nil {
 		sm.logger.WithError(err).Warn("Failed waiting for VM deletion")
+	}
+}
+
+// GCTerminatedBuilderVMs deletes GCE instances matching "layer-builder-*" that
+// are in TERMINATED state. This catches VMs that were partially created but
+// never cleaned up (e.g. launch failed after Insert but before status='running').
+func (sm *SnapshotManager) GCTerminatedBuilderVMs(ctx context.Context) {
+	if sm.gcpProject == "" {
+		return
+	}
+
+	instancesClient, err := compute.NewInstancesRESTClient(ctx)
+	if err != nil {
+		sm.logger.WithError(err).Warn("GC: failed to create compute client")
+		return
+	}
+	defer instancesClient.Close()
+
+	it := instancesClient.List(ctx, &computepb.ListInstancesRequest{
+		Project: sm.gcpProject,
+		Zone:    sm.gcpZone,
+		Filter:  proto.String(`name = "layer-builder-*" AND status = "TERMINATED"`),
+	})
+
+	var deleted int
+	for {
+		instance, err := it.Next()
+		if err != nil {
+			break
+		}
+		name := instance.GetName()
+		sm.logger.WithField("instance", name).Info("GC: deleting terminated builder VM")
+		op, err := instancesClient.Delete(ctx, &computepb.DeleteInstanceRequest{
+			Project:  sm.gcpProject,
+			Zone:     sm.gcpZone,
+			Instance: name,
+		})
+		if err != nil {
+			sm.logger.WithError(err).WithField("instance", name).Warn("GC: failed to delete VM")
+			continue
+		}
+		if err := op.Wait(ctx); err != nil {
+			sm.logger.WithError(err).WithField("instance", name).Warn("GC: failed waiting for deletion")
+			continue
+		}
+		deleted++
+	}
+	if deleted > 0 {
+		sm.logger.WithField("count", deleted).Info("GC: cleaned up terminated builder VMs")
 	}
 }
 
@@ -1253,6 +1304,8 @@ func (sm *SnapshotManager) SetActiveSnapshotForKey(ctx context.Context, workload
 
 // monitorSnapshotBuildForKey monitors a repo-scoped snapshot build.
 // After build completes, it auto-validates and optionally auto-rolls out.
+//
+//nolint:unused // will be wired up when per-key snapshot builds are enabled
 func (sm *SnapshotManager) monitorSnapshotBuildForKey(ctx context.Context, version, instanceName, workloadKey string) {
 	sm.logger.WithFields(logrus.Fields{
 		"version":      version,

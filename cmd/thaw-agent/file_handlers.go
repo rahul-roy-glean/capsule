@@ -141,10 +141,10 @@ func fileReadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonOK(w, map[string]interface{}{
-		"path":   resolved,
-		"size":   info.Size(),
+		"path":    resolved,
+		"size":    info.Size(),
 		"content": content,
-		"base64": req.Base64,
+		"base64":  req.Base64,
 	})
 }
 
@@ -162,8 +162,8 @@ func fileWriteHandler(w http.ResponseWriter, r *http.Request) {
 		Path    string `json:"path"`
 		Content string `json:"content"`
 		Base64  bool   `json:"base64,omitempty"`
-		Mode    string `json:"mode,omitempty"`   // "overwrite" (default), "append"
-		Perm    *int   `json:"perm,omitempty"`   // octal file permission, e.g. 0644
+		Mode    string `json:"mode,omitempty"` // "overwrite" (default), "append"
+		Perm    *int   `json:"perm,omitempty"` // octal file permission, e.g. 0644
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, http.StatusBadRequest, "invalid request: "+err.Error())
@@ -337,13 +337,13 @@ func fileStatHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			jsonOK(w, map[string]interface{}{
-				"name":   filepath.Base(req.Path),
-				"path":   resolved,
-				"size":   0,
-				"mode":   "",
+				"name":     filepath.Base(req.Path),
+				"path":     resolved,
+				"size":     0,
+				"mode":     "",
 				"mod_time": "",
-				"is_dir": false,
-				"exists": false,
+				"is_dir":   false,
+				"exists":   false,
 			})
 			return
 		}

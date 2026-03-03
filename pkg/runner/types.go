@@ -59,12 +59,12 @@ type Runner struct {
 	ServicePort             int // Port of the user's service inside the VM (from StartCommand)
 
 	// Network policy fields
-	NetworkPolicy        *network.NetworkPolicy `json:"network_policy,omitempty"`
-	NetworkPolicyVersion int                    `json:"network_policy_version,omitempty"`
-	PreQuarantinePolicy  *network.NetworkPolicy `json:"pre_quarantine_policy,omitempty"`
-	DynamicDomainsAdded  int                    `json:"dynamic_domains_added,omitempty"`
-	DynamicCIDRsAdded    int                    `json:"dynamic_cidrs_added,omitempty"`
-	EmergencyEgressBlocked bool                 `json:"emergency_egress_blocked,omitempty"`
+	NetworkPolicy          *network.NetworkPolicy `json:"network_policy,omitempty"`
+	NetworkPolicyVersion   int                    `json:"network_policy_version,omitempty"`
+	PreQuarantinePolicy    *network.NetworkPolicy `json:"pre_quarantine_policy,omitempty"`
+	DynamicDomainsAdded    int                    `json:"dynamic_domains_added,omitempty"`
+	DynamicCIDRsAdded      int                    `json:"dynamic_cidrs_added,omitempty"`
+	EmergencyEgressBlocked bool                   `json:"emergency_egress_blocked,omitempty"`
 
 	// Pool-related fields
 	PoolKey          *RunnerKey `json:"pool_key,omitempty"`
@@ -101,23 +101,23 @@ type Resources struct {
 
 // AllocateRequest represents a request to allocate a runner
 type AllocateRequest struct {
-	RequestID         string
-	Repo              string
-	Branch            string
-	Commit            string
-	WorkloadKey       string // Workload key identifying which snapshot to use for this runner
-	SnapshotVersion   string // Explicit snapshot version; skips current-pointer.json lookup when set
-	Resources         Resources
-	Labels            map[string]string
-	GitHubRunnerToken string
-	CISystem          string                 // CI system identifier
-	StartCommand      *snapshot.StartCommand // Optional: user service to start inside the VM
-	SessionID         string                 // optional: bind to session for pause/resume
-	TTLSeconds        int                    // idle timeout from snapshot config
-	AutoPause         bool                   // pause on TTL vs destroy
-	SnapshotTag       string                 // optional: named tag to resolve snapshot version
-	NetworkPolicyPreset string               // optional: named preset (e.g., "ci-standard")
-	NetworkPolicy     *network.NetworkPolicy // optional: full policy override
+	RequestID           string
+	Repo                string
+	Branch              string
+	Commit              string
+	WorkloadKey         string // Workload key identifying which snapshot to use for this runner
+	SnapshotVersion     string // Explicit snapshot version; skips current-pointer.json lookup when set
+	Resources           Resources
+	Labels              map[string]string
+	GitHubRunnerToken   string
+	CISystem            string                 // CI system identifier
+	StartCommand        *snapshot.StartCommand // Optional: user service to start inside the VM
+	SessionID           string                 // optional: bind to session for pause/resume
+	TTLSeconds          int                    // idle timeout from snapshot config
+	AutoPause           bool                   // pause on TTL vs destroy
+	SnapshotTag         string                 // optional: named tag to resolve snapshot version
+	NetworkPolicyPreset string                 // optional: named preset (e.g., "ci-standard")
+	NetworkPolicy       *network.NetworkPolicy // optional: full policy override
 }
 
 // MMDSData represents data to inject into the microVM via MMDS
@@ -180,10 +180,13 @@ type MMDSData struct {
 			WorkingDir string            `json:"working_dir,omitempty"`
 			TimeoutSec int               `json:"timeout_seconds,omitempty"`
 		} `json:"exec,omitempty"`
+		// Mirrors snapshot.StartCommand — keep in sync with pkg/snapshot/start_command.go.
 		StartCommand struct {
-			Command    []string `json:"command,omitempty"`
-			Port       int      `json:"port,omitempty"`
-			HealthPath string   `json:"health_path,omitempty"`
+			Command    []string          `json:"command,omitempty"`
+			Port       int               `json:"port,omitempty"`
+			HealthPath string            `json:"health_path,omitempty"`
+			Env        map[string]string `json:"env,omitempty"`
+			RunAs      string            `json:"run_as,omitempty"`
 		} `json:"start_command,omitempty"`
 	} `json:"latest"`
 }

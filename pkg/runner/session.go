@@ -275,6 +275,22 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 					}
 				}
 
+				// Include non-dirty extension drives from golden metadata so the
+				// manifest is self-contained. The snapshot state references these
+				// drives, so resume needs their ChunkIndex to create FUSE disks.
+				// No chunk upload needed — just carry forward the golden index.
+				if goldenMeta != nil {
+					for driveID, extDrive := range goldenMeta.ExtensionDrives {
+						if _, already := newExtDiskIndexes[driveID]; already {
+							continue
+						}
+						if len(extDrive.Chunks) == 0 {
+							continue
+						}
+						newExtDiskIndexes[driveID] = buildExtensionDriveBaseIndex(goldenMeta, driveID)
+					}
+				}
+
 				// Upload dirty FUSE rootfs disk chunks if available.
 				var newRootfsDiskIndex *snapshot.ChunkIndex
 				if m.getDirtyRootfsDiskChunks != nil && m.sessionDiskStore != nil {
@@ -599,6 +615,20 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 					}
 				}
 
+				// Include non-dirty extension drives from golden metadata so the
+				// manifest is self-contained.
+				if goldenMeta != nil {
+					for driveID, extDrive := range goldenMeta.ExtensionDrives {
+						if _, already := newExtDiskIndexes[driveID]; already {
+							continue
+						}
+						if len(extDrive.Chunks) == 0 {
+							continue
+						}
+						newExtDiskIndexes[driveID] = buildExtensionDriveBaseIndex(goldenMeta, driveID)
+					}
+				}
+
 				// Upload rootfs disk chunks
 				var newRootfsDiskIndex *snapshot.ChunkIndex
 				if m.getDirtyRootfsDiskChunks != nil && m.sessionDiskStore != nil {
@@ -770,10 +800,12 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		"workload_key": metadata.WorkloadKey,
 	}).Info("Resuming runner from session snapshot")
 
-	// Get golden snapshot paths
-	snapshotPaths, err := m.snapshotCache.GetSnapshotPaths()
+	// Kernel path is always needed; full snapshot paths (rootfs, mem) are only
+	// needed for the local-resume fallback.  Defer GetSnapshotPaths() to the
+	// local branch so GCS-backed resumes don't fail on missing rootfs.img.
+	kernelPath, err := m.snapshotCache.GetKernelPath()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get snapshot paths: %w", err)
+		return nil, fmt.Errorf("failed to get kernel path: %w", err)
 	}
 
 	m.mu.Lock()
@@ -784,7 +816,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	// Allocate network
 	var tap *network.TapDevice
 	var nsInfo *network.VMNamespace
-	var slot int = -1
+	var slot int
 	useNetNS := m.netnsNetwork != nil
 
 	if useNetNS {
@@ -969,6 +1001,15 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		}).Info("Resuming from GCS-backed session (UFFD chunked)")
 	} else {
 		// Local fallback: LayeredHandler uses golden snapshot.mem on this host.
+		// Full snapshot paths (including rootfs, mem) are required for local resume.
+		snapshotPaths, spErr := m.snapshotCache.GetSnapshotPaths()
+		if spErr != nil {
+			m.mu.Lock()
+			m.cleanupNetworkOnly(runnerID, tap.Name)
+			m.mu.Unlock()
+			return nil, fmt.Errorf("failed to get snapshot paths for local resume: %w", spErr)
+		}
+
 		// Build diff layer paths (oldest first).
 		var diffLayers []string
 		for i := 0; i < metadata.Layers; i++ {
@@ -1014,7 +1055,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		VMID:           runnerID,
 		SocketDir:      m.config.SocketDir,
 		FirecrackerBin: m.config.FirecrackerBin,
-		KernelPath:     snapshotPaths.Kernel,
+		KernelPath:     kernelPath,
 		RootfsPath:     overlayPath,
 		VCPUs:          metadata.VCPUs,
 		MemoryMB:       metadata.MemoryMB,
@@ -1114,7 +1155,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		InternalIP:      internalIP,
 		TapDevice:       tap.Name,
 		MAC:             tap.MAC,
-		SnapshotVersion: snapshotPaths.Version,
+		SnapshotVersion: m.snapshotCache.CurrentVersion(),
 		WorkloadKey:     metadata.WorkloadKey,
 		Resources: Resources{
 			VCPUs:    metadata.VCPUs,
