@@ -181,9 +181,10 @@ type MMDSData struct {
 			TimeoutSec int               `json:"timeout_seconds,omitempty"`
 		} `json:"exec,omitempty"`
 		StartCommand struct {
-			Command    []string `json:"command,omitempty"`
-			Port       int      `json:"port,omitempty"`
-			HealthPath string   `json:"health_path,omitempty"`
+			Command    []string          `json:"command,omitempty"`
+			Port       int               `json:"port,omitempty"`
+			HealthPath string            `json:"health_path,omitempty"`
+			Env        map[string]string `json:"env,omitempty"`
 		} `json:"start_command,omitempty"`
 	} `json:"latest"`
 }

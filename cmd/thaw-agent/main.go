@@ -222,9 +222,10 @@ type MMDSData struct {
 			Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
 		} `json:"warmup,omitempty"`
 		StartCommand struct {
-			Command    []string `json:"command,omitempty"`
-			Port       int      `json:"port,omitempty"`
-			HealthPath string   `json:"health_path,omitempty"`
+			Command    []string          `json:"command,omitempty"`
+			Port       int               `json:"port,omitempty"`
+			HealthPath string            `json:"health_path,omitempty"`
+			Env        map[string]string `json:"env,omitempty"`
 		} `json:"start_command,omitempty"`
 	} `json:"latest"`
 }
@@ -265,6 +266,13 @@ func main() {
 	bootTimer = telemetry.NewTimer()
 
 	log.Info("Thaw agent starting...")
+
+	// Load Docker image ENV variables from /etc/environment into the current
+	// process environment. The snapshot-builder writes these during the
+	// Docker-to-rootfs conversion so that start_command, shell commands, and
+	// other child processes inherit the PATH, PYTHONPATH, etc. that the
+	// Docker image defined via ENV directives.
+	loadDockerEnv()
 
 	// Initialize cgroup v2 isolation for user processes. This creates agent/
 	// and user/ sub-cgroups and moves the thaw-agent into agent/. User commands
@@ -1077,9 +1085,10 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
 				} `json:"warmup,omitempty"`
 				StartCommand struct {
-					Command    []string `json:"command,omitempty"`
-					Port       int      `json:"port,omitempty"`
-					HealthPath string   `json:"health_path,omitempty"`
+					Command    []string          `json:"command,omitempty"`
+					Port       int               `json:"port,omitempty"`
+					HealthPath string            `json:"health_path,omitempty"`
+					Env        map[string]string `json:"env,omitempty"`
 				} `json:"start_command,omitempty"`
 			}
 			if err := json.Unmarshal(body, &inner); err != nil {
@@ -2841,6 +2850,15 @@ func runStartCommand(mmdsData *MMDSData) error {
 	cmd := exec.Command(sc.Command[0], sc.Command[1:]...)
 	cmd.Dir = *workspaceDir
 
+	// Set environment: inherit current process env + start_command env overrides
+	if len(sc.Env) > 0 {
+		cmd.Env = os.Environ()
+		for k, v := range sc.Env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+		log.WithField("env_count", len(sc.Env)).Info("Injected start_command env vars")
+	}
+
 	// Open log file for stdout+stderr
 	logFile, err := os.OpenFile(serviceLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
@@ -2869,7 +2887,7 @@ func runStartCommand(mmdsData *MMDSData) error {
 
 	// Poll health endpoint if configured
 	if sc.Port > 0 && sc.HealthPath != "" {
-		healthURL := fmt.Sprintf("http://localhost:%d%s", sc.Port, sc.HealthPath)
+		healthURL := fmt.Sprintf("http://127.0.0.1:%d%s", sc.Port, sc.HealthPath)
 		client := &http.Client{Timeout: 2 * time.Second}
 
 		deadline := time.Now().Add(2 * time.Minute)
@@ -3111,5 +3129,60 @@ func startHealthServer(mmdsData *MMDSData) {
 		log.WithError(err).Error("Health server on :10500 failed to start or stopped")
 	} else {
 		log.Info("Health server on :10500 stopped gracefully")
+	}
+}
+
+// loadDockerEnv reads /etc/environment and sets any variables not already
+// present in the current process environment. The snapshot-builder writes
+// Docker image ENV directives here during rootfs creation. This ensures
+// child processes (start_command, shell warmup commands, etc.) inherit
+// PATH, PYTHONPATH, and other vars the Docker image defined.
+func loadDockerEnv() {
+	f, err := os.Open("/etc/environment")
+	if err != nil {
+		return // file doesn't exist on non-Docker-based images
+	}
+	defer f.Close()
+
+	loaded := 0
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		idx := strings.Index(line, "=")
+		if idx <= 0 {
+			continue
+		}
+		key := line[:idx]
+		val := line[idx+1:]
+		if key == "PATH" {
+			// Merge Docker PATH with existing PATH: prepend Docker-specific
+			// directories that aren't already present (e.g., /opt/venv/bin).
+			existing := os.Getenv("PATH")
+			existingDirs := make(map[string]bool)
+			for _, d := range strings.Split(existing, ":") {
+				existingDirs[d] = true
+			}
+			var newDirs []string
+			for _, d := range strings.Split(val, ":") {
+				if !existingDirs[d] {
+					newDirs = append(newDirs, d)
+				}
+			}
+			if len(newDirs) > 0 {
+				merged := strings.Join(newDirs, ":") + ":" + existing
+				os.Setenv("PATH", merged)
+				loaded++
+			}
+		} else if os.Getenv(key) == "" {
+			// Don't override vars already set (e.g., by systemd unit Environment=)
+			os.Setenv(key, val)
+			loaded++
+		}
+	}
+	if loaded > 0 && log != nil {
+		log.WithField("count", loaded).Info("Loaded Docker ENV from /etc/environment")
 	}
 }

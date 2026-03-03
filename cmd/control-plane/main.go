@@ -759,12 +759,17 @@ func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Req
 	var allRunners []map[string]interface{}
 
 	for _, h := range hosts {
-		// For now, return basic host runner info
-		for i := 0; i < h.IdleRunners+h.BusyRunners; i++ {
+		s.hostRegistry.mu.RLock()
+		runnerInfos := h.RunnerInfos
+		s.hostRegistry.mu.RUnlock()
+
+		for _, ri := range runnerInfos {
 			allRunners = append(allRunners, map[string]interface{}{
-				"host_id":   h.ID,
-				"host_name": h.InstanceName,
-				"status":    "running",
+				"runner_id":    ri.RunnerID,
+				"host_id":     h.ID,
+				"host_name":   h.InstanceName,
+				"workload_key": ri.WorkloadKey,
+				"status":      ri.State,
 			})
 		}
 	}

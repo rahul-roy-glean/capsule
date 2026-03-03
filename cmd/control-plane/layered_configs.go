@@ -139,6 +139,8 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 			ON CONFLICT (layer_hash) DO UPDATE SET
 				config_name = EXCLUDED.config_name,
+				refresh_commands = EXCLUDED.refresh_commands,
+				refresh_interval = EXCLUDED.refresh_interval,
 				all_chain_drives = EXCLUDED.all_chain_drives,
 				status = CASE WHEN snapshot_layers.status = 'inactive' THEN 'pending' ELSE snapshot_layers.status END,
 				updated_at = NOW()
