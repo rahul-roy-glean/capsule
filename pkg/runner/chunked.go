@@ -355,7 +355,11 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	}
 	cm.fuseExtensionDisks[runnerID] = make(map[string]*fuse.ChunkedDisk)
 	for driveID, extDrive := range meta.ExtensionDrives {
-		if extDrive.ReadOnly && len(extDrive.Chunks) > 0 {
+		if len(extDrive.Chunks) > 0 {
+			// FUSE-mount drives that have chunked content to preserve filesystem
+			// state from the snapshot. This applies to both read-only and writable
+			// drives — the kernel's cached inodes/dentries must match the on-disk
+			// content for correct snapshot restore.
 			fuseExtMountDir := filepath.Join(cm.config.WorkspaceDir, runnerID, "fuse-ext-"+driveID)
 			if err := os.MkdirAll(fuseExtMountDir, 0755); err != nil {
 				cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
@@ -385,9 +389,9 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 			}
 			cm.fuseExtensionDisks[runnerID][driveID] = extFUSE
 			extensionDrivePaths[driveID] = extFUSE.DiskImagePath()
-			cm.chunkedLogger.WithFields(logrus.Fields{"runner_id": runnerID, "drive_id": driveID}).Info("Mounted FUSE-backed read-only extension drive")
+			cm.chunkedLogger.WithFields(logrus.Fields{"runner_id": runnerID, "drive_id": driveID}).Info("Mounted FUSE-backed extension drive")
 		} else {
-			// Writable extension drive: create fresh ext4 image
+			// No chunks: create fresh ext4 image (e.g. overlay drives)
 			imgPath := filepath.Join(cm.config.WorkspaceDir, runnerID, driveID+"-upper.img")
 			if mkErr := os.MkdirAll(filepath.Dir(imgPath), 0755); mkErr != nil {
 				cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
@@ -540,12 +544,27 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 
 	// In chunked mode, rootfs and repo-cache-seed are served via FUSE, memory
 	// via UFFD, and state was eagerly fetched above. The only traditional local
-	// file we need is the kernel, which was fetched by SyncManifest when the
-	// first heartbeat arrived. The kernel is shared across workloads.
+	// file we need is the kernel. It is normally fetched by SyncManifest on the
+	// first heartbeat, but if allocation races ahead we fetch it on demand here.
 	kernelPath := filepath.Join(cm.config.SnapshotCachePath, "kernel.bin")
-	if _, err := os.Stat(kernelPath); err != nil {
+	if _, err := os.Stat(kernelPath); err != nil && meta.KernelHash != "" && cm.chunkStore != nil {
+		cm.chunkedLogger.WithField("kernel_hash", meta.KernelHash).Info("Fetching kernel on demand during allocation")
+		kernelData, fetchErr := cm.chunkStore.GetChunk(ctx, meta.KernelHash)
+		if fetchErr != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+			return nil, fmt.Errorf("failed to fetch kernel chunk on demand: %w", fetchErr)
+		}
+		if writeErr := os.WriteFile(kernelPath, kernelData, 0644); writeErr != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+			return nil, fmt.Errorf("failed to write kernel to %s: %w", kernelPath, writeErr)
+		}
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"kernel_size": len(kernelData),
+			"path":        kernelPath,
+		}).Info("Kernel fetched on demand during allocation")
+	} else if err != nil {
 		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
-		return nil, fmt.Errorf("kernel not found at %s (should have been fetched by SyncManifest): %w", kernelPath, err)
+		return nil, fmt.Errorf("kernel not found at %s and no KernelHash in metadata to fetch it: %w", kernelPath, err)
 	}
 
 	// Create runner record.

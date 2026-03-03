@@ -11,13 +11,13 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
 	_ "github.com/lib/pq"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
@@ -25,7 +25,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
+	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/tiers"
 )
 
@@ -43,10 +43,9 @@ var (
 	logLevel   = flag.String("log-level", "info", "Log level")
 
 	// Telemetry
-	telemetryEnabled = flag.Bool("telemetry-enabled", true, "Enable GCP Cloud Monitoring telemetry")
-	gcpProject       = flag.String("gcp-project", "", "GCP project for telemetry and snapshot builder VMs")
-	gcpZone          = flag.String("gcp-zone", "us-central1-a", "GCP zone for snapshot builder VMs")
-	environment      = flag.String("environment", "dev", "Environment name for telemetry labels")
+	gcpProject  = flag.String("gcp-project", "", "GCP project for telemetry and snapshot builder VMs")
+	gcpZone     = flag.String("gcp-zone", "us-central1-a", "GCP zone for snapshot builder VMs")
+	environment = flag.String("environment", "dev", "Environment name for telemetry labels")
 )
 
 func main() {
@@ -116,11 +115,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Initialize telemetry
-	telemetryEnabledVal := *telemetryEnabled
-	if v := os.Getenv("TELEMETRY_ENABLED"); v != "" {
-		telemetryEnabledVal = strings.ToLower(v) == "true"
-	}
+	// Initialize OpenTelemetry
 	gcpProjectVal := *gcpProject
 	if v := os.Getenv("GCP_PROJECT_ID"); v != "" {
 		gcpProjectVal = v
@@ -134,25 +129,36 @@ func main() {
 		envVal = v
 	}
 
-	var metricsClient *telemetry.Client
-	if telemetryEnabledVal && gcpProjectVal != "" {
-		telemetryCfg := telemetry.Config{
-			Enabled:       true,
-			ProjectID:     gcpProjectVal,
-			MetricPrefix:  "custom.googleapis.com/firecracker",
-			Component:     "control-plane",
-			Environment:   envVal,
-			FlushInterval: 10 * time.Second,
-		}
-		var telErr error
-		metricsClient, telErr = telemetry.NewClient(ctx, telemetryCfg, logger)
-		if telErr != nil {
-			log.WithError(telErr).Warn("Failed to initialize telemetry, continuing without metrics")
-		} else {
-			defer metricsClient.Close()
-			log.Info("GCP Cloud Monitoring telemetry initialized")
-		}
+	otelCfg := fcrotel.ConfigFromEnv("control-plane")
+	if envVal != "" {
+		otelCfg.Environment = envVal
 	}
+	otelClient, otelErr := fcrotel.Init(ctx, otelCfg)
+	if otelErr != nil {
+		log.WithError(otelErr).Warn("Failed to initialize OpenTelemetry, continuing without telemetry")
+		otelClient, _ = fcrotel.Init(ctx, fcrotel.Config{ServiceName: "control-plane"})
+	}
+	defer otelClient.Shutdown(ctx)
+
+	// Add trace correlation to logrus
+	logger.AddHook(&fcrotel.TraceCorrelationHook{})
+
+	// Create OTel instruments
+	meter := otelClient.Meter("control-plane")
+	cpHostsGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPHostsTotal)
+	cpRunnersGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPRunnersTotal)
+	cpQueueDepthGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPQueueDepth)
+	cpFleetCPUTotalGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetCPUTotal)
+	cpFleetCPUUsedGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetCPUUsed)
+	cpFleetCPUFreeGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetCPUFree)
+	cpFleetMemTotalGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetMemTotal)
+	cpFleetMemUsedGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetMemUsed)
+	cpFleetMemFreeGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetMemFree)
+	cpFleetUtilGauge, _ := fcrotel.NewFloat64Gauge(meter, fcrotel.CPFleetUtilization)
+	snapshotAgeGauge, _ := fcrotel.NewGauge(meter, fcrotel.SnapshotAge)
+	canarySuccessCounter, _ := fcrotel.NewCounter(meter, fcrotel.E2ECanarySuccess)
+	canaryFailureCounter, _ := fcrotel.NewCounter(meter, fcrotel.E2ECanaryFailure)
+	sessionResumeRoutingCounter, _ := fcrotel.NewCounter(meter, fcrotel.SessionResumeRouting)
 
 	// Create services
 	hostRegistry := NewHostRegistry(db, logger)
@@ -161,9 +167,7 @@ func main() {
 	tagRegistry := NewSnapshotTagRegistry(db, logger)
 	scheduler := NewScheduler(hostRegistry, db, snapshotManager, tagRegistry, logger)
 	scheduler.SetConfigCache(configCache)
-	if metricsClient != nil {
-		scheduler.SetMetricsClient(metricsClient)
-	}
+	scheduler.SetOTel(otelClient, sessionResumeRoutingCounter)
 	jobQueue := NewJobQueue(db, scheduler, hostRegistry, logger)
 	jobQueue.SetConfigCache(configCache)
 	layeredConfigRegistry := NewLayeredConfigRegistry(db, snapshotManager, logger)
@@ -177,10 +181,15 @@ func main() {
 	}
 
 	// Create gRPC server
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		grpc.StatsHandler(otelgrpc.NewServerHandler(
+			otelgrpc.WithTracerProvider(otelClient.TracerProvider),
+			otelgrpc.WithMeterProvider(otelClient.MeterProvider),
+		)),
+	)
 
 	// Register services
-	controlPlaneServer := NewControlPlaneServer(scheduler, hostRegistry, snapshotManager, jobQueue, metricsClient, logger)
+	controlPlaneServer := NewControlPlaneServer(scheduler, hostRegistry, snapshotManager, jobQueue, canarySuccessCounter, canaryFailureCounter, logger)
 	pb.RegisterControlPlaneServer(grpcServer, controlPlaneServer)
 
 	// Register health service
@@ -209,7 +218,10 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	})
-	httpMux.Handle("/metrics", promhttp.Handler())
+	httpMux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("metrics served via OTel Collector"))
+	})
 	httpMux.HandleFunc("/api/v1/runners", controlPlaneServer.HandleGetRunners)
 	httpMux.HandleFunc("/api/v1/runners/allocate", controlPlaneServer.HandleAllocateRunner)
 	httpMux.HandleFunc("/api/v1/runners/status", controlPlaneServer.HandleRunnerStatus)
@@ -237,7 +249,7 @@ func main() {
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *httpPort),
-		Handler: httpMux,
+		Handler: apiLoggingMiddleware(logger, httpMux),
 	}
 
 	go func() {
@@ -253,9 +265,11 @@ func main() {
 	go jobQueue.jobRetryLoop(ctx)
 	go controlPlaneServer.startTTLEnforcement(ctx)
 	go layerBuildScheduler.Run(ctx)
-	if metricsClient != nil {
-		go controlPlaneMetricsLoop(ctx, hostRegistry, scheduler, snapshotManager, metricsClient, logger)
-	}
+	go controlPlaneMetricsLoop(ctx, hostRegistry, scheduler, snapshotManager,
+		cpHostsGauge, cpRunnersGauge, cpQueueDepthGauge,
+		cpFleetCPUTotalGauge, cpFleetCPUUsedGauge, cpFleetCPUFreeGauge,
+		cpFleetMemTotalGauge, cpFleetMemUsedGauge, cpFleetMemFreeGauge,
+		cpFleetUtilGauge, snapshotAgeGauge, logger)
 
 	// Wait for shutdown
 	sigCh := make(chan os.Signal, 1)
@@ -271,6 +285,59 @@ func main() {
 	httpServer.Shutdown(shutdownCtx)
 
 	log.Info("Shutdown complete")
+}
+
+// statusRecorder wraps http.ResponseWriter to capture the status code.
+type statusRecorder struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.statusCode = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+// apiLoggingMiddleware logs every API request on completion with method, path,
+// status code, duration, and optional identifiers from query parameters.
+func apiLoggingMiddleware(logger *logrus.Logger, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip /health and /metrics — too noisy
+		if r.URL.Path == "/health" || r.URL.Path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, statusCode: 200}
+		next.ServeHTTP(rec, r)
+		duration := time.Since(start)
+
+		fields := logrus.Fields{
+			"method":      r.Method,
+			"path":        r.URL.Path,
+			"status":      rec.statusCode,
+			"duration_ms": duration.Milliseconds(),
+			"remote_addr": r.RemoteAddr,
+		}
+
+		// Extract identifiers from query string (GET endpoints)
+		if v := r.URL.Query().Get("runner_id"); v != "" {
+			fields["runner_id"] = v
+		}
+		if v := r.URL.Query().Get("workload_key"); v != "" {
+			fields["workload_key"] = v
+		}
+
+		entry := logger.WithFields(fields)
+		if rec.statusCode >= 500 {
+			entry.Error("API request completed with server error")
+		} else if rec.statusCode >= 400 {
+			entry.Warn("API request completed with client error")
+		} else {
+			entry.Info("API request completed")
+		}
+	})
 }
 
 func initSchema(db *sql.DB) error {
@@ -616,22 +683,24 @@ func initSchema(db *sql.DB) error {
 // ControlPlaneServer implements the ControlPlane gRPC service
 type ControlPlaneServer struct {
 	pb.UnimplementedControlPlaneServer
-	scheduler       *Scheduler
-	hostRegistry    *HostRegistry
-	snapshotManager *SnapshotManager
-	jobQueue        *JobQueue
-	metricsClient   *telemetry.Client
-	logger          *logrus.Entry
+	scheduler            *Scheduler
+	hostRegistry         *HostRegistry
+	snapshotManager      *SnapshotManager
+	jobQueue             *JobQueue
+	canarySuccessCounter metric.Int64Counter
+	canaryFailureCounter metric.Int64Counter
+	logger               *logrus.Entry
 }
 
-func NewControlPlaneServer(s *Scheduler, h *HostRegistry, sm *SnapshotManager, jq *JobQueue, mc *telemetry.Client, l *logrus.Logger) *ControlPlaneServer {
+func NewControlPlaneServer(s *Scheduler, h *HostRegistry, sm *SnapshotManager, jq *JobQueue, canarySuccess, canaryFailure metric.Int64Counter, l *logrus.Logger) *ControlPlaneServer {
 	return &ControlPlaneServer{
-		scheduler:       s,
-		hostRegistry:    h,
-		snapshotManager: sm,
-		jobQueue:        jq,
-		metricsClient:   mc,
-		logger:          l.WithField("service", "control-plane"),
+		scheduler:            s,
+		hostRegistry:         h,
+		snapshotManager:      sm,
+		jobQueue:             jq,
+		canarySuccessCounter: canarySuccess,
+		canaryFailureCounter: canaryFailure,
+		logger:               l.WithField("service", "control-plane"),
 	}
 }
 
@@ -706,12 +775,17 @@ func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Req
 	var allRunners []map[string]interface{}
 
 	for _, h := range hosts {
-		// For now, return basic host runner info
-		for i := 0; i < h.IdleRunners+h.BusyRunners; i++ {
+		s.hostRegistry.mu.RLock()
+		runnerInfos := h.RunnerInfos
+		s.hostRegistry.mu.RUnlock()
+
+		for _, ri := range runnerInfos {
 			allRunners = append(allRunners, map[string]interface{}{
-				"host_id":   h.ID,
-				"host_name": h.InstanceName,
-				"status":    "running",
+				"runner_id":    ri.RunnerID,
+				"host_id":     h.ID,
+				"host_name":   h.InstanceName,
+				"workload_key": ri.WorkloadKey,
+				"status":      ri.State,
 			})
 		}
 	}
@@ -1244,20 +1318,24 @@ func (s *ControlPlaneServer) HandleCanaryReport(w http.ResponseWriter, r *http.R
 		"runner": report.Runner,
 	}).Info("Received canary report")
 
-	if s.metricsClient != nil {
-		if report.Status == "success" {
-			s.metricsClient.IncrementCounter(r.Context(), telemetry.MetricE2ECanarySuccess, nil)
-		} else {
-			s.metricsClient.IncrementCounter(r.Context(), telemetry.MetricE2ECanaryFailure, nil)
-		}
+	if report.Status == "success" {
+		s.canarySuccessCounter.Add(r.Context(), 1)
+	} else {
+		s.canaryFailureCounter.Add(r.Context(), 1)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// controlPlaneMetricsLoop periodically records control plane metrics to GCP Cloud Monitoring
-func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Scheduler, sm *SnapshotManager, mc *telemetry.Client, logger *logrus.Logger) {
+// controlPlaneMetricsLoop periodically records control plane metrics via OpenTelemetry
+func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Scheduler, sm *SnapshotManager,
+	cpHostsGauge, cpRunnersGauge, cpQueueDepthGauge metric.Int64Gauge,
+	cpFleetCPUTotalGauge, cpFleetCPUUsedGauge, cpFleetCPUFreeGauge metric.Int64Gauge,
+	cpFleetMemTotalGauge, cpFleetMemUsedGauge, cpFleetMemFreeGauge metric.Int64Gauge,
+	cpFleetUtilGauge metric.Float64Gauge, snapshotAgeGauge metric.Int64Gauge,
+	logger *logrus.Logger) {
+
 	log := logger.WithField("component", "metrics-loop")
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -1296,29 +1374,29 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 
 			// Record host counts by status
 			for status, count := range statusCounts {
-				mc.RecordInt(ctx, telemetry.MetricCPHostsTotal, count, telemetry.Labels{
-					telemetry.LabelStatus: status,
-				})
+				cpHostsGauge.Record(ctx, count, metric.WithAttributes(
+					fcrotel.AttrStatus.String(status),
+				))
 			}
 
 			// Record runner totals
-			mc.RecordInt(ctx, telemetry.MetricCPRunnersTotal, totalRunners, telemetry.Labels{
-				telemetry.LabelStatus: "total",
-			})
-			mc.RecordInt(ctx, telemetry.MetricCPRunnersTotal, totalIdle, telemetry.Labels{
-				telemetry.LabelStatus: "idle",
-			})
-			mc.RecordInt(ctx, telemetry.MetricCPRunnersTotal, totalBusy, telemetry.Labels{
-				telemetry.LabelStatus: "busy",
-			})
+			cpRunnersGauge.Record(ctx, totalRunners, metric.WithAttributes(
+				fcrotel.AttrStatus.String("total"),
+			))
+			cpRunnersGauge.Record(ctx, totalIdle, metric.WithAttributes(
+				fcrotel.AttrStatus.String("idle"),
+			))
+			cpRunnersGauge.Record(ctx, totalBusy, metric.WithAttributes(
+				fcrotel.AttrStatus.String("busy"),
+			))
 
 			// Record fleet resource metrics
-			mc.RecordInt(ctx, telemetry.MetricCPFleetCPUTotal, fleetCPUTotal, nil)
-			mc.RecordInt(ctx, telemetry.MetricCPFleetCPUUsed, fleetCPUUsed, nil)
-			mc.RecordInt(ctx, telemetry.MetricCPFleetCPUFree, fleetCPUTotal-fleetCPUUsed, nil)
-			mc.RecordInt(ctx, telemetry.MetricCPFleetMemTotal, fleetMemTotal, nil)
-			mc.RecordInt(ctx, telemetry.MetricCPFleetMemUsed, fleetMemUsed, nil)
-			mc.RecordInt(ctx, telemetry.MetricCPFleetMemFree, fleetMemTotal-fleetMemUsed, nil)
+			cpFleetCPUTotalGauge.Record(ctx, fleetCPUTotal)
+			cpFleetCPUUsedGauge.Record(ctx, fleetCPUUsed)
+			cpFleetCPUFreeGauge.Record(ctx, fleetCPUTotal-fleetCPUUsed)
+			cpFleetMemTotalGauge.Record(ctx, fleetMemTotal)
+			cpFleetMemUsedGauge.Record(ctx, fleetMemUsed)
+			cpFleetMemFreeGauge.Record(ctx, fleetMemTotal-fleetMemUsed)
 
 			// Record slot-based fleet utilization for autoscaler
 			defaultTier, _ := tiers.Lookup(tiers.DefaultTier)
@@ -1346,17 +1424,17 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 			} else if queueDepth > 0 {
 				utilization = 10.0 // no capacity but demand exists — force scale-up
 			}
-			mc.RecordFloat(ctx, telemetry.MetricCPFleetUtilization, utilization, nil)
+			cpFleetUtilGauge.Record(ctx, utilization)
 
 			// Record queue depth
-			mc.RecordInt(ctx, telemetry.MetricCPQueueDepth, int64(queueDepth), nil)
+			cpQueueDepthGauge.Record(ctx, int64(queueDepth))
 
 			// Record snapshot age
 			currentVersion := sm.GetCurrentVersion()
 			if currentVersion != "" {
 				if snapshot, err := sm.GetSnapshot(ctx, currentVersion); err == nil && snapshot != nil {
 					age := time.Since(snapshot.CreatedAt)
-					mc.RecordFloat(ctx, telemetry.MetricSnapshotAge, age.Seconds(), nil)
+					snapshotAgeGauge.Record(ctx, int64(age.Seconds()))
 				}
 			}
 

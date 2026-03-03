@@ -1,0 +1,34 @@
+# Local development config for OTel Collector.
+# Receives OTLP and prints to stdout — no GCP credentials needed.
+#
+# Usage:
+#   docker run --rm -p 4317:4317 \
+#     -v $(pwd)/deploy/otel-collector:/etc/otelcol-contrib \
+#     otel/opentelemetry-collector-contrib:latest \
+#     --config /etc/otelcol-contrib/config-local.yaml
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch:
+    timeout: 2s
+    send_batch_size: 256
+
+exporters:
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

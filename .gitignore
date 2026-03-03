@@ -15,6 +15,7 @@ bin/
 /snapshot-builder
 /snapshot-converter
 /thaw-agent
+/derive-snapshot
 
 # Build outputs (use `make build-rootfs`)
 images/microvm/output/

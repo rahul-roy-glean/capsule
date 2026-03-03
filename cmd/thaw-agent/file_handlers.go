@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -444,10 +445,100 @@ func fileMkdirHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ---------------------------------------------------------------------------
+// GET /files/download?path=/workspace/foo.py
+// ---------------------------------------------------------------------------
+
+func fileDownloadHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	p := r.URL.Query().Get("path")
+	if p == "" {
+		http.Error(w, "missing path query parameter", http.StatusBadRequest)
+		return
+	}
+
+	resolved, code, msg := validatePath(p)
+	if code != 0 {
+		jsonError(w, code, msg)
+		return
+	}
+
+	// http.ServeFile handles Range headers, Content-Length, Content-Type,
+	// Last-Modified, and conditional requests (If-Modified-Since) for free.
+	http.ServeFile(w, r, resolved)
+}
+
+// ---------------------------------------------------------------------------
+// POST /files/upload?path=/workspace/foo.py[&mode=append][&perm=0644]
+// ---------------------------------------------------------------------------
+
+func fileUploadHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	p := r.URL.Query().Get("path")
+	if p == "" {
+		jsonError(w, http.StatusBadRequest, "missing path query parameter")
+		return
+	}
+
+	resolved, code, msg := validatePath(p)
+	if code != 0 {
+		jsonError(w, code, msg)
+		return
+	}
+
+	perm := fs.FileMode(0644)
+	if permStr := r.URL.Query().Get("perm"); permStr != "" {
+		if v, err := strconv.ParseUint(permStr, 8, 32); err == nil {
+			perm = fs.FileMode(v)
+		}
+	}
+
+	flag := os.O_WRONLY | os.O_CREATE
+	if r.URL.Query().Get("mode") == "append" {
+		flag |= os.O_APPEND
+	} else {
+		flag |= os.O_TRUNC
+	}
+
+	// Ensure parent directory exists.
+	if err := os.MkdirAll(filepath.Dir(resolved), 0755); err != nil {
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	f, err := os.OpenFile(resolved, flag, perm)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	n, err := io.Copy(f, r.Body)
+	f.Close()
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "write failed: "+err.Error())
+		return
+	}
+
+	jsonOK(w, map[string]interface{}{
+		"path":          resolved,
+		"bytes_written": n,
+	})
+}
+
 // registerFileHandlers wires up all /files/* endpoints on the default mux.
 func registerFileHandlers() {
 	http.HandleFunc("/files/read", fileReadHandler)
 	http.HandleFunc("/files/write", fileWriteHandler)
+	http.HandleFunc("/files/download", fileDownloadHandler)
+	http.HandleFunc("/files/upload", fileUploadHandler)
 	http.HandleFunc("/files/list", fileListHandler)
 	http.HandleFunc("/files/stat", fileStatHandler)
 	http.HandleFunc("/files/remove", fileRemoveHandler)

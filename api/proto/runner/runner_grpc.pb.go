@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.1
 // - protoc             v5.29.3
-// source: runner.proto
+// source: api/proto/runner.proto
 
 package runner
 
@@ -19,17 +19,19 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	HostAgent_AllocateRunner_FullMethodName     = "/runner.HostAgent/AllocateRunner"
-	HostAgent_ReleaseRunner_FullMethodName      = "/runner.HostAgent/ReleaseRunner"
-	HostAgent_GetHostStatus_FullMethodName      = "/runner.HostAgent/GetHostStatus"
-	HostAgent_Heartbeat_FullMethodName          = "/runner.HostAgent/Heartbeat"
-	HostAgent_SyncSnapshot_FullMethodName       = "/runner.HostAgent/SyncSnapshot"
-	HostAgent_ListRunners_FullMethodName        = "/runner.HostAgent/ListRunners"
-	HostAgent_GetRunner_FullMethodName          = "/runner.HostAgent/GetRunner"
-	HostAgent_QuarantineRunner_FullMethodName   = "/runner.HostAgent/QuarantineRunner"
-	HostAgent_UnquarantineRunner_FullMethodName = "/runner.HostAgent/UnquarantineRunner"
-	HostAgent_PauseRunner_FullMethodName        = "/runner.HostAgent/PauseRunner"
-	HostAgent_ResumeRunner_FullMethodName       = "/runner.HostAgent/ResumeRunner"
+	HostAgent_AllocateRunner_FullMethodName      = "/runner.HostAgent/AllocateRunner"
+	HostAgent_ReleaseRunner_FullMethodName       = "/runner.HostAgent/ReleaseRunner"
+	HostAgent_GetHostStatus_FullMethodName       = "/runner.HostAgent/GetHostStatus"
+	HostAgent_Heartbeat_FullMethodName           = "/runner.HostAgent/Heartbeat"
+	HostAgent_SyncSnapshot_FullMethodName        = "/runner.HostAgent/SyncSnapshot"
+	HostAgent_ListRunners_FullMethodName         = "/runner.HostAgent/ListRunners"
+	HostAgent_GetRunner_FullMethodName           = "/runner.HostAgent/GetRunner"
+	HostAgent_QuarantineRunner_FullMethodName    = "/runner.HostAgent/QuarantineRunner"
+	HostAgent_UnquarantineRunner_FullMethodName  = "/runner.HostAgent/UnquarantineRunner"
+	HostAgent_PauseRunner_FullMethodName         = "/runner.HostAgent/PauseRunner"
+	HostAgent_ResumeRunner_FullMethodName        = "/runner.HostAgent/ResumeRunner"
+	HostAgent_UpdateNetworkPolicy_FullMethodName = "/runner.HostAgent/UpdateNetworkPolicy"
+	HostAgent_GetNetworkPolicy_FullMethodName    = "/runner.HostAgent/GetNetworkPolicy"
 )
 
 // HostAgentClient is the client API for HostAgent service.
@@ -60,6 +62,10 @@ type HostAgentClient interface {
 	PauseRunner(ctx context.Context, in *PauseRunnerRequest, opts ...grpc.CallOption) (*PauseRunnerResponse, error)
 	// ResumeRunner restores a runner from a session snapshot
 	ResumeRunner(ctx context.Context, in *ResumeRunnerRequest, opts ...grpc.CallOption) (*ResumeRunnerResponse, error)
+	// UpdateNetworkPolicy updates the network policy for a running VM
+	UpdateNetworkPolicy(ctx context.Context, in *UpdateNetworkPolicyRequest, opts ...grpc.CallOption) (*UpdateNetworkPolicyResponse, error)
+	// GetNetworkPolicy returns the effective network policy for a runner
+	GetNetworkPolicy(ctx context.Context, in *GetNetworkPolicyRequest, opts ...grpc.CallOption) (*GetNetworkPolicyResponse, error)
 }
 
 type hostAgentClient struct {
@@ -180,6 +186,26 @@ func (c *hostAgentClient) ResumeRunner(ctx context.Context, in *ResumeRunnerRequ
 	return out, nil
 }
 
+func (c *hostAgentClient) UpdateNetworkPolicy(ctx context.Context, in *UpdateNetworkPolicyRequest, opts ...grpc.CallOption) (*UpdateNetworkPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateNetworkPolicyResponse)
+	err := c.cc.Invoke(ctx, HostAgent_UpdateNetworkPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *hostAgentClient) GetNetworkPolicy(ctx context.Context, in *GetNetworkPolicyRequest, opts ...grpc.CallOption) (*GetNetworkPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetNetworkPolicyResponse)
+	err := c.cc.Invoke(ctx, HostAgent_GetNetworkPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // HostAgentServer is the server API for HostAgent service.
 // All implementations must embed UnimplementedHostAgentServer
 // for forward compatibility.
@@ -208,6 +234,10 @@ type HostAgentServer interface {
 	PauseRunner(context.Context, *PauseRunnerRequest) (*PauseRunnerResponse, error)
 	// ResumeRunner restores a runner from a session snapshot
 	ResumeRunner(context.Context, *ResumeRunnerRequest) (*ResumeRunnerResponse, error)
+	// UpdateNetworkPolicy updates the network policy for a running VM
+	UpdateNetworkPolicy(context.Context, *UpdateNetworkPolicyRequest) (*UpdateNetworkPolicyResponse, error)
+	// GetNetworkPolicy returns the effective network policy for a runner
+	GetNetworkPolicy(context.Context, *GetNetworkPolicyRequest) (*GetNetworkPolicyResponse, error)
 	mustEmbedUnimplementedHostAgentServer()
 }
 
@@ -250,6 +280,12 @@ func (UnimplementedHostAgentServer) PauseRunner(context.Context, *PauseRunnerReq
 }
 func (UnimplementedHostAgentServer) ResumeRunner(context.Context, *ResumeRunnerRequest) (*ResumeRunnerResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ResumeRunner not implemented")
+}
+func (UnimplementedHostAgentServer) UpdateNetworkPolicy(context.Context, *UpdateNetworkPolicyRequest) (*UpdateNetworkPolicyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateNetworkPolicy not implemented")
+}
+func (UnimplementedHostAgentServer) GetNetworkPolicy(context.Context, *GetNetworkPolicyRequest) (*GetNetworkPolicyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetNetworkPolicy not implemented")
 }
 func (UnimplementedHostAgentServer) mustEmbedUnimplementedHostAgentServer() {}
 func (UnimplementedHostAgentServer) testEmbeddedByValue()                   {}
@@ -470,6 +506,42 @@ func _HostAgent_ResumeRunner_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _HostAgent_UpdateNetworkPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateNetworkPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HostAgentServer).UpdateNetworkPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HostAgent_UpdateNetworkPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HostAgentServer).UpdateNetworkPolicy(ctx, req.(*UpdateNetworkPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HostAgent_GetNetworkPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetNetworkPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HostAgentServer).GetNetworkPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HostAgent_GetNetworkPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HostAgentServer).GetNetworkPolicy(ctx, req.(*GetNetworkPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // HostAgent_ServiceDesc is the grpc.ServiceDesc for HostAgent service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -521,9 +593,17 @@ var HostAgent_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "ResumeRunner",
 			Handler:    _HostAgent_ResumeRunner_Handler,
 		},
+		{
+			MethodName: "UpdateNetworkPolicy",
+			Handler:    _HostAgent_UpdateNetworkPolicy_Handler,
+		},
+		{
+			MethodName: "GetNetworkPolicy",
+			Handler:    _HostAgent_GetNetworkPolicy_Handler,
+		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "runner.proto",
+	Metadata: "api/proto/runner.proto",
 }
 
 const (
@@ -831,5 +911,5 @@ var ControlPlane_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "runner.proto",
+	Metadata: "api/proto/runner.proto",
 }
