@@ -267,6 +267,22 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 					}
 				}
 
+				// Include non-dirty extension drives from golden metadata so the
+				// manifest is self-contained. The snapshot state references these
+				// drives, so resume needs their ChunkIndex to create FUSE disks.
+				// No chunk upload needed — just carry forward the golden index.
+				if goldenMeta != nil {
+					for driveID, extDrive := range goldenMeta.ExtensionDrives {
+						if _, already := newExtDiskIndexes[driveID]; already {
+							continue
+						}
+						if len(extDrive.Chunks) == 0 {
+							continue
+						}
+						newExtDiskIndexes[driveID] = buildExtensionDriveBaseIndex(goldenMeta, driveID)
+					}
+				}
+
 				// Upload dirty FUSE rootfs disk chunks if available.
 				var newRootfsDiskIndex *snapshot.ChunkIndex
 				if m.getDirtyRootfsDiskChunks != nil && m.sessionDiskStore != nil {
@@ -580,6 +596,20 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 						if diskErr == nil {
 							newExtDiskIndexes[driveID] = diskIdx
 						}
+					}
+				}
+
+				// Include non-dirty extension drives from golden metadata so the
+				// manifest is self-contained.
+				if goldenMeta != nil {
+					for driveID, extDrive := range goldenMeta.ExtensionDrives {
+						if _, already := newExtDiskIndexes[driveID]; already {
+							continue
+						}
+						if len(extDrive.Chunks) == 0 {
+							continue
+						}
+						newExtDiskIndexes[driveID] = buildExtensionDriveBaseIndex(goldenMeta, driveID)
 					}
 				}
 
