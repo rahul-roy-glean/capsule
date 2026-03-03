@@ -94,6 +94,12 @@ type Manager struct {
 	// ChunkRefs during GCS-backed session resume. Returns the disk image path.
 	setupRootfsFUSEDisk func(runnerID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (diskImagePath string, err error)
 
+	// cleanupFUSEDisks unmounts and removes all FUSE disks (rootfs + extension)
+	// for a runner. Called during pause/checkpoint after getting dirty chunks
+	// and after VM stop, so the next resume can create fresh FUSE mounts.
+	// Nil when FUSE disks are not in use (non-chunked mode).
+	cleanupFUSEDisks func(runnerID string)
+
 	// policyEnforcers tracks per-VM PolicyEnforcers for network policy enforcement.
 	// Key is runner ID. nil map when no policies are in use.
 	policyEnforcers map[string]*network.PolicyEnforcer

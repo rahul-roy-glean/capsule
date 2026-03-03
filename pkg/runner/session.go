@@ -319,6 +319,24 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 					}
 				}
 
+				// Always include rootfs in GCS manifest for cross-host resume.
+				// If no dirty chunks were uploaded, carry forward the golden base
+				// or previous session's rootfs index so the resume path can create
+				// a FUSE rootfs disk.
+				if newRootfsDiskIndex == nil {
+					if prevGCSDiskIndexObjects != nil {
+						if prevPath := prevGCSDiskIndexObjects["__rootfs__"]; prevPath != "" {
+							prevIdx, dlErr := uploader.DownloadChunkIndex(ctx, prevPath)
+							if dlErr == nil {
+								newRootfsDiskIndex = prevIdx
+							}
+						}
+					}
+					if newRootfsDiskIndex == nil && goldenMeta != nil && len(goldenMeta.RootfsChunks) > 0 {
+						newRootfsDiskIndex = buildRootfsDriveBaseIndex(goldenMeta)
+					}
+				}
+
 				snapshotID := uuid.New().String()
 				man := &snapshot.SnapshotManifest{
 					Version:     "1",
@@ -409,6 +427,15 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 		handler.Stop()
 		delete(m.uffdHandlers, runnerID)
 	}
+	m.mu.Unlock()
+
+	// Unmount FUSE disks after VM stop (Firecracker no longer holds fds open).
+	// This prevents stale mounts from colliding with fresh FUSE mounts on re-resume.
+	if m.cleanupFUSEDisks != nil {
+		m.cleanupFUSEDisks(runnerID)
+	}
+
+	m.mu.Lock()
 
 	// Release network namespace / TAP slot but keep overlay and repo cache
 	if m.netnsNetwork != nil {
@@ -650,6 +677,21 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 						if rootfsErr == nil {
 							newRootfsDiskIndex = rootfsIdx
 						}
+					}
+				}
+
+				// Always include rootfs in GCS manifest for cross-host resume.
+				if newRootfsDiskIndex == nil {
+					if prevGCSDiskIndexObjects != nil {
+						if prevPath := prevGCSDiskIndexObjects["__rootfs__"]; prevPath != "" {
+							prevIdx, dlErr := uploader.DownloadChunkIndex(ctx, prevPath)
+							if dlErr == nil {
+								newRootfsDiskIndex = prevIdx
+							}
+						}
+					}
+					if newRootfsDiskIndex == nil && goldenMeta != nil && len(goldenMeta.RootfsChunks) > 0 {
+						newRootfsDiskIndex = buildRootfsDriveBaseIndex(goldenMeta)
 					}
 				}
 
