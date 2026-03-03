@@ -114,7 +114,7 @@ fi
 SESSION_CHUNK_BUCKET=${SESSION_CHUNK_BUCKET:-}
 SNAPSHOT_BUCKET=${SNAPSHOT_BUCKET:-local-dev}
 
-MGR_CMD="OTEL_EXPORTER_OTLP_ENDPOINT=$OTEL_ENDPOINT ENVIRONMENT=dev $REPO_ROOT/bin/firecracker-manager \
+MGR_CMD="$REPO_ROOT/bin/firecracker-manager \
   --http-port=9080 \
   --grpc-port=50052 \
   --use-netns \
@@ -135,7 +135,7 @@ else
   MGR_CMD="$MGR_CMD --snapshot-bucket=$SNAPSHOT_BUCKET"
 fi
 
-sudo bash -c "nohup $MGR_CMD > $LOG_DIR/firecracker-manager.log 2>&1 &
+sudo bash -c "export OTEL_EXPORTER_OTLP_ENDPOINT='$OTEL_ENDPOINT' ENVIRONMENT=dev; nohup $MGR_CMD > $LOG_DIR/firecracker-manager.log 2>&1 &
 echo \$! > /tmp/fc-dev/pids/firecracker-manager.pid"
 # Give sudo a moment to fork
 sleep 1
