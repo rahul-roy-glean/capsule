@@ -2099,9 +2099,26 @@ func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.E
 		return fmt.Errorf("tar extract failed: %s: %w", string(output), err)
 	}
 
+	// Extract Docker image ENV variables before injecting platform shim.
+	// Docker ENV directives are image metadata (not on the filesystem), so we
+	// need to read them via `docker inspect` and write them into /etc/environment
+	// so they're available to all processes inside the Firecracker VM.
+	var dockerEnv []string
+	inspectOut, err := exec.Command("docker", "inspect", "--format", "{{json .Config.Env}}", imageURI).Output()
+	if err != nil {
+		log.WithError(err).Warn("Failed to inspect Docker image ENV, skipping ENV injection")
+	} else {
+		if err := json.Unmarshal(inspectOut, &dockerEnv); err != nil {
+			log.WithError(err).Warn("Failed to parse Docker image ENV, skipping ENV injection")
+			dockerEnv = nil
+		} else {
+			log.WithField("env_count", len(dockerEnv)).Info("Extracted Docker image ENV variables")
+		}
+	}
+
 	// Inject platform shim
 	log.Info("Injecting platform shim (systemd, thaw-agent, networking)...")
-	if err := injectPlatformShim(mountDir, runnerUser, log); err != nil {
+	if err := injectPlatformShim(mountDir, runnerUser, dockerEnv, log); err != nil {
 		return fmt.Errorf("platform shim injection failed: %w", err)
 	}
 
@@ -2111,7 +2128,10 @@ func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.E
 
 // injectPlatformShim installs the minimal components needed to run a Firecracker
 // microVM on top of any Docker image: systemd init, thaw-agent, network config.
-func injectPlatformShim(rootfsDir, runnerUser string, log *logrus.Entry) error {
+// dockerEnv contains ENV variables extracted from the Docker image config
+// (e.g., ["PATH=/opt/venv/bin:/usr/bin", "HOME=/home/user"]) that are written
+// to /etc/environment so all processes in the VM inherit them.
+func injectPlatformShim(rootfsDir, runnerUser string, dockerEnv []string, log *logrus.Entry) error {
 	// 1. Ensure systemd is installed (check for /lib/systemd/systemd)
 	systemdPath := filepath.Join(rootfsDir, "lib/systemd/systemd")
 	if _, err := os.Stat(systemdPath); os.IsNotExist(err) {
@@ -2208,8 +2228,12 @@ DHCP=no
 	// Ensure the runner user owns its workspace
 	exec.Command("chroot", rootfsDir, "chown", "-R", runnerUser+":"+runnerUser, "/workspace").Run()
 
-	// 9. Set hostname and DNS defaults
+	// 9. Set hostname, DNS defaults, and /etc/hosts.
+	// Docker bind-mounts /etc/hosts at runtime, so `docker export` produces
+	// an empty file. We must write a proper one or localhost won't resolve,
+	// breaking health checks and any loopback connections.
 	os.WriteFile(filepath.Join(rootfsDir, "etc/hostname"), []byte("runner\n"), 0644)
+	os.WriteFile(filepath.Join(rootfsDir, "etc/hosts"), []byte("127.0.0.1\tlocalhost\n::1\t\tlocalhost ip6-localhost ip6-loopback\n"), 0644)
 	os.WriteFile(filepath.Join(rootfsDir, "etc/resolv.conf.default"), []byte("nameserver 8.8.8.8\n"), 0644)
 
 	// Fix nsswitch.conf to use files+dns instead of systemd-resolve (which is masked).
@@ -2224,6 +2248,49 @@ DHCP=no
 
 	// 10. Enable serial console for Firecracker
 	exec.Command("chroot", rootfsDir, "systemctl", "enable", "serial-getty@ttyS0.service").Run()
+
+	// 11. Write Docker image ENV variables to /etc/environment so all processes
+	// (including start_command, login shells, etc.) inherit them. Docker ENV
+	// directives are image metadata, not filesystem content, so they're lost
+	// during docker export → ext4 conversion. We restore them here.
+	if len(dockerEnv) > 0 {
+		var envLines []string
+		for _, env := range dockerEnv {
+			// Skip Docker-internal vars that don't make sense in a VM context
+			if strings.HasPrefix(env, "DEBIAN_FRONTEND=") {
+				continue
+			}
+			envLines = append(envLines, env)
+		}
+		if len(envLines) > 0 {
+			envContent := strings.Join(envLines, "\n") + "\n"
+			envPath := filepath.Join(rootfsDir, "etc/environment")
+			if err := os.WriteFile(envPath, []byte(envContent), 0644); err != nil {
+				log.WithError(err).Warn("Failed to write /etc/environment")
+			} else {
+				log.WithField("env_count", len(envLines)).Info("Wrote Docker ENV to /etc/environment")
+			}
+
+			// Also write a profile.d script so interactive shells source them.
+			// /etc/environment is read by PAM but not by non-login shells;
+			// the profile.d script covers bash -c invocations used by thaw-agent.
+			profileDir := filepath.Join(rootfsDir, "etc/profile.d")
+			os.MkdirAll(profileDir, 0755)
+			var profileLines []string
+			for _, env := range envLines {
+				if idx := strings.Index(env, "="); idx > 0 {
+					key := env[:idx]
+					val := env[idx+1:]
+					profileLines = append(profileLines, fmt.Sprintf("export %s=%q", key, val))
+				}
+			}
+			profileContent := "# Docker image environment variables\n" + strings.Join(profileLines, "\n") + "\n"
+			profilePath := filepath.Join(profileDir, "docker-env.sh")
+			if err := os.WriteFile(profilePath, []byte(profileContent), 0755); err != nil {
+				log.WithError(err).Warn("Failed to write /etc/profile.d/docker-env.sh")
+			}
+		}
+	}
 
 	log.WithField("runner_user", runnerUser).Info("Platform shim injected successfully")
 	return nil

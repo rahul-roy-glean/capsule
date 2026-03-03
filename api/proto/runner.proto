@@ -167,6 +167,7 @@ message StartCommand {
   repeated string command = 1;
   int32 port = 2;
   string health_path = 3;
+  map<string, string> env = 4;
 }
 
 // AllocateRunnerRequest

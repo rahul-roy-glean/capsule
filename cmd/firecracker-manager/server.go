@@ -107,6 +107,7 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 			Command:    req.StartCommand.Command,
 			Port:       int(req.StartCommand.Port),
 			HealthPath: req.StartCommand.HealthPath,
+			Env:        req.StartCommand.Env,
 		}
 	}
 
