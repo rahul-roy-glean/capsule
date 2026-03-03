@@ -1066,6 +1066,14 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 		s.hostRegistry.mu.Unlock()
 	}
 
+	// Remove the runner from the in-memory host registry so that
+	// HandleRunnerStatus falls through to the session_snapshots DB lookup
+	// and returns "suspended" immediately (instead of stale "ready" until
+	// the next heartbeat).
+	if err := s.hostRegistry.RemoveRunner(req.RunnerID); err != nil {
+		s.logger.WithError(err).WithField("runner_id", req.RunnerID).Warn("Failed to remove paused runner from registry")
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":             resp.Success,
