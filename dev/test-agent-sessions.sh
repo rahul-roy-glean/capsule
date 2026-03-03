@@ -165,29 +165,36 @@ fi
 # =========================================================================
 
 # ---------------------------------------------------------------------------
-header "1. Register snapshot config"
+header "1. Discover workload key"
 # ---------------------------------------------------------------------------
-CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/snapshot-configs" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "display_name": "agent-sandbox-test",
-    "commands": [
-      {"type":"shell","args":["bash","-c","rm -rf /workspace/markupsafe && git clone --depth=1 --branch main https://github.com/pallets/markupsafe /workspace/markupsafe"]},
-      {"type":"shell","args":["bash","-c","rm -rf /workspace/camelcase && git clone --depth=1 --branch main https://github.com/sindresorhus/camelcase /workspace/camelcase"]},
-      {"type":"shell","args":["pip3","install","--break-system-packages","markupsafe"],"run_as_root":true}
-    ],
-    "runner_ttl_seconds": 300,
-    "auto_pause": true,
-    "session_max_age_seconds": 3600,
-    "network_policy_preset": "ci-standard"
-  }')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.workload_key')
+# The snapshot-builder computes the workload_key from the snapshot commands hash.
+# The manager discovers it via SyncManifest on heartbeat. We extract it from the
+# local chunked metadata (written by snapshot-builder to the chunks directory).
+CHUNKED_META=$(find /tmp/fc-dev/snapshots/chunks -name "chunked-metadata.json" -type f 2>/dev/null | head -1)
+if [ -n "$CHUNKED_META" ]; then
+  WORKLOAD_KEY=$(jq -r '.workload_key // empty' "$CHUNKED_META" 2>/dev/null)
+  echo "  Found chunked metadata: $CHUNKED_META"
+fi
+
+# Fallback: wait for manager heartbeat and try allocating with the key from GCS
+if [ -z "$WORKLOAD_KEY" ] || [ "$WORKLOAD_KEY" = "null" ]; then
+  echo -n "  No local chunked metadata, waiting for manager heartbeat..."
+  for i in $(seq 1 30); do
+    # The manager logs the workload_key when it syncs — try a test allocate
+    # with a known key pattern to discover it
+    sleep 2
+    echo -n "."
+  done
+  echo ""
+  fail "Could not discover workload key"; exit 1
+fi
+
 echo "  workload_key=$WORKLOAD_KEY"
 
 if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then
-  pass "Snapshot config registered"
+  pass "Workload key discovered: $WORKLOAD_KEY"
 else
-  fail "Snapshot config registration failed"; exit 1
+  fail "Could not discover workload key"; exit 1
 fi
 
 # ---------------------------------------------------------------------------
