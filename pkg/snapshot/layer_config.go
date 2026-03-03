@@ -28,17 +28,17 @@ type LayeredConfig struct {
 	BaseImage   string     `json:"base_image,omitempty" yaml:"base_image"` // Docker image URI (e.g. "ubuntu:22.04", "us-docker.pkg.dev/proj/repo/img:tag")
 	Layers      []LayerDef `json:"layers" yaml:"layers"`
 	Config      struct {
-		AutoPause            bool            `json:"auto_pause,omitempty" yaml:"auto_pause"`
-		TTL                  int             `json:"ttl,omitempty" yaml:"ttl"`
-		Tier                 string          `json:"tier,omitempty" yaml:"tier"`
-		CISystem             string          `json:"ci_system,omitempty" yaml:"ci_system"`
-		AutoRollout          bool            `json:"auto_rollout,omitempty" yaml:"auto_rollout"`
-		SessionMaxAgeSeconds int             `json:"session_max_age_seconds,omitempty" yaml:"session_max_age_seconds"`
-		RootfsSizeGB         int             `json:"rootfs_size_gb,omitempty" yaml:"rootfs_size_gb"`       // rootfs size for layer 0 (default 8)
-		RunnerUser           string          `json:"runner_user,omitempty" yaml:"runner_user"`             // user for non-root commands (default "runner")
-		WorkspaceSizeGB      int             `json:"workspace_size_gb,omitempty" yaml:"workspace_size_gb"` // auto-injected workspace drive size (default 50)
-		NetworkPolicyPreset  string          `json:"network_policy_preset,omitempty" yaml:"network_policy_preset"`
-		NetworkPolicy        json.RawMessage `json:"network_policy,omitempty" yaml:"network_policy"`
+		AutoPause            bool                  `json:"auto_pause,omitempty" yaml:"auto_pause"`
+		TTL                  int                   `json:"ttl,omitempty" yaml:"ttl"`
+		Tier                 string                `json:"tier,omitempty" yaml:"tier"`
+		CISystem             string                `json:"ci_system,omitempty" yaml:"ci_system"`
+		AutoRollout          bool                  `json:"auto_rollout,omitempty" yaml:"auto_rollout"`
+		SessionMaxAgeSeconds int                   `json:"session_max_age_seconds,omitempty" yaml:"session_max_age_seconds"`
+		RootfsSizeGB         int                   `json:"rootfs_size_gb,omitempty" yaml:"rootfs_size_gb"`       // rootfs size for layer 0 (default 8)
+		RunnerUser           string                `json:"runner_user,omitempty" yaml:"runner_user"`             // user for non-root commands (default "runner")
+		WorkspaceSizeGB      int                   `json:"workspace_size_gb,omitempty" yaml:"workspace_size_gb"` // auto-injected workspace drive size (default 50)
+		NetworkPolicyPreset  string                `json:"network_policy_preset,omitempty" yaml:"network_policy_preset"`
+		NetworkPolicy        json.RawMessage       `json:"network_policy,omitempty" yaml:"network_policy"`
 		Auth                 *authproxy.AuthConfig `json:"auth,omitempty" yaml:"auth"`
 	} `json:"config" yaml:"config"`
 	StartCommand    *StartCommand `json:"start_command,omitempty" yaml:"start_command"`

@@ -148,10 +148,10 @@ func (p *AuthProxy) Start(ctx context.Context) error {
 	}
 
 	p.logger.WithFields(logrus.Fields{
-		"runner_id":   p.runnerID,
-		"proxy_addr":  proxyAddr,
-		"providers":   len(p.providers),
-		"ssl_bump":    p.proxyConf.SSLBump,
+		"runner_id":    p.runnerID,
+		"proxy_addr":   proxyAddr,
+		"providers":    len(p.providers),
+		"ssl_bump":     p.proxyConf.SSLBump,
 		"has_metadata": p.findMetadataHandler() != nil,
 	}).Info("Auth proxy started")
 
@@ -293,7 +293,7 @@ func (p *AuthProxy) handleConnect(clientConn net.Conn, connectReq *http.Request)
 		resp := &http.Response{
 			StatusCode: http.StatusForbidden,
 			ProtoMajor: 1, ProtoMinor: 1,
-			Body:       io.NopCloser(strings.NewReader("host not allowed by proxy policy")),
+			Body: io.NopCloser(strings.NewReader("host not allowed by proxy policy")),
 		}
 		resp.Write(clientConn)
 		return
@@ -353,7 +353,7 @@ func (p *AuthProxy) handleConnect(clientConn net.Conn, connectReq *http.Request)
 			errResp := &http.Response{
 				StatusCode: http.StatusBadGateway,
 				ProtoMajor: 1, ProtoMinor: 1,
-				Body:       io.NopCloser(strings.NewReader(err.Error())),
+				Body: io.NopCloser(strings.NewReader(err.Error())),
 			}
 			errResp.Write(tlsConn)
 			return
@@ -374,7 +374,7 @@ func (p *AuthProxy) handleHTTP(clientConn net.Conn, req *http.Request) {
 		resp := &http.Response{
 			StatusCode: http.StatusForbidden,
 			ProtoMajor: 1, ProtoMinor: 1,
-			Body:       io.NopCloser(strings.NewReader("host not allowed")),
+			Body: io.NopCloser(strings.NewReader("host not allowed")),
 		}
 		resp.Write(clientConn)
 		return
@@ -396,7 +396,7 @@ func (p *AuthProxy) handleHTTP(clientConn net.Conn, req *http.Request) {
 		errResp := &http.Response{
 			StatusCode: http.StatusBadGateway,
 			ProtoMajor: 1, ProtoMinor: 1,
-			Body:       io.NopCloser(strings.NewReader(err.Error())),
+			Body: io.NopCloser(strings.NewReader(err.Error())),
 		}
 		errResp.Write(clientConn)
 		return
