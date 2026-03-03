@@ -193,7 +193,7 @@ func buildPlatformLayerDef(cfg *LayeredConfig) LayerDef {
 		Name: PlatformLayerName,
 		InitCommands: []SnapshotCommand{
 			{Type: "base-image", Args: []string{cfg.BaseImage}},
-			{Type: "platform-setup", Args: []string{"thaw-agent", "systemd", "networking"}, RunAsRoot: true},
+			{Type: "platform-setup", Args: []string{"thaw-agent", "systemd", "networking", "docker-env-v2"}, RunAsRoot: true},
 			{Type: "platform-user", Args: []string{runnerUser}},
 		},
 	}

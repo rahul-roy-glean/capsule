@@ -108,6 +108,10 @@ func (b *WarmupLogBuffer) Since(afterSeq int64) ([]string, int64) {
 
 var globalWarmupLogs = &WarmupLogBuffer{}
 
+// cgroupMgr is the cgroup v2 manager for user process isolation. Nil if cgroup
+// v2 is not available (graceful degradation).
+var cgroupMgr *cgroupManager
+
 // globalLogBuffer captures all logrus log entries for the /logs HTTP endpoint.
 // This allows debugging thaw-agent behavior from the host via:
 //
@@ -217,10 +221,13 @@ type MMDSData struct {
 		Warmup struct {
 			Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
 		} `json:"warmup,omitempty"`
+		// Mirrors snapshot.StartCommand — keep in sync with pkg/snapshot/start_command.go.
 		StartCommand struct {
-			Command    []string `json:"command,omitempty"`
-			Port       int      `json:"port,omitempty"`
-			HealthPath string   `json:"health_path,omitempty"`
+			Command    []string          `json:"command,omitempty"`
+			Port       int               `json:"port,omitempty"`
+			HealthPath string            `json:"health_path,omitempty"`
+			Env        map[string]string `json:"env,omitempty"`
+			RunAs      string            `json:"run_as,omitempty"`
 		} `json:"start_command,omitempty"`
 	} `json:"latest"`
 }
@@ -261,6 +268,18 @@ func main() {
 	bootTimer = telemetry.NewTimer()
 
 	log.Info("Thaw agent starting...")
+
+	// Load Docker image ENV variables from /etc/environment into the current
+	// process environment. The snapshot-builder writes these during the
+	// Docker-to-rootfs conversion so that start_command, shell commands, and
+	// other child processes inherit the PATH, PYTHONPATH, etc. that the
+	// Docker image defined via ENV directives.
+	loadDockerEnv()
+
+	// Initialize cgroup v2 isolation for user processes. This creates agent/
+	// and user/ sub-cgroups and moves the thaw-agent into agent/. User commands
+	// from /exec and /pty are placed into user/ to prevent resource starvation.
+	cgroupMgr = initCgroup()
 
 	// Track progress for debugging
 	currentStep := "starting"
@@ -1067,10 +1086,13 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 				Warmup struct {
 					Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
 				} `json:"warmup,omitempty"`
+				// Mirrors snapshot.StartCommand — keep in sync with pkg/snapshot/start_command.go.
 				StartCommand struct {
-					Command    []string `json:"command,omitempty"`
-					Port       int      `json:"port,omitempty"`
-					HealthPath string   `json:"health_path,omitempty"`
+					Command    []string          `json:"command,omitempty"`
+					Port       int               `json:"port,omitempty"`
+					HealthPath string            `json:"health_path,omitempty"`
+					Env        map[string]string `json:"env,omitempty"`
+					RunAs      string            `json:"run_as,omitempty"`
 				} `json:"start_command,omitempty"`
 			}
 			if err := json.Unmarshal(body, &inner); err != nil {
@@ -2724,11 +2746,8 @@ func execHandler(w http.ResponseWriter, r *http.Request) {
 		cmd.Dir = *workspaceDir
 	}
 
-	// Environment: inherit current env + merge provided env
-	cmd.Env = os.Environ()
-	for k, v := range req.Env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
+	// Environment: inherit current env + merge provided env (deduped)
+	cmd.Env = mergeEnv(os.Environ(), req.Env)
 
 	// Run as runner user
 	runnerUser, err := user.Lookup(*runnerUsername)
@@ -2741,6 +2760,7 @@ func execHandler(w http.ResponseWriter, r *http.Request) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
 	}
+	cgroupMgr.applyCgroup(cmd.SysProcAttr)
 	cmd.Env = append(cmd.Env, "HOME="+runnerUser.HomeDir)
 
 	// Create pipes
@@ -2831,6 +2851,36 @@ func runStartCommand(mmdsData *MMDSData) error {
 	cmd := exec.Command(sc.Command[0], sc.Command[1:]...)
 	cmd.Dir = *workspaceDir
 
+	// Set environment: inherit current process env + merge start_command overrides
+	cmd.Env = mergeEnv(os.Environ(), sc.Env)
+	if len(sc.Env) > 0 {
+		log.WithField("env_count", len(sc.Env)).Info("Injected start_command env vars")
+	}
+
+	// Run as the specified user (or default to --runner-user flag)
+	runAsUser := sc.RunAs
+	if runAsUser == "" {
+		runAsUser = *runnerUsername
+	}
+	targetUser, err := user.Lookup(runAsUser)
+	if err != nil {
+		return fmt.Errorf("run_as user %q not found: %w", runAsUser, err)
+	}
+	rUID, _ := strconv.ParseUint(targetUser.Uid, 10, 32)
+	rGID, _ := strconv.ParseUint(targetUser.Gid, 10, 32)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
+		Setsid:     true,
+	}
+	cgroupMgr.applyCgroup(cmd.SysProcAttr)
+	cmd.Env = append(cmd.Env, "HOME="+targetUser.HomeDir)
+
+	log.WithFields(logrus.Fields{
+		"run_as": runAsUser,
+		"uid":    rUID,
+		"gid":    rGID,
+	}).Info("start_command will run as user")
+
 	// Open log file for stdout+stderr
 	logFile, err := os.OpenFile(serviceLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
@@ -2859,7 +2909,7 @@ func runStartCommand(mmdsData *MMDSData) error {
 
 	// Poll health endpoint if configured
 	if sc.Port > 0 && sc.HealthPath != "" {
-		healthURL := fmt.Sprintf("http://localhost:%d%s", sc.Port, sc.HealthPath)
+		healthURL := fmt.Sprintf("http://127.0.0.1:%d%s", sc.Port, sc.HealthPath)
 		client := &http.Client{Timeout: 2 * time.Second}
 
 		deadline := time.Now().Add(2 * time.Minute)
@@ -3102,4 +3152,140 @@ func startHealthServer(mmdsData *MMDSData) {
 	} else {
 		log.Info("Health server on :10500 stopped gracefully")
 	}
+}
+
+// loadDockerEnv reads /etc/environment and sets any variables not already
+// present in the current process environment. The snapshot-builder writes
+// Docker image ENV directives here during rootfs creation. This ensures
+// child processes (start_command, shell warmup commands, etc.) inherit
+// PATH, PYTHONPATH, and other vars the Docker image defined.
+func loadDockerEnv() {
+	f, err := os.Open("/etc/environment")
+	if err != nil {
+		return // file doesn't exist on non-Docker-based images
+	}
+	defer f.Close()
+
+	loaded := 0
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		idx := strings.Index(line, "=")
+		if idx <= 0 {
+			continue
+		}
+		key := line[:idx]
+		val := line[idx+1:]
+		if key == "PATH" {
+			// Merge Docker PATH with existing PATH: prepend Docker-specific
+			// directories that aren't already present (e.g., /opt/venv/bin).
+			existing := os.Getenv("PATH")
+			existingDirs := make(map[string]bool)
+			for _, d := range strings.Split(existing, ":") {
+				existingDirs[d] = true
+			}
+			var newDirs []string
+			for _, d := range strings.Split(val, ":") {
+				if !existingDirs[d] {
+					newDirs = append(newDirs, d)
+				}
+			}
+			if len(newDirs) > 0 {
+				merged := strings.Join(newDirs, ":") + ":" + existing
+				os.Setenv("PATH", merged)
+				loaded++
+			}
+		} else if os.Getenv(key) == "" {
+			// Don't override vars already set (e.g., by systemd unit Environment=)
+			os.Setenv(key, val)
+			loaded++
+		}
+	}
+	if loaded > 0 && log != nil {
+		log.WithField("count", loaded).Info("Loaded Docker ENV from /etc/environment")
+	}
+}
+
+// mergeEnv merges override env vars into a base env slice (as returned by
+// os.Environ()). For PATH, override directories not already present are
+// appended. For all other variables, the override replaces any existing value.
+// Returns a clean, deduplicated slice.
+func mergeEnv(baseEnv []string, overrides map[string]string) []string {
+	if len(overrides) == 0 {
+		return baseEnv
+	}
+
+	// Parse base into ordered key→value map, preserving insertion order via keys slice.
+	type entry struct {
+		key string
+		val string
+	}
+	seen := make(map[string]int) // key → index in entries
+	entries := make([]entry, 0, len(baseEnv))
+	for _, e := range baseEnv {
+		idx := strings.Index(e, "=")
+		if idx < 0 {
+			continue
+		}
+		k := e[:idx]
+		v := e[idx+1:]
+		if i, ok := seen[k]; ok {
+			entries[i].val = v // last wins for duplicates in base
+		} else {
+			seen[k] = len(entries)
+			entries = append(entries, entry{k, v})
+		}
+	}
+
+	// Apply overrides.
+	for k, v := range overrides {
+		if k == "PATH" {
+			// Append override PATH dirs not already present.
+			existing := ""
+			if i, ok := seen["PATH"]; ok {
+				existing = entries[i].val
+			}
+			existingDirs := make(map[string]bool)
+			for _, d := range strings.Split(existing, ":") {
+				if d != "" {
+					existingDirs[d] = true
+				}
+			}
+			var extra []string
+			for _, d := range strings.Split(v, ":") {
+				if d != "" && !existingDirs[d] {
+					extra = append(extra, d)
+				}
+			}
+			if len(extra) > 0 {
+				merged := existing
+				if merged != "" {
+					merged += ":"
+				}
+				merged += strings.Join(extra, ":")
+				if i, ok := seen["PATH"]; ok {
+					entries[i].val = merged
+				} else {
+					seen["PATH"] = len(entries)
+					entries = append(entries, entry{"PATH", merged})
+				}
+			}
+		} else {
+			if i, ok := seen[k]; ok {
+				entries[i].val = v
+			} else {
+				seen[k] = len(entries)
+				entries = append(entries, entry{k, v})
+			}
+		}
+	}
+
+	result := make([]string, len(entries))
+	for i, e := range entries {
+		result[i] = e.key + "=" + e.val
+	}
+	return result
 }

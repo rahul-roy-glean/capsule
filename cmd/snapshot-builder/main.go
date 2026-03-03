@@ -224,7 +224,7 @@ func main() {
 	// Track FUSE disks for cleanup and incremental chunking
 	var vm *firecracker.VM
 	var fuseDisk *fuse.ChunkedDisk
-	var fuseSeedDisk *fuse.ChunkedDisk
+	var fuseExtDisks map[string]*fuse.ChunkedDisk // driveID → FUSE disk for extension drives
 	var incrUffdHandler *uffd.Handler
 
 	// Paths used by both paths and for final snapshot creation
@@ -241,7 +241,7 @@ func main() {
 			// Restore from parent layer: parent's VM state (+ old layer's extension drives if reattach)
 			log.Info("Attempting restore from parent layer...")
 			var reattachErr error
-			vm, fuseDisk, fuseSeedDisk, incrUffdHandler, reattachErr = reattachFromParent(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken, commands, newDrives)
+			vm, fuseDisk, fuseExtDisks, incrUffdHandler, reattachErr = reattachFromParent(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken, commands, newDrives)
 			if reattachErr != nil {
 				log.WithError(reattachErr).Warn("Reattach failed, falling back to cold boot")
 				vm = nil
@@ -253,15 +253,15 @@ func main() {
 					fuseDisk.Unmount()
 					fuseDisk = nil
 				}
-				if fuseSeedDisk != nil {
-					fuseSeedDisk.Unmount()
-					fuseSeedDisk = nil
+				for _, d := range fuseExtDisks {
+					d.Unmount()
 				}
+				fuseExtDisks = nil
 			}
 		} else {
 			log.Info("Attempting incremental restore from previous snapshot...")
 			var incrementalErr error
-			vm, fuseDisk, fuseSeedDisk, incrUffdHandler, incrementalErr = restoreFromPreviousSnapshot(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken, commands)
+			vm, fuseDisk, fuseExtDisks, incrUffdHandler, incrementalErr = restoreFromPreviousSnapshot(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken, commands)
 			if incrementalErr != nil {
 				log.WithError(incrementalErr).Warn("Incremental restore failed, falling back to cold boot")
 				vm = nil
@@ -273,10 +273,10 @@ func main() {
 					fuseDisk.Unmount()
 					fuseDisk = nil
 				}
-				if fuseSeedDisk != nil {
-					fuseSeedDisk.Unmount()
-					fuseSeedDisk = nil
+				for _, d := range fuseExtDisks {
+					d.Unmount()
 				}
+				fuseExtDisks = nil
 			}
 		}
 	}
@@ -471,7 +471,7 @@ func main() {
 	// This uploads only the changed chunks. We store the updated chunk refs for use
 	// when building the chunked metadata (avoids re-reading the entire rootfs).
 	var incrementalRootfsChunks []snapshot.ChunkRef
-	var incrementalSeedChunks []snapshot.ChunkRef
+	incrementalExtChunks := make(map[string][]snapshot.ChunkRef) // driveID → chunks
 	wasIncremental := fuseDisk != nil
 
 	if fuseDisk != nil {
@@ -488,16 +488,19 @@ func main() {
 		fuseDisk.Unmount()
 		fuseDisk = nil
 	}
-	if fuseSeedDisk != nil {
-		log.WithField("dirty_chunks", fuseSeedDisk.DirtyChunkCount()).Info("Saving FUSE seed dirty chunks to chunk store...")
-		var err error
-		incrementalSeedChunks, err = fuseSeedDisk.SaveDirtyChunks(ctx)
+	for driveID, extDisk := range fuseExtDisks {
+		log.WithFields(logrus.Fields{
+			"drive_id":     driveID,
+			"dirty_chunks": extDisk.DirtyChunkCount(),
+		}).Info("Saving FUSE extension drive dirty chunks to chunk store...")
+		chunks, err := extDisk.SaveDirtyChunks(ctx)
 		if err != nil {
-			log.WithError(err).Fatal("Failed to save dirty seed chunks")
+			log.WithError(err).WithField("drive_id", driveID).Fatal("Failed to save dirty extension drive chunks")
 		}
-		fuseSeedDisk.Unmount()
-		fuseSeedDisk = nil
+		incrementalExtChunks[driveID] = chunks
+		extDisk.Unmount()
 	}
+	fuseExtDisks = nil
 
 	// Copy kernel to output
 	kernelOutput := filepath.Join(*outputDir, "kernel.bin")
@@ -686,21 +689,57 @@ func main() {
 			chunkedMeta.RootfsChunks = incrementalRootfsChunks
 			chunkedMeta.TotalDiskSize = int64(len(incrementalRootfsChunks)) * chunkedMeta.ChunkSize
 
-			// Use seed chunks from FUSE if available (as an extension drive)
-			if incrementalSeedChunks != nil {
+			// Add extension drives that were FUSE-tracked (dirty chunks already saved)
+			if len(incrementalExtChunks) > 0 {
 				if chunkedMeta.ExtensionDrives == nil {
 					chunkedMeta.ExtensionDrives = make(map[string]snapshot.ExtensionDrive)
 				}
-				var seedSize int64
-				for _, c := range incrementalSeedChunks {
-					if end := c.Offset + c.Size; end > seedSize {
-						seedSize = end
+				for driveID, chunks := range incrementalExtChunks {
+					var totalSize int64
+					for _, c := range chunks {
+						if end := c.Offset + c.Size; end > totalSize {
+							totalSize = end
+						}
+					}
+					chunkedMeta.ExtensionDrives[driveID] = snapshot.ExtensionDrive{
+						Chunks:    chunks,
+						ReadOnly:  false,
+						SizeBytes: totalSize,
 					}
 				}
-				chunkedMeta.ExtensionDrives["repo_cache_seed"] = snapshot.ExtensionDrive{
-					Chunks:    incrementalSeedChunks,
-					ReadOnly:  false,
-					SizeBytes: seedSize,
+			}
+
+			// Chunk any remaining extension drives from newDrives that weren't
+			// FUSE-tracked (e.g. freshly created drives for new layer configs).
+			for _, d := range newDrives {
+				if _, ok := chunkedMeta.ExtensionDrives[d.DriveID]; ok {
+					continue // already handled via FUSE dirty chunks
+				}
+				imgPath := filepath.Join(*outputDir, d.DriveID+".img")
+				if _, err := os.Stat(imgPath); err != nil {
+					// Try reattach subdir
+					imgPath = filepath.Join(*outputDir, "reattach", d.DriveID+".img")
+					if _, err := os.Stat(imgPath); err != nil {
+						log.WithField("drive_id", d.DriveID).Warn("Extension drive image not found, skipping")
+						continue
+					}
+				}
+				log.WithFields(logrus.Fields{
+					"drive_id": d.DriveID,
+					"path":     imgPath,
+				}).Info("Chunking extension drive from disk")
+				chunks, chunkErr := chunkStore.ChunkFile(ctx, imgPath, snapshot.DefaultChunkSize)
+				if chunkErr != nil {
+					log.WithError(chunkErr).WithField("drive_id", d.DriveID).Fatal("Failed to chunk extension drive")
+				}
+				if chunkedMeta.ExtensionDrives == nil {
+					chunkedMeta.ExtensionDrives = make(map[string]snapshot.ExtensionDrive)
+				}
+				stat, _ := os.Stat(imgPath)
+				chunkedMeta.ExtensionDrives[d.DriveID] = snapshot.ExtensionDrive{
+					Chunks:    chunks,
+					ReadOnly:  d.ReadOnly,
+					SizeBytes: stat.Size(),
 				}
 			}
 
@@ -1192,7 +1231,7 @@ func restoreFromPreviousSnapshot(
 	vmID, tapName, guestMAC, bootArgs string,
 	gitToken, gcpAccessToken string,
 	commands []snapshot.SnapshotCommand,
-) (*firecracker.VM, *fuse.ChunkedDisk, *fuse.ChunkedDisk, *uffd.Handler, error) {
+) (*firecracker.VM, *fuse.ChunkedDisk, map[string]*fuse.ChunkedDisk, *uffd.Handler, error) {
 	// Use a subdirectory for incremental working files to avoid colliding
 	// with the symlinks in /tmp/snapshot/ that Firecracker expects.
 	incrDir := filepath.Join(*outputDir, "incremental")
@@ -1327,85 +1366,54 @@ func restoreFromPreviousSnapshot(
 	}
 	log.Info("Mounted FUSE-backed rootfs from previous snapshot")
 
-	// 6. Mount repo-cache-seed via FUSE (if chunks exist in extension drives)
-	var fuseSeedDisk *fuse.ChunkedDisk
-	var repoCacheSeedPath string
-	if seedExt, ok := chunkedMeta.ExtensionDrives["repo_cache_seed"]; ok && len(seedExt.Chunks) > 0 {
-		fuseSeedMountDir := filepath.Join(incrDir, "fuse-seed")
-		var totalSeedSize int64
-		for _, c := range seedExt.Chunks {
-			end := c.Offset + c.Size
-			if end > totalSeedSize {
-				totalSeedSize = end
+	// 6. Mount all extension drives from previous snapshot via FUSE
+	fuseExtDisks := make(map[string]*fuse.ChunkedDisk)
+	extDrivePaths := make(map[string]string) // driveID → image path
+	for driveID, extDrive := range chunkedMeta.ExtensionDrives {
+		if len(extDrive.Chunks) == 0 {
+			continue
+		}
+		fuseMountDir := filepath.Join(incrDir, "fuse-ext-"+driveID)
+		var totalSize int64
+		for _, c := range extDrive.Chunks {
+			if end := c.Offset + c.Size; end > totalSize {
+				totalSize = end
 			}
 		}
-
-		fuseSeedDisk, err = fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
+		extFUSE, fuseErr := fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
 			ChunkStore: chunkStore,
-			Chunks:     seedExt.Chunks,
-			TotalSize:  totalSeedSize,
+			Chunks:     extDrive.Chunks,
+			TotalSize:  totalSize,
 			ChunkSize:  chunkedMeta.ChunkSize,
-			MountPoint: fuseSeedMountDir,
+			MountPoint: fuseMountDir,
 			Logger:     logger,
 		})
-		if err != nil {
+		if fuseErr != nil {
 			fuseDisk.Unmount()
+			for _, d := range fuseExtDisks {
+				d.Unmount()
+			}
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to create FUSE seed disk: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("failed to create FUSE ext disk %s: %w", driveID, fuseErr)
 		}
-		if err := fuseSeedDisk.Mount(); err != nil {
+		if err := extFUSE.Mount(); err != nil {
 			fuseDisk.Unmount()
+			for _, d := range fuseExtDisks {
+				d.Unmount()
+			}
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to mount FUSE seed disk: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("failed to mount FUSE ext disk %s: %w", driveID, err)
 		}
-		repoCacheSeedPath = fuseSeedDisk.DiskImagePath()
-		log.Info("Mounted FUSE-backed repo-cache-seed from previous snapshot")
-	} else {
-		// Create a fresh placeholder
-		repoCacheSeedPath = filepath.Join(incrDir, "repo-cache-seed.img")
-		if err := createExt4Image(repoCacheSeedPath, *repoCacheSeedSizeGB, "BAZEL_REPO_SEED"); err != nil {
-			fuseDisk.Unmount()
-			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to create repo-cache-seed image: %w", err)
-		}
+		fuseExtDisks[driveID] = extFUSE
+		extDrivePaths[driveID] = extFUSE.DiskImagePath()
+		log.WithField("drive_id", driveID).Info("Mounted FUSE-backed extension drive from previous snapshot")
 	}
 
-	// 7. Create fresh repo-cache-upper, credentials, and git-cache images
-	repoCacheUpperPath := filepath.Join(incrDir, "repo-cache-upper.img")
-	if err := createExt4Image(repoCacheUpperPath, *repoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
-		fuseDisk.Unmount()
-		if fuseSeedDisk != nil {
-			fuseSeedDisk.Unmount()
-		}
-		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
-	}
-
-	credentialsPath := filepath.Join(incrDir, "credentials.img")
-	if err := createExt4ImageMB(credentialsPath, 32, "CREDENTIALS"); err != nil {
-		fuseDisk.Unmount()
-		if fuseSeedDisk != nil {
-			fuseSeedDisk.Unmount()
-		}
-		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("failed to create credentials image: %w", err)
-	}
-
-	gitCachePath := filepath.Join(incrDir, "git-cache.img")
-	if err := createExt4ImageMB(gitCachePath, 64, "GIT_CACHE"); err != nil {
-		fuseDisk.Unmount()
-		if fuseSeedDisk != nil {
-			fuseSeedDisk.Unmount()
-		}
-		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("failed to create git-cache image: %w", err)
-	}
-
-	// 8. Create symlinks in /tmp/snapshot/ so Firecracker can find drives at baked-in paths
+	// 7. Create symlinks in /tmp/snapshot/ so Firecracker can find drives at baked-in paths
 	if err := os.MkdirAll(snapshotSymlinkDir, 0755); err != nil {
 		fuseDisk.Unmount()
-		if fuseSeedDisk != nil {
-			fuseSeedDisk.Unmount()
+		for _, d := range fuseExtDisks {
+			d.Unmount()
 		}
 		chunkStore.Close()
 		return nil, nil, nil, nil, fmt.Errorf("failed to create snapshot symlink dir: %w", err)
@@ -1416,10 +1424,9 @@ func restoreFromPreviousSnapshot(
 		target string
 	}{
 		{"rootfs.img", fuseDisk.DiskImagePath()},
-		{"repo-cache-seed.img", repoCacheSeedPath},
-		{"repo-cache-upper.img", repoCacheUpperPath},
-		{"credentials.img", credentialsPath},
-		{"git-cache.img", gitCachePath},
+	}
+	for driveID, path := range extDrivePaths {
+		symlinks = append(symlinks, struct{ name, target string }{driveID + ".img", path})
 	}
 	var createdSymlinks []string
 	for _, s := range symlinks {
@@ -1430,8 +1437,8 @@ func restoreFromPreviousSnapshot(
 				os.Remove(c)
 			}
 			fuseDisk.Unmount()
-			if fuseSeedDisk != nil {
-				fuseSeedDisk.Unmount()
+			for _, d := range fuseExtDisks {
+				d.Unmount()
 			}
 			chunkStore.Close()
 			return nil, nil, nil, nil, fmt.Errorf("symlink %s -> %s: %w", linkPath, s.target, err)
@@ -1470,8 +1477,8 @@ func restoreFromPreviousSnapshot(
 			os.Remove(c)
 		}
 		fuseDisk.Unmount()
-		if fuseSeedDisk != nil {
-			fuseSeedDisk.Unmount()
+		for _, d := range fuseExtDisks {
+			d.Unmount()
 		}
 		chunkStore.Close()
 		return nil, nil, nil, nil, fmt.Errorf("failed to create VM: %w", err)
@@ -1494,8 +1501,8 @@ func restoreFromPreviousSnapshot(
 			}
 			vm.Stop()
 			fuseDisk.Unmount()
-			if fuseSeedDisk != nil {
-				fuseSeedDisk.Unmount()
+			for _, d := range fuseExtDisks {
+				d.Unmount()
 			}
 			chunkStore.Close()
 			return nil, nil, nil, nil, fmt.Errorf("failed to create mem chunk store: %w", err)
@@ -1515,8 +1522,8 @@ func restoreFromPreviousSnapshot(
 			}
 			vm.Stop()
 			fuseDisk.Unmount()
-			if fuseSeedDisk != nil {
-				fuseSeedDisk.Unmount()
+			for _, d := range fuseExtDisks {
+				d.Unmount()
 			}
 			chunkStore.Close()
 			return nil, nil, nil, nil, fmt.Errorf("failed to create UFFD handler: %w", err)
@@ -1528,8 +1535,8 @@ func restoreFromPreviousSnapshot(
 			}
 			vm.Stop()
 			fuseDisk.Unmount()
-			if fuseSeedDisk != nil {
-				fuseSeedDisk.Unmount()
+			for _, d := range fuseExtDisks {
+				d.Unmount()
 			}
 			chunkStore.Close()
 			return nil, nil, nil, nil, fmt.Errorf("failed to start UFFD handler: %w", err)
@@ -1544,8 +1551,8 @@ func restoreFromPreviousSnapshot(
 			}
 			vm.Stop()
 			fuseDisk.Unmount()
-			if fuseSeedDisk != nil {
-				fuseSeedDisk.Unmount()
+			for _, d := range fuseExtDisks {
+				d.Unmount()
 			}
 			chunkStore.Close()
 			return nil, nil, nil, nil, fmt.Errorf("failed to restore from snapshot with UFFD: %w", err)
@@ -1558,8 +1565,8 @@ func restoreFromPreviousSnapshot(
 			}
 			vm.Stop()
 			fuseDisk.Unmount()
-			if fuseSeedDisk != nil {
-				fuseSeedDisk.Unmount()
+			for _, d := range fuseExtDisks {
+				d.Unmount()
 			}
 			chunkStore.Close()
 			return nil, nil, nil, nil, fmt.Errorf("failed to restore from snapshot: %w", err)
@@ -1582,8 +1589,8 @@ func restoreFromPreviousSnapshot(
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
 		fuseDisk.Unmount()
-		if fuseSeedDisk != nil {
-			fuseSeedDisk.Unmount()
+		for _, d := range fuseExtDisks {
+			d.Unmount()
 		}
 		chunkStore.Close()
 		return nil, nil, nil, nil, fmt.Errorf("failed to set MMDS data: %w", err)
@@ -1594,15 +1601,15 @@ func restoreFromPreviousSnapshot(
 	if err := vm.Resume(ctx); err != nil {
 		vm.Stop()
 		fuseDisk.Unmount()
-		if fuseSeedDisk != nil {
-			fuseSeedDisk.Unmount()
+		for _, d := range fuseExtDisks {
+			d.Unmount()
 		}
 		chunkStore.Close()
 		return nil, nil, nil, nil, fmt.Errorf("failed to resume VM: %w", err)
 	}
 
 	log.Info("VM restored and resumed for incremental warmup")
-	return vm, fuseDisk, fuseSeedDisk, uffdHandler, nil
+	return vm, fuseDisk, fuseExtDisks, uffdHandler, nil
 }
 
 // reattachFromParent implements the reattach build path.
@@ -1617,7 +1624,7 @@ func reattachFromParent(
 	gitToken, gcpAccessToken string,
 	commands []snapshot.SnapshotCommand,
 	newDrives []snapshot.DriveSpec,
-) (*firecracker.VM, *fuse.ChunkedDisk, *fuse.ChunkedDisk, *uffd.Handler, error) {
+) (*firecracker.VM, *fuse.ChunkedDisk, map[string]*fuse.ChunkedDisk, *uffd.Handler, error) {
 	reattachDir := filepath.Join(*outputDir, "reattach")
 	if err := os.MkdirAll(reattachDir, 0755); err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("failed to create reattach dir: %w", err)
@@ -1738,8 +1745,7 @@ func reattachFromParent(
 	// The drives must match what the parent snapshot had. For layer builds,
 	// the parent was built with config-defined drives only (no legacy drives).
 	// For legacy builds, mount parent's drives via FUSE for consistency.
-	var fuseSeedDisk *fuse.ChunkedDisk
-	var extraFuseDisks []*fuse.ChunkedDisk
+	fuseExtDisks := make(map[string]*fuse.ChunkedDisk)
 	var vmDrives []firecracker.Drive
 
 	// Helper to mount an extension drive from chunked metadata via FUSE
@@ -1793,11 +1799,7 @@ func reattachFromParent(
 				log.WithError(err).WithField("drive_id", driveID).Warn("Failed to mount extension drive from parent, will create fresh")
 				continue
 			}
-			if driveID == "repo_cache_seed" {
-				fuseSeedDisk = disk
-			} else {
-				extraFuseDisks = append(extraFuseDisks, disk)
-			}
+			fuseExtDisks[driveID] = disk
 			vmDrives = append(vmDrives, firecracker.Drive{
 				DriveID: driveID, PathOnHost: path, IsRootDevice: false, IsReadOnly: false,
 			})
@@ -1838,11 +1840,8 @@ func reattachFromParent(
 	}
 
 	cleanupFuse := func() {
-		for _, d := range extraFuseDisks {
+		for _, d := range fuseExtDisks {
 			d.Unmount()
-		}
-		if fuseSeedDisk != nil {
-			fuseSeedDisk.Unmount()
 		}
 		fuseDisk.Unmount()
 		chunkStore.Close()
@@ -1983,7 +1982,7 @@ func reattachFromParent(
 	}
 
 	log.Info("VM restored and resumed for reattach warmup")
-	return vm, fuseDisk, fuseSeedDisk, uffdHandler, nil
+	return vm, fuseDisk, fuseExtDisks, uffdHandler, nil
 }
 
 // buildWarmupMMDS creates the MMDS data for warmup mode.
@@ -2100,9 +2099,26 @@ func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.E
 		return fmt.Errorf("tar extract failed: %s: %w", string(output), err)
 	}
 
+	// Extract Docker image ENV variables before injecting platform shim.
+	// Docker ENV directives are image metadata (not on the filesystem), so we
+	// need to read them via `docker inspect` and write them into /etc/environment
+	// so they're available to all processes inside the Firecracker VM.
+	var dockerEnv []string
+	inspectOut, err := exec.Command("docker", "inspect", "--format", "{{json .Config.Env}}", imageURI).Output()
+	if err != nil {
+		log.WithError(err).Warn("Failed to inspect Docker image ENV, skipping ENV injection")
+	} else {
+		if err := json.Unmarshal(inspectOut, &dockerEnv); err != nil {
+			log.WithError(err).Warn("Failed to parse Docker image ENV, skipping ENV injection")
+			dockerEnv = nil
+		} else {
+			log.WithField("env_count", len(dockerEnv)).Info("Extracted Docker image ENV variables")
+		}
+	}
+
 	// Inject platform shim
 	log.Info("Injecting platform shim (systemd, thaw-agent, networking)...")
-	if err := injectPlatformShim(mountDir, runnerUser, log); err != nil {
+	if err := injectPlatformShim(mountDir, runnerUser, dockerEnv, log); err != nil {
 		return fmt.Errorf("platform shim injection failed: %w", err)
 	}
 
@@ -2112,7 +2128,10 @@ func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.E
 
 // injectPlatformShim installs the minimal components needed to run a Firecracker
 // microVM on top of any Docker image: systemd init, thaw-agent, network config.
-func injectPlatformShim(rootfsDir, runnerUser string, log *logrus.Entry) error {
+// dockerEnv contains ENV variables extracted from the Docker image config
+// (e.g., ["PATH=/opt/venv/bin:/usr/bin", "HOME=/home/user"]) that are written
+// to /etc/environment so all processes in the VM inherit them.
+func injectPlatformShim(rootfsDir, runnerUser string, dockerEnv []string, log *logrus.Entry) error {
 	// 1. Ensure systemd is installed (check for /lib/systemd/systemd)
 	systemdPath := filepath.Join(rootfsDir, "lib/systemd/systemd")
 	if _, err := os.Stat(systemdPath); os.IsNotExist(err) {
@@ -2209,8 +2228,12 @@ DHCP=no
 	// Ensure the runner user owns its workspace
 	exec.Command("chroot", rootfsDir, "chown", "-R", runnerUser+":"+runnerUser, "/workspace").Run()
 
-	// 9. Set hostname and DNS defaults
+	// 9. Set hostname, DNS defaults, and /etc/hosts.
+	// Docker bind-mounts /etc/hosts at runtime, so `docker export` produces
+	// an empty file. We must write a proper one or localhost won't resolve,
+	// breaking health checks and any loopback connections.
 	os.WriteFile(filepath.Join(rootfsDir, "etc/hostname"), []byte("runner\n"), 0644)
+	os.WriteFile(filepath.Join(rootfsDir, "etc/hosts"), []byte("127.0.0.1\tlocalhost\n::1\t\tlocalhost ip6-localhost ip6-loopback\n"), 0644)
 	os.WriteFile(filepath.Join(rootfsDir, "etc/resolv.conf.default"), []byte("nameserver 8.8.8.8\n"), 0644)
 
 	// Fix nsswitch.conf to use files+dns instead of systemd-resolve (which is masked).
@@ -2225,6 +2248,49 @@ DHCP=no
 
 	// 10. Enable serial console for Firecracker
 	exec.Command("chroot", rootfsDir, "systemctl", "enable", "serial-getty@ttyS0.service").Run()
+
+	// 11. Write Docker image ENV variables to /etc/environment so all processes
+	// (including start_command, login shells, etc.) inherit them. Docker ENV
+	// directives are image metadata, not filesystem content, so they're lost
+	// during docker export → ext4 conversion. We restore them here.
+	if len(dockerEnv) > 0 {
+		var envLines []string
+		for _, env := range dockerEnv {
+			// Skip Docker-internal vars that don't make sense in a VM context
+			if strings.HasPrefix(env, "DEBIAN_FRONTEND=") {
+				continue
+			}
+			envLines = append(envLines, env)
+		}
+		if len(envLines) > 0 {
+			envContent := strings.Join(envLines, "\n") + "\n"
+			envPath := filepath.Join(rootfsDir, "etc/environment")
+			if err := os.WriteFile(envPath, []byte(envContent), 0644); err != nil {
+				log.WithError(err).Warn("Failed to write /etc/environment")
+			} else {
+				log.WithField("env_count", len(envLines)).Info("Wrote Docker ENV to /etc/environment")
+			}
+
+			// Also write a profile.d script so interactive shells source them.
+			// /etc/environment is read by PAM but not by non-login shells;
+			// the profile.d script covers bash -c invocations used by thaw-agent.
+			profileDir := filepath.Join(rootfsDir, "etc/profile.d")
+			os.MkdirAll(profileDir, 0755)
+			var profileLines []string
+			for _, env := range envLines {
+				if idx := strings.Index(env, "="); idx > 0 {
+					key := env[:idx]
+					val := env[idx+1:]
+					profileLines = append(profileLines, fmt.Sprintf("export %s=%q", key, val))
+				}
+			}
+			profileContent := "# Docker image environment variables\n" + strings.Join(profileLines, "\n") + "\n"
+			profilePath := filepath.Join(profileDir, "docker-env.sh")
+			if err := os.WriteFile(profilePath, []byte(profileContent), 0755); err != nil {
+				log.WithError(err).Warn("Failed to write /etc/profile.d/docker-env.sh")
+			}
+		}
+	}
 
 	log.WithField("runner_user", runnerUser).Info("Platform shim injected successfully")
 	return nil

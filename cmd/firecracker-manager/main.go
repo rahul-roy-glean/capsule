@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
@@ -30,14 +29,16 @@ import (
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel/metric"
+
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/ci"
 	cigithub "github.com/rahul-roy-glean/bazel-firecracker/pkg/ci/github"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/metrics"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
+	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
 )
 
 var (
@@ -82,17 +83,13 @@ var (
 	githubAppSecret       = flag.String("github-app-secret", "", "Secret Manager secret name containing GitHub App private key")
 	gcpProject            = flag.String("gcp-project", "", "GCP project for Secret Manager")
 
-	// Telemetry flags
-	telemetryEnabled = flag.Bool("telemetry-enabled", true, "Enable GCP Cloud Monitoring telemetry")
-	telemetryPrefix  = flag.String("telemetry-prefix", "custom.googleapis.com/firecracker", "Custom metric prefix for Cloud Monitoring")
-
 	// Chunked snapshot flags (BuildBuddy-style lazy loading)
 	useChunkedSnapshots = flag.Bool("use-chunked-snapshots", false, "Enable chunked snapshot restore with UFFD (lazy memory) and FUSE (lazy disk)")
 	chunkCacheSizeGB    = flag.Int("chunk-cache-size-gb", 2, "Size in GB of disk chunk LRU cache (FUSE)")
 	memCacheSizeGB      = flag.Int("mem-cache-size-gb", 2, "Size in GB of memory chunk LRU cache (UFFD)")
 	memBackend          = flag.String("mem-backend", "chunked", "Memory restore backend: 'chunked' (UFFD lazy loading, default) or 'file' (download full snapshot.mem at startup). Overrides the backend recorded in snapshot metadata.")
 	gcsPrefix           = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
-	enableSessionChunks = flag.Bool("enable-session-chunks", false, "Enable cloud-backed session pause/resume. Uses --snapshot-bucket for chunk storage. When enabled, PauseRunner uploads chunks to GCS and ResumeFromSession fetches lazily via UFFD+FUSE.")
+	enableSessionChunks = flag.Bool("enable-session-chunks", true, "Enable cloud-backed session pause/resume. Uses --snapshot-bucket for chunk storage. When enabled, PauseRunner uploads chunks to GCS and ResumeFromSession fetches lazily via UFFD+FUSE.")
 
 	// Network namespace mode (alternative to slot-based TAPs)
 	useNetNS = flag.Bool("use-netns", false, "Use network namespaces instead of slot-based TAP devices (simplifies snapshot restore)")
@@ -396,39 +393,74 @@ func main() {
 	// Reconcile orphaned resources from previous incarnation
 	go mgr.ReconcileOrphans(ctx)
 
-	// Initialize telemetry
-	telemetryCfg := telemetry.Config{
-		Enabled:      *telemetryEnabled,
-		ProjectID:    gcpProjectVal,
-		MetricPrefix: *telemetryPrefix,
-		Component:    "firecracker-manager",
-		Environment:  *environment,
-		InstanceID:   hostID,
-		InstanceName: instanceName,
-		Zone:         zone,
+	// Initialize OpenTelemetry
+	otelCfg := fcrotel.ConfigFromEnv("firecracker-manager")
+	otelClient, otelErr := fcrotel.Init(ctx, otelCfg)
+	if otelErr != nil {
+		log.WithError(otelErr).Warn("Failed to initialize OpenTelemetry, continuing without telemetry")
+		otelClient, _ = fcrotel.Init(ctx, fcrotel.Config{ServiceName: "firecracker-manager"})
 	}
-	// Override from metadata if set
-	if v := getMetadataAttribute("telemetry-enabled"); v != "" {
-		telemetryCfg.Enabled = strings.ToLower(v) == "true"
-	}
+	defer otelClient.Shutdown(ctx)
 
-	var metricsClient *telemetry.Client
-	if telemetryCfg.Enabled && telemetryCfg.ProjectID != "" {
-		var telErr error
-		metricsClient, telErr = telemetry.NewClient(ctx, telemetryCfg, logger)
-		if telErr != nil {
-			log.WithError(telErr).Warn("Failed to initialize telemetry, continuing without metrics")
-		} else {
-			defer metricsClient.Close()
-			log.Info("GCP Cloud Monitoring telemetry initialized")
-		}
-	}
+	logger.AddHook(&fcrotel.TraceCorrelationHook{})
 
-	// Register Prometheus metrics (legacy, for Prometheus scraping if still needed)
-	metrics.RegisterHostMetrics()
+	// Create OTel instruments
+	meter := otelClient.Meter("firecracker-manager")
+
+	// Host metrics
+	hostCPUTotalGauge, _ := fcrotel.NewGauge(meter, fcrotel.HostCPUTotal)
+	hostCPUUsedGauge, _ := fcrotel.NewGauge(meter, fcrotel.HostCPUUsed)
+	hostMemTotalGauge, _ := fcrotel.NewGauge(meter, fcrotel.HostMemTotal)
+	hostMemUsedGauge, _ := fcrotel.NewGauge(meter, fcrotel.HostMemUsed)
+	hostRunnersIdleGauge, _ := fcrotel.NewUpDownCounter(meter, fcrotel.HostRunnersIdle)
+	hostRunnersBusyGauge, _ := fcrotel.NewUpDownCounter(meter, fcrotel.HostRunnersBusy)
+
+	// VM metrics
+	vmAllocCounter, _ := fcrotel.NewCounter(meter, fcrotel.VMAllocations)
+	vmBootHist, _ := fcrotel.NewHistogram(meter, fcrotel.VMBootDuration)
+
+	// Chunked metrics (gauges for absolute values reported each iteration)
+	diskCacheSizeGauge, _ := fcrotel.NewGauge(meter, fcrotel.ChunkedDiskCacheSize)
+	diskCacheMaxGauge, _ := fcrotel.NewGauge(meter, fcrotel.ChunkedDiskCacheMax)
+	diskCacheItemsGauge, _ := fcrotel.NewGauge(meter, fcrotel.ChunkedDiskCacheItems)
+	memCacheSizeGauge, _ := fcrotel.NewGauge(meter, fcrotel.ChunkedMemCacheSize)
+	memCacheMaxGauge, _ := fcrotel.NewGauge(meter, fcrotel.ChunkedMemCacheMax)
+	memCacheItemsGauge, _ := fcrotel.NewGauge(meter, fcrotel.ChunkedMemCacheItems)
+	dirtyChunksGauge, _ := fcrotel.NewGauge(meter, fcrotel.ChunkedDirtyChunks)
+	cacheHitRatioGauge, _ := fcrotel.NewFloat64Gauge(meter, fcrotel.ChunkedCacheHitRatio)
+	// Cumulative counters reported as absolute values from GetChunkedStats - use gauges
+	pageFaultsGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedPageFaults))
+	cacheHitsGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedCacheHits))
+	chunkFetchesGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedChunkFetches))
+	diskReadsGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedDiskReads))
+	diskWritesGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedDiskWrites))
+
+	// Pool metrics (gauges for absolute values reported each iteration)
+	poolRunnersGauge, _ := fcrotel.NewGauge(meter, fcrotel.PoolRunners)
+	poolMemUsedGauge, _ := fcrotel.NewGauge(meter, fcrotel.PoolMemoryUsed)
+	poolMemMaxGauge, _ := fcrotel.NewGauge(meter, fcrotel.PoolMemoryMax)
+	poolHitRatioGauge, _ := fcrotel.NewFloat64Gauge(meter, fcrotel.PoolHitRatio)
+	// Cumulative counters reported as absolute values from GetPoolStats - use gauges
+	poolHitsGauge, _ := meter.Int64Gauge(string(fcrotel.PoolHits))
+	poolMissesGauge, _ := meter.Int64Gauge(string(fcrotel.PoolMisses))
+	poolEvictionsGauge, _ := meter.Int64Gauge(string(fcrotel.PoolEvictions))
+	poolRecycleFailsGauge, _ := meter.Int64Gauge(string(fcrotel.PoolRecycleFailures))
+
+	// Heartbeat
+	hbLatencyHist, _ := fcrotel.NewHistogram(meter, fcrotel.HostHeartbeatLatency)
+
+	// Session metrics for server.go
+	sessionPauseHist, _ := fcrotel.NewHistogram(meter, fcrotel.SessionPauseDuration)
+	sessionPauseCounter, _ := fcrotel.NewCounter(meter, fcrotel.SessionPauseTotal)
+	sessionResumeHist, _ := fcrotel.NewHistogram(meter, fcrotel.SessionResumeDuration)
+	sessionResumeCounter, _ := fcrotel.NewCounter(meter, fcrotel.SessionResumeTotal)
 
 	// Create gRPC server
 	grpcServer := grpc.NewServer(
+		grpc.StatsHandler(otelgrpc.NewServerHandler(
+			otelgrpc.WithTracerProvider(otelClient.TracerProvider),
+			otelgrpc.WithMeterProvider(otelClient.MeterProvider),
+		)),
 		grpc.UnaryInterceptor(loggingInterceptor(logger)),
 	)
 
@@ -440,9 +472,7 @@ func main() {
 		hostAgentServer = NewHostAgentServer(mgr, logger)
 	}
 	pb.RegisterHostAgentServer(grpcServer, hostAgentServer)
-	if metricsClient != nil {
-		hostAgentServer.SetMetricsClient(metricsClient)
-	}
+	hostAgentServer.SetOTelInstruments(sessionPauseHist, sessionPauseCounter, sessionResumeHist, sessionResumeCounter)
 
 	// Register health service
 	healthServer := health.NewServer()
@@ -469,7 +499,6 @@ func main() {
 	httpMux := http.NewServeMux()
 	httpMux.HandleFunc("/health", healthHandler(mgr))
 	httpMux.HandleFunc("/ready", readyHandler(mgr))
-	httpMux.Handle("/metrics", promhttp.Handler())
 	httpMux.HandleFunc("/api/v1/runners/quarantine", drainingGuard(mgr, quarantineRunnerHandler(mgr, logger)))
 	httpMux.HandleFunc("/api/v1/runners/unquarantine", drainingGuard(mgr, unquarantineRunnerHandler(mgr, logger)))
 	httpMux.HandleFunc("/api/v1/runners/network-policy", func(w http.ResponseWriter, r *http.Request) {
@@ -501,11 +530,41 @@ func main() {
 	}()
 
 	// Start autoscaler loop
-	go autoscaleLoop(ctx, mgr, chunkedMgr, *idleTarget, logger, metricsClient)
+	go autoscaleLoop(ctx, mgr, chunkedMgr, *idleTarget, logger, autoscaleInstruments{
+		vmAllocCounter:     vmAllocCounter,
+		vmBootHist:         vmBootHist,
+		hostCPUTotal:       hostCPUTotalGauge,
+		hostCPUUsed:        hostCPUUsedGauge,
+		hostMemTotal:       hostMemTotalGauge,
+		hostMemUsed:        hostMemUsedGauge,
+		hostRunnersIdle:    hostRunnersIdleGauge,
+		hostRunnersBusy:    hostRunnersBusyGauge,
+		diskCacheSize:      diskCacheSizeGauge,
+		diskCacheMax:       diskCacheMaxGauge,
+		diskCacheItems:     diskCacheItemsGauge,
+		memCacheSize:       memCacheSizeGauge,
+		memCacheMax:        memCacheMaxGauge,
+		memCacheItems:      memCacheItemsGauge,
+		pageFaults:         pageFaultsGauge,
+		cacheHits:          cacheHitsGauge,
+		chunkFetches:       chunkFetchesGauge,
+		diskReads:          diskReadsGauge,
+		diskWrites:         diskWritesGauge,
+		dirtyChunks:        dirtyChunksGauge,
+		cacheHitRatio:      cacheHitRatioGauge,
+		poolRunners:        poolRunnersGauge,
+		poolHits:           poolHitsGauge,
+		poolMisses:         poolMissesGauge,
+		poolEvictions:      poolEvictionsGauge,
+		poolRecycleFails:   poolRecycleFailsGauge,
+		poolMemUsed:        poolMemUsedGauge,
+		poolMemMax:         poolMemMaxGauge,
+		poolHitRatio:       poolHitRatioGauge,
+	})
 
 	// Start heartbeat loop if control plane is configured
 	if *controlPlane != "" {
-		go heartbeatLoop(ctx, mgr, chunkedMgr, *controlPlane, instanceName, zone, *grpcPort, *httpPort, logger, metricsClient)
+		go heartbeatLoop(ctx, mgr, chunkedMgr, *controlPlane, instanceName, zone, *grpcPort, *httpPort, logger, hbLatencyHist)
 	}
 
 	// Wait for shutdown signal
@@ -622,10 +681,46 @@ func snapshotSyncHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handle
 	}
 }
 
-func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, idleTarget int, logger *logrus.Logger, metricsClient *telemetry.Client) {
+// autoscaleInstruments holds OTel instruments used by the autoscale loop.
+type autoscaleInstruments struct {
+	vmAllocCounter   metric.Int64Counter
+	vmBootHist       metric.Float64Histogram
+	hostCPUTotal     metric.Int64Gauge
+	hostCPUUsed      metric.Int64Gauge
+	hostMemTotal     metric.Int64Gauge
+	hostMemUsed      metric.Int64Gauge
+	hostRunnersIdle  metric.Int64UpDownCounter
+	hostRunnersBusy  metric.Int64UpDownCounter
+	diskCacheSize    metric.Int64Gauge
+	diskCacheMax     metric.Int64Gauge
+	diskCacheItems   metric.Int64Gauge
+	memCacheSize     metric.Int64Gauge
+	memCacheMax      metric.Int64Gauge
+	memCacheItems    metric.Int64Gauge
+	pageFaults       metric.Int64Gauge
+	cacheHits        metric.Int64Gauge
+	chunkFetches     metric.Int64Gauge
+	diskReads        metric.Int64Gauge
+	diskWrites       metric.Int64Gauge
+	dirtyChunks      metric.Int64Gauge
+	cacheHitRatio    metric.Float64Gauge
+	poolRunners      metric.Int64Gauge
+	poolHits         metric.Int64Gauge
+	poolMisses       metric.Int64Gauge
+	poolEvictions    metric.Int64Gauge
+	poolRecycleFails metric.Int64Gauge
+	poolMemUsed      metric.Int64Gauge
+	poolMemMax       metric.Int64Gauge
+	poolHitRatio     metric.Float64Gauge
+}
+
+func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, idleTarget int, logger *logrus.Logger, instruments autoscaleInstruments) {
 	log := logger.WithField("component", "autoscaler")
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
+
+	// Track previous values of UpDownCounters to compute deltas
+	var prevIdle, prevBusy int
 
 	for {
 		select {
@@ -647,81 +742,72 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				log.Warn("Disk usage exceeds 85%, skipping runner allocation")
 			} else if !mgr.IsDraining() && status.IdleRunners < idleTarget && mgr.CanAddRunner(0, 0) {
 				log.Debug("Adding runner to maintain idle pool")
-				allocTimer := telemetry.NewStopwatch()
+				allocStart := time.Now()
 				_, err := mgr.AllocateRunner(ctx, runner.AllocateRequest{})
 				if err != nil {
 					log.WithError(err).Warn("Failed to allocate idle runner")
-					if metricsClient != nil {
-						metricsClient.IncrementCounter(ctx, telemetry.MetricVMAllocations, telemetry.Labels{
-							telemetry.LabelResult: telemetry.ResultFailure,
-							telemetry.LabelReason: "idle_pool",
-						})
-					}
+					instruments.vmAllocCounter.Add(ctx, 1, metric.WithAttributes(
+						fcrotel.AttrResult.String(fcrotel.ResultFailure),
+						fcrotel.AttrReason.String("idle_pool"),
+					))
 				} else {
-					if metricsClient != nil {
-						metricsClient.RecordDuration(ctx, telemetry.MetricVMBootDuration, allocTimer.Elapsed(), telemetry.Labels{
-							telemetry.LabelReason: "idle_pool",
-						})
-						metricsClient.IncrementCounter(ctx, telemetry.MetricVMAllocations, telemetry.Labels{
-							telemetry.LabelResult: telemetry.ResultSuccess,
-							telemetry.LabelReason: "idle_pool",
-						})
-					}
+					instruments.vmBootHist.Record(ctx, time.Since(allocStart).Seconds(), metric.WithAttributes(
+						fcrotel.AttrReason.String("idle_pool"),
+					))
+					instruments.vmAllocCounter.Add(ctx, 1, metric.WithAttributes(
+						fcrotel.AttrResult.String(fcrotel.ResultSuccess),
+						fcrotel.AttrReason.String("idle_pool"),
+					))
 				}
 			}
 
-			// Update Prometheus metrics
-			metrics.UpdateHostMetrics(
-				status.TotalCPUMillicores,
-				status.UsedCPUMillicores,
-				status.TotalMemoryMB,
-				status.UsedMemoryMB,
-				status.IdleRunners,
-				status.BusyRunners,
-			)
+			// Record host metrics
+			instruments.hostCPUTotal.Record(ctx, int64(status.TotalCPUMillicores))
+			instruments.hostCPUUsed.Record(ctx, int64(status.UsedCPUMillicores))
+			instruments.hostMemTotal.Record(ctx, int64(status.TotalMemoryMB))
+			instruments.hostMemUsed.Record(ctx, int64(status.UsedMemoryMB))
 
-			// Record GCP Cloud Monitoring metrics
-			if metricsClient != nil {
-				metricsClient.RecordHostMetrics(ctx, telemetry.HostMetrics{
-					TotalCPUMillicores: status.TotalCPUMillicores,
-					UsedCPUMillicores:  status.UsedCPUMillicores,
-					TotalMemoryMB:      status.TotalMemoryMB,
-					UsedMemoryMB:       status.UsedMemoryMB,
-					IdleRunners:        status.IdleRunners,
-					BusyRunners:        status.BusyRunners,
-				})
+			// UpDownCounters need delta from previous value
+			idleDelta := int64(status.IdleRunners - prevIdle)
+			busyDelta := int64(status.BusyRunners - prevBusy)
+			instruments.hostRunnersIdle.Add(ctx, idleDelta)
+			instruments.hostRunnersBusy.Add(ctx, busyDelta)
+			prevIdle = status.IdleRunners
+			prevBusy = status.BusyRunners
 
-				// Record chunked snapshot metrics
-				if chunkedMgr != nil {
-					cs := chunkedMgr.GetChunkedStats()
-					metricsClient.RecordChunkedMetrics(ctx, telemetry.ChunkedMetrics{
-						DiskCacheSize:    cs.DiskCacheSize,
-						DiskCacheMaxSize: cs.DiskCacheMaxSize,
-						DiskCacheItems:   cs.DiskCacheItems,
-						MemCacheSize:     cs.MemCacheSize,
-						MemCacheMaxSize:  cs.MemCacheMaxSize,
-						MemCacheItems:    cs.MemCacheItems,
-						PageFaults:       cs.TotalPageFaults,
-						CacheHits:        cs.TotalCacheHits,
-						ChunkFetches:     cs.TotalChunkFetches,
-						DiskReads:        cs.TotalDiskReads,
-						DiskWrites:       cs.TotalDiskWrites,
-						DirtyChunks:      cs.TotalDirtyChunks,
-					})
+			// Record chunked snapshot metrics
+			if chunkedMgr != nil {
+				cs := chunkedMgr.GetChunkedStats()
+				instruments.diskCacheSize.Record(ctx, cs.DiskCacheSize)
+				instruments.diskCacheMax.Record(ctx, cs.DiskCacheMaxSize)
+				instruments.diskCacheItems.Record(ctx, int64(cs.DiskCacheItems))
+				instruments.memCacheSize.Record(ctx, cs.MemCacheSize)
+				instruments.memCacheMax.Record(ctx, cs.MemCacheMaxSize)
+				instruments.memCacheItems.Record(ctx, int64(cs.MemCacheItems))
+				instruments.pageFaults.Record(ctx, int64(cs.TotalPageFaults))
+				instruments.cacheHits.Record(ctx, int64(cs.TotalCacheHits))
+				instruments.chunkFetches.Record(ctx, int64(cs.TotalChunkFetches))
+				instruments.diskReads.Record(ctx, int64(cs.TotalDiskReads))
+				instruments.diskWrites.Record(ctx, int64(cs.TotalDiskWrites))
+				instruments.dirtyChunks.Record(ctx, int64(cs.TotalDirtyChunks))
+				if cs.TotalPageFaults > 0 {
+					instruments.cacheHitRatio.Record(ctx, float64(cs.TotalCacheHits)/float64(cs.TotalPageFaults))
 				}
+			}
 
-				// Record runner pool metrics
-				if pool := mgr.GetPool(); pool != nil {
-					ps := pool.Stats()
-					metricsClient.RecordPoolMetrics(ctx, telemetry.PoolMetrics{
-						PooledRunners:   ps.PooledRunners,
-						PoolHits:        ps.PoolHits,
-						PoolMisses:      ps.PoolMisses,
-						Evictions:       ps.Evictions,
-						RecycleFailures: ps.RecycleFailures,
-						MemoryUsedBytes: ps.MemoryUsageBytes,
-						MemoryMaxBytes:  ps.MaxMemoryBytes,
-					})
+			// Record runner pool metrics
+			if pool := mgr.GetPool(); pool != nil {
+				ps := pool.Stats()
+				instruments.poolRunners.Record(ctx, int64(ps.PooledRunners))
+				instruments.poolHits.Record(ctx, ps.PoolHits)
+				instruments.poolMisses.Record(ctx, ps.PoolMisses)
+				instruments.poolEvictions.Record(ctx, ps.Evictions)
+				instruments.poolRecycleFails.Record(ctx, ps.RecycleFailures)
+				instruments.poolMemUsed.Record(ctx, ps.MemoryUsageBytes)
+				instruments.poolMemMax.Record(ctx, ps.MaxMemoryBytes)
+				totalPoolLookups := ps.PoolHits + ps.PoolMisses
+				if totalPoolLookups > 0 {
+					instruments.poolHitRatio.Record(ctx, float64(ps.PoolHits)/float64(totalPoolLookups))
 				}
 			}
 		}
@@ -756,7 +842,7 @@ type hostHeartbeatResponse struct {
 	Error              string            `json:"error,omitempty"`
 }
 
-func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, controlPlane, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger, metricsClient *telemetry.Client) {
+func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, controlPlane, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger, hbLatencyHist metric.Float64Histogram) {
 	log := logger.WithField("component", "heartbeat")
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -780,7 +866,7 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			hbTimer := telemetry.NewStopwatch()
+			hbStart := time.Now()
 			status := mgr.GetStatus()
 			reqBody := hostHeartbeatRequest{
 				InstanceName:       instanceName,
@@ -818,9 +904,7 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			resp.Body.Close()
 
 			// Record heartbeat latency
-			if metricsClient != nil {
-				metricsClient.RecordDuration(ctx, telemetry.MetricHostHeartbeatLatency, hbTimer.Elapsed(), nil)
-			}
+			hbLatencyHist.Record(ctx, time.Since(hbStart).Seconds())
 
 			if resp.StatusCode >= 400 {
 				log.WithFields(logrus.Fields{
@@ -1572,9 +1656,21 @@ func handlePTYProxy(w http.ResponseWriter, r *http.Request, mgr *runner.Manager,
 	<-done
 }
 
-// handleFileOp proxies a POST /files/{op} request to a runner's thaw-agent.
+// handleFileOp proxies a /files/{op} request to a runner's thaw-agent.
+// For download/upload ops, it uses streaming (raw bytes, no timeout).
+// For metadata ops (read/write/list/stat/remove/mkdir), it uses JSON with a 30s timeout.
 func handleFileOp(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID, fileOp string) {
-	if r.Method != http.MethodPost {
+	// download is GET, everything else is POST
+	isDownload := fileOp == "download"
+	isUpload := fileOp == "upload"
+	isStreaming := isDownload || isUpload
+
+	if isDownload {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+	} else if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -1605,6 +1701,10 @@ func handleFileOp(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, l
 	}
 
 	targetURL := fmt.Sprintf("http://%s:%d/files/%s", rn.InternalIP.String(), snapshot.ThawAgentDebugPort, fileOp)
+	// Forward query string for download/upload (path, mode, perm params).
+	if r.URL.RawQuery != "" {
+		targetURL += "?" + r.URL.RawQuery
+	}
 
 	log.WithFields(logrus.Fields{
 		"runner_id": runnerID,
@@ -1615,14 +1715,33 @@ func handleFileOp(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, l
 	mgr.IncrementActiveExecs(runnerID)
 	defer mgr.DecrementActiveExecs(runnerID)
 
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, r.Body)
+	method := r.Method
+	var body io.Reader
+	if !isDownload {
+		body = r.Body
+	}
+
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), method, targetURL, body)
 	if err != nil {
 		http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
 		return
 	}
-	upstreamReq.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	if isUpload {
+		// Forward the original content type for uploads (may be application/octet-stream).
+		if ct := r.Header.Get("Content-Type"); ct != "" {
+			upstreamReq.Header.Set("Content-Type", ct)
+		}
+	} else if !isDownload {
+		upstreamReq.Header.Set("Content-Type", "application/json")
+	}
+
+	// Streaming ops get no timeout (large files). Metadata ops keep 30s.
+	timeout := 30 * time.Second
+	if isStreaming {
+		timeout = 0
+	}
+	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(upstreamReq)
 	if err != nil {
 		log.WithError(err).WithField("runner_id", runnerID).Warn("Failed to reach thaw-agent for file op")
@@ -1631,7 +1750,17 @@ func handleFileOp(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, l
 	}
 	defer resp.Body.Close()
 
-	w.Header().Set("Content-Type", "application/json")
+	// Copy all response headers for streaming ops (Content-Type, Content-Length,
+	// Content-Range, Last-Modified, etc. from http.ServeFile).
+	if isStreaming {
+		for key, vals := range resp.Header {
+			for _, v := range vals {
+				w.Header().Add(key, v)
+			}
+		}
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }

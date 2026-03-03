@@ -757,6 +757,7 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 	// Set exec mode when explicitly requested via ci_system=none
 	if req.CISystem == "none" {
 		data.Latest.Meta.Mode = "exec"
+		data.Latest.Runner.CISystem = "none"
 	}
 
 	// Populate start_command for user service startup
@@ -764,6 +765,8 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 		data.Latest.StartCommand.Command = req.StartCommand.Command
 		data.Latest.StartCommand.Port = req.StartCommand.Port
 		data.Latest.StartCommand.HealthPath = req.StartCommand.HealthPath
+		data.Latest.StartCommand.Env = req.StartCommand.Env
+		data.Latest.StartCommand.RunAs = req.StartCommand.RunAs
 	}
 
 	return data
