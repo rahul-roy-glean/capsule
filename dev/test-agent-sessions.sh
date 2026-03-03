@@ -168,26 +168,29 @@ fi
 header "1. Discover workload key"
 # ---------------------------------------------------------------------------
 # The snapshot-builder computes the workload_key from the snapshot commands hash.
-# The manager discovers it via SyncManifest on heartbeat. We extract it from the
-# local chunked metadata (written by snapshot-builder to the chunks directory).
-CHUNKED_META=$(find /tmp/fc-dev/snapshots/chunks -name "chunked-metadata.json" -type f 2>/dev/null | head -1)
+# Extract it from the snapshot-builder log, or from the snapshot version string
+# (format: vYYYYMMDD-HHMMSS-<workload_key>).
 WORKLOAD_KEY=""
-if [ -n "$CHUNKED_META" ]; then
-  WORKLOAD_KEY=$(jq -r '.workload_key // empty' "$CHUNKED_META" 2>/dev/null || true)
-  echo "  Found chunked metadata: $CHUNKED_META"
+
+# Method 1: extract from snapshot-builder log (most reliable)
+BUILDER_LOG="/tmp/fc-dev/logs/agent-snapshot-builder.log"
+if [ -f "$BUILDER_LOG" ]; then
+  WORKLOAD_KEY=$(grep -o '"workload_key":"[^"]*"' "$BUILDER_LOG" | head -1 | cut -d'"' -f4)
+  if [ -n "$WORKLOAD_KEY" ]; then
+    echo "  Extracted from snapshot-builder log"
+  fi
 fi
 
-# Fallback: wait for manager heartbeat and try allocating with the key from GCS
-if [ -z "$WORKLOAD_KEY" ] || [ "$WORKLOAD_KEY" = "null" ]; then
-  echo -n "  No local chunked metadata, waiting for manager heartbeat..."
-  for i in $(seq 1 30); do
-    # The manager logs the workload_key when it syncs — try a test allocate
-    # with a known key pattern to discover it
-    sleep 2
-    echo -n "."
-  done
-  echo ""
-  fail "Could not discover workload key"; exit 1
+# Method 2: extract from local metadata.json version field (vDATE-TIME-KEY)
+if [ -z "$WORKLOAD_KEY" ] && [ -f "/tmp/fc-dev/snapshots/metadata.json" ]; then
+  VERSION=$(jq -r '.version // empty' /tmp/fc-dev/snapshots/metadata.json 2>/dev/null || true)
+  if [ -n "$VERSION" ]; then
+    # Version format: v20260303-133715-3d2eb2a0448d29cb → extract last segment
+    WORKLOAD_KEY=$(echo "$VERSION" | rev | cut -d'-' -f1 | rev)
+    if [ -n "$WORKLOAD_KEY" ]; then
+      echo "  Extracted from metadata.json version: $VERSION"
+    fi
+  fi
 fi
 
 echo "  workload_key=$WORKLOAD_KEY"
@@ -195,7 +198,7 @@ echo "  workload_key=$WORKLOAD_KEY"
 if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then
   pass "Workload key discovered: $WORKLOAD_KEY"
 else
-  fail "Could not discover workload key"; exit 1
+  fail "Could not discover workload key from snapshot-builder log or metadata.json"; exit 1
 fi
 
 # ---------------------------------------------------------------------------
