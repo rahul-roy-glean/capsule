@@ -171,8 +171,9 @@ header "1. Discover workload key"
 # The manager discovers it via SyncManifest on heartbeat. We extract it from the
 # local chunked metadata (written by snapshot-builder to the chunks directory).
 CHUNKED_META=$(find /tmp/fc-dev/snapshots/chunks -name "chunked-metadata.json" -type f 2>/dev/null | head -1)
+WORKLOAD_KEY=""
 if [ -n "$CHUNKED_META" ]; then
-  WORKLOAD_KEY=$(jq -r '.workload_key // empty' "$CHUNKED_META" 2>/dev/null)
+  WORKLOAD_KEY=$(jq -r '.workload_key // empty' "$CHUNKED_META" 2>/dev/null || true)
   echo "  Found chunked metadata: $CHUNKED_META"
 fi
 
