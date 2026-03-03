@@ -29,10 +29,10 @@ type mcpDeps struct {
 // --- Input/Output structs for MCP tools ---
 
 type AllocateSandboxInput struct {
-	WorkloadKey         string `json:"workload_key" jsonschema:"required,description=Snapshot workload key identifying which VM image to boot"`
-	SessionID           string `json:"session_id,omitempty" jsonschema:"description=Session ID for pause/resume. If a matching suspended session exists it resumes."`
-	SnapshotTag         string `json:"snapshot_tag,omitempty" jsonschema:"description=Named snapshot tag (e.g. stable or canary)"`
-	NetworkPolicyPreset string `json:"network_policy_preset,omitempty" jsonschema:"description=Named network policy preset (e.g. ci-standard or isolated)"`
+	WorkloadKey         string `json:"workload_key" jsonschema:"Snapshot workload key identifying which VM image to boot"`
+	SessionID           string `json:"session_id,omitempty" jsonschema:"Session ID for pause/resume. If a matching suspended session exists it resumes."`
+	SnapshotTag         string `json:"snapshot_tag,omitempty" jsonschema:"Named snapshot tag (e.g. stable or canary)"`
+	NetworkPolicyPreset string `json:"network_policy_preset,omitempty" jsonschema:"Named network policy preset (e.g. ci-standard or isolated)"`
 }
 
 type AllocateSandboxOutput struct {
@@ -45,7 +45,7 @@ type AllocateSandboxOutput struct {
 }
 
 type ReleaseSandboxInput struct {
-	SandboxID string `json:"sandbox_id" jsonschema:"required,description=ID of the sandbox to release"`
+	SandboxID string `json:"sandbox_id" jsonschema:"ID of the sandbox to release"`
 }
 
 type ReleaseSandboxOutput struct {
@@ -53,7 +53,7 @@ type ReleaseSandboxOutput struct {
 }
 
 type PauseSandboxInput struct {
-	SandboxID string `json:"sandbox_id" jsonschema:"required,description=ID of the sandbox to pause"`
+	SandboxID string `json:"sandbox_id" jsonschema:"ID of the sandbox to pause"`
 }
 
 type PauseSandboxOutput struct {
@@ -64,7 +64,7 @@ type PauseSandboxOutput struct {
 }
 
 type ResumeSandboxInput struct {
-	SandboxID string `json:"sandbox_id" jsonschema:"required,description=ID of the sandbox (runner_id) to resume"`
+	SandboxID string `json:"sandbox_id" jsonschema:"ID of the sandbox (runner_id) to resume"`
 }
 
 type ResumeSandboxOutput struct {
@@ -74,7 +74,7 @@ type ResumeSandboxOutput struct {
 }
 
 type GetSandboxStatusInput struct {
-	SandboxID string `json:"sandbox_id" jsonschema:"required,description=ID of the sandbox to query"`
+	SandboxID string `json:"sandbox_id" jsonschema:"ID of the sandbox to query"`
 }
 
 type GetSandboxStatusOutput struct {
@@ -87,8 +87,8 @@ type GetSandboxStatusOutput struct {
 }
 
 type ListSandboxesInput struct {
-	WorkloadKey string `json:"workload_key,omitempty" jsonschema:"description=Filter by workload key"`
-	Status      string `json:"status,omitempty" jsonschema:"description=Filter by status (e.g. running or suspended)"`
+	WorkloadKey string `json:"workload_key,omitempty" jsonschema:"Filter by workload key"`
+	Status      string `json:"status,omitempty" jsonschema:"Filter by status (e.g. running or suspended)"`
 }
 
 type SandboxInfo struct {
@@ -127,11 +127,11 @@ type ListHostsOutput struct {
 }
 
 type ExecCommandInput struct {
-	SandboxID   string            `json:"sandbox_id" jsonschema:"required,description=ID of the sandbox to execute in"`
-	Command     string            `json:"command" jsonschema:"required,description=Shell command to execute"`
-	WorkingDir  string            `json:"working_dir,omitempty" jsonschema:"description=Working directory for the command"`
-	Env         map[string]string `json:"env,omitempty" jsonschema:"description=Additional environment variables"`
-	TimeoutSecs int               `json:"timeout_secs,omitempty" jsonschema:"description=Timeout in seconds (default 300)"`
+	SandboxID   string            `json:"sandbox_id" jsonschema:"ID of the sandbox to execute in"`
+	Command     string            `json:"command" jsonschema:"Shell command to execute"`
+	WorkingDir  string            `json:"working_dir,omitempty" jsonschema:"Working directory for the command"`
+	Env         map[string]string `json:"env,omitempty" jsonschema:"Additional environment variables"`
+	TimeoutSecs int               `json:"timeout_secs,omitempty" jsonschema:"Timeout in seconds (default 300)"`
 }
 
 type ExecCommandOutput struct {
@@ -141,10 +141,10 @@ type ExecCommandOutput struct {
 }
 
 type ReadFileInput struct {
-	SandboxID string `json:"sandbox_id" jsonschema:"required,description=ID of the sandbox to read from"`
-	Path      string `json:"path" jsonschema:"required,description=Absolute file path inside the sandbox"`
-	Offset    int    `json:"offset,omitempty" jsonschema:"description=Byte offset to start reading from"`
-	Limit     int    `json:"limit,omitempty" jsonschema:"description=Maximum bytes to read"`
+	SandboxID string `json:"sandbox_id" jsonschema:"ID of the sandbox to read from"`
+	Path      string `json:"path" jsonschema:"Absolute file path inside the sandbox"`
+	Offset    int    `json:"offset,omitempty" jsonschema:"Byte offset to start reading from"`
+	Limit     int    `json:"limit,omitempty" jsonschema:"Maximum bytes to read"`
 }
 
 type ReadFileOutput struct {
@@ -152,10 +152,10 @@ type ReadFileOutput struct {
 }
 
 type WriteFileInput struct {
-	SandboxID string `json:"sandbox_id" jsonschema:"required,description=ID of the sandbox to write to"`
-	Path      string `json:"path" jsonschema:"required,description=Absolute file path inside the sandbox"`
-	Content   string `json:"content" jsonschema:"required,description=File content to write"`
-	Mode      string `json:"mode,omitempty" jsonschema:"description=File mode (e.g. 0644). Default is 0644."`
+	SandboxID string `json:"sandbox_id" jsonschema:"ID of the sandbox to write to"`
+	Path      string `json:"path" jsonschema:"Absolute file path inside the sandbox"`
+	Content   string `json:"content" jsonschema:"File content to write"`
+	Mode      string `json:"mode,omitempty" jsonschema:"File mode (e.g. 0644). Default is 0644."`
 }
 
 type WriteFileOutput struct {
@@ -163,8 +163,8 @@ type WriteFileOutput struct {
 }
 
 type ListFilesInput struct {
-	SandboxID string `json:"sandbox_id" jsonschema:"required,description=ID of the sandbox"`
-	Path      string `json:"path" jsonschema:"required,description=Directory path to list"`
+	SandboxID string `json:"sandbox_id" jsonschema:"ID of the sandbox"`
+	Path      string `json:"path" jsonschema:"Directory path to list"`
 }
 
 type ListFilesOutput struct {
