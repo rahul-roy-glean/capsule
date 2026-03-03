@@ -44,10 +44,15 @@ func (s *LayerBuildScheduler) Run(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
+	gcTicker := time.NewTicker(5 * time.Minute)
+	defer gcTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-gcTicker.C:
+			s.snapshotManager.GCTerminatedBuilderVMs(ctx)
 		case <-ticker.C:
 			s.processWaitingBuilds(ctx)
 			s.processQueuedBuilds(ctx)
@@ -385,6 +390,8 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 		if err != nil {
 			s.logger.WithError(err).WithField("build_id", b.buildID).Error("Failed to launch layer build VM")
 			s.db.ExecContext(ctx, `UPDATE snapshot_builds SET status='failed', failure_reason=$2 WHERE build_id=$1`, b.buildID, err.Error())
+			// Clean up VM if it was partially created before the error
+			s.snapshotManager.cleanupBuilderVM(ctx, instanceName)
 			continue
 		}
 

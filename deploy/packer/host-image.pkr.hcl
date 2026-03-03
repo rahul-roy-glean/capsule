@@ -211,6 +211,8 @@ build {
       "Restart=always",
       "RestartSec=5",
       "Environment=LOG_LEVEL=info",
+      "Environment=OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector.firecracker-runner.svc.cluster.local:4317",
+      "Environment=ENVIRONMENT=prod",
       "",
       "[Install]",
       "WantedBy=multi-user.target",
