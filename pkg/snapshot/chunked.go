@@ -22,12 +22,13 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/klauspost/compress/zstd"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 	"golang.org/x/time/rate"
 	"google.golang.org/api/googleapi"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/metrics"
+	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/util/boundedstack"
 )
 
@@ -150,6 +151,12 @@ type ChunkStore struct {
 	eagerFetchCancel  context.CancelFunc
 	eagerFetchWg      sync.WaitGroup
 	eagerFetchStarted bool
+
+	// OTel instruments (nil-safe: callers that don't provide a Meter get no-ops)
+	chunkFetchHist    metric.Float64Histogram
+	chunkFetchBytes   metric.Int64Counter
+	chunkNegCacheHits metric.Int64Counter
+	chunkSFDedup      metric.Int64Counter
 }
 
 // ChunkStoreConfig holds configuration for the chunk store
@@ -177,6 +184,10 @@ type ChunkStoreConfig struct {
 	// caches, refetched once, and if still corrupt ErrChunkCorruption is
 	// returned. Set to true only for benchmarks or trusted environments.
 	DisableVerifyOnRead bool
+
+	// Meter is an OTel metric.Meter used to create chunk-level instruments.
+	// If nil, no metrics are recorded.
+	Meter metric.Meter
 }
 
 // NewChunkStore creates a new chunk store
@@ -233,7 +244,7 @@ func NewChunkStore(ctx context.Context, cfg ChunkStoreConfig) (*ChunkStore, erro
 		fetchTimeout = defaultGCSFetchTimeout
 	}
 
-	return &ChunkStore{
+	cs := &ChunkStore{
 		gcsBucket:        cfg.GCSBucket,
 		gcsPrefix:        cfg.GCSPrefix,
 		gcsClient:        client,
@@ -249,7 +260,17 @@ func NewChunkStore(ctx context.Context, cfg ChunkStoreConfig) (*ChunkStore, erro
 		eagerFetchStack:  eagerFetchStack,
 		eagerFetchCtx:    eagerCtx,
 		eagerFetchCancel: eagerCancel,
-	}, nil
+	}
+
+	// Initialize OTel instruments if a Meter was provided.
+	if cfg.Meter != nil {
+		cs.chunkFetchHist, _ = fcrotel.NewHistogram(cfg.Meter, fcrotel.ChunkFetchDuration)
+		cs.chunkFetchBytes, _ = fcrotel.NewCounter(cfg.Meter, fcrotel.ChunkFetchBytes)
+		cs.chunkNegCacheHits, _ = fcrotel.NewCounter(cfg.Meter, fcrotel.ChunkNegCacheHits)
+		cs.chunkSFDedup, _ = fcrotel.NewCounter(cfg.Meter, fcrotel.ChunkSingleflightDedup)
+	}
+
+	return cs, nil
 }
 
 // StoreChunk stores a chunk and returns its hash.
@@ -323,22 +344,30 @@ func (cs *ChunkStore) GetChunk(ctx context.Context, hash string) ([]byte, error)
 
 	// 1. Check in-memory LRU cache first (fastest)
 	if data, ok := cs.chunkCache.Get(hash); ok {
-		metrics.ChunkFetchSeconds.WithLabelValues("lru_cache").Observe(time.Since(start).Seconds())
+		if cs.chunkFetchHist != nil {
+			cs.chunkFetchHist.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(fcrotel.AttrSource.String("lru_cache")))
+		}
 		return data, nil
 	}
 
 	// 2. Check local file cache (sharded path)
 	if data, compressed, ok := cs.readLocalCache(hash); ok {
 		cs.chunkCache.Put(hash, data)
-		metrics.ChunkFetchSeconds.WithLabelValues("disk_cache").Observe(time.Since(start).Seconds())
-		metrics.ChunkFetchBytesTotal.WithLabelValues("disk_cache").Add(float64(len(compressed)))
+		if cs.chunkFetchHist != nil {
+			cs.chunkFetchHist.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(fcrotel.AttrSource.String("disk_cache")))
+		}
+		if cs.chunkFetchBytes != nil {
+			cs.chunkFetchBytes.Add(ctx, int64(len(compressed)), metric.WithAttributes(fcrotel.AttrSource.String("disk_cache")))
+		}
 		return data, nil
 	}
 
 	// 3. Check negative cache (known-missing hashes)
 	if expiry, ok := cs.negCache.Load(hash); ok {
 		if time.Now().Before(expiry.(time.Time)) {
-			metrics.ChunkNegCacheHits.Inc()
+			if cs.chunkNegCacheHits != nil {
+				cs.chunkNegCacheHits.Add(ctx, 1)
+			}
 			return nil, fmt.Errorf("chunk %s: %w (negative cached)", hash[:12], ErrChunkNotFound)
 		}
 		// Expired entry, remove it
@@ -395,14 +424,20 @@ func (cs *ChunkStore) GetChunk(ctx context.Context, hash string) ([]byte, error)
 		cs.writeLocalCache(hash, compressed)
 		cs.chunkCache.Put(hash, data)
 
-		metrics.ChunkFetchSeconds.WithLabelValues("gcs").Observe(time.Since(start).Seconds())
-		metrics.ChunkFetchBytesTotal.WithLabelValues("gcs").Add(float64(len(compressed)))
+		if cs.chunkFetchHist != nil {
+			cs.chunkFetchHist.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(fcrotel.AttrSource.String("gcs")))
+		}
+		if cs.chunkFetchBytes != nil {
+			cs.chunkFetchBytes.Add(ctx, int64(len(compressed)), metric.WithAttributes(fcrotel.AttrSource.String("gcs")))
+		}
 
 		return &fetchResult{data: data, compressed: compressed}, nil
 	})
 
 	if shared {
-		metrics.SingleflightDedupTotal.Inc()
+		if cs.chunkSFDedup != nil {
+			cs.chunkSFDedup.Add(ctx, 1)
+		}
 	}
 
 	// Check caller context after singleflight returns — even if the fetch

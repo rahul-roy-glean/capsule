@@ -6,24 +6,28 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
+	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
 )
 
 // HostAgentServer implements the HostAgent gRPC service
 type HostAgentServer struct {
 	pb.UnimplementedHostAgentServer
-	manager       *runner.Manager
-	chunkedMgr    *runner.ChunkedManager // Optional, for chunked snapshot support
-	metricsClient *telemetry.Client      // Optional, for GCP Cloud Monitoring
-	logger        *logrus.Entry
+	manager              *runner.Manager
+	chunkedMgr           *runner.ChunkedManager // Optional, for chunked snapshot support
+	sessionPauseHist     metric.Float64Histogram
+	sessionPauseCounter  metric.Int64Counter
+	sessionResumeHist    metric.Float64Histogram
+	sessionResumeCounter metric.Int64Counter
+	logger               *logrus.Entry
 }
 
 // NewHostAgentServer creates a new HostAgentServer
@@ -43,9 +47,12 @@ func NewHostAgentServerWithChunked(mgr *runner.Manager, chunkedMgr *runner.Chunk
 	}
 }
 
-// SetMetricsClient attaches a telemetry client for GCP Cloud Monitoring.
-func (s *HostAgentServer) SetMetricsClient(c *telemetry.Client) {
-	s.metricsClient = c
+// SetOTelInstruments attaches OTel instruments for session pause/resume metrics.
+func (s *HostAgentServer) SetOTelInstruments(pauseHist metric.Float64Histogram, pauseCounter metric.Int64Counter, resumeHist metric.Float64Histogram, resumeCounter metric.Int64Counter) {
+	s.sessionPauseHist = pauseHist
+	s.sessionPauseCounter = pauseCounter
+	s.sessionResumeHist = resumeHist
+	s.sessionResumeCounter = resumeCounter
 }
 
 // AllocateRunner allocates a new runner
@@ -137,26 +144,28 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 
 				// Determine routing type: GCS-backed or local
 				meta, _ := s.manager.GetSessionMetadata(allocReq.SessionID)
-				routing := telemetry.RoutingLocal
+				routing := fcrotel.RoutingLocal
 				if meta != nil && meta.GCSManifestPath != "" {
-					routing = telemetry.RoutingGCS
+					routing = fcrotel.RoutingGCS
 				}
 
-				if s.metricsClient != nil {
-					s.metricsClient.RecordDuration(ctx, telemetry.MetricSessionResumeDuration, resumeDuration, telemetry.Labels{
-						telemetry.LabelRouting: routing,
-					})
-					s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionResumeTotal, telemetry.Labels{
-						telemetry.LabelResult:  telemetry.ResultSuccess,
-						telemetry.LabelRouting: routing,
-					})
+				if s.sessionResumeHist != nil {
+					s.sessionResumeHist.Record(ctx, resumeDuration.Seconds(), metric.WithAttributes(
+						fcrotel.AttrRouting.String(routing),
+					))
+				}
+				if s.sessionResumeCounter != nil {
+					s.sessionResumeCounter.Add(ctx, 1, metric.WithAttributes(
+						fcrotel.AttrResult.String(fcrotel.ResultSuccess),
+						fcrotel.AttrRouting.String(routing),
+					))
 				}
 			} else {
 				s.logger.WithError(err).Warn("Failed to resume from session, falling back to fresh allocation")
-				if s.metricsClient != nil {
-					s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionResumeTotal, telemetry.Labels{
-						telemetry.LabelResult: telemetry.ResultFailure,
-					})
+				if s.sessionResumeCounter != nil {
+					s.sessionResumeCounter.Add(ctx, 1, metric.WithAttributes(
+						fcrotel.AttrResult.String(fcrotel.ResultFailure),
+					))
 				}
 				err = nil // Reset error for fresh allocation
 			}
@@ -394,10 +403,10 @@ func (s *HostAgentServer) PauseRunner(ctx context.Context, req *pb.PauseRunnerRe
 
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to pause runner")
-		if s.metricsClient != nil {
-			s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionPauseTotal, telemetry.Labels{
-				telemetry.LabelResult: telemetry.ResultFailure,
-			})
+		if s.sessionPauseCounter != nil {
+			s.sessionPauseCounter.Add(ctx, 1, metric.WithAttributes(
+				fcrotel.AttrResult.String(fcrotel.ResultFailure),
+			))
 		}
 		return &pb.PauseRunnerResponse{
 			Success: false,
@@ -405,11 +414,13 @@ func (s *HostAgentServer) PauseRunner(ctx context.Context, req *pb.PauseRunnerRe
 		}, nil
 	}
 
-	if s.metricsClient != nil {
-		s.metricsClient.RecordDuration(ctx, telemetry.MetricSessionPauseDuration, duration, nil)
-		s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionPauseTotal, telemetry.Labels{
-			telemetry.LabelResult: telemetry.ResultSuccess,
-		})
+	if s.sessionPauseHist != nil {
+		s.sessionPauseHist.Record(ctx, duration.Seconds())
+	}
+	if s.sessionPauseCounter != nil {
+		s.sessionPauseCounter.Add(ctx, 1, metric.WithAttributes(
+			fcrotel.AttrResult.String(fcrotel.ResultSuccess),
+		))
 	}
 
 	return &pb.PauseRunnerResponse{
