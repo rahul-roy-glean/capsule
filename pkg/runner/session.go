@@ -872,6 +872,25 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 			m.mu.Unlock()
 			return nil, fmt.Errorf("failed to start GCS UFFD handler: %w", startErr)
 		}
+
+		// Start prefetcher if a recorded access-pattern mapping exists.
+		// Phase 1 (fetch workers) begins immediately, warming the ChunkStore cache.
+		// Phase 2 (copy workers) waits for the UFFD connection, then installs pages
+		// via UFFDIO_COPY before the VM faults on them.
+		var prefetcher *uffd.Prefetcher
+		if chunkedMeta.MemPrefetchMapping != nil && len(chunkedMeta.MemPrefetchMapping.Offsets) > 0 {
+			prefetcher = uffd.NewPrefetcher(uffd.PrefetcherConfig{
+				Mapping:    chunkedMeta.MemPrefetchMapping,
+				ChunkStore: m.sessionMemStore,
+				Metadata:   chunkedMeta,
+				Connected:  gcsHandler.Connected(),
+				Logger:     m.logger.Logger,
+			})
+			gcsHandler.SetPrefetcher(prefetcher)
+			prefetcher.Start()
+			m.logger.WithField("pages", len(chunkedMeta.MemPrefetchMapping.Offsets)).Info("Started access-pattern prefetcher")
+		}
+
 		uffdHandler = gcsHandler
 
 		// Download the VM state file locally (Firecracker requires a local path).

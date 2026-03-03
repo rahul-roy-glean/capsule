@@ -73,6 +73,12 @@ func (h *Handler) GetPrefetchMapping() *snapshot.PrefetchMapping { return nil }
 // Mappings is a stub
 func (h *Handler) Mappings() []GuestRegionUFFDMapping { return nil }
 
+// Connected is a stub
+func (h *Handler) Connected() <-chan struct{} { return nil }
+
+// SetPrefetcher is a stub
+func (h *Handler) SetPrefetcher(p *Prefetcher) {}
+
 // GuestRegionUFFDMapping is a stub for non-Linux platforms
 type GuestRegionUFFDMapping struct {
 	BaseHostVirtAddr uintptr `json:"base_host_virt_addr"`

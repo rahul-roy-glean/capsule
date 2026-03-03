@@ -106,6 +106,7 @@ resource "google_compute_instance_template" "firecracker_host" {
     chunk-cache-size-gb   = var.chunk_cache_size_gb
     mem-cache-size-gb     = var.mem_cache_size_gb
     use-netns             = var.use_netns ? "true" : "false"
+    otel-collector-endpoint = var.otel_collector_endpoint
   }
 
   metadata_startup_script = <<-EOF
@@ -404,10 +405,24 @@ LOGROTATE
       EXEC_START="$EXEC_START --use-netns"
     fi
 
+    # Read OTel collector endpoint from metadata (empty = OTel disabled)
+    OTEL_ENDPOINT=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/otel-collector-endpoint || echo "")
+    ENVIRONMENT=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/environment || echo "dev")
+
+    # Build environment lines for the systemd override
+    ENV_LINES=""
+    if [ -n "$OTEL_ENDPOINT" ]; then
+      ENV_LINES="Environment=OTEL_EXPORTER_OTLP_ENDPOINT=$OTEL_ENDPOINT"
+      ENV_LINES="$ENV_LINES\nEnvironment=ENVIRONMENT=$ENVIRONMENT"
+    fi
+
     cat > /etc/systemd/system/firecracker-manager.service.d/override.conf << OVERRIDE
 [Service]
 ExecStart=
 ExecStart=$EXEC_START
+$([ -n "$ENV_LINES" ] && echo -e "$ENV_LINES")
 OVERRIDE
 
     # Wait for background decompression before starting firecracker-manager

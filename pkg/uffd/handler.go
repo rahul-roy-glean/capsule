@@ -144,6 +144,12 @@ type Handler struct {
 	// nil when tracking is disabled.
 	prefetchTracker *PrefetchTracker
 
+	// Prefetcher: replays recorded access patterns from a previous run.
+	// Set via SetPrefetcher() before the UFFD connection is established.
+	// The handler wires the UFFD fd and mappings into the prefetcher
+	// when Firecracker connects.
+	prefetcher *Prefetcher
+
 	// Fault policy
 	consecutiveFailures    uint64 // atomic
 	killOnce               sync.Once
@@ -370,6 +376,12 @@ func (h *Handler) handleConnection(conn net.Conn) {
 	// Store mappings and build chunk lookup now that we know the address layout
 	h.mappings = mappings
 	h.buildChunkLookup()
+
+	// Wire the prefetcher with the UFFD fd and mappings before signaling
+	// connection (the prefetcher's copy workers wait on h.connected).
+	if h.prefetcher != nil {
+		h.prefetcher.SetUFFD(uffdFd, mappings)
+	}
 
 	h.logger.WithFields(logrus.Fields{
 		"fd":       uffdFd,
@@ -679,13 +691,16 @@ func (h *Handler) getPageData(ctx context.Context, offset uint64) ([]byte, error
 	return chunkData[pageOffset : pageOffset+PageSize], nil
 }
 
-// Stop stops the UFFD handler
+// Stop stops the UFFD handler and any associated prefetcher.
 func (h *Handler) Stop() {
 	h.cancel()
 	if h.listener != nil {
 		h.listener.Close()
 	}
 	h.wg.Wait()
+	if h.prefetcher != nil {
+		h.prefetcher.Stop()
+	}
 }
 
 // GetPrefetchMapping stops the prefetch tracker and returns the recorded
@@ -701,6 +716,19 @@ func (h *Handler) GetPrefetchMapping() *snapshot.PrefetchMapping {
 // These are available after the UFFD connection is established.
 func (h *Handler) Mappings() []GuestRegionUFFDMapping {
 	return h.mappings
+}
+
+// Connected returns a channel that is closed when Firecracker connects to the
+// UFFD handler. Used by the Prefetcher to know when UFFDIO_COPY is available.
+func (h *Handler) Connected() <-chan struct{} {
+	return h.connected
+}
+
+// SetPrefetcher registers a Prefetcher to be wired up when Firecracker connects.
+// Must be called before Start(). The handler will call SetUFFD on the prefetcher
+// with the fd and mappings when the connection is established.
+func (h *Handler) SetPrefetcher(p *Prefetcher) {
+	h.prefetcher = p
 }
 
 // Stats returns handler statistics

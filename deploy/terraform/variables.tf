@@ -250,6 +250,12 @@ variable "enable_monitoring_alerts" {
   default     = false
 }
 
+variable "otel_collector_endpoint" {
+  description = "OpenTelemetry Collector OTLP/gRPC endpoint reachable from host VMs (e.g. 10.0.16.17:4317). Empty = OTel disabled (no-op)."
+  type        = string
+  default     = ""
+}
+
 variable "monitoring_notification_channels" {
   description = "List of notification channel IDs for alerts (e.g., Slack, PagerDuty)"
   type        = list(string)
