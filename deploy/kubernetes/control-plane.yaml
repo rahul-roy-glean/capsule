@@ -54,10 +54,7 @@ spec:
     metadata:
       labels:
         app: control-plane
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "8080"
-        prometheus.io/path: "/metrics"
+      annotations: {}
     spec:
       serviceAccountName: control-plane
       containers:
@@ -101,6 +98,10 @@ spec:
             secretKeyRef:
               name: github-credentials
               key: webhook_secret
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "localhost:4317"
+        - name: ENVIRONMENT
+          value: "prod"
         resources:
           requests:
             cpu: 500m
@@ -123,10 +124,29 @@ spec:
         volumeMounts:
         - name: config
           mountPath: /etc/control-plane
+      - name: otel-collector
+        image: otel/opentelemetry-collector-contrib:latest
+        args: ["--config=/etc/otelcol/config.yaml"]
+        ports:
+        - containerPort: 4317
+          name: otlp-grpc
+        volumeMounts:
+        - name: otel-config
+          mountPath: /etc/otelcol
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
       volumes:
       - name: config
         configMap:
           name: control-plane-config
+      - name: otel-config
+        configMap:
+          name: otel-collector-config
 ---
 apiVersion: v1
 kind: Service

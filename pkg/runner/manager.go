@@ -766,6 +766,7 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 		data.Latest.StartCommand.Port = req.StartCommand.Port
 		data.Latest.StartCommand.HealthPath = req.StartCommand.HealthPath
 		data.Latest.StartCommand.Env = req.StartCommand.Env
+		data.Latest.StartCommand.RunAs = req.StartCommand.RunAs
 	}
 
 	return data

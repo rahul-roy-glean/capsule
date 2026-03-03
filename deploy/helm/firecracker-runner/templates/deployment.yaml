@@ -82,10 +82,8 @@ spec:
               value: {{ .Values.downscaler.maxDrains | quote }}
             - name: DOWNSCALER_HEARTBEAT_STALE
               value: {{ .Values.downscaler.heartbeatStale | quote }}
-            - name: TELEMETRY_ENABLED
-              value: {{ .Values.telemetry.enabled | quote }}
-            - name: TELEMETRY_METRIC_PREFIX
-              value: {{ .Values.telemetry.metricPrefix | quote }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ if .Values.otelCollector.enabled }}"localhost:4317"{{ else }}"otel-collector.{{ include "firecracker-runner.namespace" . }}.svc.cluster.local:4317"{{ end }}
             - name: ENVIRONMENT
               value: {{ .Values.config.environment | default "prod" | quote }}
           resources:
@@ -106,9 +104,30 @@ spec:
             - name: config
               mountPath: /etc/control-plane
               readOnly: true
+{{- if .Values.otelCollector.enabled }}
+        - name: otel-collector
+          image: "{{ .Values.otelCollector.image.repository }}:{{ .Values.otelCollector.image.tag }}"
+          args: ["--config=/etc/otelcol/config.yaml"]
+          env:
+            - name: GCP_PROJECT_ID
+              value: {{ .Values.gcp.projectId | quote }}
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+          volumeMounts:
+            - name: otel-config
+              mountPath: /etc/otelcol
+          resources:
+{{ toYaml .Values.otelCollector.resources | indent 12 }}
+{{- end }}
       volumes:
         - name: config
           configMap:
             name: {{ include "firecracker-runner.fullname" . }}-config
+{{- if .Values.otelCollector.enabled }}
+        - name: otel-config
+          configMap:
+            name: otel-collector-config
+{{- end }}
 
 

@@ -10,12 +10,14 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
+	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/telemetry"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/tiers"
 )
 
@@ -26,8 +28,10 @@ type Scheduler struct {
 	snapshotManager *SnapshotManager
 	tagRegistry     *SnapshotTagRegistry
 	configCache     *ConfigCache
-	metricsClient   *telemetry.Client
 	logger          *logrus.Entry
+
+	sessionResumeRoutingCounter metric.Int64Counter
+	otelClient                  *fcrotel.Client
 
 	// connPool caches gRPC connections to host agents, keyed by address.
 	// gRPC connections are multiplexed and designed to be long-lived, so
@@ -46,9 +50,10 @@ func NewScheduler(hr *HostRegistry, db *sql.DB, sm *SnapshotManager, tr *Snapsho
 	}
 }
 
-// SetMetricsClient attaches a telemetry client for GCP Cloud Monitoring.
-func (s *Scheduler) SetMetricsClient(c *telemetry.Client) {
-	s.metricsClient = c
+// SetOTel attaches OTel instruments for distributed tracing and metrics.
+func (s *Scheduler) SetOTel(c *fcrotel.Client, resumeRouting metric.Int64Counter) {
+	s.otelClient = c
+	s.sessionResumeRoutingCounter = resumeRouting
 }
 
 // SetConfigCache sets the in-memory config cache for fast workload config lookups.
@@ -63,7 +68,16 @@ func (s *Scheduler) getHostConn(address string) (*grpc.ClientConn, error) {
 		return v.(*grpc.ClientConn), nil
 	}
 
-	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	opts := []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	}
+	if s.otelClient != nil {
+		opts = append(opts, grpc.WithStatsHandler(otelgrpc.NewClientHandler(
+			otelgrpc.WithTracerProvider(s.otelClient.TracerProvider),
+			otelgrpc.WithMeterProvider(s.otelClient.MeterProvider),
+		)))
+	}
+	conn, err := grpc.NewClient(address, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to host %s: %w", address, err)
 	}
@@ -246,10 +260,10 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 						"session_id": req.SessionID,
 						"host_id":    sessionHostID,
 					}).Info("Session sticky routing: using original host")
-					if s.metricsClient != nil {
-						s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionResumeRouting, telemetry.Labels{
-							telemetry.LabelRouting: telemetry.RoutingSameHost,
-						})
+					if s.sessionResumeRoutingCounter != nil {
+						s.sessionResumeRoutingCounter.Add(ctx, 1, metric.WithAttributes(
+							fcrotel.AttrRouting.String(fcrotel.RoutingSameHost),
+						))
 					}
 					break
 				}
@@ -260,10 +274,10 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 					"original_host":   sessionHostID,
 					"available_hosts": len(eligible),
 				}).Warn("Session sticky host not available, falling back to best-fit")
-				if s.metricsClient != nil {
-					s.metricsClient.IncrementCounter(ctx, telemetry.MetricSessionResumeRouting, telemetry.Labels{
-						telemetry.LabelRouting: telemetry.RoutingCrossHost,
-					})
+				if s.sessionResumeRoutingCounter != nil {
+					s.sessionResumeRoutingCounter.Add(ctx, 1, metric.WithAttributes(
+						fcrotel.AttrRouting.String(fcrotel.RoutingCrossHost),
+					))
 				}
 			}
 		}
@@ -382,6 +396,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			Port:       int32(startCmd.Port),
 			HealthPath: startCmd.HealthPath,
 			Env:        startCmd.Env,
+			RunAs:      startCmd.RunAs,
 		}
 	}
 

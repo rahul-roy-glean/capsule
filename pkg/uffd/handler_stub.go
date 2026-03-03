@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
@@ -26,6 +27,7 @@ type HandlerConfig struct {
 	FaultTimeout           time.Duration
 	MaxConsecutiveFailures int
 	OnFatal                func(error)
+	Meter                  metric.Meter
 }
 
 // NewHandler returns an error on non-Linux platforms

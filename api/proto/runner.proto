@@ -168,6 +168,7 @@ message StartCommand {
   int32 port = 2;
   string health_path = 3;
   map<string, string> env = 4;
+  string run_as = 5;
 }
 
 // AllocateRunnerRequest
