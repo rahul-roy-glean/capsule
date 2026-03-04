@@ -17,6 +17,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
+	_ "github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy/providers" // register providers
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/ci"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
@@ -72,6 +74,9 @@ type Manager struct {
 	// ResumeFromSession fetches chunks lazily via UFFD from any host.
 	sessionMemStore  *snapshot.ChunkStore
 	sessionDiskStore *snapshot.ChunkStore
+
+	// authProxies tracks per-VM auth proxy instances for credential injection.
+	authProxies map[string]*authproxy.AuthProxy
 
 	// goldenChunkedMeta holds the base snapshot metadata used as the reference
 	// for session pause uploads. Only populated when sessionMemStore is non-nil.
@@ -186,6 +191,7 @@ func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logge
 		slotToRunner:     make(map[int]string),
 		runnerToSlot:     make(map[string]int),
 		policyEnforcers:  make(map[string]*network.PolicyEnforcer),
+		authProxies:      make(map[string]*authproxy.AuthProxy),
 		logger:           logger.WithField("component", "runner-manager"),
 	}
 
@@ -656,6 +662,26 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		}
 	}
 
+	// Start auth proxy if configured (requires per-VM namespace).
+	if req.AuthConfig != nil && useNetNS && nsInfo != nil {
+		proxy, proxyErr := authproxy.NewAuthProxy(
+			runnerID,
+			*req.AuthConfig,
+			nsInfo.GetFirecrackerNetNSPath(),
+			nsInfo.Gateway.String(),
+			nsInfo.HostReachableIP.String(),
+			m.logger,
+		)
+		if proxyErr != nil {
+			m.logger.WithError(proxyErr).Warn("Failed to create auth proxy (non-fatal)")
+		} else if proxyErr := proxy.Start(ctx); proxyErr != nil {
+			m.logger.WithError(proxyErr).Warn("Failed to start auth proxy (non-fatal)")
+		} else {
+			m.authProxies[runnerID] = proxy
+			m.logger.WithField("runner_id", runnerID).Info("Auth proxy started")
+		}
+	}
+
 	runner.State = StateInitializing
 	runner.StartedAt = time.Now()
 
@@ -816,6 +842,12 @@ func (m *Manager) ReleaseRunner(runnerID string, destroy bool) error {
 	if enforcer, ok := m.policyEnforcers[runnerID]; ok {
 		enforcer.Remove()
 		delete(m.policyEnforcers, runnerID)
+	}
+
+	// Stop auth proxy if one exists
+	if proxy, ok := m.authProxies[runnerID]; ok {
+		proxy.Stop()
+		delete(m.authProxies, runnerID)
 	}
 
 	// Suspended runners already had network released during pause; only clean up overlay/files
