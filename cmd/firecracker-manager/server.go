@@ -12,6 +12,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
 	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/runner"
@@ -100,6 +101,15 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 			return nil, status.Errorf(codes.InvalidArgument, "invalid network_policy_json: %v", err)
 		}
 		allocReq.NetworkPolicy = &np
+	}
+
+	// Extract auth config from labels (control plane packs auth config here).
+	if v, ok := req.Labels["_auth_config_json"]; ok && v != "" {
+		var ac authproxy.AuthConfig
+		if err := json.Unmarshal([]byte(v), &ac); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid _auth_config_json: %v", err)
+		}
+		allocReq.AuthConfig = &ac
 	}
 
 	if req.Resources != nil {
