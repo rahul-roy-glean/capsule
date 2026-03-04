@@ -8,7 +8,7 @@
 .PHONY: dev-build dev-snapshot dev-stack dev-test-exec dev-test-pause-resume dev-test-multi-pause-dedup dev-stop
 .PHONY: dev-test-derive-snapshot dev-test-extension-drives dev-test-gcs-pause-resume
 .PHONY: dev-test-gcs-rootfs-durability dev-test-file-ops dev-test-pty dev-test-checkpoint
-.PHONY: dev-test-auto-resume dev-test-template-tags dev-test-network-policy
+.PHONY: dev-test-auto-resume dev-test-template-tags dev-test-network-policy dev-test-auth-proxy
 .PHONY: dev-agent-rootfs dev-agent-snapshot dev-test-agent-sessions dev-test-agent-e2e
 .PHONY: dev-setup dev-provision
 
@@ -352,6 +352,7 @@ help:
 	@echo "  dev-test-pty         - Run E2E PTY terminal test (WS3)"
 	@echo "  dev-test-template-tags - Run E2E template tags test (WS6)"
 	@echo "  dev-test-network-policy - Run E2E network policy test"
+	@echo "  dev-test-auth-proxy  - Run E2E auth proxy test (delegated provider)"
 	@echo "  dev-test-checkpoint  - Run E2E checkpoint test (WS4, needs GCS)"
 	@echo "  dev-test-auto-resume - Run E2E auto-resume test (WS5, needs GCS)"
 	@echo "  dev-test-gcs-rootfs-durability - Run E2E rootfs durability test (WS1, needs GCS)"
@@ -440,6 +441,10 @@ dev-test-template-tags:
 
 dev-test-network-policy:
 	bash dev/test-network-policy.sh
+
+# Run E2E auth proxy test
+dev-test-auth-proxy:
+	bash dev/test-auth-proxy.sh
 
 # AI Agent Sandbox E2E tests
 dev-agent-rootfs:
