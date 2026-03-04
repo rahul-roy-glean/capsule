@@ -64,9 +64,6 @@ service ControlPlane {
   
   // GetSnapshot gets the current snapshot version
   rpc GetSnapshot(GetSnapshotRequest) returns (Snapshot);
-  
-  // TriggerSnapshotBuild triggers a new snapshot build
-  rpc TriggerSnapshotBuild(TriggerSnapshotBuildRequest) returns (TriggerSnapshotBuildResponse);
 }
 
 // Runner states
@@ -108,7 +105,8 @@ message Runner {
   string host_id = 2;
   RunnerState state = 3;
   string internal_ip = 4;
-  string github_runner_id = 5;
+  reserved 5;
+  reserved "external_runner_id";
   string job_id = 6;
   string snapshot_version = 7;
   google.protobuf.Timestamp created_at = 8;
@@ -153,8 +151,8 @@ message Snapshot {
   string version = 1;
   string status = 2;
   string gcs_path = 3;
-  // Optional: CI-specific snapshot metadata.
-  string bazel_version = 4;
+  reserved 4;
+  reserved "build_tool_version";
   string repo_commit = 5;
   int64 size_bytes = 6;
   google.protobuf.Timestamp created_at = 7;
@@ -182,10 +180,10 @@ message AllocateRunnerRequest {
   string commit = 4;
   Resources resources = 5;
   map<string, string> labels = 6;
-  // Deprecated: Use ci_runner_token instead.
-  string github_runner_token = 7;
-  string ci_runner_token = 8;     // Generic CI runner registration token
-  string ci_system = 9;           // CI system identifier (e.g., "github-actions", "none")
+  reserved 7, 8;
+  reserved "github_runner_token", "ci_runner_token";
+  reserved 9;
+  reserved "integration_name";
   string workload_key = 10;       // Hash of snapshot commands; identifies which snapshot to boot
   StartCommand start_command = 11; // Optional: user service to start inside the VM
   string session_id = 12;         // optional: bind to session for pause/resume
@@ -317,17 +315,16 @@ message GetSnapshotRequest {
   string version = 1;
 }
 
-// TriggerSnapshotBuildRequest
+// TriggerSnapshotBuildRequest (deprecated — fields reserved)
 message TriggerSnapshotBuildRequest {
-  string repo = 1;
-  string branch = 2;
-  string bazel_version = 3;
+  reserved 1, 2, 3;
+  reserved "repo", "branch", "build_tool_version";
 }
 
-// TriggerSnapshotBuildResponse
+// TriggerSnapshotBuildResponse (deprecated — fields reserved)
 message TriggerSnapshotBuildResponse {
-  string build_id = 1;
-  string status = 2;
+  reserved 1, 2;
+  reserved "build_id", "status";
 }
 
 message PauseRunnerRequest {

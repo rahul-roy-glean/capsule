@@ -3,10 +3,6 @@ platform:
   region: "us-central1"
   zone: "us-central1-a"
 
-repository:
-  url: "https://github.com/myorg/my-sandbox-app"
-  branch: "main"
-
 microvm:
   vcpus: 8
   memory_mb: 16384          # 16GB — room for model weights in RAM
@@ -18,9 +14,6 @@ hosts:
   min_count: 2
   max_count: 20
   data_disk_gb: 500
-
-ci:
-  system: "none"
 
 workload:
   # Steps baked into the golden snapshot during warmup.

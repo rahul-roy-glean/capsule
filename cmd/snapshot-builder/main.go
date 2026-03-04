@@ -36,8 +36,8 @@ var (
 	memoryMB             = flag.Int("memory-mb", 8192, "Memory MB for warmup VM")
 	warmupTimeout        = flag.Duration("warmup-timeout", 30*time.Minute, "Timeout for warmup phase")
 	rootfsSizeGB         = flag.Int("rootfs-size-gb", 0, "Expand rootfs to this size in GB (0 = keep original size). Increase if bazel fetch runs out of space.")
-	repoCacheUpperSizeGB = flag.Int("repo-cache-upper-size-gb", 10, "Size in GB of repo-cache-upper.img (writable overlay for Bazel repository cache)")
-	repoCacheSeedSizeGB  = flag.Int("repo-cache-seed-size-gb", 20, "Size in GB of repo-cache-seed.img (shared Bazel repository cache seed)")
+	repoCacheUpperSizeGB = flag.Int("artifact-cache-upper-size-gb", 10, "Size in GB of repo-cache-upper.img (writable overlay for artifact/repository cache)")
+	repoCacheSeedSizeGB  = flag.Int("artifact-cache-seed-size-gb", 20, "Size in GB of repo-cache-seed.img (shared artifact/repository cache seed)")
 	repoCacheSeedDir     = flag.String("repo-cache-seed-dir", "", "Optional directory to seed into repo-cache-seed.img (copied into image root)")
 	gitCachePath         = flag.String("git-cache-path", "", "Path to pre-populated git-cache.img (from git-cache-builder). If set, uses this instead of cloning during warmup.")
 	logLevel             = flag.String("log-level", "info", "Log level")
@@ -358,7 +358,7 @@ func main() {
 				"size_gb":  *repoCacheSeedSizeGB,
 				"seed_dir": *repoCacheSeedDir,
 			}).Info("Creating repo-cache seed image")
-			if err := createExt4Image(repoCacheSeedImg, *repoCacheSeedSizeGB, "BAZEL_REPO_SEED"); err != nil {
+			if err := createExt4Image(repoCacheSeedImg, *repoCacheSeedSizeGB, "ARTIFACT_CACHE_SEED"); err != nil {
 				log.WithError(err).Fatal("Failed to create repo-cache seed image")
 			}
 			if *repoCacheSeedDir != "" {
@@ -368,7 +368,7 @@ func main() {
 			}
 
 			repoCacheUpperImg := filepath.Join(*outputDir, "repo-cache-upper.img")
-			if err := createExt4Image(repoCacheUpperImg, *repoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
+			if err := createExt4Image(repoCacheUpperImg, *repoCacheUpperSizeGB, "ARTIFACT_CACHE_UPPER"); err != nil {
 				log.WithError(err).Fatal("Failed to create repo-cache upper image")
 			}
 
@@ -557,7 +557,7 @@ func main() {
 		RootfsPath:        "rootfs.img",
 		MemPath:           "snapshot.mem",
 		StatePath:         "snapshot.state",
-		RepoCacheSeedPath: "repo-cache-seed.img",
+		ArtifactCacheSeedPath: "repo-cache-seed.img",
 	}
 
 	// Upload to GCS
@@ -772,7 +772,7 @@ func main() {
 				if _, err := os.Stat(repoCacheSeedImg); err == nil {
 					driveSpecs = append(driveSpecs, snapshot.DriveSpec{
 						DriveID:  "repo_cache_seed",
-						Label:    "BAZEL_REPO_SEED",
+						Label:    "ARTIFACT_CACHE_SEED",
 						ReadOnly: false,
 					})
 					driveImages["repo_cache_seed"] = repoCacheSeedImg
@@ -784,7 +784,7 @@ func main() {
 				Rootfs:               workingRootfs,
 				Mem:                  memPath,
 				State:                snapshotPath,
-				RepoCacheSeed:        repoCacheSeedImg,
+				ArtifactCacheSeed:    repoCacheSeedImg,
 				Version:              version,
 				ExtensionDriveImages: driveImages,
 			}
@@ -830,31 +830,6 @@ func main() {
 	// Cleanup
 	socketPath := filepath.Join(*outputDir, vmID+".sock")
 	os.Remove(socketPath)
-}
-
-// WarmupConfig holds configuration for the warmup phase
-type WarmupConfig struct {
-	RepoURL       string
-	RepoBranch    string
-	BazelVersion  string
-	WarmupTargets string
-}
-
-// WarmupMMDSData is the MMDS data structure for warmup VM
-type WarmupMMDSData struct {
-	Latest struct {
-		Meta struct {
-			Mode        string `json:"mode"`
-			RunnerID    string `json:"runner_id"`
-			Environment string `json:"environment"`
-		} `json:"meta"`
-		Warmup struct {
-			RepoURL       string `json:"repo_url"`
-			RepoBranch    string `json:"repo_branch"`
-			BazelVersion  string `json:"bazel_version"`
-			WarmupTargets string `json:"warmup_targets"`
-		} `json:"warmup"`
-	} `json:"latest"`
 }
 
 func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, log *logrus.Entry) error {
@@ -2172,7 +2147,7 @@ Wants=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/thaw-agent --runner-user=%s
+ExecStart=/usr/local/bin/thaw-agent --sandbox-user=%s
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

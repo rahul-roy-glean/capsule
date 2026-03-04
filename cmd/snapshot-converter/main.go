@@ -134,7 +134,7 @@ func main() {
 	// Check for repo cache seed
 	repoCachePath := filepath.Join(*sourceDir, "repo-cache-seed.img")
 	if _, err := os.Stat(repoCachePath); err == nil {
-		paths.RepoCacheSeed = repoCachePath
+		paths.ArtifactCacheSeed = repoCachePath
 	}
 
 	// Create chunked snapshot builder
@@ -148,7 +148,7 @@ func main() {
 	}
 
 	// Set additional metadata
-	meta.BazelVersion = *bazelVer
+	meta.BuildToolVersion = *bazelVer
 	meta.RepoCommit = *repoCommit
 
 	// Upload metadata

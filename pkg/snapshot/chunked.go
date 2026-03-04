@@ -77,7 +77,7 @@ var ErrChunkCorruption = errors.New("chunk corruption detected")
 // Instead of storing full files, we store references to content-addressed chunks.
 type ChunkedSnapshotMetadata struct {
 	Version       string            `json:"version"`
-	BazelVersion  string            `json:"bazel_version,omitempty"`
+	BuildToolVersion  string            `json:"build_tool_version,omitempty"`
 	RepoCommit    string            `json:"repo_commit,omitempty"`
 	Repo          string            `json:"repo,omitempty"`
 	WorkloadKey   string            `json:"workload_key,omitempty"`

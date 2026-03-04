@@ -25,6 +25,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
+	cigithub "github.com/rahul-roy-glean/bazel-firecracker/pkg/ci/github"
 	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/tiers"
 )
@@ -182,6 +183,20 @@ func main() {
 	layerBuildScheduler := NewLayerBuildScheduler(db, snapshotManager, logger, 4)
 	layeredConfigRegistry.SetLayerBuilder(layerBuildScheduler)
 
+	// Wire CI webhook adapter for GitHub Actions webhook routing.
+	// The webhook-only adapter does not require GitHub App credentials.
+	var webhookAdapter *cigithub.Adapter
+	ciSystemEnv := os.Getenv("CI_SYSTEM")
+	if ciSystemEnv == "" || ciSystemEnv == "github-actions" {
+		webhookAdapter = cigithub.NewWebhookAdapter(logger)
+		webhookAdapter.SetWebhookDeps(cigithub.WebhookDeps{
+			JobQueue:       jobQueue,
+			RunnerReleaser: scheduler,
+			RunnerLookup:   &jobQueueRunnerLookup{hr: hostRegistry},
+			Logger:         logger,
+		})
+	}
+
 	// Load existing state from DB (best-effort)
 	if err := hostRegistry.LoadFromDB(ctx); err != nil {
 		log.WithError(err).Warn("Failed to load host/runner state from DB")
@@ -248,10 +263,11 @@ func main() {
 	httpMux.HandleFunc("/api/v1/versions/fleet", controlPlaneServer.HandleGetFleetConvergence)
 	// Canary report endpoint (Phase 6)
 	httpMux.HandleFunc("/api/v1/canary/report", controlPlaneServer.HandleCanaryReport)
-	// Register webhook handler conditionally based on CI system config
-	ciSystemEnv := os.Getenv("CI_SYSTEM")
-	if ciSystemEnv == "" || ciSystemEnv == "github-actions" {
-		httpMux.HandleFunc("/webhook/github", controlPlaneServer.HandleGitHubWebhook)
+	// Register webhook handler via CI adapter (replaces hardcoded CI_SYSTEM check)
+	if webhookAdapter != nil {
+		if h := webhookAdapter.WebhookHandler(); h != nil {
+			httpMux.Handle(webhookAdapter.WebhookPath(), h)
+		}
 	}
 
 	httpServer := &http.Server{
@@ -403,7 +419,6 @@ func initSchema(db *sql.DB) error {
 		host_id UUID REFERENCES hosts(id),
 		status VARCHAR(20) NOT NULL DEFAULT 'initializing',
 		internal_ip VARCHAR(15),
-		github_runner_id VARCHAR(255),
 		job_id VARCHAR(255),
 		created_at TIMESTAMP DEFAULT NOW(),
 		started_at TIMESTAMP,
@@ -414,7 +429,6 @@ func initSchema(db *sql.DB) error {
 		version VARCHAR(50) PRIMARY KEY,
 		status VARCHAR(20) NOT NULL DEFAULT 'building',
 		gcs_path VARCHAR(255),
-		bazel_version VARCHAR(20),
 		repo_commit VARCHAR(40),
 		size_bytes BIGINT,
 		created_at TIMESTAMP DEFAULT NOW(),
@@ -423,8 +437,8 @@ func initSchema(db *sql.DB) error {
 
 	CREATE TABLE IF NOT EXISTS jobs (
 		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-		github_workflow_run_id BIGINT,
-		github_job_id BIGINT,
+		ci_run_id BIGINT,
+		ci_job_id BIGINT,
 		repo VARCHAR(255),
 		branch VARCHAR(255),
 		commit_sha VARCHAR(40),
@@ -461,13 +475,12 @@ func initSchema(db *sql.DB) error {
 			slug VARCHAR(255) PRIMARY KEY,
 			url VARCHAR(512) NOT NULL,
 			branch VARCHAR(255) DEFAULT 'main',
-			bazel_version VARCHAR(32) DEFAULT '',
-			warmup_targets VARCHAR(1024) DEFAULT '//...',
 			build_schedule VARCHAR(64) DEFAULT '',
 			max_concurrent_runners INT DEFAULT 0,
 			current_version VARCHAR(255),
 			auto_rollout BOOLEAN DEFAULT true,
-			created_at TIMESTAMP DEFAULT NOW()
+			created_at TIMESTAMP DEFAULT NOW(),
+			metadata JSONB DEFAULT '{}'::jsonb
 		)`,
 		// Version assignments table
 		`CREATE TABLE IF NOT EXISTS version_assignments (
@@ -517,8 +530,8 @@ func initSchema(db *sql.DB) error {
 		`DROP INDEX IF EXISTS idx_runners_repo_status`,
 		// jobs: queue drain (WHERE status='queued' ORDER BY queued_at)
 		`CREATE INDEX IF NOT EXISTS idx_jobs_queued ON jobs(status, queued_at) WHERE status = 'queued'`,
-		// jobs: completion by github_job_id
-		`CREATE INDEX IF NOT EXISTS idx_jobs_github_job_id ON jobs(github_job_id)`,
+		// jobs: completion by ci_job_id
+		`CREATE INDEX IF NOT EXISTS idx_jobs_ci_job_id ON jobs(ci_job_id)`,
 		// snapshots: workload_key + status + created_at for version lookups
 		`CREATE INDEX IF NOT EXISTS idx_snapshots_workload_status ON snapshots(workload_key, status, created_at DESC)`,
 		// version_assignments: compound for subquery in GetFleetConvergence
@@ -591,9 +604,7 @@ func initSchema(db *sql.DB) error {
 			leaf_layer_hash        VARCHAR(64),
 			leaf_workload_key      VARCHAR(16),
 			tier                   VARCHAR(8) DEFAULT 'm',
-			ci_system              VARCHAR(64) DEFAULT '',
-			github_app_id          VARCHAR(255) DEFAULT '',
-			github_app_secret      VARCHAR(255) DEFAULT '',
+			ci_credentials         JSONB DEFAULT '{}'::jsonb,
 			start_command          TEXT DEFAULT '',
 			runner_ttl_seconds     INT DEFAULT 0,
 			session_max_age_seconds INT DEFAULT 86400,
@@ -671,6 +682,47 @@ func initSchema(db *sql.DB) error {
 		// Prevent duplicate active builds per layer
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_builds_one_active_per_layer
 			ON snapshot_builds (layer_hash) WHERE status IN ('queued', 'waiting_parent', 'running')`,
+		// Track 6 migrations: drop CI-specific columns (previously renamed, now fully removed)
+		// runners: drop external_runner_id (was github_runner_id)
+		`ALTER TABLE runners DROP COLUMN IF EXISTS github_runner_id`,
+		`ALTER TABLE runners DROP COLUMN IF EXISTS external_runner_id`,
+		// jobs: github_workflow_run_id -> ci_run_id, github_job_id -> ci_job_id
+		`DO $$ BEGIN ALTER TABLE jobs RENAME COLUMN github_workflow_run_id TO ci_run_id; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; END $$`,
+		`DO $$ BEGIN ALTER TABLE jobs RENAME COLUMN github_job_id TO ci_job_id; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; END $$`,
+		// layered_configs: drop integration_name (was ci_system); migrate github_app_id/secret -> ci_credentials JSONB
+		`ALTER TABLE layered_configs DROP COLUMN IF EXISTS ci_system`,
+		`ALTER TABLE layered_configs DROP COLUMN IF EXISTS integration_name`,
+		`ALTER TABLE layered_configs ADD COLUMN IF NOT EXISTS ci_credentials JSONB DEFAULT '{}'::jsonb`,
+		`DO $$ BEGIN
+			UPDATE layered_configs SET ci_credentials = jsonb_build_object(
+				'github_app_id', github_app_id,
+				'github_app_secret', github_app_secret
+			) WHERE ci_credentials = '{}'::jsonb AND (github_app_id != '' OR github_app_secret != '');
+		EXCEPTION WHEN undefined_column THEN NULL; END $$`,
+		`ALTER TABLE layered_configs DROP COLUMN IF EXISTS github_app_id`,
+		`ALTER TABLE layered_configs DROP COLUMN IF EXISTS github_app_secret`,
+		// snapshots: drop build_tool_version (was bazel_version); add metadata JSONB
+		`ALTER TABLE snapshots DROP COLUMN IF EXISTS bazel_version`,
+		`ALTER TABLE snapshots DROP COLUMN IF EXISTS build_tool_version`,
+		`ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb`,
+		// repos: migrate old columns then drop the table (replaced by layered_configs)
+		`ALTER TABLE repos ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb`,
+		`DO $$ BEGIN
+			UPDATE repos SET metadata = jsonb_build_object('build_tool_version', bazel_version, 'warmup_targets', warmup_targets)
+			WHERE metadata = '{}'::jsonb AND (bazel_version != '' OR warmup_targets != '//...');
+		EXCEPTION WHEN undefined_column THEN NULL; END $$`,
+		`ALTER TABLE repos DROP COLUMN IF EXISTS bazel_version`,
+		`ALTER TABLE repos DROP COLUMN IF EXISTS warmup_targets`,
+		// runners: drop vestigial repo/branch columns (replaced by workload_key)
+		`ALTER TABLE runners DROP COLUMN IF EXISTS repo`,
+		`ALTER TABLE runners DROP COLUMN IF EXISTS branch`,
+		// snapshots: drop dead columns (repo/repo_slug replaced by workload_key, metadata unused)
+		`ALTER TABLE snapshots DROP COLUMN IF EXISTS repo`,
+		`ALTER TABLE snapshots DROP COLUMN IF EXISTS repo_slug`,
+		`ALTER TABLE snapshots DROP COLUMN IF EXISTS metadata`,
+		`DROP INDEX IF EXISTS idx_snapshots_repo_slug`,
+		// Drop ci_credentials from layered_configs — auth proxy handles authentication now
+		`ALTER TABLE layered_configs DROP COLUMN IF EXISTS ci_credentials`,
 	}
 	logger := logrus.WithField("component", "migrations")
 	for i, stmt := range migrations {
@@ -791,21 +843,6 @@ func (s *ControlPlaneServer) GetSnapshot(ctx context.Context, req *pb.GetSnapsho
 	return s.snapshotManager.SnapshotToProto(snapshot), nil
 }
 
-// TriggerSnapshotBuild implements the gRPC TriggerSnapshotBuild method
-func (s *ControlPlaneServer) TriggerSnapshotBuild(ctx context.Context, req *pb.TriggerSnapshotBuildRequest) (*pb.TriggerSnapshotBuildResponse, error) {
-	buildID, err := s.snapshotManager.TriggerBuild(ctx, req.Repo, req.Branch, req.BazelVersion)
-	if err != nil {
-		return &pb.TriggerSnapshotBuildResponse{
-			Status: "error: " + err.Error(),
-		}, nil
-	}
-
-	return &pb.TriggerSnapshotBuildResponse{
-		BuildId: buildID,
-		Status:  "queued",
-	}, nil
-}
-
 // HTTP Handlers
 
 func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Request) {
@@ -839,7 +876,6 @@ func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Req
 // HandleAllocateRunner handles manual runner allocation requests.
 // POST /api/v1/runners/allocate
 // Body: {"workload_key": "abc123", "labels": {"firecracker": "true"}}
-// ci_system is resolved from the snapshot config registered for the workload_key.
 func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1284,11 +1320,6 @@ func (s *ControlPlaneServer) HandleGetSnapshots(w http.ResponseWriter, r *http.R
 		"count":           len(snapshots),
 		"current_version": s.snapshotManager.GetCurrentVersion(),
 	})
-}
-
-func (s *ControlPlaneServer) HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
-	handler := NewGitHubWebhookHandler(s.scheduler, s.hostRegistry, s.jobQueue, s.logger.Logger)
-	handler.HandleWebhook(w, r)
 }
 
 // HandleGetDesiredVersions returns the desired snapshot versions for a host.

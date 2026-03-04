@@ -3,10 +3,6 @@ platform:
   region: "us-central1"
   zone: "us-central1-a"
 
-repository:
-  url: "https://github.com/myorg/myrepo"
-  branch: "main"
-
 microvm:
   vcpus: 4
   memory_mb: 8192
@@ -19,9 +15,6 @@ hosts:
   min_count: 2
   max_count: 10
   data_disk_gb: 500
-
-ci:
-  system: "none"
 
 workload:
   # Snapshot warmup: clone the repo, install the toolchain, start LSP servers.

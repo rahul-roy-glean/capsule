@@ -52,7 +52,6 @@ type Runner struct {
 	HostID         string
 	Status         string
 	InternalIP     string
-	GitHubRunnerID string
 	JobID          string
 	WorkloadKey    string
 	CreatedAt      time.Time
@@ -459,7 +458,7 @@ func (hr *HostRegistry) LoadFromDB(ctx context.Context) error {
 
 	// Load runners
 	rows, err = hr.db.QueryContext(ctx, `
-		SELECT id, host_id, status, internal_ip, github_runner_id, job_id, created_at
+		SELECT id, host_id, status, internal_ip, job_id, created_at
 		FROM runners
 	`)
 	if err != nil {
@@ -469,19 +468,16 @@ func (hr *HostRegistry) LoadFromDB(ctx context.Context) error {
 
 	for rows.Next() {
 		var r Runner
-		var internalIP, githubRunnerID, jobID sql.NullString
+		var internalIP, jobID sql.NullString
 
 		err := rows.Scan(&r.ID, &r.HostID, &r.Status, &internalIP,
-			&githubRunnerID, &jobID, &r.CreatedAt)
+			&jobID, &r.CreatedAt)
 		if err != nil {
 			return err
 		}
 
 		if internalIP.Valid {
 			r.InternalIP = internalIP.String
-		}
-		if githubRunnerID.Valid {
-			r.GitHubRunnerID = githubRunnerID.String
 		}
 		if jobID.Valid {
 			r.JobID = jobID.String

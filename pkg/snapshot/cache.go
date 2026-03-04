@@ -20,7 +20,7 @@ import (
 // SnapshotMetadata holds metadata about a snapshot
 type SnapshotMetadata struct {
 	Version      string            `json:"version"`
-	BazelVersion string            `json:"bazel_version"`
+	BuildToolVersion string            `json:"build_tool_version"`
 	RepoCommit   string            `json:"repo_commit"`
 	Repo         string            `json:"repo,omitempty"`
 	WorkloadKey  string            `json:"workload_key,omitempty"`
@@ -31,9 +31,9 @@ type SnapshotMetadata struct {
 	RootfsPath   string            `json:"rootfs_path"`
 	MemPath      string            `json:"mem_path"`
 	StatePath    string            `json:"state_path"`
-	// RepoCacheSeedPath is a path (relative to the snapshot version dir) to the
-	// shared Bazel repository cache seed disk image (ext4).
-	RepoCacheSeedPath string `json:"repo_cache_seed_path,omitempty"`
+	// ArtifactCacheSeedPath is a path (relative to the snapshot version dir) to the
+	// shared artifact cache seed disk image (ext4).
+	ArtifactCacheSeedPath string `json:"artifact_cache_seed_path,omitempty"`
 }
 
 // SnapshotPaths holds the local paths to snapshot files
@@ -42,7 +42,7 @@ type SnapshotPaths struct {
 	Rootfs        string
 	Mem           string
 	State         string
-	RepoCacheSeed string
+	ArtifactCacheSeed string
 	Version       string
 	// ExtensionDriveImages maps DriveID to the local path of the extension drive image.
 	// Used by BuildChunkedSnapshot to chunk extension drives.
@@ -253,7 +253,7 @@ func (c *Cache) GetSnapshotPaths() (*SnapshotPaths, error) {
 
 	// repo-cache-seed is optional — new workloads use extension drives instead.
 	if _, err := os.Stat(repoCacheSeedPath); err == nil {
-		paths.RepoCacheSeed = repoCacheSeedPath
+		paths.ArtifactCacheSeed = repoCacheSeedPath
 	}
 
 	// Only include mem/state if BOTH exist (partial snapshot is invalid)

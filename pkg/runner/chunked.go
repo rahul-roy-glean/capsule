@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -16,7 +17,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/ci"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/fuse"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
@@ -56,9 +56,6 @@ type ChunkedManager struct {
 type ChunkedManagerConfig struct {
 	HostConfig
 
-	// CIAdapter is the CI system adapter (may be nil for no-op)
-	CIAdapter ci.Adapter
-
 	// UseChunkedSnapshots enables chunked snapshot restore
 	UseChunkedSnapshots bool
 
@@ -94,7 +91,7 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 	}
 
 	// Create base manager
-	baseManager, err := NewManager(ctx, cfg.HostConfig, cfg.CIAdapter, logger)
+	baseManager, err := NewManager(ctx, cfg.HostConfig, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -917,7 +914,6 @@ func (cm *ChunkedManager) setupChunkedSymlinks(rootfsPath string, extensionDrive
 		target string
 	}{
 		{"rootfs.img", rootfsPath},
-		{"credentials.img", cm.credentialsImage},
 	}
 	// Add extension drives by driveID (e.g. "repo_cache_seed" → "repo-cache-seed.img")
 	for driveID, path := range extensionDrivePaths {
@@ -1329,4 +1325,18 @@ func (cm *ChunkedManager) setupRootfsFUSEDiskForRunner(runnerID string, chunks [
 	}).Info("FUSE rootfs disk mounted for session resume")
 
 	return fuseDisk.DiskImagePath(), nil
+}
+
+// createExt4Image creates a sparse ext4 filesystem image of the given size.
+func createExt4Image(path string, sizeGB int, label string) error {
+	if sizeGB <= 0 {
+		return fmt.Errorf("invalid sizeGB: %d", sizeGB)
+	}
+	if err := exec.Command("truncate", "-s", fmt.Sprintf("%dG", sizeGB), path).Run(); err != nil {
+		return fmt.Errorf("truncate failed: %w", err)
+	}
+	if output, err := exec.Command("mkfs.ext4", "-F", "-L", label, "-E", "lazy_itable_init=1,lazy_journal_init=1", path).CombinedOutput(); err != nil {
+		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(output), err)
+	}
+	return nil
 }

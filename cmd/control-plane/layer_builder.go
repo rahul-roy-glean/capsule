@@ -267,7 +267,7 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 		       COALESCE(sl.all_chain_drives, sl.drives) AS all_chain_drives,
 		       sl.config_name,
 		       parent_sl.current_version AS parent_current_version,
-		       lc.tier, lc.github_app_id, lc.github_app_secret,
+		       lc.tier,
 		       sb.old_layer_hash, sb.old_layer_version
 		FROM snapshot_builds sb
 		JOIN claimed c ON sb.build_id = c.build_id
@@ -296,8 +296,6 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 		configName           string
 		parentCurrentVersion sql.NullString
 		tier                 sql.NullString
-		githubAppID          sql.NullString
-		githubAppSecret      sql.NullString
 		oldLayerHash         string
 		oldLayerVersion      string
 	}
@@ -309,7 +307,7 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 		if err := rows.Scan(&b.buildID, &b.layerHash, &b.version, &b.buildType, &b.parentVersion,
 			&b.parentLayerHash, &b.initCmdsJSON, &b.refreshCmdsJSON, &b.drivesJSON, &b.allChainDrivesJSON,
 			&b.configName,
-			&b.parentCurrentVersion, &b.tier, &b.githubAppID, &b.githubAppSecret,
+			&b.parentCurrentVersion, &b.tier,
 			&oldHash, &oldVer); err != nil {
 			continue
 		}
@@ -360,15 +358,6 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 			}
 		}
 
-		githubAppID := ""
-		githubAppSecret := ""
-		if b.githubAppID.Valid {
-			githubAppID = b.githubAppID.String
-		}
-		if b.githubAppSecret.Valid {
-			githubAppSecret = b.githubAppSecret.String
-		}
-
 		// Extract base-image and runner-user from init commands
 		baseImage := ""
 		runnerUser := ""
@@ -385,7 +374,7 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 
 		err := s.launchLayerBuildVM(ctx, instanceName, b.layerHash, commandsJSON, b.version,
 			parentWorkloadKey, parentVersion, b.allChainDrivesJSON, b.buildType,
-			githubAppID, githubAppSecret, snapshotVCPUs, snapshotMemoryMB,
+			snapshotVCPUs, snapshotMemoryMB,
 			baseImage, runnerUser, b.oldLayerHash, b.oldLayerVersion)
 		if err != nil {
 			s.logger.WithError(err).WithField("build_id", b.buildID).Error("Failed to launch layer build VM")
@@ -574,8 +563,8 @@ func (s *LayerBuildScheduler) onLeafLayerComplete(ctx context.Context, layerHash
 	// Insert into snapshots table for the rollout pipeline
 	metricsJSON, _ := json.Marshal(SnapshotMetrics{})
 	s.db.ExecContext(ctx, `
-		INSERT INTO snapshots (version, status, workload_key, gcs_path, bazel_version, repo_commit, size_bytes, metrics)
-		VALUES ($1, 'ready', $2, '', '', '', 0, $3)
+		INSERT INTO snapshots (version, status, workload_key, gcs_path, repo_commit, size_bytes, metrics)
+		VALUES ($1, 'ready', $2, '', '', 0, $3)
 		ON CONFLICT (version) DO NOTHING
 	`, version, workloadKey, string(metricsJSON))
 
@@ -922,7 +911,7 @@ func hasRefreshCommands(layer snapshot.LayerMaterialized) bool {
 // launchLayerBuildVM creates a GCE instance to build a layer snapshot.
 // It builds its own startup script with all layer-specific flags instead of
 // delegating to launchSnapshotBuilderVMForKey.
-func (s *LayerBuildScheduler) launchLayerBuildVM(ctx context.Context, instanceName, layerHash, commandsJSON, version, parentWorkloadKey, parentVersion, drivesJSON, buildType, githubAppID, githubAppSecret string, snapshotVCPUs, snapshotMemoryMB int, baseImage, runnerUser, oldLayerHash, oldLayerVersion string) error {
+func (s *LayerBuildScheduler) launchLayerBuildVM(ctx context.Context, instanceName, layerHash, commandsJSON, version, parentWorkloadKey, parentVersion, drivesJSON, buildType string, snapshotVCPUs, snapshotMemoryMB int, baseImage, runnerUser, oldLayerHash, oldLayerVersion string) error {
 	if s.snapshotManager.gcpProject == "" {
 		s.logger.Warn("GCP project not configured, skipping VM launch")
 		return nil
@@ -943,13 +932,6 @@ func (s *LayerBuildScheduler) launchLayerBuildVM(ctx context.Context, instanceNa
 
 	sm := s.snapshotManager
 	gcsBase := sm.gcsPath("build-artifacts")
-
-	// Build optional flags
-	githubFlags := ""
-	if githubAppID != "" && githubAppSecret != "" {
-		githubFlags = fmt.Sprintf(`--github-app-id="%s" --github-app-secret="%s" --gcp-project="%s"`,
-			githubAppID, githubAppSecret, sm.gcpProject)
-	}
 
 	// Layer-specific flags
 	layerFlags := fmt.Sprintf(`--layer-hash="%s" --layer-drives='%s' --build-type="%s"`,
@@ -1015,10 +997,10 @@ SNAPSHOT_COMMANDS=$(echo '%s' | base64 -d)
     --vcpus=%d \
     --memory-mb=%d \
     --version="%s" \
-    %s %s
+    %s
 echo "Layer build complete, shutting down..."
 shutdown -h now
-`, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, layerHash, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, base64.StdEncoding.EncodeToString([]byte(commandsJSON)), sm.gcsBucket, sm.gcsPrefix, snapshotVCPUs, snapshotMemoryMB, version, githubFlags, layerFlags)
+`, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, layerHash, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, base64.StdEncoding.EncodeToString([]byte(commandsJSON)), sm.gcsBucket, sm.gcsPrefix, snapshotVCPUs, snapshotMemoryMB, version, layerFlags)
 
 	// Size the builder VM
 	builderVCPUs := 8

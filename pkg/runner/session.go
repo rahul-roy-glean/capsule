@@ -61,8 +61,6 @@ type SessionMetadata struct {
 	PausedAt    time.Time `json:"paused_at"`
 	// RootfsPath is the path to the dirty rootfs overlay for this session.
 	RootfsPath string `json:"rootfs_path"`
-	// RepoCacheUpperPath is the per-runner repo cache writable layer.
-	RepoCacheUpperPath string `json:"repo_cache_upper_path"`
 	// Resource config preserved across pause/resume
 	VCPUs    int `json:"vcpus,omitempty"`
 	MemoryMB int `json:"memory_mb,omitempty"`
@@ -176,7 +174,6 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 		CreatedAt:          runner.CreatedAt,
 		PausedAt:           time.Now(),
 		RootfsPath:         runner.RootfsOverlay,
-		RepoCacheUpperPath: runner.RepoCacheUpper,
 		VCPUs:              runner.Resources.VCPUs,
 		MemoryMB:           runner.Resources.MemoryMB,
 		TTLSeconds:         runner.TTLSeconds,
@@ -560,7 +557,6 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 		CreatedAt:          runner.CreatedAt,
 		PausedAt:           time.Now(),
 		RootfsPath:         runner.RootfsOverlay,
-		RepoCacheUpperPath: runner.RepoCacheUpper,
 		VCPUs:              runner.Resources.VCPUs,
 		MemoryMB:           runner.Resources.MemoryMB,
 		TTLSeconds:         runner.TTLSeconds,
@@ -893,7 +889,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 
 	// Use the session's rootfs overlay (preserved during pause)
 	overlayPath := metadata.RootfsPath
-	repoCacheUpperPath := metadata.RepoCacheUpperPath
 
 	// Build the UFFD handler and state file path, using GCS-backed chunks when
 	// available (metadata.GCSManifestPath is set) or falling back to the local
@@ -1123,11 +1118,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
-	// Include the repo-cache-upper drive in the symlink map so Firecracker can find it.
-	if repoCacheUpperPath != "" {
-		extensionDrivePaths["repo_cache_upper"] = repoCacheUpperPath
-	}
-
 	// Setup symlinks for snapshot restore
 	m.mu.Lock()
 	cleanup, symlinkErr := m.setupSnapshotSymlinks(overlayPath, extensionDrivePaths)
@@ -1208,7 +1198,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		SocketPath:     filepath.Join(m.config.SocketDir, runnerID+".sock"),
 		LogPath:        filepath.Join(m.config.LogDir, runnerID+".log"),
 		RootfsOverlay:  overlayPath,
-		RepoCacheUpper: repoCacheUpperPath,
 		SessionID:      sessionID,
 		SessionDir:     sessionDir,
 		SessionLayers:  metadata.Layers,

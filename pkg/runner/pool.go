@@ -15,7 +15,7 @@ import (
 type RunnerKey struct {
 	SnapshotVersion string            // Snapshot version for binary compatibility
 	Platform        string            // OS/Arch (e.g., "linux/amd64")
-	GitHubRepo      string            // For pre-cloned repo matching
+	AffinityKey     string            // Opaque affinity key for pool reuse matching (e.g. repo name)
 	Labels          map[string]string // Custom matching labels
 }
 
@@ -381,8 +381,8 @@ func (p *Pool) keysMatch(a, b *RunnerKey) bool {
 		return false
 	}
 
-	// GitHubRepo matching (empty matches anything)
-	if a.GitHubRepo != "" && b.GitHubRepo != "" && a.GitHubRepo != b.GitHubRepo {
+	// AffinityKey matching (empty matches anything)
+	if a.AffinityKey != "" && b.AffinityKey != "" && a.AffinityKey != b.AffinityKey {
 		return false
 	}
 
@@ -548,7 +548,7 @@ func (p *Pool) FlushByDesiredVersions(ctx context.Context, desiredVersions map[s
 			remaining = append(remaining, r)
 			continue
 		}
-		desired, exists := desiredVersions[r.Runner.GitHubRepo]
+		desired, exists := desiredVersions[r.Runner.PoolAffinityKey]
 		if exists && r.key.SnapshotVersion != desired {
 			toEvict = append(toEvict, r)
 		} else {

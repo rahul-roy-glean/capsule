@@ -28,9 +28,9 @@ const (
 	SnapshotUploadDuration     HistogramName = "snapshot.upload.duration"
 	SessionPauseDuration       HistogramName = "session.pause.duration"
 	SessionResumeDuration      HistogramName = "session.resume.duration"
-	CacheGitCloneDuration      HistogramName = "cache.git_clone.duration"
-	GitHubRegistrationDuration HistogramName = "github.registration.duration"
-	GitHubJobPickupLatency     HistogramName = "github.job_pickup.latency"
+	CacheGitCloneDuration      HistogramName = "cache.clone.duration"
+	GitHubRegistrationDuration HistogramName = "ci.runner_registration.duration"
+	GitHubJobPickupLatency     HistogramName = "ci.job_pickup.latency"
 	UFFDFaultServiceDuration   HistogramName = "uffd.fault_service.duration"
 	ChunkFetchDuration         HistogramName = "chunk.fetch.duration"
 )
@@ -43,11 +43,11 @@ const (
 	CPAllocations          CounterName = "control_plane.allocations"
 	CPDownscalerActions    CounterName = "control_plane.downscaler.actions"
 	SnapshotRollouts       CounterName = "snapshot.rollouts"
-	CacheBazelRepoHits     CounterName = "cache.bazel_repo.hits"
-	CacheBazelRepoMisses   CounterName = "cache.bazel_repo.misses"
+	CacheArtifactHits      CounterName = "cache.artifact.hits"
+	CacheArtifactMisses    CounterName = "cache.artifact.misses"
 	CacheGitClones         CounterName = "cache.git_clones"
-	GitHubTokenRequests    CounterName = "github.token_requests"
-	GitHubJobs             CounterName = "github.jobs"
+	CITokenRequests        CounterName = "ci.token_requests"
+	CIJobs                 CounterName = "ci.jobs"
 	ChunkedPageFaults      CounterName = "chunked.page_faults"
 	ChunkedCacheHits       CounterName = "chunked.cache_hits"
 	ChunkedChunkFetches    CounterName = "chunked.chunk_fetches"
@@ -98,7 +98,7 @@ const (
 	SnapshotAge           GaugeName = "snapshot.age"
 	HostGCSSyncBytes      GaugeName = "host.gcs_sync.bytes"
 	HostUptime            GaugeName = "host.uptime"
-	CacheBazelRepoSize    GaugeName = "cache.bazel_repo.size"
+	CacheArtifactSize     GaugeName = "cache.artifact.size"
 	NetworkConnections    GaugeName = "network.nat_connections"
 )
 
@@ -123,11 +123,11 @@ var counterDescriptions = map[CounterName]string{
 	CPAllocations:          "Total VM allocations performed by the control plane",
 	CPDownscalerActions:    "Total downscaler actions taken",
 	SnapshotRollouts:       "Total snapshot rollouts",
-	CacheBazelRepoHits:     "Bazel repo cache hits",
-	CacheBazelRepoMisses:   "Bazel repo cache misses",
+	CacheArtifactHits:      "Artifact cache hits",
+	CacheArtifactMisses:    "Artifact cache misses",
 	CacheGitClones:         "Total git clone operations",
-	GitHubTokenRequests:    "Total GitHub token requests",
-	GitHubJobs:             "Total GitHub jobs processed",
+	CITokenRequests:        "Total CI token requests",
+	CIJobs:                 "Total CI jobs processed",
 	ChunkedPageFaults:      "Total page faults handled by chunked loader",
 	ChunkedCacheHits:       "Chunk cache hits",
 	ChunkedChunkFetches:    "Total chunk fetches from remote storage",
@@ -229,7 +229,7 @@ var gaugeDescriptions = map[GaugeName]string{
 	SnapshotAge:           "Age of the current snapshot in seconds",
 	HostGCSSyncBytes:      "Bytes synced from GCS",
 	HostUptime:            "Host uptime in seconds",
-	CacheBazelRepoSize:    "Bazel repo cache size in bytes",
+	CacheArtifactSize:     "Artifact cache size in bytes",
 	NetworkConnections:    "Number of active NAT connections",
 }
 

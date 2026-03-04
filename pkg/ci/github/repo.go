@@ -1,4 +1,4 @@
-package main
+package github
 
 import (
 	"fmt"
@@ -7,8 +7,8 @@ import (
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
-// parseGitHubRepo extracts owner and repo name from various GitHub URL formats.
-func parseGitHubRepo(repoURL string) (owner, repoName string, err error) {
+// ParseGitHubRepo extracts owner and repo name from various GitHub URL formats.
+func ParseGitHubRepo(repoURL string) (owner, repoName string, err error) {
 	s := repoURL
 
 	// Strip schemes
@@ -31,9 +31,9 @@ func parseGitHubRepo(repoURL string) (owner, repoName string, err error) {
 	return parts[0], parts[1], nil
 }
 
-// extractGitCloneArgs returns the repo URL and branch from a git-clone command,
+// ExtractGitCloneArgs returns the repo URL and branch from a git-clone command,
 // or empty strings if no git-clone command is found.
-func extractGitCloneArgs(commands []snapshot.SnapshotCommand) (repoURL, branch string) {
+func ExtractGitCloneArgs(commands []snapshot.SnapshotCommand) (repoURL, branch string) {
 	for _, cmd := range commands {
 		if cmd.Type == "git-clone" {
 			// Args convention: ["<repo-url>", "<branch>"] or just ["<repo-url>"]
@@ -50,4 +50,18 @@ func extractGitCloneArgs(commands []snapshot.SnapshotCommand) (repoURL, branch s
 		}
 	}
 	return "", ""
+}
+
+// RepoFromCommands extracts the CI repository identifier (owner/name) from
+// snapshot init commands. Returns "" if no repository can be determined.
+func RepoFromCommands(commands []snapshot.SnapshotCommand) string {
+	repoURL, _ := ExtractGitCloneArgs(commands)
+	if repoURL == "" {
+		return ""
+	}
+	owner, repoName, err := ParseGitHubRepo(repoURL)
+	if err != nil {
+		return ""
+	}
+	return owner + "/" + repoName
 }

@@ -31,8 +31,8 @@ func TestAllCountersHaveDescriptions(t *testing.T) {
 		VMAllocations, VMTerminations,
 		CPWebhookRequests, CPAllocations, CPDownscalerActions,
 		SnapshotRollouts,
-		CacheBazelRepoHits, CacheBazelRepoMisses, CacheGitClones,
-		GitHubTokenRequests, GitHubJobs,
+		CacheArtifactHits, CacheArtifactMisses, CacheGitClones,
+		CITokenRequests, CIJobs,
 		ChunkedPageFaults, ChunkedCacheHits, ChunkedChunkFetches,
 		ChunkedDiskReads, ChunkedDiskWrites,
 		PoolHits, PoolMisses, PoolEvictions, PoolRecycleFailures,
@@ -59,7 +59,7 @@ func TestAllGaugesHaveDescriptions(t *testing.T) {
 		ChunkedDirtyChunks,
 		PoolRunners, PoolMemoryUsed, PoolMemoryMax,
 		SnapshotSize, SnapshotAge,
-		HostGCSSyncBytes, HostUptime, CacheBazelRepoSize, NetworkConnections,
+		HostGCSSyncBytes, HostUptime, CacheArtifactSize, NetworkConnections,
 	}
 	for _, name := range gauges {
 		if _, ok := gaugeDescriptions[name]; !ok {

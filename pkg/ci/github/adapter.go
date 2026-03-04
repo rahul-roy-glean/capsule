@@ -7,8 +7,8 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/ci"
 	gh "github.com/rahul-roy-glean/bazel-firecracker/pkg/github"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
 // Config holds GitHub CI adapter configuration.
@@ -22,14 +22,15 @@ type Config struct {
 	Ephemeral  bool
 }
 
-// Adapter implements ci.Adapter for GitHub Actions.
+// Adapter also holds optional webhook deps for wiring the webhook handler.
 type Adapter struct {
-	config Config
-	client *gh.TokenClient
-	logger *logrus.Entry
+	config      Config
+	client      *gh.TokenClient
+	logger      *logrus.Entry
+	webhookDeps *WebhookDeps
 }
 
-var _ ci.Adapter = (*Adapter)(nil)
+
 
 // NewAdapter creates a new GitHub CI adapter.
 func NewAdapter(ctx context.Context, cfg Config, logger *logrus.Logger) (*Adapter, error) {
@@ -49,9 +50,23 @@ func NewAdapter(ctx context.Context, cfg Config, logger *logrus.Logger) (*Adapte
 	}, nil
 }
 
+// NewWebhookAdapter creates a GitHub adapter with no API client — suitable for
+// serving webhooks and RepoFromCommands without needing GitHub App credentials.
+func NewWebhookAdapter(logger *logrus.Logger) *Adapter {
+	return &Adapter{
+		logger: logger.WithField("component", "ci-github"),
+	}
+}
+
+// SetWebhookDeps wires the dependencies needed to serve the GitHub webhook.
+// Call this after creating the adapter to enable WebhookHandler().
+func (a *Adapter) SetWebhookDeps(deps WebhookDeps) {
+	a.webhookDeps = &deps
+}
+
 func (a *Adapter) Name() string { return "github-actions" }
 
-func (a *Adapter) GetRunnerToken(ctx context.Context, opts ci.RunnerTokenOpts) (string, error) {
+func (a *Adapter) GetRunnerToken(ctx context.Context, opts RunnerTokenOpts) (string, error) {
 	org := opts.Org
 	if org == "" {
 		org = a.config.Org
@@ -80,7 +95,7 @@ func (a *Adapter) RunnerURL() string {
 	return ""
 }
 
-func (a *Adapter) OnDrain(ctx context.Context, runners []ci.RunnerInfo) error {
+func (a *Adapter) OnDrain(ctx context.Context, runners []RunnerInfo) error {
 	repo := a.config.Repo
 	if repo == "" {
 		a.logger.Debug("No GitHub repo configured, skipping drain label removal")
@@ -110,12 +125,23 @@ func (a *Adapter) OnDrain(ctx context.Context, runners []ci.RunnerInfo) error {
 	return nil
 }
 
-func (a *Adapter) OnRelease(ctx context.Context, runner ci.RunnerInfo) error {
+func (a *Adapter) OnRelease(ctx context.Context, runner RunnerInfo) error {
 	return nil
 }
 
 func (a *Adapter) WebhookHandler() http.Handler {
-	return nil // Webhook is handled by the control-plane's existing handler
+	if a.webhookDeps != nil {
+		return NewGitHubWebhookHandler(*a.webhookDeps)
+	}
+	return nil
+}
+
+func (a *Adapter) WebhookPath() string {
+	return "/webhook/github"
+}
+
+func (a *Adapter) RepoFromCommands(commands []snapshot.SnapshotCommand) string {
+	return RepoFromCommands(commands)
 }
 
 func (a *Adapter) Close() error {

@@ -277,8 +277,8 @@ func TestResolvePolicy(t *testing.T) {
 
 	// Preset name
 	p := ResolvePolicy(PresetCIStandard, nil)
-	if p == nil || p.Name != "ci-standard" {
-		t.Fatal("expected ci-standard preset")
+	if p == nil || p.Name != "restricted-egress" {
+		t.Fatal("expected restricted-egress preset")
 	}
 
 	// Explicit overrides preset

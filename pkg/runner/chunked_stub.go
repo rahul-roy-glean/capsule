@@ -10,7 +10,6 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/ci"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 )
 
@@ -23,7 +22,6 @@ type ChunkedManager struct {
 // ChunkedManagerConfig extends HostConfig with chunked snapshot settings
 type ChunkedManagerConfig struct {
 	HostConfig
-	CIAdapter           ci.Adapter
 	UseChunkedSnapshots bool
 	UseNetNS            bool
 	ChunkCacheSizeBytes int64
