@@ -91,7 +91,14 @@ func (p *gcpMetadataProvider) Stop() {
 func (p *gcpMetadataProvider) ServeMetadata(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
+	// All GCP metadata responses include this header.
+	w.Header().Set("Metadata-Flavor", "Google")
+
 	switch {
+	case path == "/" || path == "/computeMetadata/v1/" || path == "/computeMetadata/v1":
+		// Ping endpoint — google-auth checks this to detect metadata server availability.
+		// Must return 200 + Metadata-Flavor: Google header.
+		fmt.Fprint(w, "ok")
 	case strings.HasSuffix(path, "/token"):
 		p.serveToken(w)
 	case strings.HasSuffix(path, "/email"):
