@@ -165,29 +165,40 @@ fi
 # =========================================================================
 
 # ---------------------------------------------------------------------------
-header "1. Register snapshot config"
+header "1. Discover workload key"
 # ---------------------------------------------------------------------------
-CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/snapshot-configs" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "display_name": "agent-sandbox-test",
-    "commands": [
-      {"type":"shell","args":["bash","-c","rm -rf /workspace/markupsafe && git clone --depth=1 --branch main https://github.com/pallets/markupsafe /workspace/markupsafe"]},
-      {"type":"shell","args":["bash","-c","rm -rf /workspace/camelcase && git clone --depth=1 --branch main https://github.com/sindresorhus/camelcase /workspace/camelcase"]},
-      {"type":"shell","args":["pip3","install","--break-system-packages","markupsafe"],"run_as_root":true}
-    ],
-    "runner_ttl_seconds": 300,
-    "auto_pause": true,
-    "session_max_age_seconds": 3600,
-    "network_policy_preset": "ci-standard"
-  }')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.workload_key')
+# The snapshot-builder computes the workload_key from the snapshot commands hash.
+# Extract it from the snapshot-builder log, or from the snapshot version string
+# (format: vYYYYMMDD-HHMMSS-<workload_key>).
+WORKLOAD_KEY=""
+
+# Method 1: extract from snapshot-builder log (most reliable)
+BUILDER_LOG="/tmp/fc-dev/logs/agent-snapshot-builder.log"
+if [ -f "$BUILDER_LOG" ]; then
+  WORKLOAD_KEY=$(grep -o '"workload_key":"[^"]*"' "$BUILDER_LOG" | head -1 | cut -d'"' -f4)
+  if [ -n "$WORKLOAD_KEY" ]; then
+    echo "  Extracted from snapshot-builder log"
+  fi
+fi
+
+# Method 2: extract from local metadata.json version field (vDATE-TIME-KEY)
+if [ -z "$WORKLOAD_KEY" ] && [ -f "/tmp/fc-dev/snapshots/metadata.json" ]; then
+  VERSION=$(jq -r '.version // empty' /tmp/fc-dev/snapshots/metadata.json 2>/dev/null || true)
+  if [ -n "$VERSION" ]; then
+    # Version format: v20260303-133715-3d2eb2a0448d29cb → extract last segment
+    WORKLOAD_KEY=$(echo "$VERSION" | rev | cut -d'-' -f1 | rev)
+    if [ -n "$WORKLOAD_KEY" ]; then
+      echo "  Extracted from metadata.json version: $VERSION"
+    fi
+  fi
+fi
+
 echo "  workload_key=$WORKLOAD_KEY"
 
 if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then
-  pass "Snapshot config registered"
+  pass "Workload key discovered: $WORKLOAD_KEY"
 else
-  fail "Snapshot config registration failed"; exit 1
+  fail "Could not discover workload key from snapshot-builder log or metadata.json"; exit 1
 fi
 
 # ---------------------------------------------------------------------------

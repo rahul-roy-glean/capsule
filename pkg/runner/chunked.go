@@ -172,6 +172,7 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 			baseManager.setupExtensionFUSEDisk = cm.setupExtensionFUSEDiskForRunner
 			baseManager.getDirtyRootfsDiskChunks = cm.getDirtyRootfsDiskChunksCallback
 			baseManager.setupRootfsFUSEDisk = cm.setupRootfsFUSEDiskForRunner
+			baseManager.cleanupFUSEDisks = cm.cleanupFUSEDisksForRunner
 			cm.chunkedLogger.Info("GCS-backed session pause/resume enabled (stores wired)")
 		}
 
@@ -1271,6 +1272,27 @@ func (cm *ChunkedManager) getDirtyRootfsDiskChunksCallback(runnerID string) map[
 		return nil
 	}
 	return disk.GetDirtyChunks()
+}
+
+// cleanupFUSEDisksForRunner unmounts and removes all FUSE disks for a runner.
+// Called during pause/checkpoint after VM stop so the next resume can create
+// fresh mounts without collisions.
+func (cm *ChunkedManager) cleanupFUSEDisksForRunner(runnerID string) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if disk, ok := cm.fuseDisks[runnerID]; ok {
+		disk.Unmount()
+		delete(cm.fuseDisks, runnerID)
+		cm.chunkedLogger.WithField("runner_id", runnerID).Debug("Cleaned up rootfs FUSE disk during pause")
+	}
+	if extDisks, ok := cm.fuseExtensionDisks[runnerID]; ok {
+		for driveID, disk := range extDisks {
+			disk.Unmount()
+			cm.chunkedLogger.WithFields(logrus.Fields{"runner_id": runnerID, "drive_id": driveID}).Debug("Cleaned up extension FUSE disk during pause")
+		}
+		delete(cm.fuseExtensionDisks, runnerID)
+	}
 }
 
 // setupRootfsFUSEDiskForRunner creates and mounts a FUSE-backed rootfs disk.
