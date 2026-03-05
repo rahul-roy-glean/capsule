@@ -22,6 +22,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
@@ -369,7 +370,25 @@ func (d *ChunkedDisk) getChunkData(chunkIdx int) ([]byte, error) {
 	}
 
 	atomic.AddUint64(&d.chunkReads, 1)
-	return d.chunkStore.GetChunk(d.ctx, chunk.Hash)
+	start := time.Now()
+	data, err := d.chunkStore.GetChunk(d.ctx, chunk.Hash)
+	elapsed := time.Since(start)
+	if err != nil {
+		d.logger.WithError(err).WithFields(logrus.Fields{
+			"chunk_idx": chunkIdx,
+			"hash":      chunk.Hash[:12],
+			"elapsed":   elapsed,
+		}).Error("FUSE getChunkData failed")
+		return nil, err
+	}
+	if elapsed > 2*time.Second {
+		d.logger.WithFields(logrus.Fields{
+			"chunk_idx": chunkIdx,
+			"hash":      chunk.Hash[:12],
+			"elapsed":   elapsed,
+		}).Warn("FUSE getChunkData slow fetch")
+	}
+	return data, nil
 }
 
 // getOrCreateDirtyChunk gets an existing dirty chunk or creates one (copy-on-write)

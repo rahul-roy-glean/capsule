@@ -377,6 +377,13 @@ func (h *Handler) handleConnection(conn net.Conn) {
 	h.mappings = mappings
 	h.buildChunkLookup()
 
+	nonZeroChunks := 0
+	for i := range h.metadata.MemChunks {
+		if !h.metadata.MemChunks[i].IsZeroChunk() {
+			nonZeroChunks++
+		}
+	}
+
 	// Wire the prefetcher with the UFFD fd and mappings before signaling
 	// connection (the prefetcher's copy workers wait on h.connected).
 	if h.prefetcher != nil {
@@ -384,8 +391,10 @@ func (h *Handler) handleConnection(conn net.Conn) {
 	}
 
 	h.logger.WithFields(logrus.Fields{
-		"fd":       uffdFd,
-		"mappings": len(mappings),
+		"fd":              uffdFd,
+		"mappings":        len(mappings),
+		"total_chunks":    len(h.metadata.MemChunks),
+		"non_zero_chunks": nonZeroChunks,
 	}).Info("Received UFFD file descriptor and memory mappings")
 
 	// Handle page faults
@@ -469,8 +478,24 @@ func (h *Handler) handlePageFaults(uffdFd int) {
 	// Pre-allocate message buffer outside the hot loop to avoid
 	// per-fault heap allocation. uffd_msg is 32 bytes on x86_64.
 	var msgBuf [uffdMsgSize]byte
+	var lastFaultLog time.Time
+	var lastFaultCount uint64
 
 	for {
+		// Periodic fault activity log (every 5s if there were faults)
+		if time.Since(lastFaultLog) > 5*time.Second {
+			currentFaults := atomic.LoadUint64(&h.pageFaults)
+			if currentFaults != lastFaultCount {
+				h.logger.WithFields(logrus.Fields{
+					"total_faults":  currentFaults,
+					"delta":         currentFaults - lastFaultCount,
+					"chunk_fetches": atomic.LoadUint64(&h.chunkFetches),
+				}).Debug("UFFD fault activity")
+				lastFaultCount = currentFaults
+			}
+			lastFaultLog = time.Now()
+		}
+
 		select {
 		case <-h.ctx.Done():
 			return
