@@ -1268,9 +1268,10 @@ func (m *Manager) setupSnapshotSymlinks(overlayPath string, extensionDrivePaths 
 	}{
 		{"rootfs.img", overlayPath},
 	}
-	// Add extension drives by driveID (e.g. "artifact_cache_seed" → "artifact-cache-seed.img")
+	// Add extension drives by driveID. The snapshot-builder bakes in paths using
+	// driveID+".img" (e.g. "bazel_output.img"), so we must match that exactly.
 	for driveID, path := range extensionDrivePaths {
-		name := strings.ReplaceAll(driveID, "_", "-") + ".img"
+		name := driveID + ".img"
 		symlinks = append(symlinks, struct{ name, target string }{name, path})
 	}
 

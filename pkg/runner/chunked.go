@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -915,9 +914,10 @@ func (cm *ChunkedManager) setupChunkedSymlinks(rootfsPath string, extensionDrive
 	}{
 		{"rootfs.img", rootfsPath},
 	}
-	// Add extension drives by driveID (e.g. "artifact_cache_seed" → "artifact-cache-seed.img")
+	// Add extension drives by driveID. The snapshot-builder bakes in paths using
+	// driveID+".img" (e.g. "bazel_output.img"), so we must match that exactly.
 	for driveID, path := range extensionDrivePaths {
-		name := strings.ReplaceAll(driveID, "_", "-") + ".img"
+		name := driveID + ".img"
 		symlinks = append(symlinks, struct{ name, target string }{name, path})
 	}
 
