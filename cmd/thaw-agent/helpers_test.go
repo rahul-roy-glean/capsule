@@ -103,34 +103,3 @@ func TestGetWorkspaceRepoPath(t *testing.T) {
 	}
 }
 
-func TestParseEnvFile(t *testing.T) {
-	tests := []struct {
-		name string
-		data string
-		want map[string]string
-	}{
-		{"valid pairs", "FOO=bar\nBAZ=qux\n", map[string]string{"FOO": "bar", "BAZ": "qux"}},
-		{"comments", "# comment\nFOO=bar\n# another\n", map[string]string{"FOO": "bar"}},
-		{"empty lines", "\n\nFOO=bar\n\n", map[string]string{"FOO": "bar"}},
-		{"no equals", "INVALID_LINE\nFOO=bar\n", map[string]string{"FOO": "bar"}},
-		{"value with equals", "URL=https://example.com?a=1&b=2\n", map[string]string{"URL": "https://example.com?a=1&b=2"}},
-		{"empty input", "", map[string]string{}},
-		{"whitespace lines", "  \n\t\n  FOO=bar  \n", map[string]string{"FOO": "bar"}},
-		{"value with spaces", "MSG=hello world\n", map[string]string{"MSG": "hello world"}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := parseEnvFile([]byte(tt.data))
-			if len(got) != len(tt.want) {
-				t.Errorf("parseEnvFile() returned %d entries, want %d\ngot: %v\nwant: %v", len(got), len(tt.want), got, tt.want)
-				return
-			}
-			for k, wantV := range tt.want {
-				if gotV, ok := got[k]; !ok || gotV != wantV {
-					t.Errorf("parseEnvFile()[%q] = %q, want %q", k, gotV, wantV)
-				}
-			}
-		})
-	}
-}

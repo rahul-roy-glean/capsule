@@ -75,6 +75,8 @@ type LayerStatus struct {
 	Status         string `json:"status"`
 	CurrentVersion string `json:"current_version,omitempty"`
 	Depth          int    `json:"depth"`
+	BuildStatus    string `json:"build_status,omitempty"`
+	BuildVersion   string `json:"build_version,omitempty"`
 }
 
 // RegisterLayeredConfig validates, materializes, and stores a layered config.
@@ -143,6 +145,7 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 				refresh_interval = EXCLUDED.refresh_interval,
 				all_chain_drives = EXCLUDED.all_chain_drives,
 				status = CASE WHEN snapshot_layers.status = 'inactive' THEN 'pending' ELSE snapshot_layers.status END,
+				current_version = CASE WHEN snapshot_layers.status = 'inactive' THEN NULL ELSE snapshot_layers.current_version END,
 				updated_at = NOW()
 		`, layer.LayerHash, parentHash, layer.Name, layer.Depth,
 			string(initCmdsJSON), string(refreshCmdsJSON), string(drivesJSON), string(allChainDrivesJSON), layer.RefreshInterval)
@@ -344,8 +347,12 @@ func (r *LayeredConfigRegistry) GetLayerStatuses(ctx context.Context, configID s
 			FROM snapshot_layers sl
 			JOIN chain c ON sl.layer_hash = c.parent_layer_hash
 		)
-		SELECT layer_hash, config_name, depth, status, current_version
-		FROM chain ORDER BY depth
+		SELECT c.layer_hash, c.config_name, c.depth, c.status, c.current_version,
+		       sb.status, sb.version
+		FROM chain c
+		LEFT JOIN snapshot_builds sb ON sb.layer_hash = c.layer_hash
+			AND sb.status IN ('queued', 'waiting_parent', 'running')
+		ORDER BY c.depth
 	`, leafHash)
 	if err != nil {
 		return nil, err
@@ -355,8 +362,8 @@ func (r *LayeredConfigRegistry) GetLayerStatuses(ctx context.Context, configID s
 	var statuses []LayerStatus
 	for rows.Next() {
 		var ls LayerStatus
-		var status, currentVersion sql.NullString
-		if err := rows.Scan(&ls.LayerHash, &ls.Name, &ls.Depth, &status, &currentVersion); err != nil {
+		var status, currentVersion, buildStatus, buildVersion sql.NullString
+		if err := rows.Scan(&ls.LayerHash, &ls.Name, &ls.Depth, &status, &currentVersion, &buildStatus, &buildVersion); err != nil {
 			continue
 		}
 		if status.Valid {
@@ -366,6 +373,12 @@ func (r *LayeredConfigRegistry) GetLayerStatuses(ctx context.Context, configID s
 		}
 		if currentVersion.Valid {
 			ls.CurrentVersion = currentVersion.String
+		}
+		if buildStatus.Valid {
+			ls.BuildStatus = buildStatus.String
+		}
+		if buildVersion.Valid {
+			ls.BuildVersion = buildVersion.String
 		}
 		statuses = append(statuses, ls)
 	}
@@ -430,8 +443,8 @@ func (r *LayeredConfigRegistry) DeleteLayeredConfig(ctx context.Context, configI
 			continue
 		}
 
-		// Deactivate orphaned layer
-		r.db.ExecContext(ctx, `UPDATE snapshot_layers SET status='inactive' WHERE layer_hash=$1`, layer.LayerHash)
+		// Deactivate orphaned layer and clear current_version so re-registration starts fresh
+		r.db.ExecContext(ctx, `UPDATE snapshot_layers SET status='inactive', current_version=NULL WHERE layer_hash=$1`, layer.LayerHash)
 
 		// Cancel active builds
 		r.db.ExecContext(ctx, `
@@ -625,6 +638,17 @@ func (r *LayeredConfigRegistry) handleTriggerBuild(w http.ResponseWriter, req *h
 
 	layers := snapshot.MaterializeLayers(&cfg)
 	forceRebuild := req.URL.Query().Get("force") == "true"
+	cleanBuild := req.URL.Query().Get("clean") == "true"
+
+	// clean=true: clear current_version for all layers so they rebuild from scratch (init)
+	if cleanBuild {
+		for _, layer := range layers {
+			r.db.ExecContext(req.Context(),
+				`UPDATE snapshot_layers SET current_version=NULL WHERE layer_hash=$1`,
+				layer.LayerHash)
+		}
+	}
+
 	if r.layerBuilder != nil {
 		if err := r.layerBuilder.EnqueueChainBuild(req.Context(), layers, 0, "init", configID, forceRebuild); err != nil {
 			http.Error(w, fmt.Sprintf("failed to enqueue build: %s", err), http.StatusInternalServerError)
@@ -638,6 +662,7 @@ func (r *LayeredConfigRegistry) handleTriggerBuild(w http.ResponseWriter, req *h
 		"config_id": configID,
 		"status":    "build_enqueued",
 		"force":     fmt.Sprintf("%v", forceRebuild),
+		"clean":     fmt.Sprintf("%v", cleanBuild),
 	})
 }
 
