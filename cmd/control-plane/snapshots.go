@@ -587,6 +587,7 @@ shutdown -h now
 	if snapshotVCPUs+2 > builderVCPUs {
 		builderVCPUs = snapshotVCPUs + 2
 	}
+	builderVCPUs = nextValidN2VCPUs(builderVCPUs)
 	machineType := fmt.Sprintf("zones/%s/machineTypes/n2-standard-%d", sm.gcpZone, builderVCPUs)
 	sourceImage := fmt.Sprintf("projects/%s/global/images/family/%s", sm.gcpProject, "firecracker-host")
 	if sm.builderImage != "" {
