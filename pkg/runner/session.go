@@ -134,12 +134,14 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 	memDiffFile := filepath.Join(layerDir, "mem_diff.sparse")
 
 	// Create diff snapshot (pauses VM internally)
+	diffStart := time.Now()
 	if err := vm.CreateDiffSnapshot(ctx, stateFile, memDiffFile); err != nil {
 		m.mu.Lock()
 		runner.State = StateIdle
 		m.mu.Unlock()
 		return nil, fmt.Errorf("failed to create diff snapshot: %w", err)
 	}
+	diffDuration := time.Since(diffStart)
 
 	// Calculate snapshot size
 	var snapshotSize int64
@@ -149,6 +151,11 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 	if info, err := os.Stat(stateFile); err == nil {
 		snapshotSize += info.Size()
 	}
+
+	m.logger.WithFields(logrus.Fields{
+		"diff_snapshot_ms": diffDuration.Milliseconds(),
+		"snapshot_bytes":   snapshotSize,
+	}).Info("Pause: diff snapshot created")
 
 	// Write metadata.json
 	sessionDir := filepath.Join(m.sessionBaseDir(), sessionID)
@@ -222,10 +229,13 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 			baseMemIndex.Region.DefaultFill = "zero"
 		}
 
+		mergeStart := time.Now()
 		newMemIndex, err := uploader.MergeAndUploadMem(ctx, memDiffFile, baseMemIndex)
+		mergeDuration := time.Since(mergeStart)
 		if err != nil {
 			m.logger.WithError(err).Warn("GCS mem chunk upload failed; falling back to local-only session")
 		} else {
+			m.logger.WithField("merge_upload_ms", mergeDuration.Milliseconds()).Info("Pause: MergeAndUploadMem complete")
 			// Attach prefetch mapping from UFFD handler if available.
 			if handler, ok := m.uffdHandlers[runnerID].(*uffd.Handler); ok {
 				if pm := handler.GetPrefetchMapping(); pm != nil {
