@@ -643,14 +643,18 @@ func (r *LayeredConfigRegistry) handleTriggerBuild(w http.ResponseWriter, req *h
 	// clean=true: clear current_version for all layers so they rebuild from scratch (init)
 	if cleanBuild {
 		for _, layer := range layers {
-			r.db.ExecContext(req.Context(),
+			if _, err := r.db.ExecContext(req.Context(),
 				`UPDATE snapshot_layers SET current_version=NULL WHERE layer_hash=$1`,
-				layer.LayerHash)
+				layer.LayerHash); err != nil {
+				logrus.WithError(err).WithField("layer_hash", layer.LayerHash[:16]).Error("Failed to clear layer version during clean build")
+				http.Error(w, "failed to clear layer versions", http.StatusInternalServerError)
+				return
+			}
 		}
 	}
 
 	if r.layerBuilder != nil {
-		if err := r.layerBuilder.EnqueueChainBuild(req.Context(), layers, 0, "init", configID, forceRebuild); err != nil {
+		if err := r.layerBuilder.EnqueueChainBuild(req.Context(), layers, 0, "init", configID, forceRebuild, cleanBuild); err != nil {
 			http.Error(w, fmt.Sprintf("failed to enqueue build: %s", err), http.StatusInternalServerError)
 			return
 		}

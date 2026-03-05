@@ -126,6 +126,11 @@ var globalWarmupState = &WarmupState{
 // MMDS access (the forwarder hijacks 169.254.169.254 from the TAP/MMDS path).
 var globalMetadataForwarderStop func()
 
+// globalProxyEnv holds proxy-related environment variables (HTTPS_PROXY, etc.)
+// set by configureAuthProxy. These are passed to child commands instead of being
+// set process-wide, so they don't persist in snapshots.
+var globalProxyEnv []string
+
 // RegistrationState tracks GitHub runner registration status
 type RegistrationState struct {
 	Attempted bool   `json:"attempted"`
@@ -524,6 +529,9 @@ func main() {
 				// Update the existing mmdsData in-place so the health server sees the new data
 				// (the health server has a reference to the original mmdsData)
 				mmdsData.Latest = newData.Latest
+
+				// Thaw any frozen filesystems before accessing drives.
+				thawFrozenFilesystems()
 
 				// Recreate symlink after restore (tmpfs was fresh, symlink from warmup is gone)
 				// Use configured paths from MMDS
@@ -1503,10 +1511,40 @@ func signalReady() error {
 	return os.WriteFile(*readyFile, []byte(time.Now().Format(time.RFC3339)), 0644)
 }
 
+// thawFrozenFilesystems unfreezes all ext4 filesystems that were frozen by
+// fsfreeze --freeze at the end of the previous warmup. After snapshot restore,
+// the VM resumes with frozen filesystems — any I/O (including umount, stat,
+// chown) blocks indefinitely in D state until we unfreeze.
+// This must be called BEFORE any filesystem access after a snapshot restore.
+func thawFrozenFilesystems() {
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		log.WithError(err).Warn("Failed to read /proc/mounts for thaw")
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		mountPath, fsType := fields[1], fields[2]
+		if fsType != "ext4" || mountPath == "/" {
+			continue
+		}
+		if out, err := exec.Command("fsfreeze", "--unfreeze", mountPath).CombinedOutput(); err != nil {
+			log.WithError(err).WithField("mount_path", mountPath).Debugf("fsfreeze --unfreeze (output: %s)", string(out))
+		} else {
+			log.WithField("mount_path", mountPath).Info("Thawed frozen filesystem")
+		}
+	}
+}
+
 // runWarmupMode runs the snapshot warmup process by dispatching each command,
 // then runs infra-level finalization steps (runner update, page pre-warm) that
 // are always needed regardless of which user commands were specified.
 func runWarmupMode(data *MMDSData) error {
+	thawFrozenFilesystems()
+
 	// Mount extension drives. On reattach, the block device may have been swapped
 	// (old layer's data replaces the parent's empty drive). If the drive is already
 	// mounted, we must unmount+remount so ext4 re-reads the superblock from the
@@ -1524,6 +1562,22 @@ func runWarmupMode(data *MMDSData) error {
 		}
 		if err := os.MkdirAll(d.MountPath, 0755); err != nil {
 			return fmt.Errorf("failed to create mount point %s: %w", d.MountPath, err)
+		}
+		// Find the block device for this label so we can run e2fsck before mount.
+		// Extension drives from a prior snapshot may have dirty ext4 journals
+		// (captured mid-write between sync and VM pause). When mounted with a
+		// different VM memory state (refresh/reattach), the kernel cannot replay
+		// the journal and returns "Structure needs cleaning". e2fsck -p fixes this.
+		devBytes, _ := exec.Command("blkid", "-L", d.Label).Output()
+		devPath := strings.TrimSpace(string(devBytes))
+		if devPath != "" {
+			if out, err := exec.Command("e2fsck", "-p", devPath).CombinedOutput(); err != nil {
+				log.WithError(err).WithFields(logrus.Fields{
+					"label": d.Label, "device": devPath,
+				}).Warnf("e2fsck returned non-zero (output: %s)", string(out))
+			} else {
+				log.WithFields(logrus.Fields{"label": d.Label, "device": devPath}).Debug("e2fsck completed")
+			}
 		}
 		if out, err := exec.Command("mount", "-L", d.Label, d.MountPath).CombinedOutput(); err != nil {
 			return fmt.Errorf("failed to mount label %s at %s: %w (output: %s)", d.Label, d.MountPath, err, string(out))
@@ -1588,6 +1642,29 @@ func runWarmupMode(data *MMDSData) error {
 	updateWarmupState("syncing", "Syncing caches to disk...")
 	exec.Command("sync").Run()
 
+	// Freeze all mounted extension drives so ext4 journals are fully committed
+	// before the snapshot is taken. Without this, the journal can be captured
+	// mid-write (between sync and VM pause), making the drive unmountable when
+	// loaded with a different VM memory state (refresh/reattach builds).
+	var frozenMounts []string
+	for _, d := range data.Latest.Warmup.Drives {
+		if d.MountPath == "" {
+			continue
+		}
+		if exec.Command("mountpoint", "-q", d.MountPath).Run() != nil {
+			continue
+		}
+		if out, err := exec.Command("fsfreeze", "--freeze", d.MountPath).CombinedOutput(); err != nil {
+			log.WithError(err).WithField("mount_path", d.MountPath).Warnf("fsfreeze failed (output: %s)", string(out))
+		} else {
+			frozenMounts = append(frozenMounts, d.MountPath)
+			log.WithField("mount_path", d.MountPath).Info("Froze filesystem for clean snapshot")
+		}
+	}
+	// Note: frozenMounts are left frozen intentionally. The VM will be paused
+	// for snapshot shortly after warmup completes. On next restore, the drives
+	// are unmounted/remounted so the freeze state doesn't carry over.
+
 	return nil
 }
 
@@ -1620,6 +1697,9 @@ func runShellCommand(args []string, runAsRoot bool, data *MMDSData) error {
 		return fmt.Errorf("shell command requires at least one argument")
 	}
 	env := os.Environ()
+	// Append proxy env vars (set by configureAuthProxy) so child commands
+	// route through the auth proxy without polluting the thaw-agent process.
+	env = append(env, globalProxyEnv...)
 	if data != nil {
 		if t := data.Latest.Job.GCPAccessToken; t != "" {
 			env = append(env, "GOOGLE_OAUTH_ACCESS_TOKEN="+t)
@@ -1678,36 +1758,35 @@ func configureAuthProxy(data *MMDSData) (stopForwarder func(), err error) {
 		}
 	}
 
-	// 2. Set proxy environment variables for child processes
-	os.Setenv("HTTPS_PROXY", proxyAddr)
-	os.Setenv("HTTP_PROXY", proxyAddr)
-	os.Setenv("https_proxy", proxyAddr)
-	os.Setenv("http_proxy", proxyAddr)
-	// Metadata requests must bypass the proxy -- they go directly to the auth proxy's
-	// metadata handler via GCE_METADATA_HOST (not through 169.254.169.254, which
-	// Firecracker's MMDS intercepts before it reaches the network).
+	// 2. Build proxy environment variables for child processes.
+	// These are stored in globalProxyEnv and appended to child command environments
+	// rather than set process-wide with os.Setenv. This prevents proxy env vars from
+	// being baked into snapshots and causing "connection refused" errors at runtime
+	// (when the build-time proxy is no longer running).
 	metadataHost := data.Latest.Proxy.MetadataHost
 	noProxy := "169.254.169.254,localhost,127.0.0.1"
 	if metadataHost != "" {
 		noProxy += "," + metadataHost
 	}
-	os.Setenv("NO_PROXY", noProxy)
-	os.Setenv("no_proxy", noProxy)
-
-	// 3. Point google-auth to the auth proxy's metadata handler on the gateway IP.
-	// Firecracker's MMDS captures all traffic to 169.254.169.254, so the real GCE
-	// metadata server is unreachable from inside the VM. GCE_METADATA_HOST tells
-	// the google-auth library to use an alternative metadata endpoint.
+	proxyEnv := []string{
+		"HTTPS_PROXY=" + proxyAddr,
+		"HTTP_PROXY=" + proxyAddr,
+		"https_proxy=" + proxyAddr,
+		"http_proxy=" + proxyAddr,
+		"NO_PROXY=" + noProxy,
+		"no_proxy=" + noProxy,
+	}
 	if metadataHost != "" {
-		os.Setenv("GCE_METADATA_HOST", metadataHost)
+		proxyEnv = append(proxyEnv, "GCE_METADATA_HOST="+metadataHost)
 		log.WithField("metadata_host", metadataHost).Info("Set GCE_METADATA_HOST for google-auth")
 	}
+	globalProxyEnv = proxyEnv
 
 	// 4. Intercept GCE metadata requests at the network level.
 	// Firecracker's MMDS V1 intercepts all traffic to 169.254.169.254 on the
 	// TAP device. By assigning 169.254.169.254 to the loopback interface, we
 	// keep metadata traffic local (kernel delivers to lo, never reaches TAP).
-	// A TCP forwarder then proxies requests to the host-side auth proxy.
+	// An HTTP reverse proxy then forwards requests to the host-side auth proxy.
 	// This is transparent to ALL programs (bazel, pip, gcloud, etc.) -- no
 	// env vars or tool-specific config needed.
 	if metadataHost != "" {
@@ -1725,11 +1804,11 @@ func configureAuthProxy(data *MMDSData) (stopForwarder func(), err error) {
 }
 
 // startMetadataForwarder assigns 169.254.169.254 to the loopback interface and
-// starts a TCP forwarder from 169.254.169.254:80 to metadataHost:80.
+// runs an HTTP reverse proxy from 169.254.169.254:80 to metadataHost:80.
 // This bypasses Firecracker's MMDS (which intercepts 169.254.169.254 on the TAP)
 // by keeping the traffic on lo, then forwarding to the host-side auth proxy.
 //
-// Returns a stop function that removes the IP from lo and closes the listener.
+// Returns a stop function that removes the IP from lo and closes the server.
 // The forwarder MUST be stopped before the MMDS poll loop, because 169.254.169.254
 // on lo prevents the thaw-agent from reading MMDS data (which goes through the TAP).
 func startMetadataForwarder(metadataHost string) (stop func(), err error) {
@@ -1739,6 +1818,52 @@ func startMetadataForwarder(metadataHost string) (stop func(), err error) {
 		return nil, fmt.Errorf("ip addr add 169.254.169.254/32 dev lo: %s: %w", string(out), err)
 	}
 
+	// Use an HTTP reverse proxy instead of raw TCP forwarding. This correctly
+	// handles HTTP connection lifecycle and provides better debugging through
+	// logging of requests and errors.
+	upstream := "http://" + metadataHost + ":80"
+	// Direct HTTP client that ignores proxy env vars — the forwarder must connect
+	// directly to the auth proxy, never routing through HTTPS_PROXY.
+	directClient := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &http.Transport{Proxy: nil},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Forward the request to the host-side auth proxy metadata handler.
+		// Use RequestURI to preserve query parameters (not just Path).
+		proxyReq, _ := http.NewRequestWithContext(r.Context(), r.Method, upstream+r.URL.RequestURI(), r.Body)
+		for k, v := range r.Header {
+			proxyReq.Header[k] = v
+		}
+		proxyReq.Header.Set("Host", r.Host)
+
+		resp, err := directClient.Do(proxyReq)
+		if err != nil {
+			log.WithError(err).WithField("path", r.URL.Path).Error("Metadata forwarder: upstream request failed")
+			http.Error(w, "metadata upstream error", http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+
+		// Copy upstream headers using direct map access with lowercase keys.
+		// Go's w.Header().Set() canonicalizes to Title-Case ("Content-Type"),
+		// but older google-auth versions look up "content-type" (lowercase) in
+		// a plain dict, causing KeyError. Direct map assignment bypasses
+		// canonicalization: w.Header()["content-type"] stores the lowercase key.
+		// We also keep the canonical key so Go's auto Content-Type detection
+		// sees it and doesn't add a duplicate.
+		h := w.Header()
+		for k, vals := range resp.Header {
+			h[k] = vals                        // canonical key (suppresses Go auto-detection)
+			h[strings.ToLower(k)] = vals       // lowercase key (for old google-auth)
+		}
+		w.WriteHeader(resp.StatusCode)
+		w.Write(body)
+	})
+
 	listener, err := gonet.Listen("tcp", "169.254.169.254:80")
 	if err != nil {
 		// Remove the IP we just added since we can't listen
@@ -1746,34 +1871,55 @@ func startMetadataForwarder(metadataHost string) (stop func(), err error) {
 		return nil, fmt.Errorf("listen 169.254.169.254:80: %w", err)
 	}
 
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			go forwardConn(conn, metadataHost+":80")
+	srv := &http.Server{Handler: mux}
+	go srv.Serve(listener)
+
+	// Self-test 1: verify direct upstream connectivity (auth proxy on host).
+	directReq, _ := http.NewRequest("GET", upstream+"/", nil)
+	directReq.Header.Set("Metadata-Flavor", "Google")
+	directResp, directErr := directClient.Do(directReq)
+	if directErr != nil {
+		log.WithError(directErr).Warn("Metadata upstream direct test FAILED — auth proxy may not be reachable on " + metadataHost + ":80")
+	} else {
+		body, _ := io.ReadAll(directResp.Body)
+		directResp.Body.Close()
+		log.WithFields(logrus.Fields{
+			"status":          directResp.StatusCode,
+			"metadata_flavor": directResp.Header.Get("Metadata-Flavor"),
+			"body":            string(body),
+			"upstream":        upstream,
+		}).Info("Metadata upstream direct test result")
+	}
+
+	// Self-test 2: verify end-to-end through the forwarder (169.254.169.254 → host).
+	// Use a separate transport that ignores proxy env vars AND has the lo-bound address.
+	e2eClient := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	testReq, _ := http.NewRequest("GET", "http://169.254.169.254/", nil)
+	testReq.Header.Set("Metadata-Flavor", "Google")
+	testResp, testErr := e2eClient.Do(testReq)
+	if testErr != nil {
+		log.WithError(testErr).Warn("Metadata forwarder e2e self-test FAILED (metadata-based auth may not work)")
+	} else {
+		flavor := testResp.Header.Get("Metadata-Flavor")
+		body, _ := io.ReadAll(testResp.Body)
+		testResp.Body.Close()
+		log.WithFields(logrus.Fields{
+			"status":          testResp.StatusCode,
+			"metadata_flavor": flavor,
+			"body":            string(body),
+		}).Info("Metadata forwarder e2e self-test result")
+		if testResp.StatusCode != 200 || flavor != "Google" {
+			log.Warn("Metadata forwarder e2e self-test: unexpected response (metadata-based auth may not work)")
 		}
-	}()
+	}
 
 	stop = func() {
-		listener.Close()
+		srv.Close()
 		exec.Command("ip", "addr", "del", "169.254.169.254/32", "dev", "lo").Run()
 		log.Info("Metadata forwarder stopped (MMDS access restored)")
 	}
 
 	return stop, nil
-}
-
-func forwardConn(client gonet.Conn, upstream string) {
-	defer client.Close()
-	backend, err := gonet.Dial("tcp", upstream)
-	if err != nil {
-		return
-	}
-	defer backend.Close()
-	go io.Copy(backend, client)
-	io.Copy(client, backend)
 }
 
 // runGCPAuthCommand configures GCP credentials inside the microVM by:
@@ -1899,7 +2045,9 @@ func runGitCloneCommand(args []string, data *MMDSData) error {
 		} else if !strings.HasPrefix(cloneURL, "https://") && !strings.HasPrefix(cloneURL, "git@") {
 			cloneURL = "https://github.com/" + cloneURL
 		}
-		if err := runStreamedCommand("", append(os.Environ(), runnerHome, "GIT_TERMINAL_PROMPT=0"), runnerCred,
+		cloneEnv := append(os.Environ(), globalProxyEnv...)
+		cloneEnv = append(cloneEnv, runnerHome, "GIT_TERMINAL_PROMPT=0")
+		if err := runStreamedCommand("", cloneEnv, runnerCred,
 			"git", "clone", "--branch", repoBranch, "--depth=1", cloneURL, repoDir); err != nil {
 			return fmt.Errorf("git clone failed: %w", err)
 		}
@@ -1967,7 +2115,8 @@ func runGitPullCommand(args []string, data *MMDSData) error {
 	}).Info("Fetching latest changes for incremental warmup")
 
 	// Set remote URL (may have changed token)
-	env := append(os.Environ(), runnerHome, "GIT_TERMINAL_PROMPT=0")
+	env := append(os.Environ(), globalProxyEnv...)
+	env = append(env, runnerHome, "GIT_TERMINAL_PROMPT=0")
 	setURLCmd := exec.Command("git", "-C", repoDir, "remote", "set-url", "origin", fetchURL)
 	setURLCmd.SysProcAttr = runnerCred
 	setURLCmd.Env = env
