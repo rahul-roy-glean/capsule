@@ -31,22 +31,37 @@ func ParseGitHubRepo(repoURL string) (owner, repoName string, err error) {
 	return parts[0], parts[1], nil
 }
 
-// ExtractGitCloneArgs returns the repo URL and branch from a git-clone command,
-// or empty strings if no git-clone command is found.
+// ExtractGitCloneArgs returns the repo URL and branch from a shell command that
+// runs git clone, or empty strings if no such command is found.
+// It scans shell-type commands for "git clone" invocations and extracts the URL
+// (https:// or git@ prefix) and branch (-b flag) from the command string.
 func ExtractGitCloneArgs(commands []snapshot.SnapshotCommand) (repoURL, branch string) {
 	for _, cmd := range commands {
-		if cmd.Type == "git-clone" {
-			// Args convention: ["<repo-url>", "<branch>"] or just ["<repo-url>"]
-			if len(cmd.Args) >= 1 {
-				repoURL = cmd.Args[0]
+		if cmd.Type != "shell" {
+			continue
+		}
+		// Look for "git clone" in any arg (typically the bash -c argument).
+		for _, arg := range cmd.Args {
+			if !strings.Contains(arg, "git clone") {
+				continue
 			}
-			if len(cmd.Args) >= 2 {
-				branch = cmd.Args[1]
+			tokens := strings.Fields(arg)
+			for i, tok := range tokens {
+				// Extract URL
+				if repoURL == "" && (strings.HasPrefix(tok, "https://") || strings.HasPrefix(tok, "git@")) {
+					repoURL = tok
+				}
+				// Extract branch from -b flag
+				if tok == "-b" && i+1 < len(tokens) {
+					branch = tokens[i+1]
+				}
 			}
-			if branch == "" {
-				branch = "main"
+			if repoURL != "" {
+				if branch == "" {
+					branch = "main"
+				}
+				return repoURL, branch
 			}
-			return repoURL, branch
 		}
 	}
 	return "", ""

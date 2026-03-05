@@ -26,8 +26,8 @@ workload:
         - type: "shell"
           args: ["bash", "-c", "curl -L https://packages.gitlab.com/install/repositories/runner/gitlab-runner/script.deb.sh | bash && apt-get install -y gitlab-runner"]
           run_as_root: true
-        - type: "git-clone"
-          args: ["https://gitlab.com/myorg/myrepo", "main"]
+        - type: "shell"
+          args: ["bash", "-c", "git clone --depth=1 -b main https://gitlab.com/myorg/myrepo /workspace"]
         - type: "shell"
           args: ["npm", "install", "--prefix", "/workspace"]
       refresh_interval: "6h"

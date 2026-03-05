@@ -27,8 +27,8 @@ frameworks. It provides four generic primitives:
 
 ```yaml
 snapshot_commands:
-  - type: "git-clone"
-    args: ["https://github.com/myorg/myrepo", "main"]
+  - type: "shell"
+    args: ["bash", "-c", "git clone --depth=1 -b main https://github.com/myorg/myrepo /workspace"]
   - type: "shell"
     args: ["bazel", "fetch", "//..."]
 ```
@@ -82,9 +82,8 @@ credentials drive inside the VM.
 
 | `type` | `args` | Notes |
 |---|---|---|
-| `git-clone` | `[url, branch]` | Clones repo into `/workspace`; uses token if configured |
-| `gcp-auth` | `[service-account-email]` | Authenticates `gcloud` as the given service account |
 | `shell` | `[command, arg1, ...]` | Runs arbitrary shell command inside the VM |
+| `gcp-auth` | `[service-account-email]` | Authenticates `gcloud` as the given service account |
 | `exec` | `[binary, arg1, ...]` | Runs a binary directly (no shell) |
 
 The `WorkloadKey` (used for pool matching and GCS routing) is a 16-char SHA256 hash of the sorted `snapshot_commands` and `drives` list. Two configs with the same commands and drives produce the same key and share snapshot chunks in GCS.

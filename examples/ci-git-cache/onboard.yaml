@@ -22,8 +22,8 @@ workload:
     # Layer 1: Clone repo and pre-populate git cache
     - name: "workspace"
       init_commands:
-        - type: "git-clone"
-          args: ["https://github.com/myorg/myrepo", "main"]
+        - type: "shell"
+          args: ["bash", "-c", "git clone --depth=1 -b main https://github.com/myorg/myrepo /workspace"]
         - type: "gcp-auth"
           args: ["my-sa@my-project.iam.gserviceaccount.com"]
       refresh_interval: "on_push"

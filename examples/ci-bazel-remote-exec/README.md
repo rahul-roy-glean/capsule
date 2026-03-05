@@ -1,34 +1,10 @@
 # Example: Bazel + Buildbarn Remote Execution
 
-This example demonstrates how the previously-hardcoded Bazel constructs
-(`BazelConfig`, `ensureCredentialsImage`, `repo_cache_upper`, Buildbarn certs)
-are expressed using only the generic platform primitives.
+This example demonstrates how Bazel constructs (artifact cache, Buildbarn certs,
+repo cache overlay) are expressed using only the generic platform primitives:
+`DriveSpec`, `SnapshotCommand`, and `init_commands`.
 
-## What was hardcoded before
-
-The old config used dedicated platform constructs:
-
-```yaml
-# OLD — hardcoded Bazel/Buildbarn support
-bazel:
-  warmup_targets: "//..."
-  repo_cache_upper_size_gb: 10
-  buildbarn:
-    certs_dir: "/etc/glean/ci/certs/buildbarn"
-    certs_mount: "/etc/bazel-firecracker/certs/buildbarn"
-    certs_image_size_mb: 32
-```
-
-This required:
-- `BazelConfig` struct (11 fields) in `pkg/runner/types.go`
-- `ensureCredentialsImage()` in `pkg/runner/manager.go` (builds ext4 at host startup)
-- `createExt4Image()` hardcoded in `AllocateRunner` for `repo_cache_upper`
-- `mountBuildbarnCerts()` in thaw-agent
-- `setupRepoCacheOverlay()` in thaw-agent
-- 6 dedicated flags in `firecracker-manager`
-- 8 dedicated flags in `thaw-agent`
-
-## How it works now: just `DriveSpec` + `SnapshotCommand`
+## How it works: `DriveSpec` + `SnapshotCommand`
 
 ### Artifact cache (seed + overlay)
 
@@ -93,8 +69,7 @@ init_commands:
 
 ### Runner registration
 
-GitHub Actions registration is a `start_command` — no `IntegrationName`,
-no `ci.Adapter`, no `CIConfig`:
+GitHub Actions registration is a `start_command` -- no special CI config needed:
 
 ```yaml
 start_command:
@@ -104,19 +79,18 @@ start_command:
     CI_RUNNER_TOKEN: "${ci_runner_token}"
 ```
 
-## What gets deleted
+## What the generic primitives replace
 
 | Old construct | Replaced by |
 |---|---|
-| `BazelConfig` struct (11 fields) | `DriveSpec` entries in `LayeredConfig` |
-| `ensureCredentialsImage()` | `DriveSpec` with `commands` |
-| `createExt4Image()` for repo_cache_upper | `DriveSpec` with `read_only: false` |
-| `mountBuildbarnCerts()` in thaw-agent | Generic drive auto-mount + `init_command` |
-| `setupRepoCacheOverlay()` in thaw-agent | `init_command` shell overlay mount |
-| `setupCredentialSymlinks()` in thaw-agent | `init_command` shell symlinks |
-| `CIConfig` struct (9 fields) | `start_command` + MMDS token injection |
-| `ci.Adapter` interface | Direct `cigithub.Client` (nilable) |
-| 14+ dedicated flags | Zero — all config in `onboard.yaml` |
+| Hardcoded artifact-cache logic | `DriveSpec` entries in `LayeredConfig` |
+| Hardcoded credentials-image builder | `DriveSpec` with `commands` |
+| Hardcoded per-runner ext4 creation | `DriveSpec` with `read_only: false` |
+| Hardcoded cert-mount in thaw-agent | Generic drive auto-mount + `init_command` |
+| Hardcoded overlay setup in thaw-agent | `init_command` shell overlay mount |
+| Hardcoded symlink setup in thaw-agent | `init_command` shell symlinks |
+| Hardcoded CI config struct | `start_command` + MMDS token injection |
+| Dedicated CLI flags | Zero -- all config in `onboard.yaml` |
 
 ## Onboard
 

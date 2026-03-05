@@ -526,12 +526,28 @@ func main() {
 		}
 	}
 
-	// Derive informational repo URL from git-clone command (best-effort, for metadata only).
+	// Derive informational repo URL from shell git-clone command (best-effort, for metadata only).
 	metaRepoURL := ""
 	for _, cmd := range commands {
-		if cmd.Type == "git-clone" && len(cmd.Args) > 0 {
-			metaRepoURL = cmd.Args[0]
-			break
+		if cmd.Type == "shell" && len(cmd.Args) > 0 {
+			// Look for "git clone" in shell command args.
+			for _, arg := range cmd.Args {
+				if strings.Contains(arg, "git clone") {
+					// Extract URL: look for https:// or git@ patterns.
+					for _, token := range strings.Fields(arg) {
+						if strings.HasPrefix(token, "https://") || strings.HasPrefix(token, "git@") {
+							metaRepoURL = token
+							break
+						}
+					}
+					if metaRepoURL != "" {
+						break
+					}
+				}
+			}
+			if metaRepoURL != "" {
+				break
+			}
 		}
 	}
 
@@ -1052,7 +1068,7 @@ func seedExt4ImageFromDir(imgPath, seedDir string, log *logrus.Entry) error {
 		return fmt.Errorf("seed dir is not a directory: %s", seedDir)
 	}
 
-	mountPoint := filepath.Join(filepath.Dir(imgPath), "mnt-repo-cache-seed")
+	mountPoint := filepath.Join(filepath.Dir(imgPath), "mnt-extension-drive")
 	if err := os.MkdirAll(mountPoint, 0755); err != nil {
 		return fmt.Errorf("failed to create mount point: %w", err)
 	}
@@ -1187,7 +1203,7 @@ const snapshotSymlinkDir = "/tmp/snapshot"
 const hostIP = "172.16.0.1" // Gateway IP for the VM tap network
 
 // restoreFromPreviousSnapshot downloads the previous chunked snapshot from GCS,
-// mounts rootfs and repo-cache-seed via FUSE, restores the VM from snapshot,
+// mounts rootfs and extension drives via FUSE, restores the VM from snapshot,
 // injects fresh MMDS data with mode=warmup and a new runner_id, and resumes.
 // The thaw-agent detects the runner_id change and re-runs warmup incrementally.
 func restoreFromPreviousSnapshot(

@@ -35,13 +35,8 @@ func GetAllSteps() []Step {
 		},
 		{
 			Name:        "snapshot-build",
-			Description: "Build Firecracker snapshot with warmed Bazel",
+			Description: "Build Firecracker snapshot with workload warmup",
 			Run:         stepSnapshotBuild,
-		},
-		{
-			Name:        "data-snapshot-build",
-			Description: "Create GCP disk snapshot with all artifacts",
-			Run:         stepDataSnapshotBuild,
 		},
 		{
 			Name:        "terraform-finalize",

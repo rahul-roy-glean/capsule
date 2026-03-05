@@ -542,7 +542,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		}).Debug("Fetched vmstate from chunk store")
 	}
 
-	// In chunked mode, rootfs and repo-cache-seed are served via FUSE, memory
+	// In chunked mode, rootfs and extension drives are served via FUSE, memory
 	// via UFFD, and state was eagerly fetched above. The only traditional local
 	// file we need is the kernel. It is normally fetched by SyncManifest on the
 	// first heartbeat, but if allocation races ahead we fetch it on demand here.
@@ -915,7 +915,7 @@ func (cm *ChunkedManager) setupChunkedSymlinks(rootfsPath string, extensionDrive
 	}{
 		{"rootfs.img", rootfsPath},
 	}
-	// Add extension drives by driveID (e.g. "repo_cache_seed" → "repo-cache-seed.img")
+	// Add extension drives by driveID (e.g. "artifact_cache_seed" → "artifact-cache-seed.img")
 	for driveID, path := range extensionDrivePaths {
 		name := strings.ReplaceAll(driveID, "_", "-") + ".img"
 		symlinks = append(symlinks, struct{ name, target string }{name, path})

@@ -7,8 +7,6 @@ Operational recipes for common tasks.
 - [Deploy from scratch](#deploy-from-scratch)
 - [Build and update host images](#build-and-update-host-images)
 - [Create a new snapshot](#create-a-new-snapshot)
-- [Build a data snapshot for fast host boot](#build-a-data-snapshot-for-fast-host-boot)
-- [Set up git-cache for private repos](#set-up-git-cache-for-private-repos)
 - [Enable GitHub Actions runner registration](#enable-github-actions-runner-registration)
 - [Roll out a host image update](#roll-out-a-host-image-update)
 - [Automate snapshot freshness checks](#automate-snapshot-freshness-checks)
@@ -115,60 +113,6 @@ The snapshot is uploaded to `gs://$BUCKET/current/` and a versioned copy at `gs:
 
 ---
 
-## Build a data snapshot for fast host boot
-
-By default, hosts download snapshots from GCS on first boot (5-15 minutes). A data snapshot pre-populates the data disk so hosts boot in ~30 seconds.
-
-```bash
-# Build the data-snapshot-builder and run it (must run on a GCE VM)
-make data-snapshot-build \
-  PROJECT_ID=$PROJECT_ID \
-  GIT_CACHE_REPOS="github.com/your-org/your-repo:repo-name"
-
-# Then update Terraform to use the snapshot
-cd deploy/terraform
-terraform apply \
-  -var="project_id=$PROJECT_ID" \
-  -var="db_password=$DB_PASSWORD" \
-  -var="use_data_snapshot=true" \
-  -var="data_snapshot_name=runner-data-YYYYMMDD-HHMMSS"
-
-# Roll out hosts with the new data disk
-make mig-rolling-update PROJECT_ID=$PROJECT_ID
-```
-
----
-
-## Set up git-cache for private repos
-
-Git-cache provides an ext4 image with bare git mirrors attached as a read-only block device to each microVM. The thaw agent uses it as a git `--reference`, avoiding network fetches.
-
-```bash
-# 1. Build the git-cache image
-make git-cache-build \
-  GIT_CACHE_REPOS="github.com/your-org/your-repo:repo-name"
-
-# 2. Enable git-cache in Terraform
-cd deploy/terraform
-terraform apply \
-  -var="project_id=$PROJECT_ID" \
-  -var="db_password=$DB_PASSWORD" \
-  -var="git_cache_enabled=true" \
-  -var='git_cache_repos={"github.com/your-org/your-repo":"repo-name"}'
-```
-
-The mapping format is `repo-url-pattern:cache-directory-name`. The thaw agent matches incoming job repos against the patterns to find the right cache directory.
-
-### Check git-cache freshness
-
-```bash
-make git-cache-check
-```
-
-This reports how many commits behind HEAD the cache is and how old it is.
-
----
-
 ## Enable GitHub Actions runner registration
 
 Runners can auto-register with GitHub when a microVM boots.
@@ -257,10 +201,7 @@ The Cloud Build pipelines are in `deploy/cloudbuild/`:
 
 | Pipeline | Purpose |
 |----------|---------|
-| `snapshot-rebuild.yaml` | Rebuild Firecracker snapshot |
-| `git-cache-build.yaml` | Rebuild git-cache image |
-| `git-cache-freshness.yaml` | Check cache freshness |
-| `data-snapshot-build.yaml` | Rebuild data disk snapshot |
+| `snapshot-build.yaml` | Build Firecracker snapshot |
 
 ---
 

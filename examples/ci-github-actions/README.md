@@ -30,34 +30,23 @@ GitHub Actions job triggered
   → VM recycled back to paused pool on completion
 ```
 
-## Key insight: no `ci.system` field
+## Key insight: no CI-specific config
 
-The old config had:
-
-```yaml
-ci:
-  system: "github-actions"
-  github:
-    repo: "myorg/myrepo"
-    labels: ["self-hosted", "firecracker", "bazel"]
-    ephemeral: true
-```
-
-This is unnecessary. The snapshot *is* a GitHub Actions runner because:
+The snapshot *is* a GitHub Actions runner because:
 1. The base image has the runner binary installed
 2. The `start_command` runs `config.sh` with the registration token
 3. The control-plane injects the token via MMDS (`ci_runner_token`)
 
 Swapping to GitLab CI or Buildkite is just changing the `start_command` and
-base image — no platform code changes needed.
+base image -- no platform code changes needed.
 
 ## Configuration
 
 ```yaml
 workload:
   snapshot_commands:
-    - type: "git-clone"
-      args: ["https://github.com/myorg/myrepo", "main"]
+    - type: "shell"
+      args: ["bash", "-c", "git clone --depth=1 -b main https://github.com/myorg/myrepo /workspace"]
     - type: "shell"
       args: ["bazel", "fetch", "//..."]
 

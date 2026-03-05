@@ -1268,7 +1268,7 @@ func (m *Manager) setupSnapshotSymlinks(overlayPath string, extensionDrivePaths 
 	}{
 		{"rootfs.img", overlayPath},
 	}
-	// Add extension drives by driveID (e.g. "repo_cache_seed" → "repo-cache-seed.img")
+	// Add extension drives by driveID (e.g. "artifact_cache_seed" → "artifact-cache-seed.img")
 	for driveID, path := range extensionDrivePaths {
 		name := strings.ReplaceAll(driveID, "_", "-") + ".img"
 		symlinks = append(symlinks, struct{ name, target string }{name, path})

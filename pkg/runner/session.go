@@ -413,7 +413,7 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 		m.logger.WithError(err).Warn("Failed to write session metadata")
 	}
 
-	// Stop VM and clean up resources (but NOT the rootfs overlay or repo cache — session needs them)
+	// Stop VM and clean up resources (but NOT the rootfs overlay or extension drives — session needs them)
 	vm.Stop()
 
 	m.mu.Lock()
@@ -434,7 +434,7 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 
 	m.mu.Lock()
 
-	// Release network namespace / TAP slot but keep overlay and repo cache
+	// Release network namespace / TAP slot but keep overlay and extension drives
 	if m.netnsNetwork != nil {
 		m.netnsNetwork.ReleaseNamespace(runnerID)
 		if slot, ok := m.runnerToSlot[runnerID]; ok {
@@ -1231,7 +1231,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	return runner, nil
 }
 
-// cleanupNetworkOnly releases network resources without touching overlay or repo cache.
+// cleanupNetworkOnly releases network resources without touching overlay or extension drives.
 func (m *Manager) cleanupNetworkOnly(runnerID, _ string) {
 	if m.netnsNetwork != nil {
 		m.netnsNetwork.ReleaseNamespace(runnerID)

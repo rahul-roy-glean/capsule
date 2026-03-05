@@ -1160,7 +1160,7 @@ producerLoop:
 
 // ChunkedSnapshotBuilder creates chunked snapshots from existing snapshot files
 type ChunkedSnapshotBuilder struct {
-	store    *ChunkStore // disk chunks (rootfs, kernel, state, repo-cache-seed)
+	store    *ChunkStore // disk chunks (rootfs, kernel, state, extension drives)
 	memStore *ChunkStore // memory chunks (UFFD); nil falls back to store
 	logger   *logrus.Entry
 	// MemBackend controls how memory is stored: "chunked" (UFFD lazy via MemChunks,
