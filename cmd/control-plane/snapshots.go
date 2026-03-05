@@ -395,6 +395,233 @@ func (sm *SnapshotManager) cleanupBuilderVM(ctx context.Context, instanceName st
 	}
 }
 
+
+// launchSnapshotBuilderVMForKey creates a GCE instance to build a snapshot from commands JSON.
+//
+//nolint:unused // will be wired up when per-key snapshot builds are enabled
+func (sm *SnapshotManager) launchSnapshotBuilderVMForKey(ctx context.Context, instanceName, workloadKey, commandsJSON, version, githubAppID, githubAppSecret string, buildType string, snapshotVCPUs, snapshotMemoryMB int) error {
+	if sm.gcpProject == "" {
+		sm.logger.Warn("GCP project not configured, skipping VM launch")
+		return nil
+	}
+
+	sm.logger.WithFields(logrus.Fields{
+		"instance":     instanceName,
+		"workload_key": workloadKey,
+		"version":      version,
+	}).Info("Launching snapshot builder VM")
+
+	instancesClient, err := compute.NewInstancesRESTClient(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create compute client: %w", err)
+	}
+	defer instancesClient.Close()
+
+	// Build optional flags
+	githubFlags := ""
+	if githubAppID != "" && githubAppSecret != "" {
+		githubFlags = fmt.Sprintf(`--github-app-id="%s" --github-app-secret="%s" --gcp-project="%s"`,
+			githubAppID, githubAppSecret, sm.gcpProject)
+	}
+	gcsBase := sm.gcsPath("build-artifacts")
+	buildTypeFlag := ""
+	if buildType != "" && buildType != "init" {
+		buildTypeFlag = fmt.Sprintf("--build-type=%s", buildType)
+	}
+
+	startupScript := fmt.Sprintf(`#!/bin/bash
+set -e
+exec > >(tee /var/log/snapshot-builder.log) 2>&1
+echo "Starting snapshot builder setup..."
+
+# Install Firecracker
+ARCH=$(uname -m)
+FC_VERSION="1.14.2"
+echo "Installing Firecracker v${FC_VERSION}..."
+cd /tmp
+curl -fSL "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-${ARCH}.tgz" -o firecracker.tgz
+tar xzf firecracker.tgz
+mv "release-v${FC_VERSION}-${ARCH}/firecracker-v${FC_VERSION}-${ARCH}" /usr/local/bin/firecracker
+chmod +x /usr/local/bin/firecracker
+rm -rf firecracker.tgz "release-v${FC_VERSION}-${ARCH}"
+
+# Setup KVM
+modprobe kvm_intel || modprobe kvm_amd || true
+chmod 666 /dev/kvm || true
+
+# Download kernel and rootfs from GCS
+echo "Downloading kernel and rootfs..."
+mkdir -p /opt/firecracker
+gcloud storage cp "gs://%s/%s/kernel.bin" /opt/firecracker/kernel.bin 2>/dev/null \
+    || echo "WARNING: kernel.bin not found"
+gcloud storage cp "gs://%s/%s/%s/rootfs.img" /opt/firecracker/rootfs.img 2>/dev/null \
+    || gcloud storage cp "gs://%s/%s/rootfs.img" /opt/firecracker/rootfs.img 2>/dev/null \
+    || echo "WARNING: rootfs.img not found"
+
+# Download snapshot-builder binary
+if [ ! -f /usr/local/bin/snapshot-builder ]; then
+    gcloud storage cp gs://%s/%s/snapshot-builder /usr/local/bin/snapshot-builder
+    chmod +x /usr/local/bin/snapshot-builder
+fi
+
+# Run snapshot builder
+/usr/local/bin/snapshot-builder \
+    --snapshot-commands='%s' \
+    --gcs-bucket="%s" \
+    --gcs-prefix="%s" \
+    --output-dir=/tmp/snapshot \
+    --log-level=info \
+	--vcpus=%d \
+	--memory-mb=%d \
+    --version="%s" \
+    %s %s
+echo "Snapshot build complete, shutting down..."
+shutdown -h now
+`, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, workloadKey, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, commandsJSON, sm.gcsBucket, sm.gcsPrefix, snapshotVCPUs, snapshotMemoryMB, version, githubFlags, buildTypeFlag)
+
+	// Size the builder VM to fit the snapshot build: give it at least 8 vCPUs
+	// or the snapshot's vCPUs + 2 headroom, whichever is larger.
+	builderVCPUs := 8
+	if snapshotVCPUs+2 > builderVCPUs {
+		builderVCPUs = snapshotVCPUs + 2
+	}
+	builderVCPUs = nextValidN2VCPUs(builderVCPUs)
+	machineType := fmt.Sprintf("zones/%s/machineTypes/n2-standard-%d", sm.gcpZone, builderVCPUs)
+	sourceImage := fmt.Sprintf("projects/%s/global/images/family/%s", sm.gcpProject, "firecracker-host")
+	if sm.builderImage != "" {
+		sourceImage = sm.builderImage
+	}
+	network := sm.builderNetwork
+	if network == "" {
+		network = "default"
+	}
+	networkURL := fmt.Sprintf("projects/%s/global/networks/%s", sm.gcpProject, network)
+
+	req := &computepb.InsertInstanceRequest{
+		Project: sm.gcpProject,
+		Zone:    sm.gcpZone,
+		InstanceResource: &computepb.Instance{
+			Name:        proto.String(instanceName),
+			MachineType: proto.String(machineType),
+			AdvancedMachineFeatures: &computepb.AdvancedMachineFeatures{
+				EnableNestedVirtualization: proto.Bool(true),
+			},
+			Disks: []*computepb.AttachedDisk{
+				{
+					InitializeParams: &computepb.AttachedDiskInitializeParams{
+						DiskSizeGb:  proto.Int64(100),
+						SourceImage: proto.String(sourceImage),
+					},
+					AutoDelete: proto.Bool(true),
+					Boot:       proto.Bool(true),
+				},
+			},
+			NetworkInterfaces: []*computepb.NetworkInterface{
+				{
+					Network: proto.String(networkURL),
+					AccessConfigs: []*computepb.AccessConfig{
+						{
+							Name: proto.String("External NAT"),
+							Type: proto.String("ONE_TO_ONE_NAT"),
+						},
+					},
+				},
+			},
+			Metadata: &computepb.Metadata{
+				Items: []*computepb.Items{
+					{Key: proto.String("startup-script"), Value: proto.String(startupScript)},
+					{Key: proto.String("snapshot-version"), Value: proto.String(version)},
+				},
+			},
+			Labels: map[string]string{
+				"purpose":          "snapshot-builder",
+				"snapshot-version": version,
+			},
+			ServiceAccounts: []*computepb.ServiceAccount{
+				{
+					Email:  proto.String("default"),
+					Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"},
+				},
+			},
+			Scheduling: &computepb.Scheduling{
+				// Refresh builds are fast and cheap to retry — use spot instances.
+				// Init builds are long-running — use on-demand instances.
+				Preemptible: proto.Bool(buildType == "refresh" || buildType == "reattach"),
+			},
+		},
+	}
+
+	op, err := instancesClient.Insert(ctx, req)
+	if err != nil {
+		return fmt.Errorf("failed to create instance: %w", err)
+	}
+	if err := op.Wait(ctx); err != nil {
+		return fmt.Errorf("instance creation failed: %w", err)
+	}
+
+	sm.logger.WithField("instance", instanceName).Info("Snapshot builder VM created")
+	return nil
+}
+
+// monitorSnapshotBuild monitors the snapshot build progress
+func (sm *SnapshotManager) monitorSnapshotBuild(ctx context.Context, version, instanceName string) {
+	sm.logger.WithFields(logrus.Fields{
+		"version":  version,
+		"instance": instanceName,
+	}).Info("Monitoring snapshot build")
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	timeout := time.After(45 * time.Minute)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timeout:
+			sm.logger.WithField("version", version).Error("Snapshot build timed out")
+			sm.UpdateSnapshotStatus(ctx, version, "failed")
+			sm.cleanupBuilderVM(ctx, instanceName)
+			return
+		case <-ticker.C:
+			// Check if snapshot files exist in GCS
+			complete, err := sm.checkSnapshotComplete(ctx, version)
+			if err != nil {
+				sm.logger.WithError(err).Debug("Error checking snapshot completion")
+				continue
+			}
+
+			if complete {
+				sm.logger.WithField("version", version).Info("Snapshot build completed")
+				sm.UpdateSnapshotStatus(ctx, version, "ready")
+				sm.cleanupBuilderVM(ctx, instanceName)
+				return
+			}
+
+			// Check if VM is still running
+			if sm.gcpProject != "" {
+				running, err := sm.isBuilderVMRunning(ctx, instanceName)
+				if err != nil {
+					sm.logger.WithError(err).Debug("Error checking VM status")
+					continue
+				}
+				if !running {
+					// VM terminated without completing - check if snapshot exists
+					complete, _ := sm.checkSnapshotComplete(ctx, version)
+					if complete {
+						sm.UpdateSnapshotStatus(ctx, version, "ready")
+					} else {
+						sm.logger.WithField("version", version).Error("Builder VM terminated without completing snapshot")
+						sm.UpdateSnapshotStatus(ctx, version, "failed")
+					}
+					return
+				}
+			}
+		}
+	}
+}
+
 // GCTerminatedBuilderVMs deletes GCE instances matching "layer-builder-*" that
 // are in TERMINATED state. This catches VMs that were partially created but
 // never cleaned up (e.g. launch failed after Insert but before status='running').
@@ -571,6 +798,89 @@ func (sm *SnapshotManager) SetActiveSnapshotForKey(ctx context.Context, workload
 	}
 
 	return tx.Commit()
+}
+
+// monitorSnapshotBuildForKey monitors a repo-scoped snapshot build.
+// After build completes, it auto-validates and optionally auto-rolls out.
+//
+//nolint:unused // will be wired up when per-key snapshot builds are enabled
+func (sm *SnapshotManager) monitorSnapshotBuildForKey(ctx context.Context, version, instanceName, workloadKey string) {
+	sm.logger.WithFields(logrus.Fields{
+		"version":      version,
+		"instance":     instanceName,
+		"workload_key": workloadKey,
+	}).Info("Monitoring repo snapshot build")
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	timeout := time.After(45 * time.Minute)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timeout:
+			sm.logger.WithField("version", version).Error("Snapshot build timed out")
+			sm.UpdateSnapshotStatus(ctx, version, "failed")
+			sm.cleanupBuilderVM(ctx, instanceName)
+			return
+		case <-ticker.C:
+			complete, err := sm.checkSnapshotComplete(ctx, version)
+			if err != nil {
+				sm.logger.WithError(err).Debug("Error checking snapshot completion")
+				continue
+			}
+
+			if complete {
+				sm.logger.WithField("version", version).Info("Snapshot build completed")
+				sm.UpdateSnapshotStatus(ctx, version, "ready")
+				sm.cleanupBuilderVM(ctx, instanceName)
+
+				// Auto-validate
+				if err := sm.ValidateSnapshot(ctx, version); err != nil {
+					sm.logger.WithError(err).Error("Snapshot validation failed")
+					sm.UpdateSnapshotStatus(ctx, version, "failed")
+					return
+				}
+				sm.UpdateSnapshotStatus(ctx, version, "validating")
+
+				// Check if auto-rollout is enabled for this workload key.
+				var autoRollout bool
+				err := sm.db.QueryRowContext(ctx, `SELECT auto_rollout FROM layered_configs WHERE leaf_workload_key = $1`, workloadKey).Scan(&autoRollout)
+				if err != nil {
+					sm.logger.WithError(err).Warn("Failed to check auto_rollout setting")
+					return
+				}
+
+				if autoRollout {
+					sm.logger.WithField("version", version).Info("Auto-rollout enabled, starting rollout")
+					// The rollout pipeline will handle canary → full rollout
+					sm.UpdateSnapshotStatus(ctx, version, "canary")
+				}
+				return
+			}
+
+			// Check if VM is still running
+			if sm.gcpProject != "" {
+				running, err := sm.isBuilderVMRunning(ctx, instanceName)
+				if err != nil {
+					sm.logger.WithError(err).Debug("Error checking VM status")
+					continue
+				}
+				if !running {
+					complete, _ := sm.checkSnapshotComplete(ctx, version)
+					if complete {
+						sm.UpdateSnapshotStatus(ctx, version, "ready")
+					} else {
+						sm.logger.WithField("version", version).Error("Builder VM terminated without completing snapshot")
+						sm.UpdateSnapshotStatus(ctx, version, "failed")
+					}
+					return
+				}
+			}
+		}
+	}
 }
 
 // --- Version Assignment Methods (Phase 4.3) ---

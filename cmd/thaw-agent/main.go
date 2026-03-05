@@ -28,11 +28,12 @@ import (
 var (
 	mmdsEndpoint   = flag.String("mmds-endpoint", "http://169.254.169.254", "MMDS endpoint")
 	workspaceDir   = flag.String("workspace-dir", "/workspace", "Workspace directory")
-	runnerDir      = flag.String("ci-runner-dir", "/home/sandbox-user", "CI runner working directory")
-	runnerUsername = flag.String("sandbox-user", "runner", "Username for the sandbox user and file ownership (e.g., 'runner' or 'gleanuser')")
+	runnerDir              = flag.String("runner-dir", "", "GitHub runner directory (default: /home/<runner-user>)")
+	runnerUsername         = flag.String("runner-user", "runner", "Username for GitHub runner and file ownership (e.g., 'runner' or 'gleanuser')")
 	logLevel       = flag.String("log-level", "info", "Log level")
 	readyFile      = flag.String("ready-file", "/var/run/thaw-agent/ready", "Ready signal file")
 	skipNetwork    = flag.Bool("skip-network", false, "Skip network configuration")
+	skipRunner             = flag.Bool("skip-runner", false, "Skip GitHub runner registration")
 )
 
 
@@ -46,6 +47,7 @@ type WarmupState struct {
 	CompletedAt      time.Time `json:"completed_at,omitempty"`
 	Duration         string    `json:"duration,omitempty"`
 	ExternalsFetched int       `json:"externals_fetched,omitempty"`
+	RunnerID         string    `json:"runner_id,omitempty"`
 }
 
 // WarmupLogBuffer is a thread-safe ring buffer for streaming warmup command output
@@ -120,6 +122,11 @@ var globalWarmupState = &WarmupState{
 	StartedAt: time.Now(),
 }
 
+// globalMetadataForwarderStop is set by configureAuthProxy when it starts the
+// metadata forwarder. Must be called after warmup commands complete to restore
+// MMDS access (the forwarder hijacks 169.254.169.254 from the TAP/MMDS path).
+var globalMetadataForwarderStop func()
+
 
 // MMDSData represents the data structure from MMDS
 type MMDSData struct {
@@ -160,8 +167,14 @@ type MMDSData struct {
 		} `json:"exec,omitempty"`
 		Warmup struct {
 			Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
+			Drives   []snapshot.DriveSpec       `json:"drives,omitempty"`
 		} `json:"warmup,omitempty"`
-		// Mirrors snapshot.StartCommand — keep in sync with pkg/snapshot/start_command.go.
+		Proxy struct {
+			CACertPEM    string `json:"ca_cert_pem"`
+			Address      string `json:"address"`
+			MetadataHost string `json:"metadata_host"`
+		} `json:"proxy,omitempty"`
+		// Mirrors snapshot.StartCommand -- keep in sync with pkg/snapshot/start_command.go.
 		StartCommand struct {
 			Command    []string          `json:"command,omitempty"`
 			Port       int               `json:"port,omitempty"`
@@ -193,6 +206,11 @@ func main() {
 	}()
 
 	flag.Parse()
+
+	// Default runner-dir to /home/<runner-user> if not explicitly set
+	if *runnerDir == "" {
+		*runnerDir = "/home/" + *runnerUsername
+	}
 
 	// Setup logger
 	log = logrus.New()
@@ -327,6 +345,9 @@ func main() {
 		go startHealthServer(mmdsData)
 		log.Info("Health server started in background for warmup mode")
 
+		// Tag warmup state with runner_id so snapshot-builder can distinguish stale status
+		globalWarmupState.RunnerID = mmdsData.Latest.Meta.RunnerID
+
 		// Run warmup process (blocking until complete)
 		if err := runWarmupMode(mmdsData); err != nil {
 			globalWarmupState.Error = err.Error()
@@ -338,6 +359,14 @@ func main() {
 			globalWarmupState.CompletedAt = time.Now()
 			globalWarmupState.Duration = time.Since(globalWarmupState.StartedAt).String()
 			log.Info("Warmup completed successfully")
+		}
+
+		// Stop metadata forwarder before entering MMDS poll loop.
+		// The forwarder hijacks 169.254.169.254 (binds to lo), which prevents
+		// MMDS access through the TAP. We need MMDS to detect runner_id changes.
+		if globalMetadataForwarderStop != nil {
+			globalMetadataForwarderStop()
+			globalMetadataForwarderStop = nil
 		}
 
 		// Signal ready
@@ -396,7 +425,7 @@ func main() {
 						}
 					}
 
-					globalWarmupState = &WarmupState{StartedAt: time.Now()}
+					globalWarmupState = &WarmupState{StartedAt: time.Now(), RunnerID: newData.Latest.Meta.RunnerID}
 					if err := runWarmupMode(mmdsData); err != nil {
 						globalWarmupState.Error = err.Error()
 						globalWarmupState.Phase = "failed"
@@ -407,6 +436,11 @@ func main() {
 						globalWarmupState.CompletedAt = time.Now()
 						globalWarmupState.Duration = time.Since(globalWarmupState.StartedAt).String()
 						log.Info("Re-warmup completed successfully")
+					}
+					// Stop metadata forwarder before returning to MMDS poll loop
+					if globalMetadataForwarderStop != nil {
+						globalMetadataForwarderStop()
+						globalMetadataForwarderStop = nil
 					}
 					if err := signalReady(); err != nil {
 						log.WithError(err).Error("Failed to signal ready after re-warmup")
@@ -659,8 +693,14 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 				} `json:"exec,omitempty"`
 				Warmup struct {
 					Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
+					Drives   []snapshot.DriveSpec       `json:"drives,omitempty"`
 				} `json:"warmup,omitempty"`
-				// Mirrors snapshot.StartCommand — keep in sync with pkg/snapshot/start_command.go.
+				Proxy struct {
+					CACertPEM    string `json:"ca_cert_pem"`
+					Address      string `json:"address"`
+					MetadataHost string `json:"metadata_host"`
+				} `json:"proxy,omitempty"`
+				// Mirrors snapshot.StartCommand -- keep in sync with pkg/snapshot/start_command.go.
 				StartCommand struct {
 					Command    []string          `json:"command,omitempty"`
 					Port       int               `json:"port,omitempty"`
@@ -990,7 +1030,7 @@ func watchForSnapshotRestore() {
 		}
 		req.Header.Set("Accept", "application/json")
 
-		// Use a fresh client per request — after snapshot restore, pooled
+		// Use a fresh client per request -- after snapshot restore, pooled
 		// connections in http.DefaultClient are stale/dead.
 		client := &http.Client{
 			Timeout: 3 * time.Second,
@@ -1015,7 +1055,7 @@ func watchForSnapshotRestore() {
 			continue
 		}
 
-		// New current_time detected — this means we were restored from a snapshot
+		// New current_time detected -- this means we were restored from a snapshot
 		lastTime = ct
 		hostTime, err := time.Parse(time.RFC3339, ct)
 		if err != nil {
@@ -1041,7 +1081,7 @@ func watchForSnapshotRestore() {
 			"server_time": hostTime.UTC().Format(time.RFC3339),
 		}).Info("Clock synced from MMDS after snapshot restore")
 
-		// Reconfigure network — the VM may have been resumed on a different
+		// Reconfigure network -- the VM may have been resumed on a different
 		// TAP slot with a new IP. Without this, the guest retains the old IP
 		// and cannot receive traffic.
 		newData, fetchErr := fetchMMDSData()
@@ -1199,6 +1239,47 @@ func signalReady() error {
 // then runs infra-level finalization steps (runner update, page pre-warm) that
 // are always needed regardless of which user commands were specified.
 func runWarmupMode(data *MMDSData) error {
+	// Mount extension drives. On reattach, the block device may have been swapped
+	// (old layer's data replaces the parent's empty drive). If the drive is already
+	// mounted, we must unmount+remount so ext4 re-reads the superblock from the
+	// new drive content — otherwise ext4's in-memory state (from the parent snapshot)
+	// is stale and all I/O returns EIO.
+	for _, d := range data.Latest.Warmup.Drives {
+		if d.MountPath == "" || d.Label == "" {
+			continue
+		}
+		if exec.Command("mountpoint", "-q", d.MountPath).Run() == nil {
+			// Drive is mounted from parent snapshot but the block device was
+			// swapped during reattach. Force unmount so we can remount fresh.
+			log.WithFields(logrus.Fields{"label": d.Label, "mount_path": d.MountPath}).Info("Remounting drive (block device may have been swapped)")
+			exec.Command("umount", "-f", d.MountPath).Run()
+		}
+		if err := os.MkdirAll(d.MountPath, 0755); err != nil {
+			return fmt.Errorf("failed to create mount point %s: %w", d.MountPath, err)
+		}
+		if out, err := exec.Command("mount", "-L", d.Label, d.MountPath).CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to mount label %s at %s: %w (output: %s)", d.Label, d.MountPath, err, string(out))
+		}
+		exec.Command("chown", *runnerUsername+":"+*runnerUsername, d.MountPath).Run()
+		log.WithFields(logrus.Fields{"label": d.Label, "mount_path": d.MountPath}).Info("Mounted drive")
+	}
+
+	// Auto-configure proxy if the auth proxy pushed CA cert + address via MMDS.
+	// This replaces the old runGCPAuthCommand auto-setup: the proxy provides both
+	// GCP metadata emulation (for keyrings.google-artifactregistry-auth) and HTTPS
+	// credential injection transparently.
+	if data.Latest.Proxy.Address != "" {
+		log.WithField("proxy_address", data.Latest.Proxy.Address).Info("Configuring auth proxy from MMDS")
+		stopFwd, proxyErr := configureAuthProxy(data)
+		if proxyErr != nil {
+			log.WithError(proxyErr).Warn("Failed to configure auth proxy (non-fatal)")
+		}
+		if stopFwd != nil {
+			// Store stop function so it can be called after warmup to restore MMDS access
+			globalMetadataForwarderStop = stopFwd
+		}
+	}
+
 	for _, cmd := range data.Latest.Warmup.Commands {
 		if err := dispatchCommand(cmd, data); err != nil {
 			return fmt.Errorf("command %s failed: %w", cmd.Type, err)
@@ -1258,6 +1339,132 @@ func runShellCommand(args []string, runAsRoot bool, data *MMDSData) error {
 		return err
 	}
 	return nil
+}
+
+// configureAuthProxy sets up the guest environment to use the host-side auth proxy.
+// It installs the proxy's CA certificate into the system trust store and sets
+// HTTPS_PROXY/HTTP_PROXY environment variables so all child processes (bazel, pip, etc.)
+// route through the proxy for transparent credential injection.
+//
+// Returns a stop function for the metadata forwarder (if started). The caller MUST
+// call stop() after warmup commands complete to restore MMDS access for the poll loop.
+func configureAuthProxy(data *MMDSData) (stopForwarder func(), err error) {
+	proxyAddr := data.Latest.Proxy.Address
+	caCertPEM := data.Latest.Proxy.CACertPEM
+
+	// 1. Install the proxy CA certificate so TLS verification passes through the MITM proxy
+	if caCertPEM != "" {
+		certDir := "/usr/local/share/ca-certificates"
+		if err := os.MkdirAll(certDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create ca-certificates dir: %w", err)
+		}
+		certPath := filepath.Join(certDir, "auth-proxy.crt")
+		if err := os.WriteFile(certPath, []byte(caCertPEM), 0644); err != nil {
+			return nil, fmt.Errorf("failed to write CA cert: %w", err)
+		}
+		if out, err := exec.Command("update-ca-certificates").CombinedOutput(); err != nil {
+			log.WithError(err).WithField("output", string(out)).Warn("update-ca-certificates failed (TLS through proxy may fail)")
+		} else {
+			log.Info("Installed auth proxy CA certificate")
+		}
+	}
+
+	// 2. Set proxy environment variables for child processes
+	os.Setenv("HTTPS_PROXY", proxyAddr)
+	os.Setenv("HTTP_PROXY", proxyAddr)
+	os.Setenv("https_proxy", proxyAddr)
+	os.Setenv("http_proxy", proxyAddr)
+	// Metadata requests must bypass the proxy -- they go directly to the auth proxy's
+	// metadata handler via GCE_METADATA_HOST (not through 169.254.169.254, which
+	// Firecracker's MMDS intercepts before it reaches the network).
+	metadataHost := data.Latest.Proxy.MetadataHost
+	noProxy := "169.254.169.254,localhost,127.0.0.1"
+	if metadataHost != "" {
+		noProxy += "," + metadataHost
+	}
+	os.Setenv("NO_PROXY", noProxy)
+	os.Setenv("no_proxy", noProxy)
+
+	// 3. Point google-auth to the auth proxy's metadata handler on the gateway IP.
+	// Firecracker's MMDS captures all traffic to 169.254.169.254, so the real GCE
+	// metadata server is unreachable from inside the VM. GCE_METADATA_HOST tells
+	// the google-auth library to use an alternative metadata endpoint.
+	if metadataHost != "" {
+		os.Setenv("GCE_METADATA_HOST", metadataHost)
+		log.WithField("metadata_host", metadataHost).Info("Set GCE_METADATA_HOST for google-auth")
+	}
+
+	// 4. Intercept GCE metadata requests at the network level.
+	// Firecracker's MMDS V1 intercepts all traffic to 169.254.169.254 on the
+	// TAP device. By assigning 169.254.169.254 to the loopback interface, we
+	// keep metadata traffic local (kernel delivers to lo, never reaches TAP).
+	// A TCP forwarder then proxies requests to the host-side auth proxy.
+	// This is transparent to ALL programs (bazel, pip, gcloud, etc.) -- no
+	// env vars or tool-specific config needed.
+	if metadataHost != "" {
+		stop, fwdErr := startMetadataForwarder(metadataHost)
+		if fwdErr != nil {
+			log.WithError(fwdErr).Warn("Failed to start metadata forwarder (metadata-based auth may not work)")
+		} else {
+			log.Info("Metadata forwarder active: 169.254.169.254:80 → " + metadataHost + ":80")
+			stopForwarder = stop
+		}
+	}
+
+	log.WithField("proxy", proxyAddr).Info("Auth proxy configured (CA cert + env vars)")
+	return stopForwarder, nil
+}
+
+// startMetadataForwarder assigns 169.254.169.254 to the loopback interface and
+// starts a TCP forwarder from 169.254.169.254:80 to metadataHost:80.
+// This bypasses Firecracker's MMDS (which intercepts 169.254.169.254 on the TAP)
+// by keeping the traffic on lo, then forwarding to the host-side auth proxy.
+//
+// Returns a stop function that removes the IP from lo and closes the listener.
+// The forwarder MUST be stopped before the MMDS poll loop, because 169.254.169.254
+// on lo prevents the thaw-agent from reading MMDS data (which goes through the TAP).
+func startMetadataForwarder(metadataHost string) (stop func(), err error) {
+	// Assign 169.254.169.254 to lo so the kernel delivers locally instead of
+	// routing through the TAP where MMDS would intercept.
+	if out, err := exec.Command("ip", "addr", "add", "169.254.169.254/32", "dev", "lo").CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("ip addr add 169.254.169.254/32 dev lo: %s: %w", string(out), err)
+	}
+
+	listener, err := gonet.Listen("tcp", "169.254.169.254:80")
+	if err != nil {
+		// Remove the IP we just added since we can't listen
+		exec.Command("ip", "addr", "del", "169.254.169.254/32", "dev", "lo").Run()
+		return nil, fmt.Errorf("listen 169.254.169.254:80: %w", err)
+	}
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go forwardConn(conn, metadataHost+":80")
+		}
+	}()
+
+	stop = func() {
+		listener.Close()
+		exec.Command("ip", "addr", "del", "169.254.169.254/32", "dev", "lo").Run()
+		log.Info("Metadata forwarder stopped (MMDS access restored)")
+	}
+
+	return stop, nil
+}
+
+func forwardConn(client gonet.Conn, upstream string) {
+	defer client.Close()
+	backend, err := gonet.Dial("tcp", upstream)
+	if err != nil {
+		return
+	}
+	defer backend.Close()
+	go io.Copy(backend, client)
+	io.Copy(client, backend)
 }
 
 // runStreamedCommand runs a command, capturing stdout/stderr line by line
@@ -1551,8 +1758,8 @@ func runStartCommand(mmdsData *MMDSData) error {
 }
 
 // serviceLogsHandler serves the service log file on the debug port.
-// GET /service-logs — returns full log content
-// GET /service-logs?follow=true — streams new lines as they appear (chunked transfer encoding)
+// GET /service-logs -- returns full log content
+// GET /service-logs?follow=true -- streams new lines as they appear (chunked transfer encoding)
 func serviceLogsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("follow") == "true" {
 		// Streaming mode
@@ -1731,7 +1938,7 @@ func startHealthServer(mmdsData *MMDSData) {
 		Handler: mux,
 	}
 
-	// Check if :10500 is already bound (from warmup mode). If so, skip —
+	// Check if :10500 is already bound (from warmup mode). If so, skip --
 	// the warmup health server is already running and has the same endpoints.
 	ln, err := gonet.Listen("tcp", ":10500")
 	if err != nil {
