@@ -7,7 +7,7 @@ toolchain go1.24.11
 require (
 	bazil.org/fuse v0.0.0-20230120002735-62a210ff1fd5
 	cloud.google.com/go/compute v1.52.0
-	cloud.google.com/go/secretmanager v1.14.7
+	cloud.google.com/go/secretmanager v1.16.0
 	cloud.google.com/go/storage v1.56.0
 	github.com/creack/pty v1.1.24
 	github.com/golang-jwt/jwt/v5 v5.3.0
