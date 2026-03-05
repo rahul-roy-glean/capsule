@@ -5,7 +5,7 @@ Wants=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/thaw-agent --runner-dir=/home/gleanuser --runner-user=gleanuser
+ExecStart=/usr/local/bin/thaw-agent --runner-user=gleanuser
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

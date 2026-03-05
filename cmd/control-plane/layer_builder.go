@@ -67,6 +67,7 @@ func (s *LayerBuildScheduler) Run(ctx context.Context) {
 // tier and credentials with a simple JOIN instead of a recursive CTE.
 func (s *LayerBuildScheduler) EnqueueChainBuild(ctx context.Context, layers []snapshot.LayerMaterialized, startDepth int, buildType string, configID string, force ...bool) error {
 	isForce := len(force) > 0 && force[0]
+	isClean := len(force) > 1 && force[1]
 
 	for i := startDepth; i < len(layers); i++ {
 		layer := layers[i]
@@ -131,10 +132,27 @@ func (s *LayerBuildScheduler) EnqueueChainBuild(ctx context.Context, layers []sn
 
 		effectiveBuildType := buildType
 		var oldLayerHash, oldLayerVersion string
-		if i > startDepth {
-			// Force rebuild: children refresh from their own current version.
-			// This preserves extension drive data (caches, repos) while re-running refresh commands.
-			if isForce && hasRefreshCommands(layer) {
+		if i == startDepth && buildType == "refresh" {
+			// Refresh at the target layer: restore from its own current version
+			// so extension drives (workspace, caches) are preserved.
+			var selfVersion sql.NullString
+			s.db.QueryRowContext(ctx,
+				`SELECT current_version FROM snapshot_layers WHERE layer_hash=$1`,
+				layer.LayerHash).Scan(&selfVersion)
+			if selfVersion.Valid && selfVersion.String != "" {
+				oldLayerHash = layer.LayerHash
+				oldLayerVersion = selfVersion.String
+			} else {
+				// No current version — fall back to init
+				effectiveBuildType = "init"
+			}
+		} else if i > startDepth {
+			// Clean build: always use init commands (ignore any stale current_version).
+			if isClean {
+				effectiveBuildType = "init"
+			} else if isForce && hasRefreshCommands(layer) {
+				// Force rebuild: children refresh from their own current version.
+				// This preserves extension drive data (caches, repos) while re-running refresh commands.
 				var selfVersion sql.NullString
 				s.db.QueryRowContext(ctx,
 					`SELECT current_version FROM snapshot_layers WHERE layer_hash=$1`,
@@ -268,7 +286,9 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 		       sl.config_name,
 		       parent_sl.current_version AS parent_current_version,
 		       lc.tier, lc.github_app_id, lc.github_app_secret,
-		       sb.old_layer_hash, sb.old_layer_version
+		       sb.old_layer_hash, sb.old_layer_version,
+		       lc.config_json,
+		       sb.retry_count, sb.max_retries
 		FROM snapshot_builds sb
 		JOIN claimed c ON sb.build_id = c.build_id
 		JOIN snapshot_layers sl ON sb.layer_hash = sl.layer_hash
@@ -300,6 +320,9 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 		githubAppSecret      sql.NullString
 		oldLayerHash         string
 		oldLayerVersion      string
+		configJSON           sql.NullString
+		retryCount           int
+		maxRetries           int
 	}
 
 	var builds []buildRow
@@ -310,7 +333,7 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 			&b.parentLayerHash, &b.initCmdsJSON, &b.refreshCmdsJSON, &b.drivesJSON, &b.allChainDrivesJSON,
 			&b.configName,
 			&b.parentCurrentVersion, &b.tier, &b.githubAppID, &b.githubAppSecret,
-			&oldHash, &oldVer); err != nil {
+			&oldHash, &oldVer, &b.configJSON, &b.retryCount, &b.maxRetries); err != nil {
 			continue
 		}
 		if oldHash.Valid {
@@ -383,15 +406,27 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 			}
 		}
 
+		// Extract auth config from the layered config JSON (if present)
+		authConfigJSON := ""
+		if b.configJSON.Valid && b.configJSON.String != "" {
+			var lcfg snapshot.LayeredConfig
+			if err := json.Unmarshal([]byte(b.configJSON.String), &lcfg); err == nil && lcfg.Config.Auth != nil {
+				if authBytes, err := json.Marshal(lcfg.Config.Auth); err == nil {
+					authConfigJSON = string(authBytes)
+				}
+			}
+		}
+
 		err := s.launchLayerBuildVM(ctx, instanceName, b.layerHash, commandsJSON, b.version,
 			parentWorkloadKey, parentVersion, b.allChainDrivesJSON, b.buildType,
 			githubAppID, githubAppSecret, snapshotVCPUs, snapshotMemoryMB,
-			baseImage, runnerUser, b.oldLayerHash, b.oldLayerVersion)
+			baseImage, runnerUser, b.oldLayerHash, b.oldLayerVersion, authConfigJSON)
 		if err != nil {
 			s.logger.WithError(err).WithField("build_id", b.buildID).Error("Failed to launch layer build VM")
-			s.db.ExecContext(ctx, `UPDATE snapshot_builds SET status='failed', failure_reason=$2 WHERE build_id=$1`, b.buildID, err.Error())
 			// Clean up VM if it was partially created before the error
 			s.snapshotManager.cleanupBuilderVM(ctx, instanceName)
+			// Use onBuildFailed for retry logic (handles rate limits, transient errors)
+			s.onBuildFailed(ctx, b.buildID, b.layerHash, err.Error(), b.retryCount, b.maxRetries)
 			continue
 		}
 
@@ -526,9 +561,24 @@ func (s *LayerBuildScheduler) onBuildComplete(ctx context.Context, buildID, laye
 		}
 	}
 
+	// Only complete the build if it's still in 'running' state.
+	// A concurrent force-cancel may have set it to 'cancelled'; in that case
+	// we must NOT update the layer's current_version (the clean path cleared it).
+	result, err2 := s.db.ExecContext(ctx, `UPDATE snapshot_builds SET status='completed', completed_at=NOW() WHERE build_id=$1 AND status='running'`, buildID)
+	if err2 != nil {
+		s.logger.WithError(err2).WithField("build_id", buildID).Error("Failed to mark build completed")
+		return
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		s.logger.WithFields(logrus.Fields{
+			"build_id":   buildID,
+			"layer_hash": layerHash[:16],
+		}).Warn("Build was cancelled/failed by another process, skipping completion")
+		return
+	}
+
 	// Update layer status
 	s.db.ExecContext(ctx, `UPDATE snapshot_layers SET current_version=$1, status='active', updated_at=NOW() WHERE layer_hash=$2`, version, layerHash)
-	s.db.ExecContext(ctx, `UPDATE snapshot_builds SET status='completed', completed_at=NOW() WHERE build_id=$1`, buildID)
 
 	// Unblock waiting children (leaf layers have no children, skip the query)
 	if !isLeaf {
@@ -731,6 +781,12 @@ func (s *LayerBuildScheduler) checkRefreshSchedules(ctx context.Context) {
 
 		// Look up owning config for this layer (needed for config_id on build rows)
 		configID := s.lookupConfigIDForLayer(ctx, layerHash)
+		if configID == "" {
+			// Layer is orphaned (config was deleted). Mark inactive to stop future refreshes.
+			s.db.ExecContext(ctx, `UPDATE snapshot_layers SET status='inactive' WHERE layer_hash=$1`, layerHash)
+			s.logger.WithField("layer_hash", layerHash[:16]).Info("Orphaned layer detected during refresh check, marked inactive")
+			continue
+		}
 
 		// Enqueue a refresh build for this layer
 		version := fmt.Sprintf("v%s-%s-%s", now.Format("20060102-150405"), layerHash[:8], fmt.Sprintf("%04d", now.Nanosecond()/1e5))
@@ -922,7 +978,7 @@ func hasRefreshCommands(layer snapshot.LayerMaterialized) bool {
 // launchLayerBuildVM creates a GCE instance to build a layer snapshot.
 // It builds its own startup script with all layer-specific flags instead of
 // delegating to launchSnapshotBuilderVMForKey.
-func (s *LayerBuildScheduler) launchLayerBuildVM(ctx context.Context, instanceName, layerHash, commandsJSON, version, parentWorkloadKey, parentVersion, drivesJSON, buildType, githubAppID, githubAppSecret string, snapshotVCPUs, snapshotMemoryMB int, baseImage, runnerUser, oldLayerHash, oldLayerVersion string) error {
+func (s *LayerBuildScheduler) launchLayerBuildVM(ctx context.Context, instanceName, layerHash, commandsJSON, version, parentWorkloadKey, parentVersion, drivesJSON, buildType, githubAppID, githubAppSecret string, snapshotVCPUs, snapshotMemoryMB int, baseImage, runnerUser, oldLayerHash, oldLayerVersion, authConfigJSON string) error {
 	if s.snapshotManager.gcpProject == "" {
 		s.logger.Warn("GCP project not configured, skipping VM launch")
 		return nil
@@ -973,6 +1029,17 @@ func (s *LayerBuildScheduler) launchLayerBuildVM(ctx context.Context, instanceNa
 		layerFlags += fmt.Sprintf(` --previous-layer-version="%s"`, oldLayerVersion)
 	}
 
+	// Auth config flag: pass via base64-encoded env var to avoid shell quoting issues
+	authConfigSetup := ""
+	if authConfigJSON != "" {
+		authConfigB64 := base64.StdEncoding.EncodeToString([]byte(authConfigJSON))
+		authConfigSetup = fmt.Sprintf(`
+# Decode auth config from base64
+AUTH_CONFIG=$(echo '%s' | base64 -d)
+`, authConfigB64)
+		layerFlags += ` --auth-config="$AUTH_CONFIG"`
+	}
+
 	startupScript := fmt.Sprintf(`#!/bin/bash
 set -e
 exec > >(tee /var/log/snapshot-builder.log) 2>&1
@@ -1004,7 +1071,7 @@ chmod +x /usr/local/bin/thaw-agent
 
 # Decode snapshot commands from base64 to avoid shell quoting issues
 SNAPSHOT_COMMANDS=$(echo '%s' | base64 -d)
-
+%s
 # Run snapshot builder
 /usr/local/bin/snapshot-builder \
     --snapshot-commands="$SNAPSHOT_COMMANDS" \
@@ -1018,13 +1085,15 @@ SNAPSHOT_COMMANDS=$(echo '%s' | base64 -d)
     %s %s
 echo "Layer build complete, shutting down..."
 shutdown -h now
-`, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, layerHash, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, base64.StdEncoding.EncodeToString([]byte(commandsJSON)), sm.gcsBucket, sm.gcsPrefix, snapshotVCPUs, snapshotMemoryMB, version, githubFlags, layerFlags)
+`, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, layerHash, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, base64.StdEncoding.EncodeToString([]byte(commandsJSON)), authConfigSetup, sm.gcsBucket, sm.gcsPrefix, snapshotVCPUs, snapshotMemoryMB, version, githubFlags, layerFlags)
 
-	// Size the builder VM
+	// Size the builder VM. Round up to a valid N2 vCPU count (powers of 2
+	// starting at 2, except 1 is also valid but too small for builds).
 	builderVCPUs := 8
 	if snapshotVCPUs+2 > builderVCPUs {
 		builderVCPUs = snapshotVCPUs + 2
 	}
+	builderVCPUs = nextValidN2VCPUs(builderVCPUs)
 	machineType := fmt.Sprintf("zones/%s/machineTypes/n2-standard-%d", sm.gcpZone, builderVCPUs)
 	sourceImage := fmt.Sprintf("projects/%s/global/images/family/%s", sm.gcpProject, "firecracker-host")
 	if sm.builderImage != "" {

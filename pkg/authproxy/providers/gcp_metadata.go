@@ -50,10 +50,24 @@ func newGCPMetadataProvider(cfg authproxy.ProviderConfig) (authproxy.CredentialP
 		}
 	}
 
+	// Auto-extract project ID from service account email (user@PROJECT.iam.gserviceaccount.com)
+	// when not explicitly configured. google-auth's default() calls get_project_id() on the
+	// metadata server; returning an empty string with 200 causes a KeyError in google-auth
+	// because Go's HTTP server omits Content-Type for zero-byte responses.
+	projectID := cfg.Config["project_id"]
+	if projectID == "" {
+		if parts := strings.SplitN(sa, "@", 2); len(parts) == 2 {
+			domain := parts[1]
+			if strings.HasSuffix(domain, ".iam.gserviceaccount.com") {
+				projectID = strings.TrimSuffix(domain, ".iam.gserviceaccount.com")
+			}
+		}
+	}
+
 	return &gcpMetadataProvider{
 		serviceAccount: sa,
 		scopes:         scopes,
-		projectID:      cfg.Config["project_id"],
+		projectID:      projectID,
 		logger:         logrus.WithField("provider", "gcp-metadata"),
 	}, nil
 }
@@ -91,17 +105,34 @@ func (p *gcpMetadataProvider) Stop() {
 func (p *gcpMetadataProvider) ServeMetadata(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
+	// All GCP metadata responses include this header.
+	w.Header().Set("Metadata-Flavor", "Google")
+
 	switch {
+	case path == "/" || path == "/computeMetadata/v1/" || path == "/computeMetadata/v1":
+		// Ping endpoint — google-auth checks this to detect metadata server availability.
+		// Must return 200 + Metadata-Flavor: Google header.
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "ok")
 	case strings.HasSuffix(path, "/token"):
 		p.serveToken(w)
 	case strings.HasSuffix(path, "/email"):
+		w.Header().Set("Content-Type", "text/plain")
 		fmt.Fprint(w, p.serviceAccount)
 	case strings.HasSuffix(path, "/scopes"):
+		w.Header().Set("Content-Type", "text/plain")
 		fmt.Fprint(w, strings.Join(p.scopes, "\n"))
 	case path == "/computeMetadata/v1/project/project-id":
+		w.Header().Set("Content-Type", "text/plain")
 		fmt.Fprint(w, p.projectID)
 	case path == "/computeMetadata/v1/project/numeric-project-id":
+		w.Header().Set("Content-Type", "text/plain")
 		fmt.Fprint(w, "0")
+	case p.isServiceAccountInfoPath(path):
+		// google-auth's credentials.refresh() calls get_service_account_info()
+		// which requests /instance/service-accounts/{account}/?recursive=true.
+		// Return JSON with email, scopes, and aliases so refresh succeeds.
+		p.serveServiceAccountInfo(w)
 	default:
 		http.NotFound(w, r)
 	}
@@ -192,4 +223,32 @@ func (p *gcpMetadataProvider) refreshLoop() {
 			return
 		}
 	}
+}
+
+// isServiceAccountInfoPath returns true for paths like
+// /computeMetadata/v1/instance/service-accounts/default/
+// /computeMetadata/v1/instance/service-accounts/{email}/
+// which google-auth's get_service_account_info() requests with ?recursive=true.
+func (p *gcpMetadataProvider) isServiceAccountInfoPath(path string) bool {
+	const prefix = "/computeMetadata/v1/instance/service-accounts/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	rest := path[len(prefix):]
+	// Must end with "/" (e.g., "default/" or "sa@proj.iam.gserviceaccount.com/")
+	// and not contain further path segments after the account name.
+	return strings.HasSuffix(rest, "/") && !strings.Contains(rest[:len(rest)-1], "/")
+}
+
+// serveServiceAccountInfo returns JSON matching the GCE metadata recursive
+// service account endpoint. google-auth's Credentials.refresh() calls
+// _metadata.get_service_account_info() which expects this format.
+func (p *gcpMetadataProvider) serveServiceAccountInfo(w http.ResponseWriter) {
+	info := map[string]any{
+		"aliases": []string{"default"},
+		"email":   p.serviceAccount,
+		"scopes":  p.scopes,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(info)
 }

@@ -28,34 +28,12 @@ import (
 var (
 	mmdsEndpoint           = flag.String("mmds-endpoint", "http://169.254.169.254", "MMDS endpoint")
 	workspaceDir           = flag.String("workspace-dir", "/workspace", "Workspace directory")
-	runnerDir              = flag.String("runner-dir", "/home/runner", "GitHub runner directory")
+	runnerDir              = flag.String("runner-dir", "", "GitHub runner directory (default: /home/<runner-user>)")
 	runnerUsername         = flag.String("runner-user", "runner", "Username for GitHub runner and file ownership (e.g., 'runner' or 'gleanuser')")
 	logLevel               = flag.String("log-level", "info", "Log level")
 	readyFile              = flag.String("ready-file", "/var/run/thaw-agent/ready", "Ready signal file")
 	skipNetwork            = flag.Bool("skip-network", false, "Skip network configuration")
 	skipRunner             = flag.Bool("skip-runner", false, "Skip GitHub runner registration")
-	skipRepoCache          = flag.Bool("skip-repo-cache", false, "Skip shared Bazel repository cache overlay setup")
-	skipBuildbarnCerts     = flag.Bool("skip-buildbarn-certs", false, "Skip mounting Buildbarn certificate drive")
-	repoCacheSeedDevice    = flag.String("repo-cache-seed-device", "/dev/vdb", "Block device for shared repo-cache seed (read-only mount inside VM)")
-	repoCacheUpperDevice   = flag.String("repo-cache-upper-device", "/dev/vdc", "Block device for per-runner repo-cache upper (writable mount inside VM)")
-	repoCacheSeedMount     = flag.String("repo-cache-seed-mount", "/mnt/bazel-repo-seed", "Mount point for repo-cache seed device")
-	repoCacheUpperMount    = flag.String("repo-cache-upper-mount", "/mnt/bazel-repo-upper", "Mount point for repo-cache upper device")
-	repoCacheOverlayTarget = flag.String("repo-cache-overlay-target", "/mnt/ephemeral/caches/repository", "Overlay mount target for Bazel --repository_cache")
-	buildbarnCertsDevice   = flag.String("buildbarn-certs-device", "/dev/vdd", "Block device for Buildbarn certs drive (read-only mount inside VM)")
-	buildbarnCertsMount    = flag.String("buildbarn-certs-mount", "/etc/bazel-firecracker/certs/buildbarn", "Mount point for Buildbarn certs inside the microVM")
-	buildbarnCertsLabel    = flag.String("buildbarn-certs-label", "BUILDBARN_CERTS", "Filesystem label for Buildbarn certs drive")
-
-	// Credentials flags (generic replacement for buildbarn-specific certs)
-	skipCredentials   = flag.Bool("skip-credentials", false, "Skip mounting credentials drive")
-	credentialsDevice = flag.String("credentials-device", "/dev/vdd", "Block device for credentials drive")
-	credentialsMount  = flag.String("credentials-mount", "/mnt/credentials", "Mount point for credentials")
-	credentialsLabel  = flag.String("credentials-label", "CREDENTIALS", "Filesystem label for credentials drive")
-
-	// Git cache flags
-	skipGitCache   = flag.Bool("skip-git-cache", false, "Skip git-cache setup and reference cloning")
-	gitCacheDevice = flag.String("git-cache-device", "/dev/vde", "Block device for git-cache (read-only mount inside VM)")
-	gitCacheMount  = flag.String("git-cache-mount", "/mnt/git-cache", "Mount point for git-cache inside the microVM")
-	gitCacheLabel  = flag.String("git-cache-label", "GIT_CACHE", "Filesystem label for git-cache drive")
 )
 
 // WarmupState tracks the current warmup progress (for snapshot building)
@@ -68,6 +46,7 @@ type WarmupState struct {
 	CompletedAt      time.Time `json:"completed_at,omitempty"`
 	Duration         string    `json:"duration,omitempty"`
 	ExternalsFetched int       `json:"externals_fetched,omitempty"`
+	RunnerID         string    `json:"runner_id,omitempty"`
 }
 
 // WarmupLogBuffer is a thread-safe ring buffer for streaming warmup command output
@@ -142,6 +121,16 @@ var globalWarmupState = &WarmupState{
 	StartedAt: time.Now(),
 }
 
+// globalMetadataForwarderStop is set by configureAuthProxy when it starts the
+// metadata forwarder. Must be called after warmup commands complete to restore
+// MMDS access (the forwarder hijacks 169.254.169.254 from the TAP/MMDS path).
+var globalMetadataForwarderStop func()
+
+// globalProxyEnv holds proxy-related environment variables (HTTPS_PROXY, etc.)
+// set by configureAuthProxy. These are passed to child commands instead of being
+// set process-wide, so they don't persist in snapshots.
+var globalProxyEnv []string
+
 // RegistrationState tracks GitHub runner registration status
 type RegistrationState struct {
 	Attempted bool   `json:"attempted"`
@@ -176,9 +165,6 @@ type MMDSData struct {
 			Mode         string `json:"mode,omitempty"`         // "warmup" for snapshot building, empty for normal runner
 			CurrentTime  string `json:"current_time,omitempty"` // RFC3339 timestamp from host for clock sync
 		} `json:"meta"`
-		Buildbarn struct {
-			CertsMountPath string `json:"certs_mount_path,omitempty"`
-		} `json:"buildbarn,omitempty"`
 		Network struct {
 			IP        string `json:"ip"`
 			Gateway   string `json:"gateway"`
@@ -220,8 +206,14 @@ type MMDSData struct {
 		} `json:"runner,omitempty"`
 		Warmup struct {
 			Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
+			Drives   []snapshot.DriveSpec       `json:"drives,omitempty"`
 		} `json:"warmup,omitempty"`
-		// Mirrors snapshot.StartCommand — keep in sync with pkg/snapshot/start_command.go.
+		Proxy struct {
+			CACertPEM    string `json:"ca_cert_pem"`
+			Address      string `json:"address"`
+			MetadataHost string `json:"metadata_host"`
+		} `json:"proxy,omitempty"`
+		// Mirrors snapshot.StartCommand -- keep in sync with pkg/snapshot/start_command.go.
 		StartCommand struct {
 			Command    []string          `json:"command,omitempty"`
 			Port       int               `json:"port,omitempty"`
@@ -253,6 +245,11 @@ func main() {
 	}()
 
 	flag.Parse()
+
+	// Default runner-dir to /home/<runner-user> if not explicitly set
+	if *runnerDir == "" {
+		*runnerDir = "/home/" + *runnerUsername
+	}
 
 	// Setup logger
 	log = logrus.New()
@@ -350,39 +347,6 @@ func main() {
 	// Initialize structured metrics logger for GCP log-based metrics
 	metrics = telemetry.NewStructuredLogger(log, "thaw-agent", mmdsData.Latest.Meta.RunnerID)
 
-	// Setup shared repo cache overlay (seed is shared across VMs, upper is per-VM).
-	setStep("repo_cache_overlay")
-	if !*skipRepoCache {
-		log.Info("Setting up shared Bazel repository cache overlay...")
-		if err := setupRepoCacheOverlay(); err != nil {
-			log.WithError(err).Error("Failed to setup repo cache overlay")
-		}
-	}
-	bootTimer.Phase("repo_cache_overlay")
-
-	// Mount credentials drive (shared read-only image with certs, keys, etc.)
-	if !*skipCredentials && !*skipBuildbarnCerts {
-		log.Info("Mounting credentials drive...")
-		if err := mountCredentials(mmdsData); err != nil {
-			log.WithError(err).Error("Failed to mount credentials drive")
-			// Fall back to legacy Buildbarn certs mount
-			log.Info("Falling back to legacy Buildbarn certs mount...")
-			if err := mountBuildbarnCerts(mmdsData); err != nil {
-				log.WithError(err).Error("Failed to mount Buildbarn certs (legacy fallback)")
-			}
-		}
-	}
-	bootTimer.Phase("credentials_mount")
-
-	// Mount git-cache for fast reference cloning
-	if !*skipGitCache && mmdsData.Latest.GitCache.Enabled {
-		log.Info("Mounting git-cache...")
-		if err := mountGitCache(mmdsData); err != nil {
-			log.WithError(err).Error("Failed to mount git-cache")
-		}
-	}
-	bootTimer.Phase("git_cache_mount")
-
 	// Configure network
 	setStep("network_config")
 	if !*skipNetwork {
@@ -443,19 +407,6 @@ func main() {
 		}
 	}
 
-	// Setup workspace from git-cache (local copy only, no network fetch)
-	// This gives actions/checkout a head start - it only needs to fetch deltas
-	setStep("git_workspace_setup")
-	if mmdsData.Latest.GitCache.Enabled && mmdsData.Latest.Job.Repo != "" {
-		log.Info("Setting up workspace from git-cache...")
-		if err := setupWorkspaceFromGitCache(mmdsData); err != nil {
-			log.WithError(err).Warn("Failed to setup workspace from git-cache, workflow will do full clone")
-		}
-	} else {
-		log.Info("Git-cache not enabled, workflow will clone repo")
-	}
-	bootTimer.Phase("git_sync")
-
 	// Check if we're in warmup mode (for snapshot building)
 	if mmdsData.Latest.Meta.Mode == "warmup" {
 		log.Info("Running in WARMUP mode for snapshot building")
@@ -463,6 +414,9 @@ func main() {
 		// Start health server in background FIRST so snapshot-builder can poll us
 		go startHealthServer(mmdsData)
 		log.Info("Health server started in background for warmup mode")
+
+		// Tag warmup state with runner_id so snapshot-builder can distinguish stale status
+		globalWarmupState.RunnerID = mmdsData.Latest.Meta.RunnerID
 
 		// Run warmup process (blocking until complete)
 		if err := runWarmupMode(mmdsData); err != nil {
@@ -475,6 +429,14 @@ func main() {
 			globalWarmupState.CompletedAt = time.Now()
 			globalWarmupState.Duration = time.Since(globalWarmupState.StartedAt).String()
 			log.Info("Warmup completed successfully")
+		}
+
+		// Stop metadata forwarder before entering MMDS poll loop.
+		// The forwarder hijacks 169.254.169.254 (binds to lo), which prevents
+		// MMDS access through the TAP. We need MMDS to detect runner_id changes.
+		if globalMetadataForwarderStop != nil {
+			globalMetadataForwarderStop()
+			globalMetadataForwarderStop = nil
 		}
 
 		// Signal ready
@@ -533,7 +495,7 @@ func main() {
 						}
 					}
 
-					globalWarmupState = &WarmupState{StartedAt: time.Now()}
+					globalWarmupState = &WarmupState{StartedAt: time.Now(), RunnerID: newData.Latest.Meta.RunnerID}
 					if err := runWarmupMode(mmdsData); err != nil {
 						globalWarmupState.Error = err.Error()
 						globalWarmupState.Phase = "failed"
@@ -544,6 +506,11 @@ func main() {
 						globalWarmupState.CompletedAt = time.Now()
 						globalWarmupState.Duration = time.Since(globalWarmupState.StartedAt).String()
 						log.Info("Re-warmup completed successfully")
+					}
+					// Stop metadata forwarder before returning to MMDS poll loop
+					if globalMetadataForwarderStop != nil {
+						globalMetadataForwarderStop()
+						globalMetadataForwarderStop = nil
 					}
 					if err := signalReady(); err != nil {
 						log.WithError(err).Error("Failed to signal ready after re-warmup")
@@ -562,6 +529,9 @@ func main() {
 				// Update the existing mmdsData in-place so the health server sees the new data
 				// (the health server has a reference to the original mmdsData)
 				mmdsData.Latest = newData.Latest
+
+				// Thaw any frozen filesystems before accessing drives.
+				thawFrozenFilesystems()
 
 				// Recreate symlink after restore (tmpfs was fresh, symlink from warmup is gone)
 				// Use configured paths from MMDS
@@ -764,233 +734,6 @@ func main() {
 	select {}
 }
 
-func setupRepoCacheOverlay() error {
-	// Ensure mount points exist
-	if err := os.MkdirAll(*repoCacheSeedMount, 0755); err != nil {
-		return fmt.Errorf("failed to create seed mount dir: %w", err)
-	}
-	if err := os.MkdirAll(*repoCacheUpperMount, 0755); err != nil {
-		return fmt.Errorf("failed to create upper mount dir: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(*repoCacheOverlayTarget), 0755); err != nil {
-		return fmt.Errorf("failed to create overlay target parent dir: %w", err)
-	}
-	if err := os.MkdirAll(*repoCacheOverlayTarget, 0755); err != nil {
-		return fmt.Errorf("failed to create overlay target dir: %w", err)
-	}
-
-	seedDev := resolveDevice(*repoCacheSeedDevice, "BAZEL_REPO_SEED")
-	upperDev := resolveDevice(*repoCacheUpperDevice, "BAZEL_REPO_UPPER")
-
-	// Mount seed read-only (safe to share)
-	// Ignore if already mounted.
-	exec.Command("mountpoint", "-q", *repoCacheSeedMount).Run()
-	if err := exec.Command("mount", "-o", "ro", seedDev, *repoCacheSeedMount).Run(); err != nil {
-		// If mount fails because it's already mounted, proceed.
-		log.WithError(err).WithFields(logrus.Fields{
-			"device": seedDev,
-			"mount":  *repoCacheSeedMount,
-		}).Warn("Seed mount failed (may already be mounted)")
-	}
-
-	// Mount upper read-write
-	exec.Command("mountpoint", "-q", *repoCacheUpperMount).Run()
-	if err := exec.Command("mount", upperDev, *repoCacheUpperMount).Run(); err != nil {
-		log.WithError(err).WithFields(logrus.Fields{
-			"device": upperDev,
-			"mount":  *repoCacheUpperMount,
-		}).Warn("Upper mount failed (may already be mounted)")
-	}
-
-	upperDir := filepath.Join(*repoCacheUpperMount, "upper")
-	workDir := filepath.Join(*repoCacheUpperMount, "work")
-	if err := os.MkdirAll(upperDir, 0755); err != nil {
-		return fmt.Errorf("failed to create overlay upper dir: %w", err)
-	}
-	if err := os.MkdirAll(workDir, 0755); err != nil {
-		return fmt.Errorf("failed to create overlay work dir: %w", err)
-	}
-
-	// Mount overlayfs at Bazel repository_cache path
-	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", *repoCacheSeedMount, upperDir, workDir)
-	if output, err := exec.Command("mount", "-t", "overlay", "overlay", "-o", opts, *repoCacheOverlayTarget).CombinedOutput(); err != nil {
-		return fmt.Errorf("overlay mount failed: %s: %w", string(output), err)
-	}
-
-	// Ensure the runner user can write into the repo cache path without recursively
-	// chowning (which would copy-up most of the seed into the upper layer).
-	_ = exec.Command("chown", *runnerUsername+":"+*runnerUsername, *repoCacheOverlayTarget).Run()
-	// Also chown the upper mount so bazel can create disk-cache dir under it.
-	_ = exec.Command("chown", *runnerUsername+":"+*runnerUsername, *repoCacheUpperMount).Run()
-
-	log.WithFields(logrus.Fields{
-		"seed_device":  seedDev,
-		"seed_mount":   *repoCacheSeedMount,
-		"upper_device": upperDev,
-		"upper_mount":  *repoCacheUpperMount,
-		"target":       *repoCacheOverlayTarget,
-	}).Info("Repo cache overlay mounted")
-
-	return nil
-}
-
-func mountBuildbarnCerts(data *MMDSData) error {
-	mountPath := *buildbarnCertsMount
-	if data != nil && data.Latest.Buildbarn.CertsMountPath != "" {
-		mountPath = data.Latest.Buildbarn.CertsMountPath
-	}
-	if mountPath == "" {
-		return nil
-	}
-
-	if err := os.MkdirAll(mountPath, 0755); err != nil {
-		return fmt.Errorf("failed to create buildbarn certs mount dir: %w", err)
-	}
-
-	dev := resolveDevice(*buildbarnCertsDevice, *buildbarnCertsLabel)
-	if err := exec.Command("mountpoint", "-q", mountPath).Run(); err == nil {
-		return nil
-	}
-	if output, err := exec.Command("mount", "-o", "ro", dev, mountPath).CombinedOutput(); err != nil {
-		return fmt.Errorf("mount failed: %s: %w", string(output), err)
-	}
-
-	log.WithFields(logrus.Fields{
-		"device": dev,
-		"mount":  mountPath,
-	}).Info("Buildbarn certs mounted")
-	return nil
-}
-
-// mountCredentials mounts the generic credentials drive and sets up symlinks.
-func mountCredentials(data *MMDSData) error {
-	mountPath := *credentialsMount
-
-	if err := os.MkdirAll(mountPath, 0755); err != nil {
-		return fmt.Errorf("failed to create credentials mount dir: %w", err)
-	}
-
-	// Try new CREDENTIALS label first, fall back to legacy BUILDBARN_CERTS
-	dev := resolveDevice(*credentialsDevice, *credentialsLabel)
-	if _, err := os.Stat(dev); err != nil {
-		dev = resolveDevice(*buildbarnCertsDevice, *buildbarnCertsLabel)
-	}
-
-	if err := exec.Command("mountpoint", "-q", mountPath).Run(); err == nil {
-		return nil // already mounted
-	}
-	if output, err := exec.Command("mount", "-o", "ro", dev, mountPath).CombinedOutput(); err != nil {
-		return fmt.Errorf("mount failed: %s: %w", string(output), err)
-	}
-
-	log.WithFields(logrus.Fields{
-		"device": dev,
-		"mount":  mountPath,
-	}).Info("Credentials drive mounted")
-
-	// Setup credential symlinks and environment
-	setupCredentialSymlinks(mountPath, data)
-
-	return nil
-}
-
-// setupCredentialSymlinks creates symlinks and environment setup from the credentials drive.
-func setupCredentialSymlinks(mountPath string, data *MMDSData) {
-	runnerHome := "/home/" + *runnerUsername
-
-	// Symlink .netrc if present
-	netrcPath := filepath.Join(mountPath, "netrc")
-	if _, err := os.Stat(netrcPath); err == nil {
-		target := filepath.Join(runnerHome, ".netrc")
-		os.Remove(target)
-		if err := os.Symlink(netrcPath, target); err != nil {
-			log.WithError(err).Warn("Failed to symlink .netrc")
-		} else {
-			log.Info("Linked .netrc from credentials drive")
-		}
-	}
-
-	// Symlink git-credentials if present
-	gitCredsPath := filepath.Join(mountPath, "git-credentials")
-	if _, err := os.Stat(gitCredsPath); err == nil {
-		target := filepath.Join(runnerHome, ".git-credentials")
-		os.Remove(target)
-		if err := os.Symlink(gitCredsPath, target); err != nil {
-			log.WithError(err).Warn("Failed to symlink .git-credentials")
-		} else {
-			log.Info("Linked .git-credentials from credentials drive")
-		}
-		// Configure git to use credential store
-		exec.Command("git", "config", "--global", "credential.helper", "store").Run()
-	}
-
-	// Source environment file if present
-	envPath := filepath.Join(mountPath, "env")
-	if envData, err := os.ReadFile(envPath); err == nil {
-		for k, v := range parseEnvFile(envData) {
-			os.Setenv(k, v)
-			log.WithField("var", k).Debug("Set environment variable from credentials")
-		}
-	}
-
-	// Install CA certs if present
-	caBundlePath := filepath.Join(mountPath, "certs", "ca-bundle")
-	if _, err := os.Stat(caBundlePath); err == nil {
-		entries, _ := os.ReadDir(caBundlePath)
-		for _, entry := range entries {
-			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".crt") {
-				src := filepath.Join(caBundlePath, entry.Name())
-				dst := filepath.Join("/usr/local/share/ca-certificates", entry.Name())
-				exec.Command("cp", src, dst).Run()
-			}
-		}
-		if len(entries) > 0 {
-			exec.Command("update-ca-certificates").Run()
-			log.Info("Installed CA certificates from credentials drive")
-		}
-	}
-
-	// Copy .npmrc if present
-	npmrcPath := filepath.Join(mountPath, "npm", ".npmrc")
-	if _, err := os.Stat(npmrcPath); err == nil {
-		target := filepath.Join(runnerHome, ".npmrc")
-		exec.Command("cp", npmrcPath, target).Run()
-		exec.Command("chown", *runnerUsername+":"+*runnerUsername, target).Run()
-		log.Info("Copied .npmrc from credentials drive")
-	}
-
-	// Backwards compatibility: if buildbarn certs exist in credentials drive,
-	// create legacy mount path symlink
-	buildbarnPath := filepath.Join(mountPath, "certs", "buildbarn")
-	if _, err := os.Stat(buildbarnPath); err == nil {
-		legacyMount := data.Latest.Buildbarn.CertsMountPath
-		if legacyMount == "" {
-			legacyMount = *buildbarnCertsMount
-		}
-		if legacyMount != "" && legacyMount != buildbarnPath {
-			os.MkdirAll(filepath.Dir(legacyMount), 0755)
-			os.Remove(legacyMount)
-			if err := os.Symlink(buildbarnPath, legacyMount); err != nil {
-				log.WithError(err).Warn("Failed to create legacy buildbarn certs symlink")
-			} else {
-				log.WithFields(logrus.Fields{
-					"link":   legacyMount,
-					"target": buildbarnPath,
-				}).Info("Created legacy Buildbarn certs symlink")
-			}
-		}
-	}
-}
-
-func resolveDevice(defaultDev string, label string) string {
-	// Prefer by-label path if present.
-	byLabel := filepath.Join("/dev/disk/by-label", label)
-	if _, err := os.Stat(byLabel); err == nil {
-		return byLabel
-	}
-	// Fall back to default device path.
-	return defaultDev
-}
 
 func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 	client := &http.Client{Timeout: 5 * time.Second}
@@ -1043,9 +786,6 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					Mode         string `json:"mode,omitempty"`
 					CurrentTime  string `json:"current_time,omitempty"`
 				} `json:"meta"`
-				Buildbarn struct {
-					CertsMountPath string `json:"certs_mount_path,omitempty"`
-				} `json:"buildbarn,omitempty"`
 				Network struct {
 					IP        string `json:"ip"`
 					Gateway   string `json:"gateway"`
@@ -1085,8 +825,14 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 				} `json:"runner,omitempty"`
 				Warmup struct {
 					Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
+					Drives   []snapshot.DriveSpec       `json:"drives,omitempty"`
 				} `json:"warmup,omitempty"`
-				// Mirrors snapshot.StartCommand — keep in sync with pkg/snapshot/start_command.go.
+				Proxy struct {
+					CACertPEM    string `json:"ca_cert_pem"`
+					Address      string `json:"address"`
+					MetadataHost string `json:"metadata_host"`
+				} `json:"proxy,omitempty"`
+				// Mirrors snapshot.StartCommand -- keep in sync with pkg/snapshot/start_command.go.
 				StartCommand struct {
 					Command    []string          `json:"command,omitempty"`
 					Port       int               `json:"port,omitempty"`
@@ -1416,7 +1162,7 @@ func watchForSnapshotRestore() {
 		}
 		req.Header.Set("Accept", "application/json")
 
-		// Use a fresh client per request — after snapshot restore, pooled
+		// Use a fresh client per request -- after snapshot restore, pooled
 		// connections in http.DefaultClient are stale/dead.
 		client := &http.Client{
 			Timeout: 3 * time.Second,
@@ -1441,7 +1187,7 @@ func watchForSnapshotRestore() {
 			continue
 		}
 
-		// New current_time detected — this means we were restored from a snapshot
+		// New current_time detected -- this means we were restored from a snapshot
 		lastTime = ct
 		hostTime, err := time.Parse(time.RFC3339, ct)
 		if err != nil {
@@ -1467,7 +1213,7 @@ func watchForSnapshotRestore() {
 			"server_time": hostTime.UTC().Format(time.RFC3339),
 		}).Info("Clock synced from MMDS after snapshot restore")
 
-		// Reconfigure network — the VM may have been resumed on a different
+		// Reconfigure network -- the VM may have been resumed on a different
 		// TAP slot with a new IP. Without this, the guest retains the old IP
 		// and cannot receive traffic.
 		newData, fetchErr := fetchMMDSData()
@@ -1610,176 +1356,6 @@ func resyncClock(mmdsData *MMDSData) error {
 	}
 
 	return fmt.Errorf("failed to sync clock from any source")
-}
-
-func mountGitCache(data *MMDSData) error {
-	mountPath := *gitCacheMount
-	if data != nil && data.Latest.GitCache.MountPath != "" {
-		mountPath = data.Latest.GitCache.MountPath
-	}
-	if mountPath == "" {
-		return nil
-	}
-
-	if err := os.MkdirAll(mountPath, 0755); err != nil {
-		return fmt.Errorf("failed to create git-cache mount dir: %w", err)
-	}
-
-	dev := resolveDevice(*gitCacheDevice, *gitCacheLabel)
-
-	// Check if already mounted
-	if err := exec.Command("mountpoint", "-q", mountPath).Run(); err == nil {
-		log.WithField("mount", mountPath).Debug("Git-cache already mounted")
-		return nil
-	}
-
-	if output, err := exec.Command("mount", "-o", "ro", dev, mountPath).CombinedOutput(); err != nil {
-		return fmt.Errorf("mount failed: %s: %w", string(output), err)
-	}
-
-	log.WithFields(logrus.Fields{
-		"device": dev,
-		"mount":  mountPath,
-	}).Info("Git-cache mounted")
-	return nil
-}
-
-// setupWorkspaceFromGitCache copies the git-cache to workspace (local only, no network)
-// This gives actions/checkout a huge head start - it only needs to fetch deltas
-func setupWorkspaceFromGitCache(data *MMDSData) error {
-	job := data.Latest.Job
-	if job.Repo == "" {
-		return nil
-	}
-
-	// Determine paths
-	gitCachePath := *gitCacheMount
-	if data.Latest.GitCache.MountPath != "" {
-		gitCachePath = data.Latest.GitCache.MountPath
-	}
-
-	workspacePath := *workspaceDir
-	if data.Latest.GitCache.WorkspaceDir != "" {
-		workspacePath = data.Latest.GitCache.WorkspaceDir
-	}
-
-	// Find the cached repo
-	// Git-cache uses simple repo name: /mnt/git-cache/scio (from git_cache_repos config)
-	// Workspace uses GitHub Actions convention: /mnt/ephemeral/workdir/scio/scio
-	repoFullPath := extractRepoDir(job.Repo) // Returns "scio/scio" for askscio/scio
-	parts := strings.Split(job.Repo, "/")
-	simpleRepoName := parts[len(parts)-1] // Just "scio"
-
-	cachePath := filepath.Join(gitCachePath, simpleRepoName) // /mnt/git-cache/scio
-	targetPath := filepath.Join(workspacePath, repoFullPath) // /mnt/ephemeral/workdir/scio/scio
-
-	// Check if git-cache has this repo
-	if _, err := os.Stat(filepath.Join(cachePath, ".git")); os.IsNotExist(err) {
-		return fmt.Errorf("repo not found in git-cache: %s", cachePath)
-	}
-
-	log.WithFields(logrus.Fields{
-		"cache":  cachePath,
-		"target": targetPath,
-		"repo":   job.Repo,
-	}).Info("Copying git-cache to workspace")
-
-	// Create workspace directory
-	if err := os.MkdirAll(workspacePath, 0755); err != nil {
-		return fmt.Errorf("failed to create workspace: %w", err)
-	}
-
-	// Use git clone --reference for efficient local copy
-	// --dissociate makes it independent (copies objects instead of linking)
-	// --no-checkout is fast, actions/checkout will do the checkout
-	cloneCmd := exec.Command("git", "clone",
-		"--reference", cachePath,
-		"--dissociate",
-		"--no-checkout",
-		"file://"+cachePath, // Local clone
-		targetPath,
-	)
-	cloneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-
-	if output, err := cloneCmd.CombinedOutput(); err != nil {
-		// If target exists, try to set it up as alternates instead
-		if _, statErr := os.Stat(targetPath); statErr == nil {
-			log.Info("Target exists, setting up alternates instead")
-			return setupGitAlternates(targetPath, cachePath)
-		}
-		return fmt.Errorf("git clone failed: %s: %w", string(output), err)
-	}
-
-	// Set remote to the real GitHub URL (so fetch works)
-	repoURL := "https://github.com/" + job.Repo
-	if err := exec.Command("git", "-C", targetPath, "remote", "set-url", "origin", repoURL).Run(); err != nil {
-		log.WithError(err).Warn("Failed to set remote URL")
-	}
-
-	// Make it writable for the runner user
-	exec.Command("chown", "-R", *runnerUsername+":"+*runnerUsername, targetPath).Run()
-
-	log.WithField("target", targetPath).Info("Workspace setup from git-cache complete")
-	return nil
-}
-
-// setupGitAlternates configures an existing repo to use git-cache objects
-func setupGitAlternates(repoPath, cachePath string) error {
-	alternatesFile := filepath.Join(repoPath, ".git", "objects", "info", "alternates")
-	cacheObjects := filepath.Join(cachePath, ".git", "objects")
-
-	if err := os.MkdirAll(filepath.Dir(alternatesFile), 0755); err != nil {
-		return err
-	}
-
-	return os.WriteFile(alternatesFile, []byte(cacheObjects+"\n"), 0644)
-}
-
-func findGitCacheReference(data *MMDSData, repoURL string) string {
-	gitCache := data.Latest.GitCache
-	if !gitCache.Enabled {
-		return ""
-	}
-
-	mountPath := gitCache.MountPath
-	if mountPath == "" {
-		mountPath = *gitCacheMount
-	}
-
-	// Check repo mappings first
-	for pattern, cacheName := range gitCache.RepoMappings {
-		if strings.Contains(repoURL, pattern) || pattern == repoURL {
-			refPath := filepath.Join(mountPath, cacheName)
-			if _, err := os.Stat(filepath.Join(refPath, ".git")); err == nil {
-				return refPath
-			}
-			// Also try bare repo
-			if _, err := os.Stat(filepath.Join(refPath, "HEAD")); err == nil {
-				return refPath
-			}
-		}
-	}
-
-	// Try to infer from repo URL - extractRepoDir returns repo/repo, we need just repo
-	repoPath := extractRepoDir(repoURL) // scio/scio
-	repoName := filepath.Base(repoPath) // scio
-	candidates := []string{
-		filepath.Join(mountPath, repoName),        // /mnt/git-cache/scio
-		filepath.Join(mountPath, repoName+".git"), // /mnt/git-cache/scio.git
-	}
-
-	for _, candidate := range candidates {
-		// Check for regular clone
-		if _, err := os.Stat(filepath.Join(candidate, ".git")); err == nil {
-			return candidate
-		}
-		// Check for bare repo
-		if _, err := os.Stat(filepath.Join(candidate, "HEAD")); err == nil {
-			return candidate
-		}
-	}
-
-	return ""
 }
 
 func extractRepoDir(repoURL string) string {
@@ -1935,10 +1511,103 @@ func signalReady() error {
 	return os.WriteFile(*readyFile, []byte(time.Now().Format(time.RFC3339)), 0644)
 }
 
+// thawFrozenFilesystems unfreezes all ext4 filesystems that were frozen by
+// fsfreeze --freeze at the end of the previous warmup. After snapshot restore,
+// the VM resumes with frozen filesystems — any I/O (including umount, stat,
+// chown) blocks indefinitely in D state until we unfreeze.
+// This must be called BEFORE any filesystem access after a snapshot restore.
+func thawFrozenFilesystems() {
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		log.WithError(err).Warn("Failed to read /proc/mounts for thaw")
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		mountPath, fsType := fields[1], fields[2]
+		if fsType != "ext4" || mountPath == "/" {
+			continue
+		}
+		if out, err := exec.Command("fsfreeze", "--unfreeze", mountPath).CombinedOutput(); err != nil {
+			log.WithError(err).WithField("mount_path", mountPath).Debugf("fsfreeze --unfreeze (output: %s)", string(out))
+		} else {
+			log.WithField("mount_path", mountPath).Info("Thawed frozen filesystem")
+		}
+	}
+}
+
 // runWarmupMode runs the snapshot warmup process by dispatching each command,
 // then runs infra-level finalization steps (runner update, page pre-warm) that
 // are always needed regardless of which user commands were specified.
 func runWarmupMode(data *MMDSData) error {
+	thawFrozenFilesystems()
+
+	// Mount extension drives. On reattach, the block device may have been swapped
+	// (old layer's data replaces the parent's empty drive). If the drive is already
+	// mounted, we must unmount+remount so ext4 re-reads the superblock from the
+	// new drive content — otherwise ext4's in-memory state (from the parent snapshot)
+	// is stale and all I/O returns EIO.
+	for _, d := range data.Latest.Warmup.Drives {
+		if d.MountPath == "" || d.Label == "" {
+			continue
+		}
+		if exec.Command("mountpoint", "-q", d.MountPath).Run() == nil {
+			// Drive is mounted from parent snapshot but the block device was
+			// swapped during reattach. Force unmount so we can remount fresh.
+			log.WithFields(logrus.Fields{"label": d.Label, "mount_path": d.MountPath}).Info("Remounting drive (block device may have been swapped)")
+			exec.Command("umount", "-f", d.MountPath).Run()
+		}
+		if err := os.MkdirAll(d.MountPath, 0755); err != nil {
+			return fmt.Errorf("failed to create mount point %s: %w", d.MountPath, err)
+		}
+		// Find the block device for this label so we can run e2fsck before mount.
+		// Extension drives from a prior snapshot may have dirty ext4 journals
+		// (captured mid-write between sync and VM pause). When mounted with a
+		// different VM memory state (refresh/reattach), the kernel cannot replay
+		// the journal and returns "Structure needs cleaning". e2fsck -p fixes this.
+		devBytes, _ := exec.Command("blkid", "-L", d.Label).Output()
+		devPath := strings.TrimSpace(string(devBytes))
+		if devPath != "" {
+			if out, err := exec.Command("e2fsck", "-p", devPath).CombinedOutput(); err != nil {
+				log.WithError(err).WithFields(logrus.Fields{
+					"label": d.Label, "device": devPath,
+				}).Warnf("e2fsck returned non-zero (output: %s)", string(out))
+			} else {
+				log.WithFields(logrus.Fields{"label": d.Label, "device": devPath}).Debug("e2fsck completed")
+			}
+		}
+		if out, err := exec.Command("mount", "-L", d.Label, d.MountPath).CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to mount label %s at %s: %w (output: %s)", d.Label, d.MountPath, err, string(out))
+		}
+		exec.Command("chown", *runnerUsername+":"+*runnerUsername, d.MountPath).Run()
+		log.WithFields(logrus.Fields{"label": d.Label, "mount_path": d.MountPath}).Info("Mounted drive")
+	}
+
+	// Auto-configure proxy if the auth proxy pushed CA cert + address via MMDS.
+	// This replaces the old runGCPAuthCommand auto-setup: the proxy provides both
+	// GCP metadata emulation (for keyrings.google-artifactregistry-auth) and HTTPS
+	// credential injection transparently.
+	if data.Latest.Proxy.Address != "" {
+		log.WithField("proxy_address", data.Latest.Proxy.Address).Info("Configuring auth proxy from MMDS")
+		stopFwd, proxyErr := configureAuthProxy(data)
+		if proxyErr != nil {
+			log.WithError(proxyErr).Warn("Failed to configure auth proxy (non-fatal)")
+		}
+		if stopFwd != nil {
+			// Store stop function so it can be called after warmup to restore MMDS access
+			globalMetadataForwarderStop = stopFwd
+		}
+	} else if token := data.Latest.Job.GCPAccessToken; token != "" {
+		// Fallback: if no proxy is configured, use the legacy token-based approach
+		log.Info("Auto-configuring GCP credentials from MMDS token (legacy)")
+		if err := runGCPAuthCommand(data); err != nil {
+			log.WithError(err).Warn("Failed to auto-configure GCP credentials (non-fatal)")
+		}
+	}
+
 	for _, cmd := range data.Latest.Warmup.Commands {
 		if err := dispatchCommand(cmd, data); err != nil {
 			return fmt.Errorf("command %s failed: %w", cmd.Type, err)
@@ -1973,6 +1642,29 @@ func runWarmupMode(data *MMDSData) error {
 	updateWarmupState("syncing", "Syncing caches to disk...")
 	exec.Command("sync").Run()
 
+	// Freeze all mounted extension drives so ext4 journals are fully committed
+	// before the snapshot is taken. Without this, the journal can be captured
+	// mid-write (between sync and VM pause), making the drive unmountable when
+	// loaded with a different VM memory state (refresh/reattach builds).
+	var frozenMounts []string
+	for _, d := range data.Latest.Warmup.Drives {
+		if d.MountPath == "" {
+			continue
+		}
+		if exec.Command("mountpoint", "-q", d.MountPath).Run() != nil {
+			continue
+		}
+		if out, err := exec.Command("fsfreeze", "--freeze", d.MountPath).CombinedOutput(); err != nil {
+			log.WithError(err).WithField("mount_path", d.MountPath).Warnf("fsfreeze failed (output: %s)", string(out))
+		} else {
+			frozenMounts = append(frozenMounts, d.MountPath)
+			log.WithField("mount_path", d.MountPath).Info("Froze filesystem for clean snapshot")
+		}
+	}
+	// Note: frozenMounts are left frozen intentionally. The VM will be paused
+	// for snapshot shortly after warmup completes. On next restore, the drives
+	// are unmounted/remounted so the freeze state doesn't carry over.
+
 	return nil
 }
 
@@ -2005,6 +1697,9 @@ func runShellCommand(args []string, runAsRoot bool, data *MMDSData) error {
 		return fmt.Errorf("shell command requires at least one argument")
 	}
 	env := os.Environ()
+	// Append proxy env vars (set by configureAuthProxy) so child commands
+	// route through the auth proxy without polluting the thaw-agent process.
+	env = append(env, globalProxyEnv...)
 	if data != nil {
 		if t := data.Latest.Job.GCPAccessToken; t != "" {
 			env = append(env, "GOOGLE_OAUTH_ACCESS_TOKEN="+t)
@@ -2033,6 +1728,198 @@ func runShellCommand(args []string, runAsRoot bool, data *MMDSData) error {
 		return err
 	}
 	return nil
+}
+
+// configureAuthProxy sets up the guest environment to use the host-side auth proxy.
+// It installs the proxy's CA certificate into the system trust store and sets
+// HTTPS_PROXY/HTTP_PROXY environment variables so all child processes (bazel, pip, etc.)
+// route through the proxy for transparent credential injection.
+//
+// Returns a stop function for the metadata forwarder (if started). The caller MUST
+// call stop() after warmup commands complete to restore MMDS access for the poll loop.
+func configureAuthProxy(data *MMDSData) (stopForwarder func(), err error) {
+	proxyAddr := data.Latest.Proxy.Address
+	caCertPEM := data.Latest.Proxy.CACertPEM
+
+	// 1. Install the proxy CA certificate so TLS verification passes through the MITM proxy
+	if caCertPEM != "" {
+		certDir := "/usr/local/share/ca-certificates"
+		if err := os.MkdirAll(certDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create ca-certificates dir: %w", err)
+		}
+		certPath := filepath.Join(certDir, "auth-proxy.crt")
+		if err := os.WriteFile(certPath, []byte(caCertPEM), 0644); err != nil {
+			return nil, fmt.Errorf("failed to write CA cert: %w", err)
+		}
+		if out, err := exec.Command("update-ca-certificates").CombinedOutput(); err != nil {
+			log.WithError(err).WithField("output", string(out)).Warn("update-ca-certificates failed (TLS through proxy may fail)")
+		} else {
+			log.Info("Installed auth proxy CA certificate")
+		}
+	}
+
+	// 2. Build proxy environment variables for child processes.
+	// These are stored in globalProxyEnv and appended to child command environments
+	// rather than set process-wide with os.Setenv. This prevents proxy env vars from
+	// being baked into snapshots and causing "connection refused" errors at runtime
+	// (when the build-time proxy is no longer running).
+	metadataHost := data.Latest.Proxy.MetadataHost
+	noProxy := "169.254.169.254,localhost,127.0.0.1"
+	if metadataHost != "" {
+		noProxy += "," + metadataHost
+	}
+	proxyEnv := []string{
+		"HTTPS_PROXY=" + proxyAddr,
+		"HTTP_PROXY=" + proxyAddr,
+		"https_proxy=" + proxyAddr,
+		"http_proxy=" + proxyAddr,
+		"NO_PROXY=" + noProxy,
+		"no_proxy=" + noProxy,
+	}
+	if metadataHost != "" {
+		proxyEnv = append(proxyEnv, "GCE_METADATA_HOST="+metadataHost)
+		log.WithField("metadata_host", metadataHost).Info("Set GCE_METADATA_HOST for google-auth")
+	}
+	globalProxyEnv = proxyEnv
+
+	// 4. Intercept GCE metadata requests at the network level.
+	// Firecracker's MMDS V1 intercepts all traffic to 169.254.169.254 on the
+	// TAP device. By assigning 169.254.169.254 to the loopback interface, we
+	// keep metadata traffic local (kernel delivers to lo, never reaches TAP).
+	// An HTTP reverse proxy then forwards requests to the host-side auth proxy.
+	// This is transparent to ALL programs (bazel, pip, gcloud, etc.) -- no
+	// env vars or tool-specific config needed.
+	if metadataHost != "" {
+		stop, fwdErr := startMetadataForwarder(metadataHost)
+		if fwdErr != nil {
+			log.WithError(fwdErr).Warn("Failed to start metadata forwarder (metadata-based auth may not work)")
+		} else {
+			log.Info("Metadata forwarder active: 169.254.169.254:80 → " + metadataHost + ":80")
+			stopForwarder = stop
+		}
+	}
+
+	log.WithField("proxy", proxyAddr).Info("Auth proxy configured (CA cert + env vars)")
+	return stopForwarder, nil
+}
+
+// startMetadataForwarder assigns 169.254.169.254 to the loopback interface and
+// runs an HTTP reverse proxy from 169.254.169.254:80 to metadataHost:80.
+// This bypasses Firecracker's MMDS (which intercepts 169.254.169.254 on the TAP)
+// by keeping the traffic on lo, then forwarding to the host-side auth proxy.
+//
+// Returns a stop function that removes the IP from lo and closes the server.
+// The forwarder MUST be stopped before the MMDS poll loop, because 169.254.169.254
+// on lo prevents the thaw-agent from reading MMDS data (which goes through the TAP).
+func startMetadataForwarder(metadataHost string) (stop func(), err error) {
+	// Assign 169.254.169.254 to lo so the kernel delivers locally instead of
+	// routing through the TAP where MMDS would intercept.
+	if out, err := exec.Command("ip", "addr", "add", "169.254.169.254/32", "dev", "lo").CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("ip addr add 169.254.169.254/32 dev lo: %s: %w", string(out), err)
+	}
+
+	// Use an HTTP reverse proxy instead of raw TCP forwarding. This correctly
+	// handles HTTP connection lifecycle and provides better debugging through
+	// logging of requests and errors.
+	upstream := "http://" + metadataHost + ":80"
+	// Direct HTTP client that ignores proxy env vars — the forwarder must connect
+	// directly to the auth proxy, never routing through HTTPS_PROXY.
+	directClient := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &http.Transport{Proxy: nil},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Forward the request to the host-side auth proxy metadata handler.
+		// Use RequestURI to preserve query parameters (not just Path).
+		proxyReq, _ := http.NewRequestWithContext(r.Context(), r.Method, upstream+r.URL.RequestURI(), r.Body)
+		for k, v := range r.Header {
+			proxyReq.Header[k] = v
+		}
+		proxyReq.Header.Set("Host", r.Host)
+
+		resp, err := directClient.Do(proxyReq)
+		if err != nil {
+			log.WithError(err).WithField("path", r.URL.Path).Error("Metadata forwarder: upstream request failed")
+			http.Error(w, "metadata upstream error", http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+
+		// Copy upstream headers using direct map access with lowercase keys.
+		// Go's w.Header().Set() canonicalizes to Title-Case ("Content-Type"),
+		// but older google-auth versions look up "content-type" (lowercase) in
+		// a plain dict, causing KeyError. Direct map assignment bypasses
+		// canonicalization: w.Header()["content-type"] stores the lowercase key.
+		// We also keep the canonical key so Go's auto Content-Type detection
+		// sees it and doesn't add a duplicate.
+		h := w.Header()
+		for k, vals := range resp.Header {
+			h[k] = vals                        // canonical key (suppresses Go auto-detection)
+			h[strings.ToLower(k)] = vals       // lowercase key (for old google-auth)
+		}
+		w.WriteHeader(resp.StatusCode)
+		w.Write(body)
+	})
+
+	listener, err := gonet.Listen("tcp", "169.254.169.254:80")
+	if err != nil {
+		// Remove the IP we just added since we can't listen
+		exec.Command("ip", "addr", "del", "169.254.169.254/32", "dev", "lo").Run()
+		return nil, fmt.Errorf("listen 169.254.169.254:80: %w", err)
+	}
+
+	srv := &http.Server{Handler: mux}
+	go srv.Serve(listener)
+
+	// Self-test 1: verify direct upstream connectivity (auth proxy on host).
+	directReq, _ := http.NewRequest("GET", upstream+"/", nil)
+	directReq.Header.Set("Metadata-Flavor", "Google")
+	directResp, directErr := directClient.Do(directReq)
+	if directErr != nil {
+		log.WithError(directErr).Warn("Metadata upstream direct test FAILED — auth proxy may not be reachable on " + metadataHost + ":80")
+	} else {
+		body, _ := io.ReadAll(directResp.Body)
+		directResp.Body.Close()
+		log.WithFields(logrus.Fields{
+			"status":          directResp.StatusCode,
+			"metadata_flavor": directResp.Header.Get("Metadata-Flavor"),
+			"body":            string(body),
+			"upstream":        upstream,
+		}).Info("Metadata upstream direct test result")
+	}
+
+	// Self-test 2: verify end-to-end through the forwarder (169.254.169.254 → host).
+	// Use a separate transport that ignores proxy env vars AND has the lo-bound address.
+	e2eClient := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	testReq, _ := http.NewRequest("GET", "http://169.254.169.254/", nil)
+	testReq.Header.Set("Metadata-Flavor", "Google")
+	testResp, testErr := e2eClient.Do(testReq)
+	if testErr != nil {
+		log.WithError(testErr).Warn("Metadata forwarder e2e self-test FAILED (metadata-based auth may not work)")
+	} else {
+		flavor := testResp.Header.Get("Metadata-Flavor")
+		body, _ := io.ReadAll(testResp.Body)
+		testResp.Body.Close()
+		log.WithFields(logrus.Fields{
+			"status":          testResp.StatusCode,
+			"metadata_flavor": flavor,
+			"body":            string(body),
+		}).Info("Metadata forwarder e2e self-test result")
+		if testResp.StatusCode != 200 || flavor != "Google" {
+			log.Warn("Metadata forwarder e2e self-test: unexpected response (metadata-based auth may not work)")
+		}
+	}
+
+	stop = func() {
+		srv.Close()
+		exec.Command("ip", "addr", "del", "169.254.169.254/32", "dev", "lo").Run()
+		log.Info("Metadata forwarder stopped (MMDS access restored)")
+	}
+
+	return stop, nil
 }
 
 // runGCPAuthCommand configures GCP credentials inside the microVM by:
@@ -2150,38 +2037,19 @@ func runGitCloneCommand(args []string, data *MMDSData) error {
 	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err == nil {
 		log.Info("Repository already exists, skipping clone")
 	} else {
-		var cloned bool
-		if data.Latest.GitCache.Enabled {
-			cachePath := findGitCacheReference(data, repoURL)
-			if cachePath != "" {
-				cloneCmd := exec.Command("git", "clone", "--branch", repoBranch, "file://"+cachePath, repoDir)
-				cloneCmd.SysProcAttr = runnerCred
-				cloneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", runnerHome)
-				output, err := cloneCmd.CombinedOutput()
-				if err != nil {
-					log.WithFields(logrus.Fields{"error": err.Error(), "output": string(output)}).Warn("Local clone from git-cache failed, will try network clone")
-				} else {
-					setURLCmd := exec.Command("git", "-C", repoDir, "remote", "set-url", "origin", "https://github.com/"+repoURL)
-					setURLCmd.SysProcAttr = runnerCred
-					setURLCmd.Env = append(os.Environ(), runnerHome)
-					setURLCmd.Run()
-					cloned = true
-				}
-			}
+		cloneURL := repoURL
+		if data.Latest.Job.GitToken != "" {
+			repoPath := strings.TrimPrefix(repoURL, "https://github.com/")
+			repoPath = strings.TrimPrefix(repoPath, "github.com/")
+			cloneURL = fmt.Sprintf("https://x-access-token:%s@github.com/%s", data.Latest.Job.GitToken, repoPath)
+		} else if !strings.HasPrefix(cloneURL, "https://") && !strings.HasPrefix(cloneURL, "git@") {
+			cloneURL = "https://github.com/" + cloneURL
 		}
-		if !cloned {
-			cloneURL := repoURL
-			if data.Latest.Job.GitToken != "" {
-				repoPath := strings.TrimPrefix(repoURL, "https://github.com/")
-				repoPath = strings.TrimPrefix(repoPath, "github.com/")
-				cloneURL = fmt.Sprintf("https://x-access-token:%s@github.com/%s", data.Latest.Job.GitToken, repoPath)
-			} else if !strings.HasPrefix(cloneURL, "https://") && !strings.HasPrefix(cloneURL, "git@") {
-				cloneURL = "https://github.com/" + cloneURL
-			}
-			if err := runStreamedCommand("", append(os.Environ(), runnerHome, "GIT_TERMINAL_PROMPT=0"), runnerCred,
-				"git", "clone", "--branch", repoBranch, "--depth=1", cloneURL, repoDir); err != nil {
-				return fmt.Errorf("git clone failed: %w", err)
-			}
+		cloneEnv := append(os.Environ(), globalProxyEnv...)
+		cloneEnv = append(cloneEnv, runnerHome, "GIT_TERMINAL_PROMPT=0")
+		if err := runStreamedCommand("", cloneEnv, runnerCred,
+			"git", "clone", "--branch", repoBranch, "--depth=1", cloneURL, repoDir); err != nil {
+			return fmt.Errorf("git clone failed: %w", err)
 		}
 	}
 
@@ -2247,7 +2115,8 @@ func runGitPullCommand(args []string, data *MMDSData) error {
 	}).Info("Fetching latest changes for incremental warmup")
 
 	// Set remote URL (may have changed token)
-	env := append(os.Environ(), runnerHome, "GIT_TERMINAL_PROMPT=0")
+	env := append(os.Environ(), globalProxyEnv...)
+	env = append(env, runnerHome, "GIT_TERMINAL_PROMPT=0")
 	setURLCmd := exec.Command("git", "-C", repoDir, "remote", "set-url", "origin", fetchURL)
 	setURLCmd.SysProcAttr = runnerCred
 	setURLCmd.Env = env
@@ -2286,10 +2155,10 @@ func preWarmRunnerPages(runnerPath string, cred *syscall.SysProcAttr, homeEnv st
 	}
 
 	// Start Runner.Listener briefly. It will fail quickly because config.sh
-	// hasn't been run (no .runner config file), but that's fine — the .NET
+	// hasn't been run (no .runner config file), but that's fine -- the .NET
 	// runtime, JIT compiler, and managed assemblies all get loaded into memory
 	// before it exits, which is exactly what we need for the snapshot.
-	// Give it up to 15 seconds — .NET runtime typically loads within a few seconds,
+	// Give it up to 15 seconds -- .NET runtime typically loads within a few seconds,
 	// then Runner.Listener exits with an error because it's not configured.
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -2303,7 +2172,7 @@ func preWarmRunnerPages(runnerPath string, cred *syscall.SysProcAttr, homeEnv st
 	out, err := cmd.CombinedOutput()
 	elapsed := time.Since(start)
 
-	// We expect it to fail (no config) — that's fine, pages are loaded.
+	// We expect it to fail (no config) -- that's fine, pages are loaded.
 	log.WithFields(logrus.Fields{
 		"duration_ms": elapsed.Milliseconds(),
 		"exit_error":  err,
@@ -2433,7 +2302,7 @@ func updateGitHubRunner(runnerPath string, cred *syscall.SysProcAttr, homeEnv st
 		return
 	}
 
-	// Fix ownership — tar may extract as root, but runner needs to run as the runner user.
+	// Fix ownership -- tar may extract as root, but runner needs to run as the runner user.
 	if cred != nil && cred.Credential != nil {
 		chownCmd := exec.Command("chown", "-R",
 			fmt.Sprintf("%d:%d", cred.Credential.Uid, cred.Credential.Gid), runnerPath)
@@ -2521,22 +2390,6 @@ func updateWarmupState(phase, message string) {
 		"phase":   phase,
 		"message": message,
 	}).Info("Warmup progress")
-}
-
-// parseEnvFile parses an env file (KEY=VALUE per line, # comments, blank lines ignored).
-func parseEnvFile(data []byte) map[string]string {
-	env := make(map[string]string)
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) == 2 {
-			env[parts[0]] = parts[1]
-		}
-	}
-	return env
 }
 
 // getPreClonedPath returns the path to the pre-cloned repo in the snapshot.
@@ -2684,7 +2537,7 @@ func verifyConnectivity(repoURL string) error {
 	return nil
 }
 
-// execHandler handles POST /exec requests — runs a command inside the VM and
+// execHandler handles POST /exec requests -- runs a command inside the VM and
 // streams stdout/stderr/exit as ndjson frames.
 func execHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -2921,8 +2774,8 @@ func runStartCommand(mmdsData *MMDSData) error {
 }
 
 // serviceLogsHandler serves the service log file on the debug port.
-// GET /service-logs — returns full log content
-// GET /service-logs?follow=true — streams new lines as they appear (chunked transfer encoding)
+// GET /service-logs -- returns full log content
+// GET /service-logs?follow=true -- streams new lines as they appear (chunked transfer encoding)
 func serviceLogsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("follow") == "true" {
 		// Streaming mode
@@ -3127,7 +2980,7 @@ func startHealthServer(mmdsData *MMDSData) {
 		Handler: mux,
 	}
 
-	// Check if :10500 is already bound (from warmup mode). If so, skip —
+	// Check if :10500 is already bound (from warmup mode). If so, skip --
 	// the warmup health server is already running and has the same endpoints.
 	ln, err := gonet.Listen("tcp", ":10500")
 	if err != nil {
