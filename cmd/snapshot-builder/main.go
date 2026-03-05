@@ -314,7 +314,6 @@ func main() {
 		// you can't add/remove drives between snapshot and restore. Sparse files
 		// don't consume actual disk space until written to.
 		var drives []firecracker.Drive
-		gitCacheEnabled := false
 
 		if *layerHash != "" {
 			// Layer mode: create sparse drives for all config-defined drives.
@@ -378,7 +377,7 @@ func main() {
 			log.WithError(err).Fatal("Failed to start VM")
 		}
 
-		mmdsData := buildWarmupMMDS(commands, gitToken, gcpAccessToken, gitCacheEnabled)
+		mmdsData := buildWarmupMMDS(commands, gitToken)
 		if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 			vm.Stop()
 			log.WithError(err).Fatal("Failed to set MMDS data")
@@ -1489,9 +1488,8 @@ func restoreFromPreviousSnapshot(
 
 	// 11. Set MMDS with mode=warmup and new runner_id
 	newRunnerID := fmt.Sprintf("snapshot-builder-incr-%s", uuid.New().String()[:8])
-	gitCacheEnabled := false
 	// The control plane passes the right commands for this build type via --snapshot-commands
-	mmdsData := buildWarmupMMDS(commands, gitToken, gcpAccessToken, gitCacheEnabled)
+	mmdsData := buildWarmupMMDS(commands, gitToken)
 	// Override runner_id so thaw-agent detects the change and re-runs warmup
 	mmdsData["latest"].(map[string]interface{})["meta"].(map[string]interface{})["runner_id"] = newRunnerID
 
@@ -1871,8 +1869,7 @@ func reattachFromParent(
 	}
 
 	newRunnerID := fmt.Sprintf("snapshot-builder-reattach-%s", uuid.New().String()[:8])
-	gitCacheEnabled := false
-	mmdsData := buildWarmupMMDS(commands, gitToken, gcpAccessToken, gitCacheEnabled)
+	mmdsData := buildWarmupMMDS(commands, gitToken)
 	mmdsData["latest"].(map[string]interface{})["meta"].(map[string]interface{})["runner_id"] = newRunnerID
 
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
@@ -1894,20 +1891,10 @@ func reattachFromParent(
 
 // buildWarmupMMDS creates the MMDS data for warmup mode.
 // commands are passed through to thaw-agent as warmup.commands.
-func buildWarmupMMDS(commands []snapshot.SnapshotCommand, gitToken, gcpAccessToken string, gitCacheEnabled bool) map[string]interface{} {
-	// Extract repo URL from git-clone command for git_cache mapping (best-effort).
-	repoURL := ""
-	for _, cmd := range commands {
-		if cmd.Type == "git-clone" && len(cmd.Args) > 0 {
-			repoURL = cmd.Args[0]
-			break
-		}
-	}
-	repoName := filepath.Base(strings.TrimSuffix(repoURL, ".git"))
-
-	repoMappings := map[string]string{}
-	if repoURL != "" {
-		repoMappings[repoURL] = repoName
+func buildWarmupMMDS(commands []snapshot.SnapshotCommand, gitToken string) map[string]interface{} {
+	job := map[string]interface{}{}
+	if gitToken != "" {
+		job["git_token"] = gitToken
 	}
 
 	return map[string]interface{}{
@@ -1927,17 +1914,7 @@ func buildWarmupMMDS(commands []snapshot.SnapshotCommand, gitToken, gcpAccessTok
 				"dns":       "8.8.8.8",
 				"interface": "eth0",
 			},
-			"job": map[string]interface{}{
-				"repo":             repoURL,
-				"git_token":        gitToken,
-				"gcp_access_token": gcpAccessToken,
-			},
-			"git_cache": map[string]interface{}{
-				"enabled":       gitCacheEnabled,
-				"mount_path":    "/mnt/git-cache",
-				"workspace_dir": "/mnt/ephemeral/workdir",
-				"repo_mappings": repoMappings,
-			},
+			"job": job,
 		},
 	}
 }
