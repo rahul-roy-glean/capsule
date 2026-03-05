@@ -35,11 +35,6 @@ var (
 	skipNetwork    = flag.Bool("skip-network", false, "Skip network configuration")
 )
 
-// init registers backwards-compatible flag aliases for renamed flags.
-func init() {
-	flag.StringVar(runnerDir, "runner-dir", "/home/sandbox-user", "Deprecated: use --ci-runner-dir")
-	flag.StringVar(runnerUsername, "runner-user", "runner", "Deprecated: use --sandbox-user")
-}
 
 // WarmupState tracks the current warmup progress (for snapshot building)
 type WarmupState struct {
@@ -536,17 +531,11 @@ func main() {
 	select {}
 }
 
-func resolveDevice(defaultDev string, label string, fallbackLabels ...string) string {
-	// Prefer by-label path if present (try primary label first, then fallbacks).
+func resolveDevice(defaultDev string, label string) string {
+	// Prefer by-label path if present.
 	byLabel := filepath.Join("/dev/disk/by-label", label)
 	if _, err := os.Stat(byLabel); err == nil {
 		return byLabel
-	}
-	for _, fb := range fallbackLabels {
-		byLabel = filepath.Join("/dev/disk/by-label", fb)
-		if _, err := os.Stat(byLabel); err == nil {
-			return byLabel
-		}
 	}
 	// Fall back to default device path.
 	return defaultDev

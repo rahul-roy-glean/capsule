@@ -36,10 +36,6 @@ var (
 	memoryMB             = flag.Int("memory-mb", 8192, "Memory MB for warmup VM")
 	warmupTimeout        = flag.Duration("warmup-timeout", 30*time.Minute, "Timeout for warmup phase")
 	rootfsSizeGB         = flag.Int("rootfs-size-gb", 0, "Expand rootfs to this size in GB (0 = keep original size). Increase if bazel fetch runs out of space.")
-	repoCacheUpperSizeGB = flag.Int("artifact-cache-upper-size-gb", 10, "Size in GB of repo-cache-upper.img (writable overlay for artifact/repository cache)")
-	repoCacheSeedSizeGB  = flag.Int("artifact-cache-seed-size-gb", 20, "Size in GB of repo-cache-seed.img (shared artifact/repository cache seed)")
-	repoCacheSeedDir     = flag.String("repo-cache-seed-dir", "", "Optional directory to seed into repo-cache-seed.img (copied into image root)")
-	gitCachePath         = flag.String("git-cache-path", "", "Path to pre-populated git-cache.img (from git-cache-builder). If set, uses this instead of cloning during warmup.")
 	logLevel             = flag.String("log-level", "info", "Log level")
 	enableChunked        = flag.Bool("enable-chunked", true, "Also build a chunked snapshot for lazy loading")
 	memBackend           = flag.String("mem-backend", "chunked", "Memory backend for chunked snapshots: 'chunked' (UFFD lazy loading via MemChunks, default) or 'file' (upload snapshot.mem as single blob)")
@@ -229,7 +225,6 @@ func main() {
 
 	// Paths used by both paths and for final snapshot creation
 	workingRootfs := filepath.Join(*outputDir, "rootfs.img")
-	repoCacheSeedImg := filepath.Join(*outputDir, "repo-cache-seed.img")
 
 	// rootfsSourceHash is lazily computed and stored in chunked metadata
 	// so future incremental builds can detect rootfs changes.
@@ -318,8 +313,6 @@ func main() {
 		// the same set of drives so that Firecracker snapshot restore works —
 		// you can't add/remove drives between snapshot and restore. Sparse files
 		// don't consume actual disk space until written to.
-		//
-		// Legacy builds: use the hardcoded repo_cache_seed/upper/credentials/git_cache.
 		var drives []firecracker.Drive
 		gitCacheEnabled := false
 
@@ -350,52 +343,6 @@ func main() {
 					"size_gb":  sizeGB,
 					"label":    label,
 				}).Info("Created sparse drive")
-			}
-		} else {
-			// Legacy mode: create hardcoded drives
-			log.WithFields(logrus.Fields{
-				"path":     repoCacheSeedImg,
-				"size_gb":  *repoCacheSeedSizeGB,
-				"seed_dir": *repoCacheSeedDir,
-			}).Info("Creating repo-cache seed image")
-			if err := createExt4Image(repoCacheSeedImg, *repoCacheSeedSizeGB, "ARTIFACT_CACHE_SEED"); err != nil {
-				log.WithError(err).Fatal("Failed to create repo-cache seed image")
-			}
-			if *repoCacheSeedDir != "" {
-				if err := seedExt4ImageFromDir(repoCacheSeedImg, *repoCacheSeedDir, log); err != nil {
-					log.WithError(err).Warn("Failed to seed repo-cache image from directory; continuing with empty seed")
-				}
-			}
-
-			repoCacheUpperImg := filepath.Join(*outputDir, "repo-cache-upper.img")
-			if err := createExt4Image(repoCacheUpperImg, *repoCacheUpperSizeGB, "ARTIFACT_CACHE_UPPER"); err != nil {
-				log.WithError(err).Fatal("Failed to create repo-cache upper image")
-			}
-
-			credentialsImg := filepath.Join(*outputDir, "credentials.img")
-			if err := createExt4ImageMB(credentialsImg, 32, "CREDENTIALS"); err != nil {
-				log.WithError(err).Fatal("Failed to create credentials image")
-			}
-
-			gitCacheImg := filepath.Join(*outputDir, "git-cache.img")
-			if *gitCachePath != "" {
-				log.WithField("source", *gitCachePath).Info("Copying pre-populated git-cache image...")
-				if err := copyFile(*gitCachePath, gitCacheImg); err != nil {
-					log.WithError(err).Fatal("Failed to copy git-cache image")
-				}
-				gitCacheEnabled = true
-			} else {
-				log.Info("Creating placeholder git-cache image...")
-				if err := createExt4ImageMB(gitCacheImg, 64, "GIT_CACHE"); err != nil {
-					log.WithError(err).Fatal("Failed to create git-cache image")
-				}
-			}
-
-			drives = []firecracker.Drive{
-				{DriveID: "repo_cache_seed", PathOnHost: repoCacheSeedImg, IsRootDevice: false, IsReadOnly: false},
-				{DriveID: "repo_cache_upper", PathOnHost: repoCacheUpperImg, IsRootDevice: false, IsReadOnly: false},
-				{DriveID: "credentials", PathOnHost: credentialsImg, IsRootDevice: false, IsReadOnly: true},
-				{DriveID: "git_cache", PathOnHost: gitCacheImg, IsRootDevice: false, IsReadOnly: true},
 			}
 		}
 
@@ -528,7 +475,7 @@ func main() {
 
 	// Get file sizes (some files may not exist in incremental mode)
 	var totalSize int64
-	for _, f := range []string{kernelOutput, workingRootfs, snapshotPath, memPath, repoCacheSeedImg} {
+	for _, f := range []string{kernelOutput, workingRootfs, snapshotPath, memPath} {
 		info, _ := os.Stat(f)
 		if info != nil {
 			totalSize += info.Size()
@@ -557,7 +504,6 @@ func main() {
 		RootfsPath:        "rootfs.img",
 		MemPath:           "snapshot.mem",
 		StatePath:         "snapshot.state",
-		ArtifactCacheSeedPath: "repo-cache-seed.img",
 	}
 
 	// Upload to GCS
@@ -572,7 +518,7 @@ func main() {
 	defer uploader.Close()
 
 	if *enableChunked {
-		log.Info("Chunked mode: skipping legacy full-file upload (rootfs, mem, repo-cache-seed)")
+		log.Info("Chunked mode: skipping full-file upload")
 	} else if !wasIncremental {
 		// Legacy upload only works with cold boot (needs full files on disk)
 		log.Info("Uploading full snapshot to GCS...")
@@ -753,8 +699,8 @@ func main() {
 			}).Info("Incremental chunked snapshot built and uploaded")
 		} else {
 			// Cold boot: chunk everything from full files on disk.
-			// Include all drives (config-defined or legacy) so child layers
-			// can restore them via FUSE for filesystem consistency.
+			// Include all drives so child layers can restore them via FUSE
+			// for filesystem consistency.
 			driveSpecs := []snapshot.DriveSpec{}
 			driveImages := map[string]string{}
 
@@ -767,16 +713,6 @@ func main() {
 						driveImages[d.DriveID] = imgPath
 					}
 				}
-			} else {
-				// Legacy mode: include repo_cache_seed
-				if _, err := os.Stat(repoCacheSeedImg); err == nil {
-					driveSpecs = append(driveSpecs, snapshot.DriveSpec{
-						DriveID:  "repo_cache_seed",
-						Label:    "ARTIFACT_CACHE_SEED",
-						ReadOnly: false,
-					})
-					driveImages["repo_cache_seed"] = repoCacheSeedImg
-				}
 			}
 
 			snapshotPaths := &snapshot.SnapshotPaths{
@@ -784,7 +720,6 @@ func main() {
 				Rootfs:               workingRootfs,
 				Mem:                  memPath,
 				State:                snapshotPath,
-				ArtifactCacheSeed:    repoCacheSeedImg,
 				Version:              version,
 				ExtensionDriveImages: driveImages,
 			}
@@ -1716,9 +1651,7 @@ func reattachFromParent(
 	log.Info("Mounted FUSE-backed rootfs from parent for reattach")
 
 	// 7. Build extension drives for the restored VM.
-	// The drives must match what the parent snapshot had. For layer builds,
-	// the parent was built with config-defined drives only (no legacy drives).
-	// For legacy builds, mount parent's drives via FUSE for consistency.
+	// The drives must match what the parent snapshot had.
 	fuseExtDisks := make(map[string]*fuse.ChunkedDisk)
 	var vmDrives []firecracker.Drive
 

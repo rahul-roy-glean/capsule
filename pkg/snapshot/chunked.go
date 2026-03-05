@@ -77,7 +77,6 @@ var ErrChunkCorruption = errors.New("chunk corruption detected")
 // Instead of storing full files, we store references to content-addressed chunks.
 type ChunkedSnapshotMetadata struct {
 	Version       string            `json:"version"`
-	BuildToolVersion  string            `json:"build_tool_version,omitempty"`
 	RepoCommit    string            `json:"repo_commit,omitempty"`
 	Repo          string            `json:"repo,omitempty"`
 	WorkloadKey   string            `json:"workload_key,omitempty"`
@@ -96,7 +95,6 @@ type ChunkedSnapshotMetadata struct {
 	// MemChunks will be empty/nil for new-style snapshots.
 	MemFilePath string `json:"mem_file_path,omitempty"`
 	// ExtensionDrives holds chunks for extension block devices, keyed by DriveID.
-	// Replaces the old RepoCacheSeedChunks field.
 	ExtensionDrives map[string]ExtensionDrive `json:"extension_drives,omitempty"`
 	// RootfsSourceHash is the SHA-256 hash of the original base rootfs.img used
 	// to build this snapshot. Used by incremental builds to detect rootfs changes

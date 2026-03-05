@@ -34,26 +34,6 @@ func TestAllocateRequest_WorkloadKey(t *testing.T) {
 	}
 }
 
-func TestSnapshotMetadata_BackwardsCompatible(t *testing.T) {
-	// Old metadata without repo fields should still unmarshal
-	oldJSON := `{"version":"v1","bazel_version":"7.0","created_at":"2026-01-01T00:00:00Z"}`
-
-	var meta SnapshotMetadata
-	if err := json.Unmarshal([]byte(oldJSON), &meta); err != nil {
-		t.Fatalf("Failed to unmarshal old metadata: %v", err)
-	}
-
-	if meta.Version != "v1" {
-		t.Errorf("Version = %q, want %q", meta.Version, "v1")
-	}
-	if meta.Repo != "" {
-		t.Errorf("Repo should be empty for old metadata, got %q", meta.Repo)
-	}
-	if meta.WorkloadKey != "" {
-		t.Errorf("WorkloadKey should be empty for old metadata, got %q", meta.WorkloadKey)
-	}
-}
-
 func TestChunkedSnapshotMetadata_WorkloadKeyFields(t *testing.T) {
 	meta := ChunkedSnapshotMetadata{
 		Version:     "v20260221-120000-main",

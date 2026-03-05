@@ -35,7 +35,6 @@ var (
 	setCurrent      = flag.Bool("set-current", false, "Set this version as current after conversion")
 	logLevel        = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	localCache      = flag.String("local-cache", "/tmp/chunk-cache", "Local chunk cache directory")
-	bazelVer        = flag.String("bazel-version", "", "Bazel version in the snapshot")
 	repoCommit      = flag.String("repo-commit", "", "Repository commit hash in the snapshot")
 	workloadKeyFlag = flag.String("workload-key", "", "Workload key for scoping GCS paths (required)")
 	gcsPrefix       = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
@@ -73,7 +72,7 @@ func main() {
 
 	// Verify source files exist
 	requiredFiles := []string{"kernel.bin", "rootfs.img"}
-	optionalFiles := []string{"snapshot.mem", "snapshot.state", "repo-cache-seed.img"}
+	optionalFiles := []string{"snapshot.mem", "snapshot.state"}
 
 	for _, f := range requiredFiles {
 		path := filepath.Join(*sourceDir, f)
@@ -131,12 +130,6 @@ func main() {
 		paths.State = filepath.Join(*sourceDir, "snapshot.state")
 	}
 
-	// Check for repo cache seed
-	repoCachePath := filepath.Join(*sourceDir, "repo-cache-seed.img")
-	if _, err := os.Stat(repoCachePath); err == nil {
-		paths.ArtifactCacheSeed = repoCachePath
-	}
-
 	// Create chunked snapshot builder
 	builder := snapshot.NewChunkedSnapshotBuilder(chunkStore, nil, logger)
 
@@ -148,7 +141,6 @@ func main() {
 	}
 
 	// Set additional metadata
-	meta.BuildToolVersion = *bazelVer
 	meta.RepoCommit = *repoCommit
 
 	// Upload metadata

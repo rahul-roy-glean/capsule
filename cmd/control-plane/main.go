@@ -495,10 +495,10 @@ func initSchema(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_version_assignments_repo ON version_assignments(repo_slug)`,
 		`CREATE INDEX IF NOT EXISTS idx_version_assignments_host ON version_assignments(host_id)`,
-		// Rename chunk_key -> workload_key in existing tables (idempotent: no-op if column doesn't exist or target already exists)
-		`DO $$ BEGIN ALTER TABLE snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
-		`DO $$ BEGIN ALTER TABLE version_assignments RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
-		`DO $$ BEGIN ALTER TABLE session_snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
+		// Drop old chunk_key columns (previously renamed to workload_key, now fully removed)
+		`ALTER TABLE snapshots DROP COLUMN IF EXISTS chunk_key`,
+		`ALTER TABLE version_assignments DROP COLUMN IF EXISTS chunk_key`,
+		`ALTER TABLE session_snapshots DROP COLUMN IF EXISTS chunk_key`,
 		// Add workload_key column to snapshots (for fresh installs without chunk_key)
 		`ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshots_workload_key ON snapshots(workload_key)`,
@@ -686,9 +686,9 @@ func initSchema(db *sql.DB) error {
 		// runners: drop external_runner_id (was github_runner_id)
 		`ALTER TABLE runners DROP COLUMN IF EXISTS github_runner_id`,
 		`ALTER TABLE runners DROP COLUMN IF EXISTS external_runner_id`,
-		// jobs: github_workflow_run_id -> ci_run_id, github_job_id -> ci_job_id
-		`DO $$ BEGIN ALTER TABLE jobs RENAME COLUMN github_workflow_run_id TO ci_run_id; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; END $$`,
-		`DO $$ BEGIN ALTER TABLE jobs RENAME COLUMN github_job_id TO ci_job_id; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; END $$`,
+		// jobs: drop old github_workflow_run_id and github_job_id columns
+		`ALTER TABLE jobs DROP COLUMN IF EXISTS github_workflow_run_id`,
+		`ALTER TABLE jobs DROP COLUMN IF EXISTS github_job_id`,
 		// layered_configs: drop integration_name (was ci_system); migrate github_app_id/secret -> ci_credentials JSONB
 		`ALTER TABLE layered_configs DROP COLUMN IF EXISTS ci_system`,
 		`ALTER TABLE layered_configs DROP COLUMN IF EXISTS integration_name`,

@@ -219,9 +219,6 @@ const (
 	PresetQuarantine      = "quarantine"
 	PresetRestrictedEgress = "restricted-egress"
 	PresetAgentSandbox    = "agent-sandbox"
-
-	// PresetCIStandard is a backwards-compat alias for PresetRestrictedEgress.
-	PresetCIStandard = PresetRestrictedEgress
 )
 
 // GetPreset returns a named preset policy. Returns nil for unknown names.
@@ -231,7 +228,7 @@ func GetPreset(name string) *NetworkPolicy {
 		return presetUnrestricted()
 	case PresetQuarantine:
 		return presetQuarantine()
-	case PresetRestrictedEgress, "ci-standard":
+	case PresetRestrictedEgress:
 		return presetRestrictedEgress()
 	case PresetAgentSandbox:
 		return presetAgentSandbox()

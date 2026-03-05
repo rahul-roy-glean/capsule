@@ -112,7 +112,7 @@ type AllocateRequest struct {
 	TTLSeconds          int                    // idle timeout from snapshot config
 	AutoPause           bool                   // pause on TTL vs destroy
 	SnapshotTag         string                 // optional: named tag to resolve snapshot version
-	NetworkPolicyPreset string                 // optional: named preset (e.g., "ci-standard")
+	NetworkPolicyPreset string                 // optional: named preset (e.g., "restricted-egress")
 	NetworkPolicy       *network.NetworkPolicy // optional: full policy override
 	AuthConfig          *authproxy.AuthConfig  // optional: auth proxy configuration
 }

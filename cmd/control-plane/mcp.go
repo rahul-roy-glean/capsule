@@ -32,7 +32,7 @@ type AllocateSandboxInput struct {
 	WorkloadKey         string `json:"workload_key" jsonschema:"Snapshot workload key identifying which VM image to boot"`
 	SessionID           string `json:"session_id,omitempty" jsonschema:"Session ID for pause/resume. If a matching suspended session exists it resumes."`
 	SnapshotTag         string `json:"snapshot_tag,omitempty" jsonschema:"Named snapshot tag (e.g. stable or canary)"`
-	NetworkPolicyPreset string `json:"network_policy_preset,omitempty" jsonschema:"Named network policy preset (e.g. ci-standard or isolated)"`
+	NetworkPolicyPreset string `json:"network_policy_preset,omitempty" jsonschema:"Named network policy preset (e.g. restricted-egress or isolated)"`
 }
 
 type AllocateSandboxOutput struct {

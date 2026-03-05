@@ -191,7 +191,7 @@ message AllocateRunnerRequest {
   int32 ttl_seconds = 14;         // idle timeout from snapshot config (0 = no timeout)
   bool auto_pause = 15;           // pause on TTL expiry instead of destroy
   string snapshot_tag = 16;       // optional: named tag to resolve snapshot version
-  string network_policy_preset = 17; // optional: named preset (e.g., "ci-standard", "agent-sandbox")
+  string network_policy_preset = 17; // optional: named preset (e.g., "restricted-egress", "agent-sandbox")
   string network_policy_json = 18;   // optional: full NetworkPolicy as JSON (overrides preset)
 }
 

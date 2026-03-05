@@ -49,7 +49,6 @@ func (u *IncrementalUploader) UploadIncrementalSnapshot(
 	// Create new metadata based on base
 	newMeta := &ChunkedSnapshotMetadata{
 		Version:       newVersion,
-		BuildToolVersion: baseMeta.BuildToolVersion,
 		RepoCommit:    baseMeta.RepoCommit,
 		CreatedAt:     time.Now(),
 		ChunkSize:     baseMeta.ChunkSize,
