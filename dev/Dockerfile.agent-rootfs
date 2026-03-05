@@ -87,7 +87,7 @@ Wants=network.target\n\
 \n\
 [Service]\n\
 Type=simple\n\
-ExecStart=/usr/local/bin/thaw-agent --skip-runner --skip-repo-cache --skip-buildbarn-certs --skip-credentials --skip-git-cache\n\
+ExecStart=/usr/local/bin/thaw-agent\n\
 Restart=on-failure\n\
 RestartSec=2\n\
 StandardOutput=journal\n\
