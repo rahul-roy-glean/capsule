@@ -213,7 +213,8 @@ func (f *diskFile) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.R
 	data := make([]byte, size)
 	n, err := f.disk.ReadAt(data, offset)
 	if err != nil {
-		return err
+		f.disk.logger.WithError(err).WithField("offset", offset).Error("FUSE read failed")
+		return syscall.EIO
 	}
 
 	resp.Data = data[:n]
@@ -226,7 +227,8 @@ func (f *diskFile) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse
 
 	n, err := f.disk.WriteAt(req.Data, req.Offset)
 	if err != nil {
-		return err
+		f.disk.logger.WithError(err).WithField("offset", req.Offset).Error("FUSE write failed")
+		return syscall.EIO
 	}
 
 	resp.Size = n

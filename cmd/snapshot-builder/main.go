@@ -19,6 +19,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
+	_ "github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy/providers" // register auth providers
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/fuse"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/github"
@@ -67,6 +69,9 @@ var (
 	// Base image support: build rootfs from Docker image instead of pre-baked rootfs.img
 	baseImage  = flag.String("base-image", "", "Docker image URI to use as rootfs base (e.g. 'ubuntu:22.04'). When set, pulls the image, converts to ext4, and installs thaw-agent.")
 	runnerUser = flag.String("runner-user", "runner", "Username for non-root commands inside the VM")
+
+	// Auth proxy: transparent credential injection for the warmup VM
+	authConfigJSON = flag.String("auth-config", "", "JSON auth proxy config (AuthConfig). When set, starts an auth proxy on the host to provide GCP metadata and HTTPS credential injection.")
 )
 
 func main() {
@@ -209,7 +214,7 @@ func main() {
 	tapName := "tap-slot-0"         // Must match manager's slot naming for snapshot compatibility
 	guestIP := "172.16.0.2"         // Slot 0 always gets .2
 	guestMAC := "AA:FC:00:00:00:02" // Deterministic MAC based on slot
-	hostIP := "172.16.0.1"
+	// hostIP is a package-level constant (172.16.0.1)
 	netmask := "255.255.255.0"
 
 	log.Info("Setting up network for warmup VM...")
@@ -217,6 +222,36 @@ func main() {
 		log.WithError(err).Fatal("Failed to setup warmup network")
 	}
 	defer cleanupWarmupNetwork(tapName)
+
+	// Start auth proxy if configured. The proxy provides:
+	// 1. GCP metadata server emulation on hostIP:80 (for keyrings.google-artifactregistry-auth)
+	// 2. HTTPS MITM proxy on hostIP:3128 (injects auth headers for matched hosts)
+	var authProxy *authproxy.AuthProxy
+	var authProxyAddr string // e.g. "http://172.16.0.1:3128"
+	if *authConfigJSON != "" {
+		var authCfg authproxy.AuthConfig
+		if err := json.Unmarshal([]byte(*authConfigJSON), &authCfg); err != nil {
+			log.WithError(err).Fatal("Failed to parse --auth-config JSON")
+		}
+		proxyPort := authCfg.Proxy.ListenPort
+		if proxyPort == 0 {
+			proxyPort = 3128
+		}
+		authProxyAddr = fmt.Sprintf("http://%s:%d", hostIP, proxyPort)
+		var proxyErr error
+		authProxy, proxyErr = authproxy.NewAuthProxy("snapshot-builder", authCfg, "", hostIP, "", log)
+		if proxyErr != nil {
+			log.WithError(proxyErr).Fatal("Failed to create auth proxy")
+		}
+		if proxyErr = authProxy.Start(ctx); proxyErr != nil {
+			log.WithError(proxyErr).Fatal("Failed to start auth proxy")
+		}
+		defer authProxy.Stop()
+		// Note: DNAT to 169.254.169.254 doesn't work because Firecracker's MMDS
+		// intercepts all traffic to that IP before it reaches the tap interface.
+		// Instead, we pass the metadata host (gatewayIP) via MMDS and set
+		// GCE_METADATA_HOST in the guest so google-auth talks directly to the proxy.
+	}
 
 	bootArgs := fmt.Sprintf("console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off",
 		guestIP, hostIP, netmask)
@@ -235,16 +270,24 @@ func main() {
 	// so future incremental builds can detect rootfs changes.
 	var rootfsSourceHash string
 
+	// expectedRunnerID is the runner_id we expect to see in warmup status.
+	// For reattach/incremental builds (restoring from parent snapshot), we set
+	// this to the new runner_id so waitForWarmup ignores stale status from the
+	// parent layer's completed warmup.
+	var expectedRunnerID string
+
 	// Try incremental/reattach restore from previous snapshot
 	if incremental {
+		expectedRunnerID = fmt.Sprintf("snapshot-builder-restore-%s", uuid.New().String()[:8])
 		if *parentWorkloadKey != "" && *parentVersion != "" {
 			// Restore from parent layer: parent's VM state (+ old layer's extension drives if reattach)
 			log.Info("Attempting restore from parent layer...")
 			var reattachErr error
-			vm, fuseDisk, fuseExtDisks, incrUffdHandler, reattachErr = reattachFromParent(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken, commands, newDrives)
+			vm, fuseDisk, fuseExtDisks, incrUffdHandler, reattachErr = reattachFromParent(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken, commands, newDrives, expectedRunnerID, authProxy, authProxyAddr)
 			if reattachErr != nil {
 				log.WithError(reattachErr).Warn("Reattach failed, falling back to cold boot")
 				vm = nil
+				expectedRunnerID = "" // Cold boot fallback — no stale state
 				if incrUffdHandler != nil {
 					incrUffdHandler.Stop()
 					incrUffdHandler = nil
@@ -261,10 +304,11 @@ func main() {
 		} else {
 			log.Info("Attempting incremental restore from previous snapshot...")
 			var incrementalErr error
-			vm, fuseDisk, fuseExtDisks, incrUffdHandler, incrementalErr = restoreFromPreviousSnapshot(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken, commands)
+			vm, fuseDisk, fuseExtDisks, incrUffdHandler, incrementalErr = restoreFromPreviousSnapshot(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken, commands, newDrives, expectedRunnerID, authProxy, authProxyAddr)
 			if incrementalErr != nil {
 				log.WithError(incrementalErr).Warn("Incremental restore failed, falling back to cold boot")
 				vm = nil
+				expectedRunnerID = "" // Cold boot fallback — no stale state
 				if incrUffdHandler != nil {
 					incrUffdHandler.Stop()
 					incrUffdHandler = nil
@@ -431,7 +475,8 @@ func main() {
 			log.WithError(err).Fatal("Failed to start VM")
 		}
 
-		mmdsData := buildWarmupMMDS(commands, gitToken, gcpAccessToken, gitCacheEnabled)
+		mmdsData := buildWarmupMMDS(commands, gitToken, gcpAccessToken, gitCacheEnabled, newDrives)
+		injectProxyMMDS(mmdsData, authProxy, authProxyAddr, hostIP)
 		if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 			vm.Stop()
 			log.WithError(err).Fatal("Failed to set MMDS data")
@@ -443,7 +488,7 @@ func main() {
 	warmupCtx, warmupCancel := context.WithTimeout(ctx, *warmupTimeout)
 	defer warmupCancel()
 
-	if err := waitForWarmup(warmupCtx, vm, guestIP, log); err != nil {
+	if err := waitForWarmup(warmupCtx, vm, guestIP, expectedRunnerID, log); err != nil {
 		vm.Stop()
 		log.WithError(err).Fatal("Warmup failed")
 	}
@@ -857,11 +902,11 @@ type WarmupMMDSData struct {
 	} `json:"latest"`
 }
 
-func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, log *logrus.Entry) error {
+func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, expectedRunnerID string, log *logrus.Entry) error {
 	// Wait for thaw-agent health endpoint to become available
 	// The thaw-agent runs warmup and exposes /health and /warmup-status endpoints
 
-	log.WithField("guest_ip", guestIP).Info("Waiting for warmup to complete...")
+	log.WithFields(logrus.Fields{"guest_ip": guestIP, "expected_runner_id": expectedRunnerID}).Info("Waiting for warmup to complete...")
 
 	healthURL := fmt.Sprintf("http://%s:%d/health", guestIP, snapshot.ThawAgentHealthPort)
 	warmupURL := fmt.Sprintf("http://%s:%d/warmup-status", guestIP, snapshot.ThawAgentHealthPort)
@@ -917,6 +962,17 @@ func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, log 
 					"message": status.Message,
 				}).Info("Warmup progress")
 				lastPhase = status.Phase
+			}
+
+			// Ignore stale status from a previous warmup (e.g. parent layer).
+			// The thaw-agent tags warmup status with the runner_id so we can
+			// detect when it hasn't yet picked up the new MMDS data.
+			if expectedRunnerID != "" && status.RunnerID != expectedRunnerID {
+				log.WithFields(logrus.Fields{
+					"status_runner_id":   status.RunnerID,
+					"expected_runner_id": expectedRunnerID,
+				}).Debug("Ignoring stale warmup status from previous layer")
+				continue
 			}
 
 			if status.Complete {
@@ -982,6 +1038,7 @@ type WarmupStatus struct {
 	Error            string `json:"error,omitempty"`
 	Duration         string `json:"duration,omitempty"`
 	ExternalsFetched int    `json:"externals_fetched,omitempty"`
+	RunnerID         string `json:"runner_id,omitempty"`
 }
 
 func getWarmupStatus(client *http.Client, url string) (*WarmupStatus, error) {
@@ -1218,6 +1275,7 @@ func cleanupWarmupNetwork(tapName string) {
 // Firecracker opens drive backing files at the paths baked into the snapshot state,
 // which are /tmp/snapshot/*.img.
 const snapshotSymlinkDir = "/tmp/snapshot"
+const hostIP = "172.16.0.1" // Gateway IP for the VM tap network
 
 // restoreFromPreviousSnapshot downloads the previous chunked snapshot from GCS,
 // mounts rootfs and repo-cache-seed via FUSE, restores the VM from snapshot,
@@ -1230,6 +1288,9 @@ func restoreFromPreviousSnapshot(
 	vmID, tapName, guestMAC, bootArgs string,
 	gitToken, gcpAccessToken string,
 	commands []snapshot.SnapshotCommand,
+	newDrives []snapshot.DriveSpec,
+	runnerID string,
+	authProxy *authproxy.AuthProxy, authProxyAddr string,
 ) (*firecracker.VM, *fuse.ChunkedDisk, map[string]*fuse.ChunkedDisk, *uffd.Handler, error) {
 	// Use a subdirectory for incremental working files to avoid colliding
 	// with the symlinks in /tmp/snapshot/ that Firecracker expects.
@@ -1578,12 +1639,12 @@ func restoreFromPreviousSnapshot(
 	}
 
 	// 11. Set MMDS with mode=warmup and new runner_id
-	newRunnerID := fmt.Sprintf("snapshot-builder-incr-%s", uuid.New().String()[:8])
 	gitCacheEnabled := false
 	// The control plane passes the right commands for this build type via --snapshot-commands
-	mmdsData := buildWarmupMMDS(commands, gitToken, gcpAccessToken, gitCacheEnabled)
+	mmdsData := buildWarmupMMDS(commands, gitToken, gcpAccessToken, gitCacheEnabled, newDrives)
 	// Override runner_id so thaw-agent detects the change and re-runs warmup
-	mmdsData["latest"].(map[string]interface{})["meta"].(map[string]interface{})["runner_id"] = newRunnerID
+	mmdsData["latest"].(map[string]interface{})["meta"].(map[string]interface{})["runner_id"] = runnerID
+	injectProxyMMDS(mmdsData, authProxy, authProxyAddr, hostIP)
 
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
@@ -1596,7 +1657,7 @@ func restoreFromPreviousSnapshot(
 	}
 
 	// 12. Resume VM — thaw-agent wakes up, detects runner_id change, re-runs warmup
-	log.WithField("runner_id", newRunnerID).Info("Resuming VM for incremental warmup...")
+	log.WithField("runner_id", runnerID).Info("Resuming VM for incremental warmup...")
 	if err := vm.Resume(ctx); err != nil {
 		vm.Stop()
 		fuseDisk.Unmount()
@@ -1623,6 +1684,8 @@ func reattachFromParent(
 	gitToken, gcpAccessToken string,
 	commands []snapshot.SnapshotCommand,
 	newDrives []snapshot.DriveSpec,
+	runnerID string,
+	authProxy *authproxy.AuthProxy, authProxyAddr string,
 ) (*firecracker.VM, *fuse.ChunkedDisk, map[string]*fuse.ChunkedDisk, *uffd.Handler, error) {
 	reattachDir := filepath.Join(*outputDir, "reattach")
 	if err := os.MkdirAll(reattachDir, 0755); err != nil {
@@ -1962,10 +2025,10 @@ func reattachFromParent(
 		os.Remove(c)
 	}
 
-	newRunnerID := fmt.Sprintf("snapshot-builder-reattach-%s", uuid.New().String()[:8])
 	gitCacheEnabled := false
-	mmdsData := buildWarmupMMDS(commands, gitToken, gcpAccessToken, gitCacheEnabled)
-	mmdsData["latest"].(map[string]interface{})["meta"].(map[string]interface{})["runner_id"] = newRunnerID
+	mmdsData := buildWarmupMMDS(commands, gitToken, gcpAccessToken, gitCacheEnabled, newDrives)
+	mmdsData["latest"].(map[string]interface{})["meta"].(map[string]interface{})["runner_id"] = runnerID
+	injectProxyMMDS(mmdsData, authProxy, authProxyAddr, hostIP)
 
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
@@ -1973,7 +2036,7 @@ func reattachFromParent(
 		return nil, nil, nil, nil, fmt.Errorf("failed to set MMDS data: %w", err)
 	}
 
-	log.WithField("runner_id", newRunnerID).Info("Resuming VM for reattach warmup...")
+	log.WithField("runner_id", runnerID).Info("Resuming VM for reattach warmup...")
 	if err := vm.Resume(ctx); err != nil {
 		vm.Stop()
 		cleanupFuse()
@@ -1986,7 +2049,7 @@ func reattachFromParent(
 
 // buildWarmupMMDS creates the MMDS data for warmup mode.
 // commands are passed through to thaw-agent as warmup.commands.
-func buildWarmupMMDS(commands []snapshot.SnapshotCommand, gitToken, gcpAccessToken string, gitCacheEnabled bool) map[string]interface{} {
+func buildWarmupMMDS(commands []snapshot.SnapshotCommand, gitToken, gcpAccessToken string, gitCacheEnabled bool, drives ...[]snapshot.DriveSpec) map[string]interface{} {
 	// Extract repo URL from git-clone command for git_cache mapping (best-effort).
 	repoURL := ""
 	for _, cmd := range commands {
@@ -2009,9 +2072,13 @@ func buildWarmupMMDS(commands []snapshot.SnapshotCommand, gitToken, gcpAccessTok
 				"runner_id":   "snapshot-builder",
 				"environment": "snapshot-build",
 			},
-			"warmup": map[string]interface{}{
-				"commands": commands,
-			},
+			"warmup": func() map[string]interface{} {
+				w := map[string]interface{}{"commands": commands}
+				if len(drives) > 0 && len(drives[0]) > 0 {
+					w["drives"] = drives[0]
+				}
+				return w
+			}(),
 			"network": map[string]interface{}{
 				"ip":        "172.16.0.2/24",
 				"gateway":   "172.16.0.1",
@@ -2031,6 +2098,20 @@ func buildWarmupMMDS(commands []snapshot.SnapshotCommand, gitToken, gcpAccessTok
 				"repo_mappings": repoMappings,
 			},
 		},
+	}
+}
+
+// injectProxyMMDS adds auth proxy metadata to the MMDS data if an auth proxy is running.
+// The thaw-agent reads this to configure HTTPS_PROXY, GCE_METADATA_HOST, and install the CA certificate.
+func injectProxyMMDS(mmdsData map[string]interface{}, proxy *authproxy.AuthProxy, proxyAddr, metadataHost string) {
+	if proxy == nil {
+		return
+	}
+	latest := mmdsData["latest"].(map[string]interface{})
+	latest["proxy"] = map[string]interface{}{
+		"ca_cert_pem":   string(proxy.CACertPEM),
+		"address":       proxyAddr,
+		"metadata_host": metadataHost,
 	}
 }
 
