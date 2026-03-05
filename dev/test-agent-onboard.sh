@@ -100,8 +100,6 @@ BUILDER_FLAGS=(
   --vcpus=2
   --memory-mb=4096
   --warmup-timeout=5m
-  --artifact-cache-seed-size-gb=1
-  --artifact-cache-upper-size-gb=1
   --snapshot-commands="$SNAPSHOT_COMMANDS"
   --log-level=info
 )

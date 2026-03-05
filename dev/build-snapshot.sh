@@ -80,8 +80,6 @@ sudo "$REPO_ROOT/bin/snapshot-builder" \
   --vcpus=2 \
   --memory-mb=2048 \
   --warmup-timeout=5m \
-  --artifact-cache-seed-size-gb=1 \
-  --artifact-cache-upper-size-gb=1 \
   --enable-chunked="$ENABLE_CHUNKED" \
   --snapshot-commands="$SNAPSHOT_COMMANDS" \
   --log-level=info \
