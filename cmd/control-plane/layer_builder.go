@@ -267,7 +267,7 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 		       COALESCE(sl.all_chain_drives, sl.drives) AS all_chain_drives,
 		       sl.config_name,
 		       parent_sl.current_version AS parent_current_version,
-		       lc.tier, lc.github_app_id, lc.github_app_secret,
+		       lc.tier,
 		       sb.old_layer_hash, sb.old_layer_version,
 		       lc.config_json,
 		       sb.retry_count, sb.max_retries
