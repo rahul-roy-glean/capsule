@@ -1141,10 +1141,10 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		return nil, fmt.Errorf("failed to setup snapshot symlinks: %w", symlinkErr)
 	}
 
-	// Restore from snapshot with UFFD
+	// Restore from snapshot with UFFD (paused — don't resume yet)
 	var restoreErr error
 	if useNetNS {
-		restoreErr = vm.RestoreFromSnapshotWithUFFD(ctx, latestStateFile, uffdSocketPath, true)
+		restoreErr = vm.RestoreFromSnapshotWithUFFD(ctx, latestStateFile, uffdSocketPath, false)
 		cleanup()
 	} else {
 		m.mu.Lock()
@@ -1159,7 +1159,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 			m.mu.Unlock()
 			return nil, fmt.Errorf("failed to setup TAP rename: %w", tapErr)
 		}
-		restoreErr = vm.RestoreFromSnapshotWithUFFD(ctx, latestStateFile, uffdSocketPath, true)
+		restoreErr = vm.RestoreFromSnapshotWithUFFD(ctx, latestStateFile, uffdSocketPath, false)
 		tapRestore()
 		cleanup()
 	}
@@ -1224,12 +1224,25 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	m.uffdHandlers[runnerID] = uffdHandler
 	m.mu.Unlock()
 
-	// Inject MMDS data
+	// Inject MMDS data BEFORE resuming so the thaw-agent sees fresh config
 	mmdsData := m.buildMMDSData(ctx, runner, tap, AllocateRequest{
 		WorkloadKey: metadata.WorkloadKey,
 	})
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		m.logger.WithError(err).Warn("Failed to set MMDS data on resumed runner")
+	}
+
+	// Now resume the VM — thaw-agent will read the fresh MMDS data
+	if err := vm.Resume(ctx); err != nil {
+		vm.Stop()
+		uffdHandler.Stop()
+		m.mu.Lock()
+		delete(m.runners, runnerID)
+		delete(m.vms, runnerID)
+		delete(m.uffdHandlers, runnerID)
+		m.cleanupNetworkOnly(runnerID, tap.Name)
+		m.mu.Unlock()
+		return nil, fmt.Errorf("failed to resume VM after MMDS injection: %w", err)
 	}
 
 	m.logger.WithFields(logrus.Fields{
