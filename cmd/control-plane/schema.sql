@@ -85,11 +85,10 @@ CREATE TABLE IF NOT EXISTS session_snapshots (
     workload_key VARCHAR(16) NOT NULL,
     host_id VARCHAR(255) NOT NULL,
     runner_id VARCHAR(255) NOT NULL,
-    layers INT DEFAULT 0,
+    layer_count INT DEFAULT 0,
     status VARCHAR(32) DEFAULT 'active',
-    gcs_manifest_path VARCHAR(512),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    last_paused_at TIMESTAMP WITH TIME ZONE
+    paused_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- Layered snapshot pipeline tables
