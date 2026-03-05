@@ -1548,7 +1548,6 @@ func restoreFromPreviousSnapshot(
 	}
 
 	// 11. Set MMDS with mode=warmup and new runner_id
-	newRunnerID := fmt.Sprintf("snapshot-builder-incr-%s", uuid.New().String()[:8])
 	// The control plane passes the right commands for this build type via --snapshot-commands
 	mmdsData := buildWarmupMMDS(commands, gitToken, newDrives)
 	// Override runner_id so thaw-agent detects the change and re-runs warmup
@@ -1956,7 +1955,7 @@ func reattachFromParent(
 
 // buildWarmupMMDS creates the MMDS data for warmup mode.
 // commands are passed through to thaw-agent as warmup.commands.
-func buildWarmupMMDS(commands []snapshot.SnapshotCommand, gitToken, drives ...[]snapshot.DriveSpec) map[string]interface{} {
+func buildWarmupMMDS(commands []snapshot.SnapshotCommand, gitToken string, drives []snapshot.DriveSpec) map[string]interface{} {
 	job := map[string]interface{}{}
 	if gitToken != "" {
 		job["git_token"] = gitToken
@@ -1971,8 +1970,8 @@ func buildWarmupMMDS(commands []snapshot.SnapshotCommand, gitToken, drives ...[]
 			},
 			"warmup": func() map[string]interface{} {
 				w := map[string]interface{}{"commands": commands}
-				if len(drives) > 0 && len(drives[0]) > 0 {
-					w["drives"] = drives[0]
+				if len(drives) > 0 {
+					w["drives"] = drives
 				}
 				return w
 			}(),
