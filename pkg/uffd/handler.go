@@ -486,10 +486,16 @@ func (h *Handler) handlePageFaults(uffdFd int) {
 		if time.Since(lastFaultLog) > 5*time.Second {
 			currentFaults := atomic.LoadUint64(&h.pageFaults)
 			if currentFaults != lastFaultCount {
+				cacheStats := h.chunkStore.CacheStats()
 				h.logger.WithFields(logrus.Fields{
-					"total_faults":  currentFaults,
-					"delta":         currentFaults - lastFaultCount,
-					"chunk_fetches": atomic.LoadUint64(&h.chunkFetches),
+					"total_faults":   currentFaults,
+					"delta":          currentFaults - lastFaultCount,
+					"chunk_fetches":  atomic.LoadUint64(&h.chunkFetches),
+					"lru_hits":       cacheStats.Hits,
+					"lru_misses":     cacheStats.Misses,
+					"lru_evictions":  cacheStats.Evictions,
+					"lru_items":      cacheStats.ItemCount,
+					"lru_size_mb":    cacheStats.Size / (1024 * 1024),
 				}).Debug("UFFD fault activity")
 				lastFaultCount = currentFaults
 			}
