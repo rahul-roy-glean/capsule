@@ -127,6 +127,32 @@ var globalWarmupState = &WarmupState{
 // MMDS access (the forwarder hijacks 169.254.169.254 from the TAP/MMDS path).
 var globalMetadataForwarderStop func()
 
+// globalProxyEnv holds proxy-related environment variables (HTTPS_PROXY, etc.)
+// set by configureAuthProxy. These are passed to child commands instead of being
+// set process-wide, so they don't persist in snapshots.
+var globalProxyEnv []string
+
+// RegistrationState tracks GitHub runner registration status
+type RegistrationState struct {
+	Attempted bool   `json:"attempted"`
+	Success   bool   `json:"success"`
+	Error     string `json:"error,omitempty"`
+	Output    string `json:"output,omitempty"`
+}
+
+var globalRegistrationState = &RegistrationState{}
+
+// SymlinkState tracks pre-cloned repo symlink status
+type SymlinkState struct {
+	Attempted    bool   `json:"attempted"`
+	Success      bool   `json:"success"`
+	SymlinkPath  string `json:"symlink_path,omitempty"`
+	TargetPath   string `json:"target_path,omitempty"`
+	TargetExists bool   `json:"target_exists"`
+	Error        string `json:"error,omitempty"`
+}
+
+var globalSymlinkState = &SymlinkState{}
 
 // MMDSData represents the data structure from MMDS
 type MMDSData struct {
@@ -459,6 +485,13 @@ func main() {
 				// Update the existing mmdsData in-place so the health server sees the new data
 				// (the health server has a reference to the original mmdsData)
 				mmdsData.Latest = newData.Latest
+
+				// Thaw any frozen filesystems before accessing drives.
+				thawFrozenFilesystems()
+
+				// Recreate symlink after restore (tmpfs was fresh, symlink from warmup is gone)
+				// Use configured paths from MMDS
+				globalSymlinkState.Attempted = true
 
 				// Use a temporary MMDSData wrapper for the helper functions
 				tempData := &MMDSData{}
@@ -1235,10 +1268,40 @@ func signalReady() error {
 	return os.WriteFile(*readyFile, []byte(time.Now().Format(time.RFC3339)), 0644)
 }
 
+// thawFrozenFilesystems unfreezes all ext4 filesystems that were frozen by
+// fsfreeze --freeze at the end of the previous warmup. After snapshot restore,
+// the VM resumes with frozen filesystems — any I/O (including umount, stat,
+// chown) blocks indefinitely in D state until we unfreeze.
+// This must be called BEFORE any filesystem access after a snapshot restore.
+func thawFrozenFilesystems() {
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		log.WithError(err).Warn("Failed to read /proc/mounts for thaw")
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		mountPath, fsType := fields[1], fields[2]
+		if fsType != "ext4" || mountPath == "/" {
+			continue
+		}
+		if out, err := exec.Command("fsfreeze", "--unfreeze", mountPath).CombinedOutput(); err != nil {
+			log.WithError(err).WithField("mount_path", mountPath).Debugf("fsfreeze --unfreeze (output: %s)", string(out))
+		} else {
+			log.WithField("mount_path", mountPath).Info("Thawed frozen filesystem")
+		}
+	}
+}
+
 // runWarmupMode runs the snapshot warmup process by dispatching each command,
 // then runs infra-level finalization steps (runner update, page pre-warm) that
 // are always needed regardless of which user commands were specified.
 func runWarmupMode(data *MMDSData) error {
+	thawFrozenFilesystems()
+
 	// Mount extension drives. On reattach, the block device may have been swapped
 	// (old layer's data replaces the parent's empty drive). If the drive is already
 	// mounted, we must unmount+remount so ext4 re-reads the superblock from the
@@ -1256,6 +1319,22 @@ func runWarmupMode(data *MMDSData) error {
 		}
 		if err := os.MkdirAll(d.MountPath, 0755); err != nil {
 			return fmt.Errorf("failed to create mount point %s: %w", d.MountPath, err)
+		}
+		// Find the block device for this label so we can run e2fsck before mount.
+		// Extension drives from a prior snapshot may have dirty ext4 journals
+		// (captured mid-write between sync and VM pause). When mounted with a
+		// different VM memory state (refresh/reattach), the kernel cannot replay
+		// the journal and returns "Structure needs cleaning". e2fsck -p fixes this.
+		devBytes, _ := exec.Command("blkid", "-L", d.Label).Output()
+		devPath := strings.TrimSpace(string(devBytes))
+		if devPath != "" {
+			if out, err := exec.Command("e2fsck", "-p", devPath).CombinedOutput(); err != nil {
+				log.WithError(err).WithFields(logrus.Fields{
+					"label": d.Label, "device": devPath,
+				}).Warnf("e2fsck returned non-zero (output: %s)", string(out))
+			} else {
+				log.WithFields(logrus.Fields{"label": d.Label, "device": devPath}).Debug("e2fsck completed")
+			}
 		}
 		if out, err := exec.Command("mount", "-L", d.Label, d.MountPath).CombinedOutput(); err != nil {
 			return fmt.Errorf("failed to mount label %s at %s: %w (output: %s)", d.Label, d.MountPath, err, string(out))
@@ -1289,6 +1368,29 @@ func runWarmupMode(data *MMDSData) error {
 	updateWarmupState("syncing", "Syncing caches to disk...")
 	exec.Command("sync").Run()
 
+	// Freeze all mounted extension drives so ext4 journals are fully committed
+	// before the snapshot is taken. Without this, the journal can be captured
+	// mid-write (between sync and VM pause), making the drive unmountable when
+	// loaded with a different VM memory state (refresh/reattach builds).
+	var frozenMounts []string
+	for _, d := range data.Latest.Warmup.Drives {
+		if d.MountPath == "" {
+			continue
+		}
+		if exec.Command("mountpoint", "-q", d.MountPath).Run() != nil {
+			continue
+		}
+		if out, err := exec.Command("fsfreeze", "--freeze", d.MountPath).CombinedOutput(); err != nil {
+			log.WithError(err).WithField("mount_path", d.MountPath).Warnf("fsfreeze failed (output: %s)", string(out))
+		} else {
+			frozenMounts = append(frozenMounts, d.MountPath)
+			log.WithField("mount_path", d.MountPath).Info("Froze filesystem for clean snapshot")
+		}
+	}
+	// Note: frozenMounts are left frozen intentionally. The VM will be paused
+	// for snapshot shortly after warmup completes. On next restore, the drives
+	// are unmounted/remounted so the freeze state doesn't carry over.
+
 	return nil
 }
 
@@ -1315,6 +1417,9 @@ func runShellCommand(args []string, runAsRoot bool, data *MMDSData) error {
 		return fmt.Errorf("shell command requires at least one argument")
 	}
 	env := os.Environ()
+	// Append proxy env vars (set by configureAuthProxy) so child commands
+	// route through the auth proxy without polluting the thaw-agent process.
+	env = append(env, globalProxyEnv...)
 	if data != nil {
 		if t := data.Latest.Job.GitToken; t != "" {
 			env = append(env, "GIT_TOKEN="+t)
@@ -1369,36 +1474,35 @@ func configureAuthProxy(data *MMDSData) (stopForwarder func(), err error) {
 		}
 	}
 
-	// 2. Set proxy environment variables for child processes
-	os.Setenv("HTTPS_PROXY", proxyAddr)
-	os.Setenv("HTTP_PROXY", proxyAddr)
-	os.Setenv("https_proxy", proxyAddr)
-	os.Setenv("http_proxy", proxyAddr)
-	// Metadata requests must bypass the proxy -- they go directly to the auth proxy's
-	// metadata handler via GCE_METADATA_HOST (not through 169.254.169.254, which
-	// Firecracker's MMDS intercepts before it reaches the network).
+	// 2. Build proxy environment variables for child processes.
+	// These are stored in globalProxyEnv and appended to child command environments
+	// rather than set process-wide with os.Setenv. This prevents proxy env vars from
+	// being baked into snapshots and causing "connection refused" errors at runtime
+	// (when the build-time proxy is no longer running).
 	metadataHost := data.Latest.Proxy.MetadataHost
 	noProxy := "169.254.169.254,localhost,127.0.0.1"
 	if metadataHost != "" {
 		noProxy += "," + metadataHost
 	}
-	os.Setenv("NO_PROXY", noProxy)
-	os.Setenv("no_proxy", noProxy)
-
-	// 3. Point google-auth to the auth proxy's metadata handler on the gateway IP.
-	// Firecracker's MMDS captures all traffic to 169.254.169.254, so the real GCE
-	// metadata server is unreachable from inside the VM. GCE_METADATA_HOST tells
-	// the google-auth library to use an alternative metadata endpoint.
+	proxyEnv := []string{
+		"HTTPS_PROXY=" + proxyAddr,
+		"HTTP_PROXY=" + proxyAddr,
+		"https_proxy=" + proxyAddr,
+		"http_proxy=" + proxyAddr,
+		"NO_PROXY=" + noProxy,
+		"no_proxy=" + noProxy,
+	}
 	if metadataHost != "" {
-		os.Setenv("GCE_METADATA_HOST", metadataHost)
+		proxyEnv = append(proxyEnv, "GCE_METADATA_HOST="+metadataHost)
 		log.WithField("metadata_host", metadataHost).Info("Set GCE_METADATA_HOST for google-auth")
 	}
+	globalProxyEnv = proxyEnv
 
 	// 4. Intercept GCE metadata requests at the network level.
 	// Firecracker's MMDS V1 intercepts all traffic to 169.254.169.254 on the
 	// TAP device. By assigning 169.254.169.254 to the loopback interface, we
 	// keep metadata traffic local (kernel delivers to lo, never reaches TAP).
-	// A TCP forwarder then proxies requests to the host-side auth proxy.
+	// An HTTP reverse proxy then forwards requests to the host-side auth proxy.
 	// This is transparent to ALL programs (bazel, pip, gcloud, etc.) -- no
 	// env vars or tool-specific config needed.
 	if metadataHost != "" {
@@ -1416,11 +1520,11 @@ func configureAuthProxy(data *MMDSData) (stopForwarder func(), err error) {
 }
 
 // startMetadataForwarder assigns 169.254.169.254 to the loopback interface and
-// starts a TCP forwarder from 169.254.169.254:80 to metadataHost:80.
+// runs an HTTP reverse proxy from 169.254.169.254:80 to metadataHost:80.
 // This bypasses Firecracker's MMDS (which intercepts 169.254.169.254 on the TAP)
 // by keeping the traffic on lo, then forwarding to the host-side auth proxy.
 //
-// Returns a stop function that removes the IP from lo and closes the listener.
+// Returns a stop function that removes the IP from lo and closes the server.
 // The forwarder MUST be stopped before the MMDS poll loop, because 169.254.169.254
 // on lo prevents the thaw-agent from reading MMDS data (which goes through the TAP).
 func startMetadataForwarder(metadataHost string) (stop func(), err error) {
@@ -1430,6 +1534,52 @@ func startMetadataForwarder(metadataHost string) (stop func(), err error) {
 		return nil, fmt.Errorf("ip addr add 169.254.169.254/32 dev lo: %s: %w", string(out), err)
 	}
 
+	// Use an HTTP reverse proxy instead of raw TCP forwarding. This correctly
+	// handles HTTP connection lifecycle and provides better debugging through
+	// logging of requests and errors.
+	upstream := "http://" + metadataHost + ":80"
+	// Direct HTTP client that ignores proxy env vars — the forwarder must connect
+	// directly to the auth proxy, never routing through HTTPS_PROXY.
+	directClient := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &http.Transport{Proxy: nil},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Forward the request to the host-side auth proxy metadata handler.
+		// Use RequestURI to preserve query parameters (not just Path).
+		proxyReq, _ := http.NewRequestWithContext(r.Context(), r.Method, upstream+r.URL.RequestURI(), r.Body)
+		for k, v := range r.Header {
+			proxyReq.Header[k] = v
+		}
+		proxyReq.Header.Set("Host", r.Host)
+
+		resp, err := directClient.Do(proxyReq)
+		if err != nil {
+			log.WithError(err).WithField("path", r.URL.Path).Error("Metadata forwarder: upstream request failed")
+			http.Error(w, "metadata upstream error", http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+
+		// Copy upstream headers using direct map access with lowercase keys.
+		// Go's w.Header().Set() canonicalizes to Title-Case ("Content-Type"),
+		// but older google-auth versions look up "content-type" (lowercase) in
+		// a plain dict, causing KeyError. Direct map assignment bypasses
+		// canonicalization: w.Header()["content-type"] stores the lowercase key.
+		// We also keep the canonical key so Go's auto Content-Type detection
+		// sees it and doesn't add a duplicate.
+		h := w.Header()
+		for k, vals := range resp.Header {
+			h[k] = vals                        // canonical key (suppresses Go auto-detection)
+			h[strings.ToLower(k)] = vals       // lowercase key (for old google-auth)
+		}
+		w.WriteHeader(resp.StatusCode)
+		w.Write(body)
+	})
+
 	listener, err := gonet.Listen("tcp", "169.254.169.254:80")
 	if err != nil {
 		// Remove the IP we just added since we can't listen
@@ -1437,18 +1587,50 @@ func startMetadataForwarder(metadataHost string) (stop func(), err error) {
 		return nil, fmt.Errorf("listen 169.254.169.254:80: %w", err)
 	}
 
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			go forwardConn(conn, metadataHost+":80")
+	srv := &http.Server{Handler: mux}
+	go srv.Serve(listener)
+
+	// Self-test 1: verify direct upstream connectivity (auth proxy on host).
+	directReq, _ := http.NewRequest("GET", upstream+"/", nil)
+	directReq.Header.Set("Metadata-Flavor", "Google")
+	directResp, directErr := directClient.Do(directReq)
+	if directErr != nil {
+		log.WithError(directErr).Warn("Metadata upstream direct test FAILED — auth proxy may not be reachable on " + metadataHost + ":80")
+	} else {
+		body, _ := io.ReadAll(directResp.Body)
+		directResp.Body.Close()
+		log.WithFields(logrus.Fields{
+			"status":          directResp.StatusCode,
+			"metadata_flavor": directResp.Header.Get("Metadata-Flavor"),
+			"body":            string(body),
+			"upstream":        upstream,
+		}).Info("Metadata upstream direct test result")
+	}
+
+	// Self-test 2: verify end-to-end through the forwarder (169.254.169.254 → host).
+	// Use a separate transport that ignores proxy env vars AND has the lo-bound address.
+	e2eClient := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	testReq, _ := http.NewRequest("GET", "http://169.254.169.254/", nil)
+	testReq.Header.Set("Metadata-Flavor", "Google")
+	testResp, testErr := e2eClient.Do(testReq)
+	if testErr != nil {
+		log.WithError(testErr).Warn("Metadata forwarder e2e self-test FAILED (metadata-based auth may not work)")
+	} else {
+		flavor := testResp.Header.Get("Metadata-Flavor")
+		body, _ := io.ReadAll(testResp.Body)
+		testResp.Body.Close()
+		log.WithFields(logrus.Fields{
+			"status":          testResp.StatusCode,
+			"metadata_flavor": flavor,
+			"body":            string(body),
+		}).Info("Metadata forwarder e2e self-test result")
+		if testResp.StatusCode != 200 || flavor != "Google" {
+			log.Warn("Metadata forwarder e2e self-test: unexpected response (metadata-based auth may not work)")
 		}
-	}()
+	}
 
 	stop = func() {
-		listener.Close()
+		srv.Close()
 		exec.Command("ip", "addr", "del", "169.254.169.254/32", "dev", "lo").Run()
 		log.Info("Metadata forwarder stopped (MMDS access restored)")
 	}
@@ -1465,6 +1647,422 @@ func forwardConn(client gonet.Conn, upstream string) {
 	defer backend.Close()
 	go io.Copy(backend, client)
 	io.Copy(client, backend)
+}
+
+// runGCPAuthCommand configures GCP credentials inside the microVM by:
+//   - Setting environment variables (GOOGLE_OAUTH_ACCESS_TOKEN, CLOUDSDK_AUTH_ACCESS_TOKEN)
+//   - Installing a gcloud shim at /usr/local/bin/gcloud that returns the access token
+//
+// The gcloud shim is critical because keyrings.google-artifactregistry-auth (used by
+// pip inside bazel) calls `gcloud config config-helper --format=json(credential)` to
+// obtain credentials. Since gcloud isn't installed in the microVM and there's no
+// metadata server, the shim fakes the expected responses.
+func runGCPAuthCommand(data *MMDSData) error {
+	token := data.Latest.Job.GCPAccessToken
+	if token == "" {
+		return fmt.Errorf("gcp-auth: no GCP access token in MMDS (gcp_access_token is empty)")
+	}
+
+	// Set env vars for tools that check them directly.
+	os.Setenv("GOOGLE_OAUTH_ACCESS_TOKEN", token)
+	os.Setenv("CLOUDSDK_AUTH_ACCESS_TOKEN", token)
+
+	// Install a gcloud shim that returns the access token for all relevant subcommands.
+	// This makes keyrings.google-artifactregistry-auth and bazel credential helpers work
+	// without a real gcloud installation.
+	shimScript := fmt.Sprintf(`#!/bin/sh
+# Shim installed by thaw-agent for Artifact Registry auth in microVM
+# Returns the access token passed via MMDS from the host
+case "$1" in
+  auth)
+    case "$2" in
+      print-access-token) echo '%s' ;;
+      application-default) echo '%s' ;;
+      *) echo '%s' ;;
+    esac
+    ;;
+  config)
+    # keyrings.google-artifactregistry-auth calls:
+    #   gcloud config config-helper --format=json(credential)
+    # and parses credential.access_token + credential.token_expiry from JSON
+    echo '{"credential":{"access_token":"%s","token_expiry":"2099-12-31T23:59:59Z"}}'
+    ;;
+  *) echo '%s' ;;
+esac
+`, token, token, token, token, token)
+
+	shimPath := filepath.Join("/usr/local/bin", "gcloud")
+	if err := os.WriteFile(shimPath, []byte(shimScript), 0755); err != nil {
+		log.WithError(err).Warn("Failed to write gcloud shim")
+	} else {
+		log.Info("Installed gcloud shim for credential helper")
+	}
+
+	log.Info("GCP credentials configured (env vars + gcloud shim)")
+	return nil
+}
+
+// runGitCloneCommand implements the "git-clone" warmup step.
+// args[0] = repo URL, args[1] = branch (optional), args[2] = warmup targets (optional),
+// args[3] = bazelrc path relative to repo root (optional)
+func runGitCloneCommand(args []string, data *MMDSData) error {
+	if len(args) == 0 {
+		return fmt.Errorf("git-clone command requires a repo URL argument")
+	}
+	repoURL := args[0]
+	repoBranch := "main"
+	if len(args) > 1 && args[1] != "" {
+		repoBranch = args[1]
+	}
+	// Store bazelrc and warmup targets for use by the caller
+	// (they'll be read from args by runBazelFetchCommand)
+
+	// Look up runner user
+	runnerUser, err := user.Lookup(*runnerUsername)
+	if err != nil {
+		return fmt.Errorf("runner user not found: %w", err)
+	}
+	rUID, _ := strconv.ParseUint(runnerUser.Uid, 10, 32)
+	rGID, _ := strconv.ParseUint(runnerUser.Gid, 10, 32)
+	runnerCred := &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
+	}
+	runnerHome := "HOME=" + runnerUser.HomeDir
+
+	repoPath := extractRepoDir(repoURL)
+	actualRepoDir := filepath.Join("/workspace", repoPath)
+	workDir := data.Latest.GitCache.WorkspaceDir
+	if workDir == "" {
+		workDir = "/mnt/ephemeral/workdir"
+	}
+	expectedRepoDir := filepath.Join(workDir, repoPath)
+	repoDir := actualRepoDir
+
+	log.WithFields(logrus.Fields{
+		"actual_repo_dir":   actualRepoDir,
+		"expected_repo_dir": expectedRepoDir,
+	}).Info("Setting up repo directories for warmup")
+
+	updateWarmupState("connectivity_check", "Verifying network connectivity...")
+	if err := verifyConnectivity(repoURL); err != nil {
+		return fmt.Errorf("connectivity check failed: %w", err)
+	}
+
+	updateWarmupState("cloning", "Cloning repository...")
+	log.WithFields(logrus.Fields{
+		"repo_url": repoURL,
+		"branch":   repoBranch,
+		"repo_dir": repoDir,
+	}).Info("Cloning repository for warmup")
+
+	parentDir := filepath.Dir(repoDir)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		return fmt.Errorf("failed to create repo parent dir: %w", err)
+	}
+	os.Chown(parentDir, int(rUID), int(rGID))
+
+	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err == nil {
+		log.Info("Repository already exists, skipping clone")
+	} else {
+		cloneURL := repoURL
+		if data.Latest.Job.GitToken != "" {
+			repoPath := strings.TrimPrefix(repoURL, "https://github.com/")
+			repoPath = strings.TrimPrefix(repoPath, "github.com/")
+			cloneURL = fmt.Sprintf("https://x-access-token:%s@github.com/%s", data.Latest.Job.GitToken, repoPath)
+		} else if !strings.HasPrefix(cloneURL, "https://") && !strings.HasPrefix(cloneURL, "git@") {
+			cloneURL = "https://github.com/" + cloneURL
+		}
+		cloneEnv := append(os.Environ(), globalProxyEnv...)
+		cloneEnv = append(cloneEnv, runnerHome, "GIT_TERMINAL_PROMPT=0")
+		if err := runStreamedCommand("", cloneEnv, runnerCred,
+			"git", "clone", "--branch", repoBranch, "--depth=1", cloneURL, repoDir); err != nil {
+			return fmt.Errorf("git clone failed: %w", err)
+		}
+	}
+
+	if actualRepoDir != expectedRepoDir {
+		if err := os.MkdirAll(filepath.Dir(expectedRepoDir), 0755); err == nil {
+			os.RemoveAll(expectedRepoDir)
+			os.Symlink(actualRepoDir, expectedRepoDir)
+		}
+	}
+	return nil
+}
+
+// runGitPullCommand implements the "git-pull" warmup step for incremental builds.
+// It fetches and resets to the latest commit instead of cloning from scratch.
+// args[0] = repo URL, args[1] = branch (optional)
+// If the repo doesn't exist yet, falls back to runGitCloneCommand.
+func runGitPullCommand(args []string, data *MMDSData) error {
+	if len(args) == 0 {
+		return fmt.Errorf("git-pull command requires a repo URL argument")
+	}
+	repoURL := args[0]
+	repoBranch := "main"
+	if len(args) > 1 && args[1] != "" {
+		repoBranch = args[1]
+	}
+
+	repoPath := extractRepoDir(repoURL)
+	repoDir := filepath.Join("/workspace", repoPath)
+
+	// If the repo doesn't exist, fall back to clone
+	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err != nil {
+		log.WithField("repo_dir", repoDir).Info("Repository not found, falling back to git-clone")
+		return runGitCloneCommand(args, data)
+	}
+
+	// Look up runner user
+	runnerUser, err := user.Lookup(*runnerUsername)
+	if err != nil {
+		return fmt.Errorf("runner user not found: %w", err)
+	}
+	rUID, _ := strconv.ParseUint(runnerUser.Uid, 10, 32)
+	rGID, _ := strconv.ParseUint(runnerUser.Gid, 10, 32)
+	runnerCred := &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
+	}
+	runnerHome := "HOME=" + runnerUser.HomeDir
+
+	// Build authenticated remote URL if token is available
+	fetchURL := repoURL
+	if data.Latest.Job.GitToken != "" {
+		repoPathStr := strings.TrimPrefix(repoURL, "https://github.com/")
+		repoPathStr = strings.TrimPrefix(repoPathStr, "github.com/")
+		fetchURL = fmt.Sprintf("https://x-access-token:%s@github.com/%s", data.Latest.Job.GitToken, repoPathStr)
+	} else if !strings.HasPrefix(fetchURL, "https://") && !strings.HasPrefix(fetchURL, "git@") {
+		fetchURL = "https://github.com/" + fetchURL
+	}
+
+	updateWarmupState("pulling", "Pulling latest changes...")
+	log.WithFields(logrus.Fields{
+		"repo_url": repoURL,
+		"branch":   repoBranch,
+		"repo_dir": repoDir,
+	}).Info("Fetching latest changes for incremental warmup")
+
+	// Set remote URL (may have changed token)
+	env := append(os.Environ(), globalProxyEnv...)
+	env = append(env, runnerHome, "GIT_TERMINAL_PROMPT=0")
+	setURLCmd := exec.Command("git", "-C", repoDir, "remote", "set-url", "origin", fetchURL)
+	setURLCmd.SysProcAttr = runnerCred
+	setURLCmd.Env = env
+	setURLCmd.Run()
+
+	// Fetch the branch
+	globalWarmupLogs.Add(fmt.Sprintf("[git-pull] Fetching origin/%s", repoBranch))
+	if err := runStreamedCommand("", env, runnerCred,
+		"git", "-C", repoDir, "fetch", "origin", repoBranch); err != nil {
+		globalWarmupLogs.Add(fmt.Sprintf("[git-pull] fetch failed: %v", err))
+		return fmt.Errorf("git fetch failed: %w", err)
+	}
+
+	// Hard reset to origin/<branch> to handle force pushes
+	globalWarmupLogs.Add(fmt.Sprintf("[git-pull] Resetting to origin/%s", repoBranch))
+	if err := runStreamedCommand("", env, runnerCred,
+		"git", "-C", repoDir, "reset", "--hard", "origin/"+repoBranch); err != nil {
+		globalWarmupLogs.Add(fmt.Sprintf("[git-pull] reset failed: %v", err))
+		return fmt.Errorf("git reset failed: %w", err)
+	}
+
+	log.Info("Git pull completed successfully")
+	return nil
+}
+
+func preWarmRunnerPages(runnerPath string, cred *syscall.SysProcAttr, homeEnv string) {
+	start := time.Now()
+	log.WithField("runner_path", runnerPath).Info("Pre-warming .NET runner pages...")
+	globalWarmupLogs.Add("[phase] runner page pre-warm")
+
+	listenerBin := filepath.Join(runnerPath, "bin", "Runner.Listener")
+	if _, err := os.Stat(listenerBin); err != nil {
+		log.WithError(err).Warn("Runner.Listener binary not found, skipping pre-warm")
+		globalWarmupLogs.Add("[warn] Runner.Listener not found: " + err.Error())
+		return
+	}
+
+	// Start Runner.Listener briefly. It will fail quickly because config.sh
+	// hasn't been run (no .runner config file), but that's fine -- the .NET
+	// runtime, JIT compiler, and managed assemblies all get loaded into memory
+	// before it exits, which is exactly what we need for the snapshot.
+	// Give it up to 15 seconds -- .NET runtime typically loads within a few seconds,
+	// then Runner.Listener exits with an error because it's not configured.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, listenerBin)
+	cmd.Dir = runnerPath
+	cmd.Env = append(os.Environ(), homeEnv, "DOTNET_EnableDiagnostics=0")
+	if cred != nil {
+		cmd.SysProcAttr = cred
+	}
+
+	out, err := cmd.CombinedOutput()
+	elapsed := time.Since(start)
+
+	// We expect it to fail (no config) -- that's fine, pages are loaded.
+	log.WithFields(logrus.Fields{
+		"duration_ms": elapsed.Milliseconds(),
+		"exit_error":  err,
+		"output":      strings.TrimSpace(string(out)),
+	}).Info("Runner.Listener pre-warm completed")
+	globalWarmupLogs.Add(fmt.Sprintf("[done] runner pre-warm completed in %dms", elapsed.Milliseconds()))
+}
+
+// updateGitHubRunner downloads the latest GitHub Actions runner release and
+// replaces the existing installation. This avoids a ~3-4 minute self-update
+// delay after snapshot restore. The runner is downloaded directly from GitHub
+// releases API rather than relying on run.sh's self-update mechanism (which
+// requires the runner to be configured and connected first).
+func updateGitHubRunner(runnerPath string, cred *syscall.SysProcAttr, homeEnv string) {
+	start := time.Now()
+	log.WithField("runner_path", runnerPath).Info("Checking for GitHub Actions runner updates...")
+	globalWarmupLogs.Add("[phase] runner update check")
+
+	binDir := filepath.Join(runnerPath, "bin")
+	if _, err := os.Stat(binDir); err != nil {
+		log.WithError(err).Warn("Runner bin dir not found, skipping update")
+		globalWarmupLogs.Add("[warn] runner bin dir not found, skipping update")
+		return
+	}
+
+	// Read current version from Runner.Listener.deps.json filename pattern or
+	// by running Runner.Listener --version.
+	currentVersion := getRunnerVersion(runnerPath, cred, homeEnv)
+	log.WithField("current_version", currentVersion).Info("Current runner version")
+
+	// Query GitHub API for latest runner release.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET",
+		"https://api.github.com/repos/actions/runner/releases/latest", nil)
+	if err != nil {
+		log.WithError(err).Warn("Failed to create GitHub API request")
+		return
+	}
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.WithError(err).Warn("Failed to query GitHub releases API")
+		globalWarmupLogs.Add("[warn] failed to query GitHub releases: " + err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	var release struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		log.WithError(err).Warn("Failed to parse GitHub releases response")
+		return
+	}
+
+	latestVersion := strings.TrimPrefix(release.TagName, "v")
+	log.WithFields(logrus.Fields{
+		"current": currentVersion,
+		"latest":  latestVersion,
+	}).Info("Runner version check")
+
+	if currentVersion == latestVersion {
+		log.Info("Runner is already at latest version, no update needed")
+		globalWarmupLogs.Add("[done] runner already at latest version " + latestVersion)
+		return
+	}
+
+	// Download the latest runner tarball.
+	tarballURL := fmt.Sprintf(
+		"https://github.com/actions/runner/releases/download/v%s/actions-runner-linux-x64-%s.tar.gz",
+		latestVersion, latestVersion)
+	log.WithField("url", tarballURL).Info("Downloading latest runner...")
+	globalWarmupLogs.Add("[info] downloading runner " + latestVersion)
+
+	dlCtx, dlCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer dlCancel()
+
+	dlReq, err := http.NewRequestWithContext(dlCtx, "GET", tarballURL, nil)
+	if err != nil {
+		log.WithError(err).Warn("Failed to create download request")
+		return
+	}
+	dlResp, err := http.DefaultClient.Do(dlReq)
+	if err != nil {
+		log.WithError(err).Warn("Failed to download runner tarball")
+		globalWarmupLogs.Add("[warn] failed to download runner: " + err.Error())
+		return
+	}
+	defer dlResp.Body.Close()
+
+	if dlResp.StatusCode != 200 {
+		log.WithField("status", dlResp.StatusCode).Warn("Runner download returned non-200")
+		return
+	}
+
+	// Save tarball to temp file (world-readable so runner user can access it).
+	tmpFile, err := os.CreateTemp("", "runner-*.tar.gz")
+	if err != nil {
+		log.WithError(err).Warn("Failed to create temp file")
+		return
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := io.Copy(tmpFile, dlResp.Body); err != nil {
+		tmpFile.Close()
+		log.WithError(err).Warn("Failed to save runner tarball")
+		return
+	}
+	tmpFile.Close()
+	os.Chmod(tmpPath, 0644)
+
+	log.WithField("duration_ms", time.Since(start).Milliseconds()).Info("Runner tarball downloaded")
+
+	// Extract as root over existing installation, then chown to runner user.
+	// We extract as root because the temp file is owned by root and the runner
+	// user may not have write access to all directories being overwritten.
+	extractCmd := exec.Command("tar", "-xzf", tmpPath, "-C", runnerPath)
+	if out, err := extractCmd.CombinedOutput(); err != nil {
+		log.WithFields(logrus.Fields{
+			"error":  err,
+			"output": string(out),
+		}).Warn("Failed to extract runner tarball")
+		return
+	}
+
+	// Fix ownership -- tar may extract as root, but runner needs to run as the runner user.
+	if cred != nil && cred.Credential != nil {
+		chownCmd := exec.Command("chown", "-R",
+			fmt.Sprintf("%d:%d", cred.Credential.Uid, cred.Credential.Gid), runnerPath)
+		chownCmd.Run()
+	}
+
+	elapsed := time.Since(start)
+	newVersion := getRunnerVersion(runnerPath, cred, homeEnv)
+	log.WithFields(logrus.Fields{
+		"old_version": currentVersion,
+		"new_version": newVersion,
+		"duration_ms": elapsed.Milliseconds(),
+	}).Info("Runner updated successfully")
+	globalWarmupLogs.Add(fmt.Sprintf("[done] runner updated %s -> %s in %dms", currentVersion, newVersion, elapsed.Milliseconds()))
+}
+
+// getRunnerVersion returns the installed runner version by running Runner.Listener --version.
+func getRunnerVersion(runnerPath string, cred *syscall.SysProcAttr, homeEnv string) string {
+	listenerBin := filepath.Join(runnerPath, "bin", "Runner.Listener")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, listenerBin, "--version")
+	cmd.Dir = runnerPath
+	cmd.Env = append(os.Environ(), homeEnv, "DOTNET_EnableDiagnostics=0")
+	if cred != nil {
+		cmd.SysProcAttr = cred
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // runStreamedCommand runs a command, capturing stdout/stderr line by line

@@ -896,7 +896,9 @@ func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, expe
 				log.WithFields(logrus.Fields{
 					"status_runner_id":   status.RunnerID,
 					"expected_runner_id": expectedRunnerID,
-				}).Debug("Ignoring stale warmup status from previous layer")
+					"status_phase":       status.Phase,
+					"status_complete":    status.Complete,
+				}).Info("Waiting for thaw-agent to detect new runner_id (stale status from parent)")
 				continue
 			}
 
@@ -2158,8 +2160,8 @@ Type=simple
 ExecStart=/usr/local/bin/thaw-agent --sandbox-user=%s
 Restart=on-failure
 RestartSec=5
-StandardOutput=journal
-StandardError=journal
+StandardOutput=journal+console
+StandardError=journal+console
 Environment=LOG_LEVEL=info
 Environment=HOME=/root
 

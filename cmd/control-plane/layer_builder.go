@@ -67,6 +67,7 @@ func (s *LayerBuildScheduler) Run(ctx context.Context) {
 // tier and credentials with a simple JOIN instead of a recursive CTE.
 func (s *LayerBuildScheduler) EnqueueChainBuild(ctx context.Context, layers []snapshot.LayerMaterialized, startDepth int, buildType string, configID string, force ...bool) error {
 	isForce := len(force) > 0 && force[0]
+	isClean := len(force) > 1 && force[1]
 
 	for i := startDepth; i < len(layers); i++ {
 		layer := layers[i]
@@ -131,10 +132,27 @@ func (s *LayerBuildScheduler) EnqueueChainBuild(ctx context.Context, layers []sn
 
 		effectiveBuildType := buildType
 		var oldLayerHash, oldLayerVersion string
-		if i > startDepth {
-			// Force rebuild: children refresh from their own current version.
-			// This preserves extension drive data (caches, repos) while re-running refresh commands.
-			if isForce && hasRefreshCommands(layer) {
+		if i == startDepth && buildType == "refresh" {
+			// Refresh at the target layer: restore from its own current version
+			// so extension drives (workspace, caches) are preserved.
+			var selfVersion sql.NullString
+			s.db.QueryRowContext(ctx,
+				`SELECT current_version FROM snapshot_layers WHERE layer_hash=$1`,
+				layer.LayerHash).Scan(&selfVersion)
+			if selfVersion.Valid && selfVersion.String != "" {
+				oldLayerHash = layer.LayerHash
+				oldLayerVersion = selfVersion.String
+			} else {
+				// No current version — fall back to init
+				effectiveBuildType = "init"
+			}
+		} else if i > startDepth {
+			// Clean build: always use init commands (ignore any stale current_version).
+			if isClean {
+				effectiveBuildType = "init"
+			} else if isForce && hasRefreshCommands(layer) {
+				// Force rebuild: children refresh from their own current version.
+				// This preserves extension drive data (caches, repos) while re-running refresh commands.
 				var selfVersion sql.NullString
 				s.db.QueryRowContext(ctx,
 					`SELECT current_version FROM snapshot_layers WHERE layer_hash=$1`,
@@ -532,9 +550,24 @@ func (s *LayerBuildScheduler) onBuildComplete(ctx context.Context, buildID, laye
 		}
 	}
 
+	// Only complete the build if it's still in 'running' state.
+	// A concurrent force-cancel may have set it to 'cancelled'; in that case
+	// we must NOT update the layer's current_version (the clean path cleared it).
+	result, err2 := s.db.ExecContext(ctx, `UPDATE snapshot_builds SET status='completed', completed_at=NOW() WHERE build_id=$1 AND status='running'`, buildID)
+	if err2 != nil {
+		s.logger.WithError(err2).WithField("build_id", buildID).Error("Failed to mark build completed")
+		return
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		s.logger.WithFields(logrus.Fields{
+			"build_id":   buildID,
+			"layer_hash": layerHash[:16],
+		}).Warn("Build was cancelled/failed by another process, skipping completion")
+		return
+	}
+
 	// Update layer status
 	s.db.ExecContext(ctx, `UPDATE snapshot_layers SET current_version=$1, status='active', updated_at=NOW() WHERE layer_hash=$2`, version, layerHash)
-	s.db.ExecContext(ctx, `UPDATE snapshot_builds SET status='completed', completed_at=NOW() WHERE build_id=$1`, buildID)
 
 	// Unblock waiting children (leaf layers have no children, skip the query)
 	if !isLeaf {
