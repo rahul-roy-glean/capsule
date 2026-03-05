@@ -22,7 +22,7 @@ header "1. Register snapshot config with TTL + auto_pause"
 # ---------------------------------------------------------------------------
 # Register a config with 15s TTL and auto_pause enabled.
 # In a real scenario this would be done once per workload_key.
-CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/snapshot-configs" \
+CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "pause-resume-test",

@@ -11,7 +11,7 @@ echo ""
 
 # --- 0. Register snapshot config ---
 echo "=== 0. Register snapshot config ==="
-CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/snapshot-configs" \
+CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "exec-test",

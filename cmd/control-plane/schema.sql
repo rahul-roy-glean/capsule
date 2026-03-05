@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     repo VARCHAR(512) NOT NULL,
     branch VARCHAR(255),
     commit_sha VARCHAR(64),
-    status VARCHAR(32) DEFAULT 'queued' CHECK (status IN ('queued', 'assigned', 'running', 'completed', 'failed', 'cancelled')),
+    status VARCHAR(32) DEFAULT 'queued' CHECK (status IN ('queued', 'assigned', 'in_progress', 'running', 'completed', 'failed', 'cancelled')),
     runner_id UUID REFERENCES runners(id) ON DELETE SET NULL,
     labels JSONB DEFAULT '[]'::jsonb,
     queued_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -162,11 +162,13 @@ CREATE TABLE IF NOT EXISTS repo_workload_mappings (
 
 -- snapshot_tags: named aliases for snapshot versions
 CREATE TABLE IF NOT EXISTS snapshot_tags (
-    tag           VARCHAR(64) PRIMARY KEY,
+    tag           VARCHAR(64) NOT NULL,
     workload_key  VARCHAR(16) NOT NULL,
     version       VARCHAR(255) NOT NULL,
+    description   TEXT DEFAULT '',
     created_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    updated_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    PRIMARY KEY (tag, workload_key)
 );
 
 -- Indexes

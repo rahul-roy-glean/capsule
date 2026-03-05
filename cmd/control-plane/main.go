@@ -184,6 +184,7 @@ func main() {
 	jobQueue.SetConfigCache(configCache)
 	layeredConfigRegistry := NewLayeredConfigRegistry(db, snapshotManager, logger)
 	layeredConfigRegistry.SetConfigCache(configCache)
+	layeredConfigRegistry.tagRegistry = tagRegistry
 	layerBuildScheduler := NewLayerBuildScheduler(db, snapshotManager, logger, 4)
 	layeredConfigRegistry.SetLayerBuilder(layerBuildScheduler)
 

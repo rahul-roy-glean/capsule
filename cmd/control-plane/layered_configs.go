@@ -23,6 +23,7 @@ type LayeredConfigRegistry struct {
 	snapshotManager *SnapshotManager
 	layerBuilder    *LayerBuildScheduler
 	configCache     *ConfigCache
+	tagRegistry     *SnapshotTagRegistry
 	logger          *logrus.Entry
 }
 
@@ -475,6 +476,25 @@ func (r *LayeredConfigRegistry) HandleLayeredConfigs(w http.ResponseWriter, req 
 	if strings.Contains(path, "/layers/") && strings.HasSuffix(path, "/refresh") {
 		r.handleRefreshLayer(w, req)
 		return
+	}
+
+	// Route /{wk}/tags, /{wk}/tags/{tag}, /{wk}/promote to tag registry
+	parts := strings.SplitN(path, "/", 3)
+	if len(parts) >= 2 && r.tagRegistry != nil {
+		wk := parts[0]
+		sub := parts[1]
+		if sub == "tags" {
+			subpath := ""
+			if len(parts) == 3 {
+				subpath = parts[2]
+			}
+			r.tagRegistry.HandleTags(w, req, wk, subpath)
+			return
+		}
+		if sub == "promote" {
+			r.tagRegistry.HandlePromote(w, req, wk)
+			return
+		}
 	}
 
 	switch req.Method {
