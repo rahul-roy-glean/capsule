@@ -1,6 +1,6 @@
 .PHONY: all build test clean proto docker-build docker-push terraform-init terraform-plan terraform-apply
 .PHONY: packer-init packer-validate packer-build firecracker-manager-linux release-host-image mig-rolling-update
-.PHONY: onboard onboard-validate bin-onboard
+.PHONY: onboard onboard-validate onboard-plan bin-onboard
 .PHONY: firecracker-manager control-plane snapshot-builder thaw-agent
 .PHONY: test-unit test-race test-cover test-integration test-all check
 .PHONY: sdk-python-lint sdk-python-test sdk-python-typecheck
@@ -63,6 +63,9 @@ onboard: bin-onboard
 
 onboard-validate: bin-onboard
 	./bin/onboard --config=$(CONFIG) --dry-run
+
+onboard-plan: bin-onboard
+	./bin/onboard --config=$(CONFIG) --plan $(if $(STEPS),--steps=$(STEPS))
 
 # Generate protobuf code
 .PHONY: proto proto-buf proto-protoc

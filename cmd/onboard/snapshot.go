@@ -9,8 +9,22 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func stepSnapshotBuild(cfg *Config, logger *logrus.Logger) error {
+func stepSnapshotBuild(cfg *Config, logger *logrus.Logger, planOnly bool) error {
 	log := logger.WithField("step", "snapshot-build")
+
+	gcsBucket := fmt.Sprintf("%s-firecracker-snapshots", cfg.Platform.GCPProject)
+
+	if planOnly {
+		fmt.Println("\n[plan] snapshot-build:")
+		fmt.Printf("  GCS bucket:     %s\n", gcsBucket)
+		fmt.Printf("  Commands:       %d snapshot commands\n", len(cfg.Workload.SnapshotCommands))
+		fmt.Printf("  vCPUs: %d, Memory: %dMB\n", cfg.MicroVM.VCPUs, cfg.MicroVM.MemoryMB)
+		if len(cfg.Workload.StartCommand.Command) > 0 {
+			fmt.Printf("  Start command:  %s\n", cfg.Workload.StartCommand.Command[0])
+			fmt.Printf("  Health check:   :%d%s\n", cfg.Workload.StartCommand.Port, cfg.Workload.StartCommand.HealthPath)
+		}
+		return nil
+	}
 
 	// Build snapshot-builder binary
 	log.Info("Building snapshot-builder...")
@@ -23,8 +37,6 @@ func stepSnapshotBuild(cfg *Config, logger *logrus.Logger) error {
 
 	log.Info("Running snapshot build (this runs on a GCE VM with Firecracker)...")
 	log.Info("NOTE: Ensure you are running this on a GCE VM with nested virtualization enabled")
-
-	gcsBucket := fmt.Sprintf("%s-firecracker-snapshots", cfg.Platform.GCPProject)
 
 	// Build the --snapshot-commands JSON from config.
 	cmdJSON, err := json.Marshal(cfg.Workload.SnapshotCommands)

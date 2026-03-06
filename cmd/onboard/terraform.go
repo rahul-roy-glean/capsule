@@ -10,7 +10,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func stepTerraformBootstrap(cfg *Config, logger *logrus.Logger) error {
+func stepTerraformBootstrap(cfg *Config, logger *logrus.Logger, planOnly bool) error {
 	log := logger.WithField("step", "terraform-bootstrap")
 
 	tfvarsPath, err := generateTFVars(cfg, false)
@@ -30,6 +30,20 @@ func stepTerraformBootstrap(cfg *Config, logger *logrus.Logger) error {
 		return fmt.Errorf("terraform init failed: %w", err)
 	}
 
+	if planOnly {
+		log.Info("Running terraform plan (bootstrap mode - stock images)...")
+		planCmd := exec.Command("terraform", "plan",
+			fmt.Sprintf("-var-file=%s", tfvarsPath),
+			"-out=tfplan-bootstrap")
+		planCmd.Dir = tfDir
+		planCmd.Stdout = os.Stdout
+		planCmd.Stderr = os.Stderr
+		if err := planCmd.Run(); err != nil {
+			return fmt.Errorf("terraform plan failed: %w", err)
+		}
+		return nil
+	}
+
 	log.Info("Running terraform apply (bootstrap mode - stock images)...")
 	applyCmd := exec.Command("terraform", "apply",
 		"-auto-approve",
@@ -44,7 +58,7 @@ func stepTerraformBootstrap(cfg *Config, logger *logrus.Logger) error {
 	return nil
 }
 
-func stepTerraformFinalize(cfg *Config, logger *logrus.Logger) error {
+func stepTerraformFinalize(cfg *Config, logger *logrus.Logger, planOnly bool) error {
 	log := logger.WithField("step", "terraform-finalize")
 
 	tfvarsPath, err := generateTFVars(cfg, true)
@@ -54,6 +68,20 @@ func stepTerraformFinalize(cfg *Config, logger *logrus.Logger) error {
 	log.WithField("tfvars", tfvarsPath).Info("Generated terraform.tfvars (finalize mode)")
 
 	tfDir := "deploy/terraform"
+
+	if planOnly {
+		log.Info("Running terraform plan (finalize mode - custom images)...")
+		planCmd := exec.Command("terraform", "plan",
+			fmt.Sprintf("-var-file=%s", tfvarsPath),
+			"-out=tfplan-finalize")
+		planCmd.Dir = tfDir
+		planCmd.Stdout = os.Stdout
+		planCmd.Stderr = os.Stderr
+		if err := planCmd.Run(); err != nil {
+			return fmt.Errorf("terraform plan failed: %w", err)
+		}
+		return nil
+	}
 
 	log.Info("Running terraform apply (finalize mode - custom images)...")
 	applyCmd := exec.Command("terraform", "apply",
