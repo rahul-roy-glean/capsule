@@ -191,14 +191,33 @@ func waitReady(client *http.Client, cp, runnerID string, timeout, poll time.Dura
 }
 
 func execInRunner(client *http.Client, mgr, runnerID, cmd string) error {
-	body, _ := json.Marshal(map[string]any{
+	bodyBytes, _ := json.Marshal(map[string]any{
 		"command":         []string{"sh", "-c", cmd},
 		"timeout_seconds": 30,
 	})
-	req, _ := http.NewRequest(http.MethodPost, mgr+"/api/v1/runners/"+runnerID+"/exec", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	_, err := doJSON(client, req)
-	return err
+	url := mgr + "/api/v1/runners/" + runnerID + "/exec"
+	const maxRetries = 5
+	const retryDelay = 300 * time.Millisecond
+	var lastErr error
+	for attempt := range maxRetries {
+		if attempt > 0 {
+			time.Sleep(retryDelay)
+		}
+		req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(bodyBytes))
+		req.Header.Set("Content-Type", "application/json")
+		_, err := doJSON(client, req)
+		if err == nil {
+			return nil
+		}
+		if strings.Contains(err.Error(), "connection reset by peer") ||
+			strings.Contains(err.Error(), "EOF") ||
+			strings.Contains(err.Error(), "connection refused") {
+			lastErr = err
+			continue
+		}
+		return err
+	}
+	return lastErr
 }
 
 func releaseRunner(client *http.Client, cp, runnerID string) error {

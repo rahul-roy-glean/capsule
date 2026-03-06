@@ -372,45 +372,66 @@ func execInRunner(client *http.Client, mgr, runnerID, cmd string) error {
 
 // execGetStdout runs cmd in the runner and collects stdout from the
 // streaming NDJSON exec response used by the manager's /exec endpoint.
+// Retries on transient connection errors (thaw-agent readiness race).
 func execGetStdout(client *http.Client, mgr, runnerID, cmd string) (string, error) {
-	body, _ := json.Marshal(map[string]any{
+	bodyBytes, _ := json.Marshal(map[string]any{
 		"command":         []string{"sh", "-c", cmd},
 		"timeout_seconds": 30,
 	})
-	req, _ := http.NewRequest(http.MethodPost, mgr+"/api/v1/runners/"+runnerID+"/exec", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
+	url := mgr + "/api/v1/runners/" + runnerID + "/exec"
+	const maxRetries = 5
+	const retryDelay = 300 * time.Millisecond
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		buf := new(bytes.Buffer)
-		buf.ReadFrom(resp.Body)
-		return "", fmt.Errorf("exec status %d body=%s", resp.StatusCode, strings.TrimSpace(buf.String()))
-	}
-
-	// The manager streams NDJSON exec events. Collect stdout lines and check
-	// for a non-zero exit code.
-	var stdout strings.Builder
-	dec := json.NewDecoder(resp.Body)
-	for dec.More() {
-		var ev execEvent
-		if err := dec.Decode(&ev); err != nil {
-			break
+	var lastErr error
+	for attempt := range maxRetries {
+		if attempt > 0 {
+			time.Sleep(retryDelay)
 		}
-		switch ev.Type {
-		case "stdout":
-			stdout.WriteString(ev.Data)
-		case "exit":
-			if ev.Code != 0 {
-				return "", fmt.Errorf("exec exited with code %d", ev.Code)
+		req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(bodyBytes))
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			if strings.Contains(err.Error(), "connection reset by peer") ||
+				strings.Contains(err.Error(), "EOF") ||
+				strings.Contains(err.Error(), "connection refused") {
+				lastErr = err
+				continue
+			}
+			return "", err
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			buf := new(bytes.Buffer)
+			buf.ReadFrom(resp.Body)
+			resp.Body.Close()
+			lastErr = fmt.Errorf("exec status %d body=%s", resp.StatusCode, strings.TrimSpace(buf.String()))
+			continue
+		}
+
+		// The manager streams NDJSON exec events. Collect stdout lines and check
+		// for a non-zero exit code.
+		var stdout strings.Builder
+		dec := json.NewDecoder(resp.Body)
+		for dec.More() {
+			var ev execEvent
+			if err := dec.Decode(&ev); err != nil {
+				break
+			}
+			switch ev.Type {
+			case "stdout":
+				stdout.WriteString(ev.Data)
+			case "exit":
+				if ev.Code != 0 {
+					resp.Body.Close()
+					return "", fmt.Errorf("exec exited with code %d", ev.Code)
+				}
 			}
 		}
+		resp.Body.Close()
+		return stdout.String(), nil
 	}
-	return stdout.String(), nil
+	return "", lastErr
 }
 
 func pauseRunner(client *http.Client, cp, runnerID string) (pauseResp, error) {
