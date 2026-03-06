@@ -1,0 +1,42 @@
+platform:
+  gcp_project: "dev-sandbox-334901"
+  region: "us-central1"
+  zone: "us-central1-a"
+
+microvm:
+  max_per_host: 32
+  idle_target: 4
+
+hosts:
+  machine_type: "n2-standard-16"
+  min_count: 2
+  max_count: 20
+  data_disk_gb: 300
+
+workload:
+  base_image: "us-central1-docker.pkg.dev/scio-engineering/glean-images/afs-sandbox:latest"
+
+  layers:
+    - name: "runtime"
+      init_commands:
+        - type: "shell"
+          args: ["bash", "-c", "mkdir -p /home/user/{upload,output,Documents,Research,Downloads} && chown -R 1000:1000 /home/user"]
+          run_as_root: true
+
+  config:
+    tier: "xs"                  # 1 vCPU, 512MB — smallest tier
+    auto_pause: true
+    ttl: 300
+    session_max_age_seconds: 86400
+    runner_user: "user"
+    workspace_size_gb: 10
+
+session:
+  enabled: true
+  ttl_seconds: 300
+  auto_pause: true
+
+credentials:
+  secrets: []
+  host_dirs: []
+  env: {}

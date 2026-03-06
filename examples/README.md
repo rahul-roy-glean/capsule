@@ -21,26 +21,48 @@ make onboard CONFIG=<your-config>.yaml
 ## How the platform handles different workloads
 
 The platform has no knowledge of CI systems, build tools, or application
-frameworks. It provides four generic primitives:
+frameworks. It provides five generic primitives:
 
-### 1. `snapshot_commands` / `init_commands` — what to bake and what to run
+### 1. `base_image` — bring your own Docker image
 
 ```yaml
-snapshot_commands:
-  - type: "shell"
-    args: ["bash", "-c", "git clone --depth=1 -b main https://github.com/myorg/myrepo /workspace"]
-  - type: "shell"
-    args: ["bazel", "fetch", "//..."]
+workload:
+  base_image: "us-docker.pkg.dev/my-project/images/my-runtime:latest"
 ```
 
-These run inside the VM during snapshot building. The result is frozen into the
-snapshot. `init_commands` run after each snapshot restore.
+Any Docker image — from public registries, Artifact Registry, or your own. The
+platform converts it to a Firecracker rootfs and installs the system components
+(thaw-agent, systemd, networking). Each workload can specify a different image.
 
-### 2. `start_command` — what the VM does after restore
+Two workloads using the same `base_image` share the platform layer (same hash);
+different images get their own. The hash chain ensures changing the image
+triggers a rebuild while keeping user layer hashes stable.
+
+### 2. `layers` — what to bake into the snapshot
+
+```yaml
+layers:
+  - name: "workspace"
+    init_commands:
+      - type: "shell"
+        args: ["bash", "-c", "git clone --depth=1 -b main https://github.com/myorg/myrepo /workspace"]
+      - type: "shell"
+        args: ["bazel", "fetch", "//..."]
+    refresh_interval: "on_push"
+```
+
+Layers run inside the VM during snapshot building. The result is frozen into the
+snapshot. Multiple layers form a hash chain — changing an earlier layer triggers
+rebuilds of all downstream layers. `refresh_interval` controls automatic
+rebuilds (`"on_push"`, `"6h"`, `"daily"`).
+
+### 3. `start_command` — what the VM does after restore
 
 ```yaml
 start_command:
   command: ["/home/runner/config.sh", "--token", "${CI_RUNNER_TOKEN}", "--ephemeral"]
+  port: 8080
+  health_path: "/health"
   env:
     CI_RUNNER_TOKEN: "${ci_runner_token}"
 ```
@@ -48,7 +70,7 @@ start_command:
 This is how CI runner registration, user services, and function runtimes all
 work. The platform starts the command and waits for the health check.
 
-### 3. `drives` — block devices attached to the VM
+### 4. `drives` — block devices attached to the VM
 
 ```yaml
 drives:
@@ -63,9 +85,10 @@ drives:
 ```
 
 Drives are created by snapshot-builder, chunked for lazy loading, and attached
-to every VM. `read_only: false` drives get a fresh copy per allocation.
+to every VM. `read_only: false` drives get a fresh copy per allocation. A
+default 50GB workspace drive is auto-injected if no drives are declared.
 
-### 4. `credentials` — secrets injected into the VM
+### 5. `credentials` — secrets injected into the VM
 
 ```yaml
 credentials:
@@ -78,7 +101,7 @@ credentials:
 Secrets are fetched from GCP Secret Manager and placed on a read-only
 credentials drive inside the VM.
 
-## `snapshot_commands` reference
+## `init_commands` reference
 
 | `type` | `args` | Notes |
 |---|---|---|
@@ -86,4 +109,7 @@ credentials drive inside the VM.
 | `gcp-auth` | `[service-account-email]` | Authenticates `gcloud` as the given service account |
 | `exec` | `[binary, arg1, ...]` | Runs a binary directly (no shell) |
 
-The `WorkloadKey` (used for pool matching and GCS routing) is a 16-char SHA256 hash of the sorted `snapshot_commands` and `drives` list. Two configs with the same commands and drives produce the same key and share snapshot chunks in GCS.
+The `WorkloadKey` (used for pool matching and GCS routing) is derived from the
+leaf layer hash. The hash chain includes `base_image`, all layer commands, and
+drives — so two configs with the same image and commands produce the same key
+and share snapshot chunks in GCS.
