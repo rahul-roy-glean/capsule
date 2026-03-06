@@ -10,6 +10,7 @@
 .PHONY: dev-test-auto-resume dev-test-template-tags dev-test-network-policy dev-test-auth-proxy
 .PHONY: dev-agent-rootfs dev-agent-snapshot dev-test-agent-sessions dev-test-agent-e2e
 .PHONY: dev-setup dev-provision
+.PHONY: bench-allocate bench-session dev-bench-allocate dev-bench-session
 
 # Variables
 PROJECT_ID ?= your-project-id
@@ -50,6 +51,12 @@ thaw-agent:
 
 bin-onboard:
 	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/onboard ./cmd/onboard
+
+bench-allocate:
+	$(GO) build $(GOFLAGS) -o bin/bench-allocate ./cmd/bench-allocate
+
+bench-session:
+	$(GO) build $(GOFLAGS) -o bin/bench-session ./cmd/bench-session
 
 onboard: bin-onboard
 	./bin/onboard --config=$(CONFIG) $(if $(STEPS),--steps=$(STEPS))
@@ -343,6 +350,26 @@ dev-stop:
 # Run E2E exec test
 dev-test-exec:
 	bash dev/test-exec.sh
+
+# Benchmark: cold allocate → exec → release latency
+# Usage: WORKLOAD_KEY=<key> make dev-bench-allocate
+dev-bench-allocate: bench-allocate
+	./bin/bench-allocate \
+	  --cp http://localhost:8080 \
+	  --mgr http://localhost:9080 \
+	  --workload-key "$(WORKLOAD_KEY)" \
+	  --iterations $(or $(ITERATIONS),50) \
+	  --warmup $(or $(WARMUP),5)
+
+# Benchmark: session pause + resume latency
+# Usage: WORKLOAD_KEY=<key> make dev-bench-session
+dev-bench-session: bench-session
+	./bin/bench-session \
+	  --cp http://localhost:8080 \
+	  --mgr http://localhost:9080 \
+	  --workload-key "$(WORKLOAD_KEY)" \
+	  --iterations $(or $(ITERATIONS),50) \
+	  --warmup $(or $(WARMUP),5)
 
 # Run E2E pause/resume test
 dev-test-pause-resume:
