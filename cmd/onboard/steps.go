@@ -12,7 +12,7 @@ import (
 type Step struct {
 	Name        string
 	Description string
-	Run         func(cfg *Config, logger *logrus.Logger) error
+	Run         func(cfg *Config, logger *logrus.Logger, planOnly bool) error
 }
 
 // GetAllSteps returns all onboard steps in order.
@@ -66,7 +66,7 @@ func GetStepByName(steps []Step, name string) (Step, bool) {
 	return Step{}, false
 }
 
-func stepValidate(cfg *Config, logger *logrus.Logger) error {
+func stepValidate(cfg *Config, logger *logrus.Logger, planOnly bool) error {
 	log := logger.WithField("step", "validate")
 
 	// Check GCP access
@@ -88,8 +88,19 @@ func stepValidate(cfg *Config, logger *logrus.Logger) error {
 	return nil
 }
 
-func stepPackerBuild(cfg *Config, logger *logrus.Logger) error {
+func stepPackerBuild(cfg *Config, logger *logrus.Logger, planOnly bool) error {
 	log := logger.WithField("step", "packer-build")
+
+	if planOnly {
+		fmt.Println("\n[plan] packer-build:")
+		fmt.Printf("  GCP project:    %s\n", cfg.Platform.GCPProject)
+		fmt.Printf("  Image family:   firecracker-host\n")
+		fmt.Printf("  Source image:   ubuntu-2204-lts (ubuntu-os-cloud)\n")
+		fmt.Printf("  Machine type:   n2-standard-4\n")
+		fmt.Printf("  Binary:         bin/firecracker-manager (linux/amd64)\n")
+		fmt.Printf("  Provisioners:   7 shell, 1 file upload\n")
+		return nil
+	}
 
 	// Cross-compile firecracker-manager for linux
 	log.Info("Building firecracker-manager for linux/amd64...")
@@ -112,8 +123,17 @@ func stepPackerBuild(cfg *Config, logger *logrus.Logger) error {
 	return nil
 }
 
-func stepControlPlaneDeploy(cfg *Config, logger *logrus.Logger) error {
+func stepControlPlaneDeploy(cfg *Config, logger *logrus.Logger, planOnly bool) error {
 	log := logger.WithField("step", "control-plane-deploy")
+
+	if planOnly {
+		fmt.Println("\n[plan] control-plane-deploy:")
+		fmt.Printf("  Image:          %s-docker.pkg.dev/%s/firecracker/control-plane:latest\n",
+			cfg.Platform.Region, cfg.Platform.GCPProject)
+		fmt.Printf("  K8s resources:  Namespace, SA, ConfigMap, Deployment, Service, Ingress, HPA, PDB\n")
+		fmt.Printf("  Namespace:      firecracker-runner\n")
+		return nil
+	}
 
 	log.Info("Building control plane Docker image...")
 	buildCmd := exec.Command("make", "docker-build-control-plane",

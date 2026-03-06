@@ -342,13 +342,13 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 
 	// Build the proto request
 	protoReq := &pb.AllocateRunnerRequest{
-		RequestId:         req.RequestID,
-		Labels:            req.Labels,
-		WorkloadKey:       workloadKey,
-		SessionId:         req.SessionID,
-		SnapshotVersion:   snapshotVersion,
-		TtlSeconds:        int32(runnerTTLSeconds),
-		AutoPause:         autoPause,
+		RequestId:       req.RequestID,
+		Labels:          req.Labels,
+		WorkloadKey:     workloadKey,
+		SessionId:       req.SessionID,
+		SnapshotVersion: snapshotVersion,
+		TtlSeconds:      int32(runnerTTLSeconds),
+		AutoPause:       autoPause,
 	}
 	// Pass network policy fields via labels (proto fields 17-18 not in
 	// generated wire descriptor; labels are serialized reliably).

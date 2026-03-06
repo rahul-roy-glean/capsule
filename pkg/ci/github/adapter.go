@@ -30,8 +30,6 @@ type Adapter struct {
 	webhookDeps *WebhookDeps
 }
 
-
-
 // NewAdapter creates a new GitHub CI adapter.
 func NewAdapter(ctx context.Context, cfg Config, logger *logrus.Logger) (*Adapter, error) {
 	if cfg.AppID == "" || cfg.AppSecret == "" {

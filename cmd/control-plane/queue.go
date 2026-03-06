@@ -55,9 +55,9 @@ func (jq *JobQueue) EnqueueJob(ctx context.Context, event *cigithub.WorkflowJobE
 	}
 
 	jq.logger.WithFields(logrus.Fields{
-		"job_id":     jobID,
-		"ci_job_id":  event.WorkflowJob.ID,
-		"repo":       event.Repository.FullName,
+		"job_id":    jobID,
+		"ci_job_id": event.WorkflowJob.ID,
+		"repo":      event.Repository.FullName,
 	}).Info("Job enqueued")
 
 	return jobID, nil
@@ -164,8 +164,8 @@ func (jq *JobQueue) CompleteJob(ctx context.Context, ciJobID int64, runnerName s
 
 	rows, _ := result.RowsAffected()
 	jq.logger.WithFields(logrus.Fields{
-		"ci_job_id":   ciJobID,
-		"runner_name": runnerName,
+		"ci_job_id":     ciJobID,
+		"runner_name":   runnerName,
 		"rows_affected": rows,
 	}).Info("Job completed")
 

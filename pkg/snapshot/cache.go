@@ -19,26 +19,26 @@ import (
 
 // SnapshotMetadata holds metadata about a snapshot
 type SnapshotMetadata struct {
-	Version      string            `json:"version"`
-	RepoCommit   string            `json:"repo_commit"`
-	Repo         string            `json:"repo,omitempty"`
-	WorkloadKey  string            `json:"workload_key,omitempty"`
-	Commands     []SnapshotCommand `json:"commands,omitempty"`
-	CreatedAt    time.Time         `json:"created_at"`
-	SizeBytes    int64             `json:"size_bytes"`
-	KernelPath   string            `json:"kernel_path"`
-	RootfsPath   string            `json:"rootfs_path"`
-	MemPath      string            `json:"mem_path"`
-	StatePath    string            `json:"state_path"`
+	Version     string            `json:"version"`
+	RepoCommit  string            `json:"repo_commit"`
+	Repo        string            `json:"repo,omitempty"`
+	WorkloadKey string            `json:"workload_key,omitempty"`
+	Commands    []SnapshotCommand `json:"commands,omitempty"`
+	CreatedAt   time.Time         `json:"created_at"`
+	SizeBytes   int64             `json:"size_bytes"`
+	KernelPath  string            `json:"kernel_path"`
+	RootfsPath  string            `json:"rootfs_path"`
+	MemPath     string            `json:"mem_path"`
+	StatePath   string            `json:"state_path"`
 }
 
 // SnapshotPaths holds the local paths to snapshot files
 type SnapshotPaths struct {
-	Kernel        string
-	Rootfs        string
-	Mem           string
-	State         string
-	Version       string
+	Kernel  string
+	Rootfs  string
+	Mem     string
+	State   string
+	Version string
 	// ExtensionDriveImages maps DriveID to the local path of the extension drive image.
 	// Used by BuildChunkedSnapshot to chunk extension drives.
 	ExtensionDriveImages map[string]string

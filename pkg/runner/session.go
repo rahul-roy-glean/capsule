@@ -173,18 +173,18 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 	}
 
 	metadata := SessionMetadata{
-		SessionID:          sessionID,
-		WorkloadKey:        runner.WorkloadKey,
-		RunnerID:           runnerID,
-		HostID:             m.config.HostID,
-		Layers:             layerN + 1,
-		CreatedAt:          runner.CreatedAt,
-		PausedAt:           time.Now(),
-		RootfsPath:         runner.RootfsOverlay,
-		VCPUs:              runner.Resources.VCPUs,
-		MemoryMB:           runner.Resources.MemoryMB,
-		TTLSeconds:         runner.TTLSeconds,
-		AutoPause:          runner.AutoPause,
+		SessionID:   sessionID,
+		WorkloadKey: runner.WorkloadKey,
+		RunnerID:    runnerID,
+		HostID:      m.config.HostID,
+		Layers:      layerN + 1,
+		CreatedAt:   runner.CreatedAt,
+		PausedAt:    time.Now(),
+		RootfsPath:  runner.RootfsOverlay,
+		VCPUs:       runner.Resources.VCPUs,
+		MemoryMB:    runner.Resources.MemoryMB,
+		TTLSeconds:  runner.TTLSeconds,
+		AutoPause:   runner.AutoPause,
 	}
 
 	// GCS-backed upload: when sessionMemStore is configured, upload dirty mem
@@ -559,18 +559,18 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 	}
 
 	metadata := SessionMetadata{
-		SessionID:          sessionID,
-		WorkloadKey:        runner.WorkloadKey,
-		RunnerID:           runnerID,
-		HostID:             m.config.HostID,
-		Layers:             layerN + 1,
-		CreatedAt:          runner.CreatedAt,
-		PausedAt:           time.Now(),
-		RootfsPath:         runner.RootfsOverlay,
-		VCPUs:              runner.Resources.VCPUs,
-		MemoryMB:           runner.Resources.MemoryMB,
-		TTLSeconds:         runner.TTLSeconds,
-		AutoPause:          runner.AutoPause,
+		SessionID:   sessionID,
+		WorkloadKey: runner.WorkloadKey,
+		RunnerID:    runnerID,
+		HostID:      m.config.HostID,
+		Layers:      layerN + 1,
+		CreatedAt:   runner.CreatedAt,
+		PausedAt:    time.Now(),
+		RootfsPath:  runner.RootfsOverlay,
+		VCPUs:       runner.Resources.VCPUs,
+		MemoryMB:    runner.Resources.MemoryMB,
+		TTLSeconds:  runner.TTLSeconds,
+		AutoPause:   runner.AutoPause,
 	}
 
 	// GCS-backed upload (same logic as PauseRunner)
@@ -1203,17 +1203,17 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 			VCPUs:    metadata.VCPUs,
 			MemoryMB: metadata.MemoryMB,
 		},
-		CreatedAt:      metadata.CreatedAt,
-		StartedAt:      time.Now(),
-		SocketPath:     filepath.Join(m.config.SocketDir, runnerID+".sock"),
-		LogPath:        filepath.Join(m.config.LogDir, runnerID+".log"),
-		RootfsOverlay:  overlayPath,
-		SessionID:      sessionID,
-		SessionDir:     sessionDir,
-		SessionLayers:  metadata.Layers,
-		TTLSeconds:     metadata.TTLSeconds,
-		AutoPause:      metadata.AutoPause,
-		LastExecAt:     time.Now(),
+		CreatedAt:     metadata.CreatedAt,
+		StartedAt:     time.Now(),
+		SocketPath:    filepath.Join(m.config.SocketDir, runnerID+".sock"),
+		LogPath:       filepath.Join(m.config.LogDir, runnerID+".log"),
+		RootfsOverlay: overlayPath,
+		SessionID:     sessionID,
+		SessionDir:    sessionDir,
+		SessionLayers: metadata.Layers,
+		TTLSeconds:    metadata.TTLSeconds,
+		AutoPause:     metadata.AutoPause,
+		LastExecAt:    time.Now(),
 	}
 
 	m.mu.Lock()

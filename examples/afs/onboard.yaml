@@ -1,0 +1,47 @@
+platform:
+  gcp_project: "dev-sandbox-334901"
+  region: "us-central1"
+  zone: "us-central1-a"
+
+microvm:
+  max_per_host: 32
+  idle_target: 4            # Keep warm VMs for low-latency cold starts
+
+hosts:
+  machine_type: "n2-standard-16"
+  min_count: 2
+  max_count: 20
+  data_disk_gb: 300
+
+workload:
+  base_image: "us-central1-docker.pkg.dev/scio-engineering/glean-images/afs-sandbox:latest"
+
+  layers:
+    - name: "runtime"
+      init_commands:
+        - type: "shell"
+          args: ["bash", "-c", "mkdir -p /home/user/{upload,output,Documents,Research,Downloads} && chown -R 1000:1000 /home/user"]
+          run_as_root: true
+
+  start_command:
+    command: ["uvicorn", "afs_sandbox:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1", "--timeout-keep-alive", "600"]
+    port: 8080
+    health_path: "/health"
+
+  config:
+    tier: "xs"                  # 1 vCPU, 512MB — smallest tier
+    auto_pause: true
+    ttl: 300                    # Auto-pause after 5min idle
+    session_max_age_seconds: 86400
+    runner_user: "user"         # Map to UID 1000 from the Dockerfile
+    workspace_size_gb: 10       # /workspace drive for user files
+
+session:
+  enabled: true
+  ttl_seconds: 300      # Auto-pause after 5min idle
+  auto_pause: true      # Pause to GCS (preserves full VM state)
+
+credentials:
+  secrets: []
+  host_dirs: []
+  env: {}

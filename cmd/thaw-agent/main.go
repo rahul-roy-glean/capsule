@@ -28,14 +28,12 @@ import (
 var (
 	mmdsEndpoint   = flag.String("mmds-endpoint", "http://169.254.169.254", "MMDS endpoint")
 	workspaceDir   = flag.String("workspace-dir", "/workspace", "Workspace directory")
-	runnerDir              = flag.String("runner-dir", "", "GitHub runner directory (default: /home/<runner-user>)")
-	runnerUsername         = flag.String("runner-user", "runner", "Username for GitHub runner and file ownership (e.g., 'runner' or 'gleanuser')")
+	runnerDir      = flag.String("runner-dir", "", "GitHub runner directory (default: /home/<runner-user>)")
+	runnerUsername = flag.String("runner-user", "runner", "Username for GitHub runner and file ownership (e.g., 'runner' or 'gleanuser')")
 	logLevel       = flag.String("log-level", "info", "Log level")
 	readyFile      = flag.String("ready-file", "/var/run/thaw-agent/ready", "Ready signal file")
 	skipNetwork    = flag.Bool("skip-network", false, "Skip network configuration")
-	skipRunner             = flag.Bool("skip-runner", false, "Skip GitHub runner registration")
 )
-
 
 // WarmupState tracks the current warmup progress (for snapshot building)
 type WarmupState struct {
@@ -140,8 +138,6 @@ type RegistrationState struct {
 	Output    string `json:"output,omitempty"`
 }
 
-var globalRegistrationState = &RegistrationState{}
-
 // SymlinkState tracks pre-cloned repo symlink status
 type SymlinkState struct {
 	Attempted    bool   `json:"attempted"`
@@ -175,11 +171,11 @@ type MMDSData struct {
 			MAC       string `json:"mac"`
 		} `json:"network"`
 		Job struct {
-			Repo          string            `json:"repo"`
-			Branch        string            `json:"branch"`
-			Commit        string            `json:"commit"`
-			GitToken      string            `json:"git_token"`
-			Labels        map[string]string `json:"labels"`
+			Repo     string            `json:"repo"`
+			Branch   string            `json:"branch"`
+			Commit   string            `json:"commit"`
+			GitToken string            `json:"git_token"`
+			Labels   map[string]string `json:"labels"`
 		} `json:"job"`
 		Snapshot struct {
 			Version string `json:"version"`
@@ -708,11 +704,11 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					MAC       string `json:"mac"`
 				} `json:"network"`
 				Job struct {
-					Repo          string            `json:"repo"`
-					Branch        string            `json:"branch"`
-					Commit        string            `json:"commit"`
-					GitToken      string            `json:"git_token"`
-					Labels        map[string]string `json:"labels"`
+					Repo     string            `json:"repo"`
+					Branch   string            `json:"branch"`
+					Commit   string            `json:"commit"`
+					GitToken string            `json:"git_token"`
+					Labels   map[string]string `json:"labels"`
 				} `json:"job"`
 				Snapshot struct {
 					Version string `json:"version"`
@@ -1372,7 +1368,6 @@ func runWarmupMode(data *MMDSData) error {
 	// before the snapshot is taken. Without this, the journal can be captured
 	// mid-write (between sync and VM pause), making the drive unmountable when
 	// loaded with a different VM memory state (refresh/reattach builds).
-	var frozenMounts []string
 	for _, d := range data.Latest.Warmup.Drives {
 		if d.MountPath == "" {
 			continue
@@ -1383,11 +1378,10 @@ func runWarmupMode(data *MMDSData) error {
 		if out, err := exec.Command("fsfreeze", "--freeze", d.MountPath).CombinedOutput(); err != nil {
 			log.WithError(err).WithField("mount_path", d.MountPath).Warnf("fsfreeze failed (output: %s)", string(out))
 		} else {
-			frozenMounts = append(frozenMounts, d.MountPath)
 			log.WithField("mount_path", d.MountPath).Info("Froze filesystem for clean snapshot")
 		}
 	}
-	// Note: frozenMounts are left frozen intentionally. The VM will be paused
+	// Note: frozen drives are left frozen intentionally. The VM will be paused
 	// for snapshot shortly after warmup completes. On next restore, the drives
 	// are unmounted/remounted so the freeze state doesn't carry over.
 
@@ -1573,8 +1567,8 @@ func startMetadataForwarder(metadataHost string) (stop func(), err error) {
 		// sees it and doesn't add a duplicate.
 		h := w.Header()
 		for k, vals := range resp.Header {
-			h[k] = vals                        // canonical key (suppresses Go auto-detection)
-			h[strings.ToLower(k)] = vals       // lowercase key (for old google-auth)
+			h[k] = vals                  // canonical key (suppresses Go auto-detection)
+			h[strings.ToLower(k)] = vals // lowercase key (for old google-auth)
 		}
 		w.WriteHeader(resp.StatusCode)
 		w.Write(body)
@@ -1638,16 +1632,6 @@ func startMetadataForwarder(metadataHost string) (stop func(), err error) {
 	return stop, nil
 }
 
-func forwardConn(client gonet.Conn, upstream string) {
-	defer client.Close()
-	backend, err := gonet.Dial("tcp", upstream)
-	if err != nil {
-		return
-	}
-	defer backend.Close()
-	go io.Copy(backend, client)
-	io.Copy(client, backend)
-}
 // runStreamedCommand runs a command, capturing stdout/stderr line by line
 // into the warmup log buffer and the structured logger.
 func runStreamedCommand(dir string, env []string, procAttr *syscall.SysProcAttr, name string, args ...string) error {
@@ -2013,10 +1997,10 @@ func startHealthServer(mmdsData *MMDSData) {
 			mode = mmdsData.Latest.Meta.Mode
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":       "healthy",
-			"runner_id":    runnerID,
-			"mode":         mode,
-			"uptime":       time.Since(globalWarmupState.StartedAt).String(),
+			"status":    "healthy",
+			"runner_id": runnerID,
+			"mode":      mode,
+			"uptime":    time.Since(globalWarmupState.StartedAt).String(),
 		})
 	})
 

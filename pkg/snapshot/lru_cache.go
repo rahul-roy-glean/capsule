@@ -13,11 +13,11 @@ const numShards = 64
 // when many goroutines (UFFD handlers, FUSE disks, eager fetchers) access
 // the cache concurrently.
 type LRUCache struct {
-	shards     [numShards]*lruShard
-	maxSize    int64
-	hits       atomic.Int64
-	misses     atomic.Int64
-	evictions  atomic.Int64
+	shards    [numShards]*lruShard
+	maxSize   int64
+	hits      atomic.Int64
+	misses    atomic.Int64
+	evictions atomic.Int64
 }
 
 // lruShard is a single shard of the LRU cache with its own lock.

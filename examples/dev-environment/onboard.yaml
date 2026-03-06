@@ -17,17 +17,22 @@ hosts:
   data_disk_gb: 500
 
 workload:
-  # Snapshot warmup: clone the repo, install the toolchain, start LSP servers.
-  snapshot_commands:
-    - type: "shell"
-      args: ["bash", "-c", "git clone --depth=1 -b main https://github.com/myorg/myrepo /workspace"]
-    - type: "shell"
-      args: ["bash", "/setup/install-toolchain.sh"]
-      run_as_root: true
-    - type: "shell"
-      # Pre-warm the language server so it's already indexed at restore time.
-      args: ["bash", "/setup/warm-lsp.sh"]
-      run_as_root: false
+  # Docker image with your dev toolchain pre-installed.
+  # The platform converts it to a Firecracker rootfs and installs thaw-agent.
+  # Example: an image with code-server, Node.js, Python, Go, etc.
+  base_image: "us-docker.pkg.dev/my-project/images/dev-env:latest"
+
+  layers:
+    - name: "workspace"
+      init_commands:
+        - type: "shell"
+          args: ["bash", "-c", "git clone --depth=1 -b main https://github.com/myorg/myrepo /workspace"]
+        - type: "shell"
+          args: ["bash", "/setup/install-toolchain.sh"]
+          run_as_root: true
+        - type: "shell"
+          # Pre-warm the language server so it's already indexed at restore time.
+          args: ["bash", "/setup/warm-lsp.sh"]
 
   # VS Code Server (code-server) as the IDE.
   # Users connect via browser at https://<host-ip>:8443
@@ -35,6 +40,11 @@ workload:
     command: ["/usr/bin/code-server", "--auth=none", "--bind-addr=0.0.0.0:8443", "/workspace"]
     port: 8443
     health_path: "/healthz"
+
+  config:
+    auto_pause: true
+    ttl: 3600                   # Auto-pause after 1h idle
+    session_max_age_seconds: 86400
 
 # Session persistence is the key feature for dev environments:
 # - On browser close / idle timeout, the VM is paused to GCS (cheap, fast).

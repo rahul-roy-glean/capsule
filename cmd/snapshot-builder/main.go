@@ -29,19 +29,19 @@ import (
 )
 
 var (
-	gcsBucket            = flag.String("gcs-bucket", "", "GCS bucket for snapshots")
-	outputDir            = flag.String("output-dir", "/tmp/snapshot", "Output directory for snapshot files")
-	kernelPath           = flag.String("kernel-path", "/opt/firecracker/kernel.bin", "Path to kernel")
-	rootfsPath           = flag.String("rootfs-path", "/opt/firecracker/rootfs.img", "Path to base rootfs")
-	firecrackerBin       = flag.String("firecracker-bin", "/usr/local/bin/firecracker", "Path to firecracker binary")
-	vcpus                = flag.Int("vcpus", 4, "vCPUs for warmup VM")
-	memoryMB             = flag.Int("memory-mb", 8192, "Memory MB for warmup VM")
-	warmupTimeout        = flag.Duration("warmup-timeout", 30*time.Minute, "Timeout for warmup phase")
-	rootfsSizeGB         = flag.Int("rootfs-size-gb", 0, "Expand rootfs to this size in GB (0 = keep original size). Increase if bazel fetch runs out of space.")
-	logLevel             = flag.String("log-level", "info", "Log level")
-	enableChunked        = flag.Bool("enable-chunked", true, "Also build a chunked snapshot for lazy loading")
-	memBackend           = flag.String("mem-backend", "chunked", "Memory backend for chunked snapshots: 'chunked' (UFFD lazy loading via MemChunks, default) or 'file' (upload snapshot.mem as single blob)")
-	gcsPrefix            = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
+	gcsBucket      = flag.String("gcs-bucket", "", "GCS bucket for snapshots")
+	outputDir      = flag.String("output-dir", "/tmp/snapshot", "Output directory for snapshot files")
+	kernelPath     = flag.String("kernel-path", "/opt/firecracker/kernel.bin", "Path to kernel")
+	rootfsPath     = flag.String("rootfs-path", "/opt/firecracker/rootfs.img", "Path to base rootfs")
+	firecrackerBin = flag.String("firecracker-bin", "/usr/local/bin/firecracker", "Path to firecracker binary")
+	vcpus          = flag.Int("vcpus", 4, "vCPUs for warmup VM")
+	memoryMB       = flag.Int("memory-mb", 8192, "Memory MB for warmup VM")
+	warmupTimeout  = flag.Duration("warmup-timeout", 30*time.Minute, "Timeout for warmup phase")
+	rootfsSizeGB   = flag.Int("rootfs-size-gb", 0, "Expand rootfs to this size in GB (0 = keep original size). Increase if bazel fetch runs out of space.")
+	logLevel       = flag.String("log-level", "info", "Log level")
+	enableChunked  = flag.Bool("enable-chunked", true, "Also build a chunked snapshot for lazy loading")
+	memBackend     = flag.String("mem-backend", "chunked", "Memory backend for chunked snapshots: 'chunked' (UFFD lazy loading via MemChunks, default) or 'file' (upload snapshot.mem as single blob)")
+	gcsPrefix      = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
 
 	versionOverride = flag.String("version", "", "Snapshot version string (if empty, auto-generated from timestamp + workload key)")
 
@@ -560,17 +560,17 @@ func main() {
 
 	// Create metadata
 	metadata := snapshot.SnapshotMetadata{
-		Version:           version,
-		RepoCommit:        getGitCommit(*outputDir),
-		Repo:              metaRepoURL,
-		WorkloadKey:       workloadKey,
-		Commands:          commands,
-		CreatedAt:         time.Now(),
-		SizeBytes:         totalSize,
-		KernelPath:        "kernel.bin",
-		RootfsPath:        "rootfs.img",
-		MemPath:           "snapshot.mem",
-		StatePath:         "snapshot.state",
+		Version:     version,
+		RepoCommit:  getGitCommit(*outputDir),
+		Repo:        metaRepoURL,
+		WorkloadKey: workloadKey,
+		Commands:    commands,
+		CreatedAt:   time.Now(),
+		SizeBytes:   totalSize,
+		KernelPath:  "kernel.bin",
+		RootfsPath:  "rootfs.img",
+		MemPath:     "snapshot.mem",
+		StatePath:   "snapshot.state",
 	}
 
 	// Upload to GCS
@@ -1050,62 +1050,6 @@ func createExt4Image(path string, sizeGB int, label string) error {
 	// mkfs.ext4 works on regular files with -F
 	if output, err := exec.Command("mkfs.ext4", "-F", "-L", label, path).CombinedOutput(); err != nil {
 		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(output), err)
-	}
-	return nil
-}
-
-func createExt4ImageMB(path string, sizeMB int, label string) error {
-	if sizeMB <= 0 {
-		return fmt.Errorf("invalid sizeMB: %d", sizeMB)
-	}
-	if err := exec.Command("truncate", "-s", fmt.Sprintf("%dM", sizeMB), path).Run(); err != nil {
-		return fmt.Errorf("truncate failed: %w", err)
-	}
-	// mkfs.ext4 works on regular files with -F
-	if output, err := exec.Command("mkfs.ext4", "-F", "-L", label, path).CombinedOutput(); err != nil {
-		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(output), err)
-	}
-	return nil
-}
-
-func seedExt4ImageFromDir(imgPath, seedDir string, log *logrus.Entry) error {
-	info, err := os.Stat(seedDir)
-	if err != nil {
-		return fmt.Errorf("seed dir stat failed: %w", err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("seed dir is not a directory: %s", seedDir)
-	}
-
-	mountPoint := filepath.Join(filepath.Dir(imgPath), "mnt-extension-drive")
-	if err := os.MkdirAll(mountPoint, 0755); err != nil {
-		return fmt.Errorf("failed to create mount point: %w", err)
-	}
-	defer os.RemoveAll(mountPoint)
-
-	// Mount loopback image (requires root)
-	if output, err := exec.Command("mount", "-o", "loop", imgPath, mountPoint).CombinedOutput(); err != nil {
-		return fmt.Errorf("mount loop failed: %s: %w", string(output), err)
-	}
-	defer func() {
-		if output, err := exec.Command("umount", mountPoint).CombinedOutput(); err != nil {
-			log.WithError(err).WithField("output", string(output)).Warn("Failed to unmount repo-cache seed image")
-		}
-	}()
-
-	// Copy seed content into the image root
-	// We prefer rsync for correctness (preserve permissions, symlinks) if available.
-	if _, err := exec.LookPath("rsync"); err == nil {
-		cmd := exec.Command("rsync", "-a", "--delete", seedDir+string(os.PathSeparator), mountPoint+string(os.PathSeparator))
-		if output, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("rsync failed: %s: %w", string(output), err)
-		}
-		return nil
-	}
-
-	cmd := exec.Command("cp", "-a", seedDir+string(os.PathSeparator)+".", mountPoint+string(os.PathSeparator))
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("cp -a failed: %s: %w", string(output), err)
 	}
 	return nil
 }

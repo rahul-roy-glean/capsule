@@ -138,10 +138,10 @@ type MMDSData struct {
 			MAC       string `json:"mac"`
 		} `json:"network"`
 		Job struct {
-			Repo          string            `json:"repo"`
-			Branch        string            `json:"branch"`
-			Commit        string            `json:"commit"`
-			Labels        map[string]string `json:"labels"`
+			Repo   string            `json:"repo"`
+			Branch string            `json:"branch"`
+			Commit string            `json:"commit"`
+			Labels map[string]string `json:"labels"`
 		} `json:"job"`
 		Snapshot struct {
 			Version string `json:"version"`

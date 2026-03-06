@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -42,7 +43,7 @@ type Manager struct {
 	vms            map[string]*firecracker.VM
 	uffdHandlers   map[string]uffdStopper // layered UFFD handlers per runner (session resume)
 	snapshotCache  *snapshot.Cache
-	network *network.NATNetwork
+	network        *network.NATNetwork
 	// netnsNetwork manages per-VM network namespaces (nil if using legacy bridge mode).
 	// When set, each VM gets its own namespace with point-to-point veth routing
 	// instead of sharing the fcbr0 bridge.
@@ -153,18 +154,18 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 	}
 
 	m := &Manager{
-		config:           cfg,
-		runners:          make(map[string]*Runner),
-		recentRequests:   make(map[string]*recentAllocation),
-		vms:              make(map[string]*firecracker.VM),
-		uffdHandlers:     make(map[string]uffdStopper),
-		snapshotCache:    cache,
-		network:          natNet,
-		slotToRunner:     make(map[int]string),
-		runnerToSlot:     make(map[string]int),
-		policyEnforcers:  make(map[string]*network.PolicyEnforcer),
-		authProxies:      make(map[string]*authproxy.AuthProxy),
-		logger:           logger.WithField("component", "runner-manager"),
+		config:          cfg,
+		runners:         make(map[string]*Runner),
+		recentRequests:  make(map[string]*recentAllocation),
+		vms:             make(map[string]*firecracker.VM),
+		uffdHandlers:    make(map[string]uffdStopper),
+		snapshotCache:   cache,
+		network:         natNet,
+		slotToRunner:    make(map[int]string),
+		runnerToSlot:    make(map[string]int),
+		policyEnforcers: make(map[string]*network.PolicyEnforcer),
+		authProxies:     make(map[string]*authproxy.AuthProxy),
+		logger:          logger.WithField("component", "runner-manager"),
 	}
 
 	// Initialize runner pool if enabled
@@ -634,6 +635,13 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		}
 	}
 
+	// Wait for thaw-agent to be ready before returning. After snapshot restore,
+	// the VM's HTTP listener needs a moment to accept connections. Without this
+	// gate, the first exec request races the thaw-agent and gets connection reset.
+	if err := m.waitForThawAgent(ctx, runner.InternalIP.String(), 10*time.Second); err != nil {
+		m.logger.WithError(err).WithField("runner_id", runnerID).Warn("Thaw-agent readiness check failed (non-fatal)")
+	}
+
 	runner.State = StateInitializing
 	runner.StartedAt = time.Now()
 
@@ -649,14 +657,38 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	}
 
 	m.logger.WithFields(logrus.Fields{
-		"runner_id":         runnerID,
-		"ip":                runner.InternalIP.String(),
-		"snapshot":          runner.SnapshotVersion,
-		"alloc_ms":          time.Since(allocStart).Milliseconds(),
-		"overlay_ms":        overlayDur.Milliseconds(),
+		"runner_id":  runnerID,
+		"ip":         runner.InternalIP.String(),
+		"snapshot":   runner.SnapshotVersion,
+		"alloc_ms":   time.Since(allocStart).Milliseconds(),
+		"overlay_ms": overlayDur.Milliseconds(),
 	}).Info("Runner allocated successfully")
 
 	return runner, nil
+}
+
+// waitForThawAgent polls the thaw-agent /alive endpoint until it returns
+// HTTP 200 or the timeout expires. This ensures the VM is functional after
+// snapshot restore before we expose it to callers.
+func (m *Manager) waitForThawAgent(ctx context.Context, ip string, timeout time.Duration) error {
+	aliveURL := fmt.Sprintf("http://%s:%d/alive", ip, snapshot.ThawAgentDebugPort)
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		resp, err := client.Get(aliveURL)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("thaw-agent at %s not ready after %v", aliveURL, timeout)
 }
 
 // buildMMDSData builds the MMDS data structure for a runner
