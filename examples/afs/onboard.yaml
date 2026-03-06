@@ -14,67 +14,15 @@ hosts:
   data_disk_gb: 300
 
 workload:
-  # The existing AFS Docker image — used as-is.
-  # The platform auto-injects thaw-agent, systemd, and networking into the
-  # rootfs at snapshot-build time. No changes to the Dockerfile needed.
   base_image: "us-central1-docker.pkg.dev/scio-engineering/glean-images/afs-sandbox:latest"
 
   layers:
     - name: "runtime"
       init_commands:
-        # pip dependencies are already in the Docker image, but if you want
-        # to bake additional packages into the snapshot (so they survive
-        # pause/resume without re-install), add them here:
-        #
-        # - type: "shell"
-        #   args: ["pip", "install", "some-extra-package"]
-        #   run_as_root: true
-        #
-        # For now, just ensure the work directories exist with correct ownership.
         - type: "shell"
           args: ["bash", "-c", "mkdir -p /home/user/{upload,output,Documents,Research,Downloads} && chown -R 1000:1000 /home/user"]
           run_as_root: true
 
-  # The AFS sandbox FastAPI server.
-  # On the pods-based system this is the ENTRYPOINT; here it's start_command.
-  #
-  # The thaw-agent already provides native equivalents for all AFS endpoints:
-  #
-  #   AFS (pods)                  → Thaw-agent (firecracker)
-  #   ─────────────────────────────────────────────────────────────────
-  #   POST /execshell             → POST /api/v1/runners/{id}/exec
-  #                                 (streaming NDJSON: stdout/stderr/exit)
-  #   POST /uploadfiles           → POST /api/v1/runners/{id}/files/upload?path=/home/user/file.py
-  #                                 (raw body upload, supports binary)
-  #   GET  /downloadfile?path=... → GET  /api/v1/runners/{id}/files/download?path=/home/user/file.py
-  #                                 (streaming file download)
-  #   GET  /health                → GET  /api/v1/runners/status?runner_id={id}
-  #                                 (control-plane readiness check)
-  #   POST /pause                 → POST /api/v1/runners/pause
-  #                                 (VM-level, replaces tarball+GCS)
-  #   POST /restore               → POST /api/v1/runners/allocate (with session_id)
-  #                                 (VM-level, replaces tarball+GCS)
-  #   GET  /getlastexecutiontimev2→ (handled by platform TTL/auto-pause)
-  #
-  # Plus additional thaw-agent endpoints not in AFS:
-  #   POST /api/v1/runners/{id}/files/write   (write file content from JSON body)
-  #   POST /api/v1/runners/{id}/files/read    (read file content as JSON)
-  #   POST /api/v1/runners/{id}/files/list    (ls directory)
-  #   POST /api/v1/runners/{id}/files/stat    (file metadata)
-  #   POST /api/v1/runners/{id}/files/remove  (delete file)
-  #   POST /api/v1/runners/{id}/files/mkdir   (create directory)
-  #   WS   /api/v1/runners/{id}/pty           (interactive terminal via WebSocket)
-  #
-  # Migration options:
-  #   (a) Keep afs_sandbox as start_command (zero orchestrator changes).
-  #       The orchestrator talks to port 8080 as before, proxied through the
-  #       manager. Only change: pause/restore calls go to the control-plane.
-  #
-  #   (b) Drop afs_sandbox entirely. Point the orchestrator at the manager's
-  #       /api/v1/runners/{id}/exec and /files/* endpoints. No Python process
-  #       needed inside the VM — lower memory, faster restore, fewer moving parts.
-  #
-  # Option (a) is shown here for a drop-in migration:
   start_command:
     command: ["uvicorn", "afs_sandbox:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1", "--timeout-keep-alive", "600"]
     port: 8080
@@ -88,27 +36,6 @@ workload:
     runner_user: "user"         # Map to UID 1000 from the Dockerfile
     workspace_size_gb: 10       # /workspace drive for user files
 
-# Session persistence replaces the app-level /pause and /restore endpoints.
-#
-# OLD (pods): orchestrator calls POST /pause with a signed URL → app creates
-#   tarball of /home/user → uploads to GCS → orchestrator calls POST /restore
-#   on a new pod → app downloads tarball → extracts to /home/user.
-#   Cost: tarball creation + GCS upload + GCS download + extraction each time.
-#
-# NEW (firecracker): platform pauses the entire VM (CPU + memory + disk) in
-#   ~140ms and resumes in ~165ms. Full process state is preserved — open file
-#   handles, running processes, TCP connections, everything. No tarball, no
-#   GCS round-trip for the app, no data loss from SNAPSHOT_EXCLUDES filtering.
-#
-# The orchestrator changes from:
-#   POST /pause   {"sandbox_id": "...", "upload_url": "..."}
-# to:
-#   POST /api/v1/runners/pause  {"runner_id": "..."}
-#
-# And from:
-#   POST /restore {"sandbox_id": "...", "download_url": "..."}
-# to:
-#   POST /api/v1/runners/allocate {"workload_key": "...", "session_id": "..."}
 session:
   enabled: true
   ttl_seconds: 300      # Auto-pause after 5min idle
