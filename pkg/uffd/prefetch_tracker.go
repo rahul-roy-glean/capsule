@@ -26,15 +26,20 @@ type PrefetchTracker struct {
 	entries      map[int64]PrefetchEntry // offset → entry (first-write-wins)
 	orderCounter uint64
 	blockSize    int64
+	maxPages     int // 0 = no cap
 	tracking     atomic.Bool
 }
 
 // NewPrefetchTracker creates a tracker that records page fault order.
 // blockSize should match PageSize (4096).
-func NewPrefetchTracker(blockSize int64) *PrefetchTracker {
+// maxPages caps how many pages are retained in the mapping (0 = unlimited).
+// The cap prevents unbounded growth across pause/resume cycles that would
+// flood the ChunkStore LRU on the next resume.
+func NewPrefetchTracker(blockSize int64, maxPages int) *PrefetchTracker {
 	t := &PrefetchTracker{
 		entries:   make(map[int64]PrefetchEntry),
 		blockSize: blockSize,
+		maxPages:  maxPages,
 	}
 	t.tracking.Store(true)
 	return t
@@ -63,6 +68,7 @@ func (t *PrefetchTracker) Add(offset int64) {
 
 // GetMapping stops tracking and returns the recorded offsets sorted by access
 // order. After calling this, further Add() calls are no-ops.
+// The mapping is capped at maxPages to prevent cache eviction storms.
 func (t *PrefetchTracker) GetMapping() *snapshot.PrefetchMapping {
 	t.tracking.Store(false)
 
@@ -85,6 +91,11 @@ func (t *PrefetchTracker) GetMapping() *snapshot.PrefetchMapping {
 	offsets := make([]int64, len(sorted))
 	for i, e := range sorted {
 		offsets[i] = e.Offset
+	}
+
+	// Cap to prevent cache eviction storms on resume.
+	if t.maxPages > 0 && len(offsets) > t.maxPages {
+		offsets = offsets[:t.maxPages]
 	}
 
 	return &snapshot.PrefetchMapping{
