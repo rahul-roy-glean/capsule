@@ -38,10 +38,6 @@ var (
 	memoryMB             = flag.Int("memory-mb", 8192, "Memory MB for warmup VM")
 	warmupTimeout        = flag.Duration("warmup-timeout", 30*time.Minute, "Timeout for warmup phase")
 	rootfsSizeGB         = flag.Int("rootfs-size-gb", 0, "Expand rootfs to this size in GB (0 = keep original size). Increase if bazel fetch runs out of space.")
-	repoCacheUpperSizeGB = flag.Int("repo-cache-upper-size-gb", 10, "Size in GB of repo-cache-upper.img (writable overlay for Bazel repository cache)")
-	repoCacheSeedSizeGB  = flag.Int("repo-cache-seed-size-gb", 20, "Size in GB of repo-cache-seed.img (shared Bazel repository cache seed)")
-	repoCacheSeedDir     = flag.String("repo-cache-seed-dir", "", "Optional directory to seed into repo-cache-seed.img (copied into image root)")
-	gitCachePath         = flag.String("git-cache-path", "", "Path to pre-populated git-cache.img (from git-cache-builder). If set, uses this instead of cloning during warmup.")
 	logLevel             = flag.String("log-level", "info", "Log level")
 	enableChunked        = flag.Bool("enable-chunked", true, "Also build a chunked snapshot for lazy loading")
 	memBackend           = flag.String("mem-backend", "chunked", "Memory backend for chunked snapshots: 'chunked' (UFFD lazy loading via MemChunks, default) or 'file' (upload snapshot.mem as single blob)")
@@ -264,7 +260,6 @@ func main() {
 
 	// Paths used by both paths and for final snapshot creation
 	workingRootfs := filepath.Join(*outputDir, "rootfs.img")
-	repoCacheSeedImg := filepath.Join(*outputDir, "repo-cache-seed.img")
 
 	// rootfsSourceHash is lazily computed and stored in chunked metadata
 	// so future incremental builds can detect rootfs changes.
@@ -362,10 +357,7 @@ func main() {
 		// the same set of drives so that Firecracker snapshot restore works —
 		// you can't add/remove drives between snapshot and restore. Sparse files
 		// don't consume actual disk space until written to.
-		//
-		// Legacy builds: use the hardcoded repo_cache_seed/upper/credentials/git_cache.
 		var drives []firecracker.Drive
-		gitCacheEnabled := false
 
 		if *layerHash != "" {
 			// Layer mode: create sparse drives for all config-defined drives.
@@ -394,52 +386,6 @@ func main() {
 					"size_gb":  sizeGB,
 					"label":    label,
 				}).Info("Created sparse drive")
-			}
-		} else {
-			// Legacy mode: create hardcoded drives
-			log.WithFields(logrus.Fields{
-				"path":     repoCacheSeedImg,
-				"size_gb":  *repoCacheSeedSizeGB,
-				"seed_dir": *repoCacheSeedDir,
-			}).Info("Creating repo-cache seed image")
-			if err := createExt4Image(repoCacheSeedImg, *repoCacheSeedSizeGB, "BAZEL_REPO_SEED"); err != nil {
-				log.WithError(err).Fatal("Failed to create repo-cache seed image")
-			}
-			if *repoCacheSeedDir != "" {
-				if err := seedExt4ImageFromDir(repoCacheSeedImg, *repoCacheSeedDir, log); err != nil {
-					log.WithError(err).Warn("Failed to seed repo-cache image from directory; continuing with empty seed")
-				}
-			}
-
-			repoCacheUpperImg := filepath.Join(*outputDir, "repo-cache-upper.img")
-			if err := createExt4Image(repoCacheUpperImg, *repoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
-				log.WithError(err).Fatal("Failed to create repo-cache upper image")
-			}
-
-			credentialsImg := filepath.Join(*outputDir, "credentials.img")
-			if err := createExt4ImageMB(credentialsImg, 32, "CREDENTIALS"); err != nil {
-				log.WithError(err).Fatal("Failed to create credentials image")
-			}
-
-			gitCacheImg := filepath.Join(*outputDir, "git-cache.img")
-			if *gitCachePath != "" {
-				log.WithField("source", *gitCachePath).Info("Copying pre-populated git-cache image...")
-				if err := copyFile(*gitCachePath, gitCacheImg); err != nil {
-					log.WithError(err).Fatal("Failed to copy git-cache image")
-				}
-				gitCacheEnabled = true
-			} else {
-				log.Info("Creating placeholder git-cache image...")
-				if err := createExt4ImageMB(gitCacheImg, 64, "GIT_CACHE"); err != nil {
-					log.WithError(err).Fatal("Failed to create git-cache image")
-				}
-			}
-
-			drives = []firecracker.Drive{
-				{DriveID: "repo_cache_seed", PathOnHost: repoCacheSeedImg, IsRootDevice: false, IsReadOnly: false},
-				{DriveID: "repo_cache_upper", PathOnHost: repoCacheUpperImg, IsRootDevice: false, IsReadOnly: false},
-				{DriveID: "credentials", PathOnHost: credentialsImg, IsRootDevice: false, IsReadOnly: true},
-				{DriveID: "git_cache", PathOnHost: gitCacheImg, IsRootDevice: false, IsReadOnly: true},
 			}
 		}
 
@@ -475,7 +421,7 @@ func main() {
 			log.WithError(err).Fatal("Failed to start VM")
 		}
 
-		mmdsData := buildWarmupMMDS(commands, gitToken, gcpAccessToken, gitCacheEnabled, newDrives)
+		mmdsData := buildWarmupMMDS(commands, gitToken, newDrives)
 		injectProxyMMDS(mmdsData, authProxy, authProxyAddr, hostIP)
 		if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 			vm.Stop()
@@ -573,19 +519,35 @@ func main() {
 
 	// Get file sizes (some files may not exist in incremental mode)
 	var totalSize int64
-	for _, f := range []string{kernelOutput, workingRootfs, snapshotPath, memPath, repoCacheSeedImg} {
+	for _, f := range []string{kernelOutput, workingRootfs, snapshotPath, memPath} {
 		info, _ := os.Stat(f)
 		if info != nil {
 			totalSize += info.Size()
 		}
 	}
 
-	// Derive informational repo URL from git-clone command (best-effort, for metadata only).
+	// Derive informational repo URL from shell git-clone command (best-effort, for metadata only).
 	metaRepoURL := ""
 	for _, cmd := range commands {
-		if cmd.Type == "git-clone" && len(cmd.Args) > 0 {
-			metaRepoURL = cmd.Args[0]
-			break
+		if cmd.Type == "shell" && len(cmd.Args) > 0 {
+			// Look for "git clone" in shell command args.
+			for _, arg := range cmd.Args {
+				if strings.Contains(arg, "git clone") {
+					// Extract URL: look for https:// or git@ patterns.
+					for _, token := range strings.Fields(arg) {
+						if strings.HasPrefix(token, "https://") || strings.HasPrefix(token, "git@") {
+							metaRepoURL = token
+							break
+						}
+					}
+					if metaRepoURL != "" {
+						break
+					}
+				}
+			}
+			if metaRepoURL != "" {
+				break
+			}
 		}
 	}
 
@@ -602,7 +564,6 @@ func main() {
 		RootfsPath:        "rootfs.img",
 		MemPath:           "snapshot.mem",
 		StatePath:         "snapshot.state",
-		RepoCacheSeedPath: "repo-cache-seed.img",
 	}
 
 	// Upload to GCS
@@ -617,7 +578,7 @@ func main() {
 	defer uploader.Close()
 
 	if *enableChunked {
-		log.Info("Chunked mode: skipping legacy full-file upload (rootfs, mem, repo-cache-seed)")
+		log.Info("Chunked mode: skipping full-file upload")
 	} else if !wasIncremental {
 		// Legacy upload only works with cold boot (needs full files on disk)
 		log.Info("Uploading full snapshot to GCS...")
@@ -798,8 +759,8 @@ func main() {
 			}).Info("Incremental chunked snapshot built and uploaded")
 		} else {
 			// Cold boot: chunk everything from full files on disk.
-			// Include all drives (config-defined or legacy) so child layers
-			// can restore them via FUSE for filesystem consistency.
+			// Include all drives so child layers can restore them via FUSE
+			// for filesystem consistency.
 			driveSpecs := []snapshot.DriveSpec{}
 			driveImages := map[string]string{}
 
@@ -812,16 +773,6 @@ func main() {
 						driveImages[d.DriveID] = imgPath
 					}
 				}
-			} else {
-				// Legacy mode: include repo_cache_seed
-				if _, err := os.Stat(repoCacheSeedImg); err == nil {
-					driveSpecs = append(driveSpecs, snapshot.DriveSpec{
-						DriveID:  "repo_cache_seed",
-						Label:    "BAZEL_REPO_SEED",
-						ReadOnly: false,
-					})
-					driveImages["repo_cache_seed"] = repoCacheSeedImg
-				}
 			}
 
 			snapshotPaths := &snapshot.SnapshotPaths{
@@ -829,7 +780,6 @@ func main() {
 				Rootfs:               workingRootfs,
 				Mem:                  memPath,
 				State:                snapshotPath,
-				RepoCacheSeed:        repoCacheSeedImg,
 				Version:              version,
 				ExtensionDriveImages: driveImages,
 			}
@@ -875,31 +825,6 @@ func main() {
 	// Cleanup
 	socketPath := filepath.Join(*outputDir, vmID+".sock")
 	os.Remove(socketPath)
-}
-
-// WarmupConfig holds configuration for the warmup phase
-type WarmupConfig struct {
-	RepoURL       string
-	RepoBranch    string
-	BazelVersion  string
-	WarmupTargets string
-}
-
-// WarmupMMDSData is the MMDS data structure for warmup VM
-type WarmupMMDSData struct {
-	Latest struct {
-		Meta struct {
-			Mode        string `json:"mode"`
-			RunnerID    string `json:"runner_id"`
-			Environment string `json:"environment"`
-		} `json:"meta"`
-		Warmup struct {
-			RepoURL       string `json:"repo_url"`
-			RepoBranch    string `json:"repo_branch"`
-			BazelVersion  string `json:"bazel_version"`
-			WarmupTargets string `json:"warmup_targets"`
-		} `json:"warmup"`
-	} `json:"latest"`
 }
 
 func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, expectedRunnerID string, log *logrus.Entry) error {
@@ -1145,7 +1070,7 @@ func seedExt4ImageFromDir(imgPath, seedDir string, log *logrus.Entry) error {
 		return fmt.Errorf("seed dir is not a directory: %s", seedDir)
 	}
 
-	mountPoint := filepath.Join(filepath.Dir(imgPath), "mnt-repo-cache-seed")
+	mountPoint := filepath.Join(filepath.Dir(imgPath), "mnt-extension-drive")
 	if err := os.MkdirAll(mountPoint, 0755); err != nil {
 		return fmt.Errorf("failed to create mount point: %w", err)
 	}
@@ -1280,7 +1205,7 @@ const snapshotSymlinkDir = "/tmp/snapshot"
 const hostIP = "172.16.0.1" // Gateway IP for the VM tap network
 
 // restoreFromPreviousSnapshot downloads the previous chunked snapshot from GCS,
-// mounts rootfs and repo-cache-seed via FUSE, restores the VM from snapshot,
+// mounts rootfs and extension drives via FUSE, restores the VM from snapshot,
 // injects fresh MMDS data with mode=warmup and a new runner_id, and resumes.
 // The thaw-agent detects the runner_id change and re-runs warmup incrementally.
 func restoreFromPreviousSnapshot(
@@ -1641,9 +1566,8 @@ func restoreFromPreviousSnapshot(
 	}
 
 	// 11. Set MMDS with mode=warmup and new runner_id
-	gitCacheEnabled := false
 	// The control plane passes the right commands for this build type via --snapshot-commands
-	mmdsData := buildWarmupMMDS(commands, gitToken, gcpAccessToken, gitCacheEnabled, newDrives)
+	mmdsData := buildWarmupMMDS(commands, gitToken, newDrives)
 	// Override runner_id so thaw-agent detects the change and re-runs warmup
 	mmdsData["latest"].(map[string]interface{})["meta"].(map[string]interface{})["runner_id"] = runnerID
 	injectProxyMMDS(mmdsData, authProxy, authProxyAddr, hostIP)
@@ -1806,9 +1730,7 @@ func reattachFromParent(
 	log.Info("Mounted FUSE-backed rootfs from parent for reattach")
 
 	// 7. Build extension drives for the restored VM.
-	// The drives must match what the parent snapshot had. For layer builds,
-	// the parent was built with config-defined drives only (no legacy drives).
-	// For legacy builds, mount parent's drives via FUSE for consistency.
+	// The drives must match what the parent snapshot had.
 	fuseExtDisks := make(map[string]*fuse.ChunkedDisk)
 	var vmDrives []firecracker.Drive
 
@@ -2027,9 +1949,9 @@ func reattachFromParent(
 		os.Remove(c)
 	}
 
-	gitCacheEnabled := false
-	mmdsData := buildWarmupMMDS(commands, gitToken, gcpAccessToken, gitCacheEnabled, newDrives)
-	mmdsData["latest"].(map[string]interface{})["meta"].(map[string]interface{})["runner_id"] = runnerID
+	newRunnerID := fmt.Sprintf("snapshot-builder-reattach-%s", uuid.New().String()[:8])
+	mmdsData := buildWarmupMMDS(commands, gitToken, newDrives)
+	mmdsData["latest"].(map[string]interface{})["meta"].(map[string]interface{})["runner_id"] = newRunnerID
 	injectProxyMMDS(mmdsData, authProxy, authProxyAddr, hostIP)
 
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
@@ -2051,20 +1973,10 @@ func reattachFromParent(
 
 // buildWarmupMMDS creates the MMDS data for warmup mode.
 // commands are passed through to thaw-agent as warmup.commands.
-func buildWarmupMMDS(commands []snapshot.SnapshotCommand, gitToken, gcpAccessToken string, gitCacheEnabled bool, drives ...[]snapshot.DriveSpec) map[string]interface{} {
-	// Extract repo URL from git-clone command for git_cache mapping (best-effort).
-	repoURL := ""
-	for _, cmd := range commands {
-		if cmd.Type == "git-clone" && len(cmd.Args) > 0 {
-			repoURL = cmd.Args[0]
-			break
-		}
-	}
-	repoName := filepath.Base(strings.TrimSuffix(repoURL, ".git"))
-
-	repoMappings := map[string]string{}
-	if repoURL != "" {
-		repoMappings[repoURL] = repoName
+func buildWarmupMMDS(commands []snapshot.SnapshotCommand, gitToken string, drives []snapshot.DriveSpec) map[string]interface{} {
+	job := map[string]interface{}{}
+	if gitToken != "" {
+		job["git_token"] = gitToken
 	}
 
 	return map[string]interface{}{
@@ -2076,8 +1988,8 @@ func buildWarmupMMDS(commands []snapshot.SnapshotCommand, gitToken, gcpAccessTok
 			},
 			"warmup": func() map[string]interface{} {
 				w := map[string]interface{}{"commands": commands}
-				if len(drives) > 0 && len(drives[0]) > 0 {
-					w["drives"] = drives[0]
+				if len(drives) > 0 {
+					w["drives"] = drives
 				}
 				return w
 			}(),
@@ -2088,17 +2000,7 @@ func buildWarmupMMDS(commands []snapshot.SnapshotCommand, gitToken, gcpAccessTok
 				"dns":       "8.8.8.8",
 				"interface": "eth0",
 			},
-			"job": map[string]interface{}{
-				"repo":             repoURL,
-				"git_token":        gitToken,
-				"gcp_access_token": gcpAccessToken,
-			},
-			"git_cache": map[string]interface{}{
-				"enabled":       gitCacheEnabled,
-				"mount_path":    "/mnt/git-cache",
-				"workspace_dir": "/mnt/ephemeral/workdir",
-				"repo_mappings": repoMappings,
-			},
+			"job": job,
 		},
 	}
 }
@@ -2255,7 +2157,7 @@ Wants=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/thaw-agent --runner-user=%s
+ExecStart=/usr/local/bin/thaw-agent --sandbox-user=%s
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal+console

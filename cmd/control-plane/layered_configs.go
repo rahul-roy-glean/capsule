@@ -23,6 +23,7 @@ type LayeredConfigRegistry struct {
 	snapshotManager *SnapshotManager
 	layerBuilder    *LayerBuildScheduler
 	configCache     *ConfigCache
+	tagRegistry     *SnapshotTagRegistry
 	logger          *logrus.Entry
 }
 
@@ -52,9 +53,6 @@ type StoredLayeredConfig struct {
 	LeafLayerHash        string                 `json:"leaf_layer_hash"`
 	LeafWorkloadKey      string                 `json:"leaf_workload_key"`
 	Tier                 string                 `json:"tier"`
-	CISystem             string                 `json:"ci_system"`
-	GitHubAppID          string                 `json:"github_app_id,omitempty"`
-	GitHubAppSecret      string                 `json:"github_app_secret,omitempty"`
 	StartCommand         *snapshot.StartCommand `json:"start_command,omitempty"`
 	RunnerTTLSeconds     int                    `json:"runner_ttl_seconds"`
 	SessionMaxAgeSeconds int                    `json:"session_max_age_seconds"`
@@ -164,19 +162,16 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 	// Upsert layered_configs
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO layered_configs (config_id, display_name, config_json, leaf_layer_hash, leaf_workload_key,
-			tier, ci_system, github_app_id, github_app_secret, start_command,
+			tier, start_command,
 			runner_ttl_seconds, session_max_age_seconds, auto_pause, auto_rollout,
 			max_concurrent_runners, build_schedule, network_policy_preset, network_policy)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		ON CONFLICT (config_id) DO UPDATE SET
 			display_name = EXCLUDED.display_name,
 			config_json = EXCLUDED.config_json,
 			leaf_layer_hash = EXCLUDED.leaf_layer_hash,
 			leaf_workload_key = EXCLUDED.leaf_workload_key,
 			tier = EXCLUDED.tier,
-			ci_system = EXCLUDED.ci_system,
-			github_app_id = EXCLUDED.github_app_id,
-			github_app_secret = EXCLUDED.github_app_secret,
 			start_command = EXCLUDED.start_command,
 			runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
 			session_max_age_seconds = EXCLUDED.session_max_age_seconds,
@@ -188,7 +183,7 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 			network_policy = EXCLUDED.network_policy,
 			updated_at = NOW()
 	`, configID, cfg.DisplayName, string(cfgJSON), leafLayer.LayerHash, leafWorkloadKey,
-		tierName, cfg.Config.CISystem, cfg.GitHubAppID, cfg.GitHubAppSecret, startCommandJSON,
+		tierName, startCommandJSON,
 		cfg.Config.TTL, cfg.Config.SessionMaxAgeSeconds, cfg.Config.AutoPause, cfg.Config.AutoRollout,
 		0, "", cfg.Config.NetworkPolicyPreset, networkPolicyVal(cfg.Config.NetworkPolicy))
 
@@ -202,19 +197,19 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 
 	// Best-effort: populate repo_workload_mappings for CI webhook routing.
 	// This is outside the transaction — a failed upsert doesn't break registration.
+	// Scan init_commands for any argument that looks like a repo URL (e.g.
+	// "https://github.com/org/repo" or "org/repo") and extract a simple
+	// "owner/repo" string. No CI-specific adapter required.
 	for _, layer := range cfg.Layers {
-		repoURL, _ := extractGitCloneArgs(layer.InitCommands)
-		if repoURL != "" {
-			if owner, repoName, parseErr := parseGitHubRepo(repoURL); parseErr == nil {
-				repo := owner + "/" + repoName
-				r.db.ExecContext(ctx, `
-					INSERT INTO repo_workload_mappings (repo, workload_key) VALUES ($1, $2)
-					ON CONFLICT (repo) DO UPDATE SET workload_key = EXCLUDED.workload_key
-				`, repo, leafWorkloadKey)
-				// Update in-memory cache
-				if r.configCache != nil {
-					r.configCache.PutRepoMapping(repo, leafWorkloadKey)
-				}
+		repo := repoFromCommandArgs(layer.InitCommands)
+		if repo != "" {
+			r.db.ExecContext(ctx, `
+				INSERT INTO repo_workload_mappings (repo, workload_key) VALUES ($1, $2)
+				ON CONFLICT (repo) DO UPDATE SET workload_key = EXCLUDED.workload_key
+			`, repo, leafWorkloadKey)
+			// Update in-memory cache
+			if r.configCache != nil {
+				r.configCache.PutRepoMapping(repo, leafWorkloadKey)
 			}
 			break
 		}
@@ -229,7 +224,6 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 		r.configCache.PutWorkloadConfig(&WorkloadConfig{
 			WorkloadKey:          leafWorkloadKey,
 			Tier:                 tierName,
-			CISystem:             cfg.Config.CISystem,
 			StartCommand:         cfg.StartCommand,
 			RunnerTTLSeconds:     cfg.Config.TTL,
 			SessionMaxAgeSeconds: cfg.Config.SessionMaxAgeSeconds,
@@ -239,7 +233,6 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 			NetworkPolicyJSON:    npJSON,
 		})
 	}
-
 	return configID, leafWorkloadKey, nil
 }
 
@@ -247,19 +240,18 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 func (r *LayeredConfigRegistry) GetLayeredConfig(ctx context.Context, configID string) (*StoredLayeredConfig, error) {
 	var sc StoredLayeredConfig
 	var startCommandJSON sql.NullString
-	var githubAppID, githubAppSecret sql.NullString
 	var npPreset sql.NullString
 	var npJSON sql.NullString
 
 	err := r.db.QueryRowContext(ctx, `
 		SELECT config_id, display_name, leaf_layer_hash, leaf_workload_key,
-		       tier, ci_system, github_app_id, github_app_secret, start_command,
+		       tier, start_command,
 		       runner_ttl_seconds, session_max_age_seconds, auto_pause, auto_rollout,
 		       max_concurrent_runners, build_schedule, network_policy_preset, network_policy,
 		       created_at, updated_at
 		FROM layered_configs WHERE config_id = $1
 	`, configID).Scan(&sc.ConfigID, &sc.DisplayName, &sc.LeafLayerHash, &sc.LeafWorkloadKey,
-		&sc.Tier, &sc.CISystem, &githubAppID, &githubAppSecret, &startCommandJSON,
+		&sc.Tier, &startCommandJSON,
 		&sc.RunnerTTLSeconds, &sc.SessionMaxAgeSeconds, &sc.AutoPause, &sc.AutoRollout,
 		&sc.MaxConcurrentRunners, &sc.BuildSchedule, &npPreset, &npJSON,
 		&sc.CreatedAt, &sc.UpdatedAt)
@@ -268,12 +260,6 @@ func (r *LayeredConfigRegistry) GetLayeredConfig(ctx context.Context, configID s
 	}
 	if err != nil {
 		return nil, err
-	}
-	if githubAppID.Valid {
-		sc.GitHubAppID = githubAppID.String
-	}
-	if githubAppSecret.Valid {
-		sc.GitHubAppSecret = githubAppSecret.String
 	}
 	if startCommandJSON.Valid && startCommandJSON.String != "" {
 		sc.StartCommand = &snapshot.StartCommand{}
@@ -292,7 +278,7 @@ func (r *LayeredConfigRegistry) GetLayeredConfig(ctx context.Context, configID s
 func (r *LayeredConfigRegistry) ListLayeredConfigs(ctx context.Context) ([]*StoredLayeredConfig, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT config_id, display_name, leaf_layer_hash, leaf_workload_key,
-		       tier, ci_system, github_app_id, github_app_secret, start_command,
+		       tier, start_command,
 		       runner_ttl_seconds, session_max_age_seconds, auto_pause, auto_rollout,
 		       max_concurrent_runners, build_schedule, created_at, updated_at
 		FROM layered_configs ORDER BY display_name
@@ -305,19 +291,13 @@ func (r *LayeredConfigRegistry) ListLayeredConfigs(ctx context.Context) ([]*Stor
 	var configs []*StoredLayeredConfig
 	for rows.Next() {
 		var sc StoredLayeredConfig
-		var startCommandJSON, githubAppID, githubAppSecret sql.NullString
+		var startCommandJSON sql.NullString
 
 		if err := rows.Scan(&sc.ConfigID, &sc.DisplayName, &sc.LeafLayerHash, &sc.LeafWorkloadKey,
-			&sc.Tier, &sc.CISystem, &githubAppID, &githubAppSecret, &startCommandJSON,
+			&sc.Tier, &startCommandJSON,
 			&sc.RunnerTTLSeconds, &sc.SessionMaxAgeSeconds, &sc.AutoPause, &sc.AutoRollout,
 			&sc.MaxConcurrentRunners, &sc.BuildSchedule, &sc.CreatedAt, &sc.UpdatedAt); err != nil {
 			return nil, err
-		}
-		if githubAppID.Valid {
-			sc.GitHubAppID = githubAppID.String
-		}
-		if githubAppSecret.Valid {
-			sc.GitHubAppSecret = githubAppSecret.String
 		}
 		if startCommandJSON.Valid && startCommandJSON.String != "" {
 			sc.StartCommand = &snapshot.StartCommand{}
@@ -496,6 +476,25 @@ func (r *LayeredConfigRegistry) HandleLayeredConfigs(w http.ResponseWriter, req 
 	if strings.Contains(path, "/layers/") && strings.HasSuffix(path, "/refresh") {
 		r.handleRefreshLayer(w, req)
 		return
+	}
+
+	// Route /{wk}/tags, /{wk}/tags/{tag}, /{wk}/promote to tag registry
+	parts := strings.SplitN(path, "/", 3)
+	if len(parts) >= 2 && r.tagRegistry != nil {
+		wk := parts[0]
+		sub := parts[1]
+		if sub == "tags" {
+			subpath := ""
+			if len(parts) == 3 {
+				subpath = parts[2]
+			}
+			r.tagRegistry.HandleTags(w, req, wk, subpath)
+			return
+		}
+		if sub == "promote" {
+			r.tagRegistry.HandlePromote(w, req, wk)
+			return
+		}
 	}
 
 	switch req.Method {
@@ -737,4 +736,70 @@ func networkPolicyVal(policy json.RawMessage) *string {
 	}
 	s := string(policy)
 	return &s
+}
+
+// repoFromCommandArgs scans snapshot init commands for any argument that looks
+// like a repository URL (e.g. "https://github.com/org/repo.git") and extracts
+// a normalized "owner/repo" string. This is a simple heuristic that avoids
+// depending on any CI-specific adapter.
+func repoFromCommandArgs(commands []snapshot.SnapshotCommand) string {
+	for _, cmd := range commands {
+		for _, arg := range cmd.Args {
+			repo := parseRepoURL(arg)
+			if repo != "" {
+				return repo
+			}
+		}
+	}
+	return ""
+}
+
+// parseRepoURL tries to extract "owner/repo" from a URL-like string.
+// Supports:
+//
+//	https://github.com/org/repo.git
+//	https://gitlab.com/org/repo
+//	git@github.com:org/repo.git
+//	org/repo  (bare owner/repo with no slashes beyond the first)
+func parseRepoURL(s string) string {
+	s = strings.TrimSuffix(s, ".git")
+
+	// Handle git@host:owner/repo
+	if strings.HasPrefix(s, "git@") {
+		s = strings.TrimPrefix(s, "git@")
+		if idx := strings.Index(s, ":"); idx >= 0 {
+			s = s[idx+1:]
+		}
+		return extractOwnerRepo(s)
+	}
+
+	// Handle https:// or http://
+	for _, scheme := range []string{"https://", "http://"} {
+		if strings.HasPrefix(s, scheme) {
+			s = strings.TrimPrefix(s, scheme)
+			// Strip hostname (first segment before /)
+			if idx := strings.Index(s, "/"); idx >= 0 {
+				s = s[idx+1:]
+			} else {
+				return ""
+			}
+			return extractOwnerRepo(s)
+		}
+	}
+
+	// Bare "owner/repo" — must have exactly one slash and no spaces
+	if !strings.Contains(s, " ") && strings.Count(s, "/") == 1 && len(s) > 2 {
+		return extractOwnerRepo(s)
+	}
+
+	return ""
+}
+
+// extractOwnerRepo returns "owner/repo" from a path like "owner/repo/extra/stuff".
+func extractOwnerRepo(path string) string {
+	parts := strings.SplitN(path, "/", 3)
+	if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
+		return parts[0] + "/" + parts[1]
+	}
+	return ""
 }

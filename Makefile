@@ -2,11 +2,10 @@
 .PHONY: packer-init packer-validate packer-build firecracker-manager-linux release-host-image mig-rolling-update
 .PHONY: onboard onboard-validate bin-onboard
 .PHONY: firecracker-manager control-plane snapshot-builder thaw-agent
-.PHONY: git-cache-builder git-cache-freshness data-snapshot-builder snapshot-converter derive-snapshot
 .PHONY: test-unit test-race test-cover test-integration test-all check
 .PHONY: sdk-python-lint sdk-python-test sdk-python-typecheck
 .PHONY: dev-build dev-snapshot dev-stack dev-test-exec dev-test-pause-resume dev-test-multi-pause-dedup dev-stop
-.PHONY: dev-test-derive-snapshot dev-test-extension-drives dev-test-gcs-pause-resume
+.PHONY: dev-test-extension-drives dev-test-gcs-pause-resume
 .PHONY: dev-test-gcs-rootfs-durability dev-test-file-ops dev-test-pty dev-test-checkpoint
 .PHONY: dev-test-auto-resume dev-test-template-tags dev-test-network-policy dev-test-auth-proxy
 .PHONY: dev-agent-rootfs dev-agent-snapshot dev-test-agent-sessions dev-test-agent-e2e
@@ -28,7 +27,7 @@ GOARCH_TARGET ?= amd64
 export PATH := /usr/local/go/bin:$(PATH)
 
 # Binaries
-BINARIES := firecracker-manager control-plane snapshot-builder thaw-agent git-cache-builder git-cache-freshness data-snapshot-builder snapshot-converter derive-snapshot bin-onboard
+BINARIES := firecracker-manager control-plane snapshot-builder thaw-agent bin-onboard
 
 all: build
 
@@ -48,21 +47,6 @@ snapshot-builder:
 
 thaw-agent:
 	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/thaw-agent ./cmd/thaw-agent
-
-git-cache-builder:
-	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/git-cache-builder ./cmd/git-cache-builder
-
-git-cache-freshness:
-	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/git-cache-freshness ./cmd/git-cache-freshness
-
-data-snapshot-builder:
-	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/data-snapshot-builder ./cmd/data-snapshot-builder
-
-snapshot-converter:
-	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/snapshot-converter ./cmd/snapshot-converter
-
-derive-snapshot:
-	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/derive-snapshot ./cmd/derive-snapshot
 
 bin-onboard:
 	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/onboard ./cmd/onboard
@@ -240,41 +224,6 @@ run-host-agent:
 # Data snapshot targets (disk snapshot approach - fast host boot)
 .PHONY: data-snapshot-build data-snapshot-check
 
-data-snapshot-build: data-snapshot-builder
-	@echo "Building data snapshot (run on a GCE VM)..."
-	@echo "This creates a disk, populates it with snapshot+git-cache, and creates a GCP disk snapshot."
-	./bin/data-snapshot-builder \
-		--project=$(PROJECT_ID) \
-		--zone=$(ZONE) \
-		--snapshot-gcs=gs://$(PROJECT_ID)-firecracker-snapshots/current/ \
-		--repos="$(GIT_CACHE_REPOS)" \
-		--metadata-bucket=$(PROJECT_ID)-firecracker-snapshots
-
-data-snapshot-check: git-cache-freshness
-	@echo "Checking data snapshot freshness..."
-	./bin/git-cache-freshness \
-		--gcs-bucket=$(PROJECT_ID)-firecracker-snapshots \
-		--gcp-project=$(PROJECT_ID) \
-		--max-age-hours=24 \
-		--max-commit-drift=50
-
-# Legacy git-cache targets (GCS-based approach - slower host boot)
-.PHONY: git-cache-build git-cache-check
-
-git-cache-build: git-cache-builder
-	@echo "Building git-cache image to GCS (legacy mode)..."
-	./bin/git-cache-builder \
-		--repos="$(GIT_CACHE_REPOS)" \
-		--gcs-bucket=$(PROJECT_ID)-firecracker-snapshots \
-		--output-dir=/tmp/git-cache-build
-
-git-cache-check: git-cache-freshness
-	@echo "Checking git-cache freshness..."
-	./bin/git-cache-freshness \
-		--gcs-bucket=$(PROJECT_ID)-firecracker-snapshots \
-		--max-age-hours=24 \
-		--max-commit-drift=50
-
 # Unit tests (works on macOS + Linux, no infra needed)
 test-unit:
 	$(GO) test -v -count=1 ./pkg/... ./cmd/...
@@ -402,10 +351,6 @@ dev-test-pause-resume:
 # Run E2E multi-pause chunk dedup test
 dev-test-multi-pause-dedup:
 	bash dev/test-multi-pause-dedup.sh
-
-# Run E2E derive-snapshot test
-dev-test-derive-snapshot:
-	bash dev/test-derive-snapshot.sh
 
 # Run E2E extension drives test
 dev-test-extension-drives:

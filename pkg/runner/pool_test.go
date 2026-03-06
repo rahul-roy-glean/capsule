@@ -492,20 +492,20 @@ func TestKeysMatch(t *testing.T) {
 		},
 		{
 			name:     "matching repos",
-			a:        &RunnerKey{SnapshotVersion: "v1", GitHubRepo: "org/repo"},
-			b:        &RunnerKey{SnapshotVersion: "v1", GitHubRepo: "org/repo"},
+			a:        &RunnerKey{SnapshotVersion: "v1", AffinityKey: "org/repo"},
+			b:        &RunnerKey{SnapshotVersion: "v1", AffinityKey: "org/repo"},
 			expected: true,
 		},
 		{
 			name:     "different repos",
-			a:        &RunnerKey{SnapshotVersion: "v1", GitHubRepo: "org/repo1"},
-			b:        &RunnerKey{SnapshotVersion: "v1", GitHubRepo: "org/repo2"},
+			a:        &RunnerKey{SnapshotVersion: "v1", AffinityKey: "org/repo1"},
+			b:        &RunnerKey{SnapshotVersion: "v1", AffinityKey: "org/repo2"},
 			expected: false,
 		},
 		{
 			name:     "empty repo matches any",
-			a:        &RunnerKey{SnapshotVersion: "v1", GitHubRepo: ""},
-			b:        &RunnerKey{SnapshotVersion: "v1", GitHubRepo: "org/repo"},
+			a:        &RunnerKey{SnapshotVersion: "v1", AffinityKey: ""},
+			b:        &RunnerKey{SnapshotVersion: "v1", AffinityKey: "org/repo"},
 			expected: true,
 		},
 		{
@@ -726,15 +726,15 @@ func TestFlushByDesiredVersions(t *testing.T) {
 	pool.mu.Lock()
 	pool.runners = append(pool.runners,
 		&pooledRunner{
-			Runner: &Runner{ID: "r1", State: StatePaused, SnapshotVersion: "v1", GitHubRepo: "org/repo-a"},
+			Runner: &Runner{ID: "r1", State: StatePaused, SnapshotVersion: "v1", PoolAffinityKey: "org/repo-a"},
 			key:    &RunnerKey{SnapshotVersion: "v1"},
 		},
 		&pooledRunner{
-			Runner: &Runner{ID: "r2", State: StatePaused, SnapshotVersion: "v2", GitHubRepo: "org/repo-a"},
+			Runner: &Runner{ID: "r2", State: StatePaused, SnapshotVersion: "v2", PoolAffinityKey: "org/repo-a"},
 			key:    &RunnerKey{SnapshotVersion: "v2"},
 		},
 		&pooledRunner{
-			Runner: &Runner{ID: "r3", State: StatePaused, SnapshotVersion: "v1", GitHubRepo: "org/repo-b"},
+			Runner: &Runner{ID: "r3", State: StatePaused, SnapshotVersion: "v1", PoolAffinityKey: "org/repo-b"},
 			key:    &RunnerKey{SnapshotVersion: "v1"},
 		},
 	)

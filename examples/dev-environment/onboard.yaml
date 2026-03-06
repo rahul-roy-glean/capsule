@@ -3,10 +3,6 @@ platform:
   region: "us-central1"
   zone: "us-central1-a"
 
-repository:
-  url: "https://github.com/myorg/myrepo"
-  branch: "main"
-
 microvm:
   vcpus: 4
   memory_mb: 8192
@@ -20,14 +16,11 @@ hosts:
   max_count: 10
   data_disk_gb: 500
 
-ci:
-  system: "none"
-
 workload:
   # Snapshot warmup: clone the repo, install the toolchain, start LSP servers.
   snapshot_commands:
-    - type: "git-clone"
-      args: ["https://github.com/myorg/myrepo", "main"]
+    - type: "shell"
+      args: ["bash", "-c", "git clone --depth=1 -b main https://github.com/myorg/myrepo /workspace"]
     - type: "shell"
       args: ["bash", "/setup/install-toolchain.sh"]
       run_as_root: true

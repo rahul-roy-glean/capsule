@@ -82,7 +82,6 @@ func TestRunnerToProto_Fields(t *testing.T) {
 		HostID:          "host-xyz",
 		State:           runner.StateBusy,
 		InternalIP:      net.ParseIP("172.16.0.5"),
-		GitHubRunnerID:  "gh-runner-1",
 		JobID:           "job-456",
 		SnapshotVersion: "v2.0",
 		Resources:       runner.Resources{VCPUs: 4, MemoryMB: 8192},
@@ -100,9 +99,6 @@ func TestRunnerToProto_Fields(t *testing.T) {
 	}
 	if proto.InternalIp != "172.16.0.5" {
 		t.Errorf("InternalIp = %q, want %q", proto.InternalIp, "172.16.0.5")
-	}
-	if proto.GithubRunnerId != "gh-runner-1" {
-		t.Errorf("GithubRunnerId = %q, want %q", proto.GithubRunnerId, "gh-runner-1")
 	}
 	if proto.JobId != "job-456" {
 		t.Errorf("JobId = %q, want %q", proto.JobId, "job-456")

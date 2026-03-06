@@ -77,11 +77,13 @@ func (u *SessionChunkUploader) MergeAndUploadMem(ctx context.Context, memDiffPat
 	if err != nil {
 		return nil, fmt.Errorf("failed to find dirty chunks in %s: %w", memDiffPath, err)
 	}
+	findDirtyDuration := time.Since(start)
 
 	u.logger.WithFields(logrus.Fields{
-		"mem_diff_path": memDiffPath,
-		"dirty_chunks":  len(dirtyChunks),
-		"base_extents":  len(baseIndex.Region.Extents),
+		"mem_diff_path":    memDiffPath,
+		"dirty_chunks":     len(dirtyChunks),
+		"base_extents":     len(baseIndex.Region.Extents),
+		"find_dirty_ms":    findDirtyDuration.Milliseconds(),
 	}).Info("Merging dirty mem diff into base chunk index")
 
 	// Build a lookup map: chunk index -> base ManifestChunkRef
@@ -126,10 +128,15 @@ func (u *SessionChunkUploader) MergeAndUploadMem(ctx context.Context, memDiffPat
 	}
 
 	// Wait and collect.
+	mergeUploadStart := time.Now()
 	if err := g.Wait(); err != nil {
 		return nil, fmt.Errorf("chunk merge/upload failed: %w", err)
 	}
 	close(results)
+	mergeUploadDuration := time.Since(mergeUploadStart)
+
+	// Count how many chunks needed base merge vs direct upload
+	var mergedCount, directCount, zeroCount int
 
 	// Build merged map: dirty results override base; non-dirty base entries pass through.
 	mergedByIdx := make(map[int64]ManifestChunkRef, len(baseByChunkIdx))
@@ -140,7 +147,13 @@ func (u *SessionChunkUploader) MergeAndUploadMem(ctx context.Context, memDiffPat
 		if r.err != nil {
 			continue
 		}
-		if r.ref.Hash != ZeroChunkHash {
+		if r.ref.Hash == ZeroChunkHash {
+			zeroCount++
+		} else if _, hadBase := baseByChunkIdx[r.idx]; hadBase {
+			mergedCount++
+			mergedByIdx[r.idx] = r.ref
+		} else {
+			directCount++
 			mergedByIdx[r.idx] = r.ref
 		}
 		// Note: we intentionally do NOT delete base entries when a dirty chunk
@@ -173,8 +186,14 @@ func (u *SessionChunkUploader) MergeAndUploadMem(ctx context.Context, memDiffPat
 	newIdx.Region.Extents = extents
 
 	u.logger.WithFields(logrus.Fields{
-		"extents":  len(extents),
-		"duration": time.Since(start),
+		"extents":            len(extents),
+		"duration":           time.Since(start),
+		"find_dirty_ms":      findDirtyDuration.Milliseconds(),
+		"merge_upload_ms":    mergeUploadDuration.Milliseconds(),
+		"dirty_merged":       mergedCount,
+		"dirty_direct":       directCount,
+		"dirty_zero":         zeroCount,
+		"base_carried_fwd":   len(baseByChunkIdx) - mergedCount,
 	}).Info("MergeAndUploadMem complete")
 
 	return newIdx, nil
@@ -216,9 +235,18 @@ func (u *SessionChunkUploader) mergeChunk(
 
 	if needsMerge {
 		baseHash := baseByIdx[chunkIdx].Hash
+		baseFetchStart := time.Now()
 		baseData, err := u.memStore.GetChunk(ctx, baseHash)
 		if err != nil {
 			return ManifestChunkRef{}, fmt.Errorf("failed to fetch base chunk %s: %w", baseHash[:12], err)
+		}
+		baseFetchDur := time.Since(baseFetchStart)
+		if baseFetchDur > 500*time.Millisecond {
+			u.logger.WithFields(logrus.Fields{
+				"chunk_idx":      chunkIdx,
+				"base_hash":      baseHash[:12],
+				"base_fetch_ms":  baseFetchDur.Milliseconds(),
+			}).Warn("Slow base chunk fetch during merge")
 		}
 		// Overlay: non-zero diff pages replace base pages.
 		merged := make([]byte, size)

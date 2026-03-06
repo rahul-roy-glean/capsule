@@ -47,8 +47,8 @@ Customize `workload.snapshot_commands` for your stack:
 
 ```yaml
 snapshot_commands:
-  - type: "git-clone"
-    args: ["https://github.com/myorg/myrepo", "main"]
+  - type: "shell"
+    args: ["bash", "-c", "git clone --depth=1 -b main https://github.com/myorg/myrepo /workspace"]
   - type: "shell"
     args: ["bash", "/setup/install-toolchain.sh"]
     run_as_root: true

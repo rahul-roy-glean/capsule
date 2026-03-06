@@ -16,7 +16,6 @@ import (
 type WorkloadConfig struct {
 	WorkloadKey          string
 	Tier                 string
-	CISystem             string
 	StartCommand         *snapshot.StartCommand
 	RunnerTTLSeconds     int
 	SessionMaxAgeSeconds int
@@ -67,7 +66,7 @@ func (cc *ConfigCache) loadFromDB() {
 	}
 
 	// Load layered_configs
-	lcRows, err := cc.db.Query(`SELECT leaf_workload_key, tier, ci_system, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy FROM layered_configs`)
+	lcRows, err := cc.db.Query(`SELECT leaf_workload_key, tier, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy FROM layered_configs`)
 	if err == nil {
 		defer lcRows.Close()
 		for lcRows.Next() {
@@ -75,7 +74,7 @@ func (cc *ConfigCache) loadFromDB() {
 			var startCmdJSON sql.NullString
 			var npPreset sql.NullString
 			var npJSON sql.NullString
-			if err := lcRows.Scan(&wc.WorkloadKey, &wc.Tier, &wc.CISystem, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON); err != nil {
+			if err := lcRows.Scan(&wc.WorkloadKey, &wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON); err != nil {
 				continue
 			}
 			if startCmdJSON.Valid && startCmdJSON.String != "" {
@@ -148,9 +147,9 @@ func (cc *ConfigCache) loadWorkloadConfigFromDB(ctx context.Context, workloadKey
 
 	// Try layered_configs first
 	err := cc.db.QueryRowContext(ctx,
-		`SELECT tier, ci_system, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy
+		`SELECT tier, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy
 		 FROM layered_configs WHERE leaf_workload_key = $1`, workloadKey).Scan(
-		&wc.Tier, &wc.CISystem, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON)
+		&wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON)
 	if err != nil {
 		return nil
 	}

@@ -9,7 +9,7 @@ import (
 
 // SnapshotCommand describes a single warmup step baked into a snapshot.
 type SnapshotCommand struct {
-	Type      string   `json:"type"` // "git-clone", "gcp-auth", "shell"
+	Type      string   `json:"type"` // "shell", "gcp-auth", "exec"
 	Args      []string `json:"args"`
 	RunAsRoot bool     `json:"run_as_root"` // if true, run as root; otherwise run as the configured runner user
 }

@@ -213,7 +213,7 @@ for i in $(seq 1 30); do
       \"ci_system\":\"none\",
       \"workload_key\":\"$WORKLOAD_KEY\",
       \"session_id\":\"$SESSION_ID\",
-      \"network_policy_preset\":\"ci-standard\"
+      \"network_policy_preset\":\"restricted-egress\"
     }")
   RUNNER_ID=$(echo "$ALLOC_RESP" | jq -r '.runner_id // empty')
   if [ -n "$RUNNER_ID" ] && [ "$RUNNER_ID" != "null" ]; then
@@ -552,7 +552,7 @@ RESUME_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
     \"ci_system\":\"none\",
     \"workload_key\":\"$WORKLOAD_KEY\",
     \"session_id\":\"$SESSION_ID\",
-    \"network_policy_preset\":\"ci-standard\"
+    \"network_policy_preset\":\"restricted-egress\"
   }")
 echo "Response: $RESUME_RESP"
 
@@ -694,7 +694,7 @@ RESUME2_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
     \"ci_system\":\"none\",
     \"workload_key\":\"$WORKLOAD_KEY\",
     \"session_id\":\"$SESSION_ID\",
-    \"network_policy_preset\":\"ci-standard\"
+    \"network_policy_preset\":\"restricted-egress\"
   }")
 echo "Response: $RESUME2_RESP"
 
@@ -778,8 +778,8 @@ POLICY_NAME=$(echo "$POLICY_RESP" | jq -r '.policy.name // ""')
 POLICY_VER=$(echo "$POLICY_RESP" | jq -r '.version // 0')
 echo "  Policy: name=$POLICY_NAME version=$POLICY_VER"
 
-if [ "$POLICY_NAME" = "ci-standard" ]; then
-  pass "ci-standard network policy applied"
+if [ "$POLICY_NAME" = "restricted-egress" ]; then
+  pass "restricted-egress network policy applied"
 elif [ "$POLICY_VER" != "0" ]; then
   pass "Network policy applied (name=$POLICY_NAME)"
 else
@@ -800,11 +800,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-header "26. Verify RFC1918 blocked (ci-standard)"
+header "26. Verify RFC1918 blocked (restricted-egress)"
 # ---------------------------------------------------------------------------
 RFC_OUT=$(vm_tcp_check_blocked "$RESUME2_RUNNER_ID" "10.0.0.1" "80")
 if echo "$RFC_OUT" | grep -q "NET_BLOCKED"; then
-  pass "RFC1918 (10.0.0.1) blocked by ci-standard"
+  pass "RFC1918 (10.0.0.1) blocked by restricted-egress"
 elif echo "$RFC_OUT" | grep -q "NET_OK"; then
   fail "RFC1918 NOT blocked (10.0.0.1 reachable)"
 else

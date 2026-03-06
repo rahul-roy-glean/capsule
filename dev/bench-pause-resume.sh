@@ -32,7 +32,7 @@ elapsed_ms() {
 }
 
 register_config() {
-  curl -s -X POST "$CP/api/v1/snapshot-configs" \
+  curl -s -X POST "$CP/api/v1/layered-configs" \
     -H 'Content-Type: application/json' \
     -d '{
       "display_name": "bench-pause-resume",

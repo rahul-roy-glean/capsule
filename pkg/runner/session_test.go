@@ -147,7 +147,6 @@ func TestSessionMetadata_JSON(t *testing.T) {
 		CreatedAt:          time.Now().Truncate(time.Second),
 		PausedAt:           time.Now().Truncate(time.Second),
 		RootfsPath:         "/tmp/overlay.img",
-		RepoCacheUpperPath: "/tmp/upper.img",
 		TTLSeconds:         30,
 		AutoPause:          true,
 	}

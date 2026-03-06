@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -89,24 +88,6 @@ func generateTFVars(cfg *Config, finalize bool, targetDir ...string) (string, er
 	addInt := func(key string, value int) {
 		lines = append(lines, fmt.Sprintf("%s = %d", key, value))
 	}
-	addMap := func(key string, m map[string]string) {
-		// Terraform HCL map literal.
-		if len(m) == 0 {
-			lines = append(lines, fmt.Sprintf("%s = {}", key))
-			return
-		}
-		// Sort keys for deterministic output.
-		keys := make([]string, 0, len(m))
-		for k := range m {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		var pairs []string
-		for _, k := range keys {
-			pairs = append(pairs, fmt.Sprintf("  %q = %q", k, m[k]))
-		}
-		lines = append(lines, fmt.Sprintf("%s = {\n%s\n}", key, strings.Join(pairs, "\n")))
-	}
 
 	// --- Platform ---
 	addStr("project_id", cfg.Platform.GCPProject)
@@ -122,52 +103,6 @@ func generateTFVars(cfg *Config, finalize bool, targetDir ...string) (string, er
 	// --- MicroVMs ---
 	addInt("max_runners_per_host", cfg.MicroVM.MaxPerHost)
 	addInt("idle_runners_target", cfg.MicroVM.IdleTarget)
-
-	// CI system
-	addStr("ci_system", cfg.CI.System)
-
-	// GitHub config
-	if cfg.CI.System == "github-actions" {
-		addBool("github_runner_enabled", true)
-		if cfg.CI.GitHub.Repo != "" {
-			addStr("github_repo", cfg.CI.GitHub.Repo)
-		}
-		if cfg.CI.GitHub.Org != "" {
-			addStr("github_org", cfg.CI.GitHub.Org)
-		}
-		if len(cfg.CI.GitHub.Labels) > 0 {
-			addStr("github_runner_labels", strings.Join(cfg.CI.GitHub.Labels, ","))
-		}
-		addBool("runner_ephemeral", cfg.CI.GitHub.Ephemeral)
-	}
-
-	// --- Repository (GitHub App auth for private repos) ---
-	if cfg.Repository.GitHubAppID != "" {
-		addStr("github_app_id", cfg.Repository.GitHubAppID)
-	}
-	if cfg.Repository.GitHubAppSecretName != "" {
-		addStr("github_app_secret", cfg.Repository.GitHubAppSecretName)
-	}
-
-	// --- Bazel add-on ---
-	// repo_cache_upper_size_gb: emit whenever non-default, or for github-actions.
-	if cfg.CI.System == "github-actions" || cfg.Bazel.RepoCacheUpperSizeGB != 10 {
-		addInt("repo_cache_upper_size_gb", cfg.Bazel.RepoCacheUpperSizeGB)
-	}
-
-	// Git cache (Bazel sub-feature).
-	addBool("git_cache_enabled", cfg.Bazel.GitCache.Enabled)
-	if cfg.Bazel.GitCache.Enabled {
-		addMap("git_cache_repos", cfg.Bazel.GitCache.Repos)
-		if cfg.Bazel.GitCache.WorkspaceDir != "" {
-			addStr("git_cache_workspace_dir", cfg.Bazel.GitCache.WorkspaceDir)
-		}
-	}
-
-	// Buildbarn (Bazel sub-feature).
-	if cfg.Bazel.Buildbarn.CertsDir != "" {
-		addStr("buildbarn_certs_dir", cfg.Bazel.Buildbarn.CertsDir)
-	}
 
 	// --- Finalize mode ---
 	addBool("use_custom_host_image", finalize)

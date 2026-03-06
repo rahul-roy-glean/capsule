@@ -1,0 +1,78 @@
+platform:
+  gcp_project: "my-project"
+  region: "us-central1"
+  zone: "us-central1-a"
+
+microvm:
+  vcpus: 4
+  memory_mb: 8192
+  max_per_host: 16
+  idle_target: 2
+
+hosts:
+  machine_type: "n2-standard-64"
+  min_count: 2
+  max_count: 20
+  data_disk_gb: 500
+
+workload:
+  base_image: "us-docker.pkg.dev/my-project/images/ci-runner:latest"
+
+  layers:
+    # Layer 1: Clone repo and pre-populate git cache
+    - name: "workspace"
+      init_commands:
+        - type: "shell"
+          args: ["bash", "-c", "git clone --depth=1 -b main https://github.com/myorg/myrepo /workspace"]
+        - type: "gcp-auth"
+          args: ["my-sa@my-project.iam.gserviceaccount.com"]
+      refresh_interval: "on_push"
+
+      drives:
+        # Git-cache: a read-only ext4 image with bare clones of frequently used repos.
+        # Populated at snapshot-build time. At runtime, thaw-agent auto-mounts it
+        # and `actions/checkout` uses --reference to avoid full clones.
+        #
+        # This replaces: BazelConfig.GitCache* (7 fields), mountGitCache(),
+        # setupWorkspaceFromGitCache(), findGitCacheReference(), the MMDS
+        # GitCache struct, and 3 thaw-agent flags.
+        - drive_id: "git_cache"
+          label: "GIT_CACHE"
+          size_gb: 10
+          read_only: true
+          mount_path: "/mnt/git-cache"
+          commands:
+            # Create bare clones of repos during snapshot building.
+            # These become --reference targets for actions/checkout.
+            - type: "shell"
+              args: ["bash", "-c", "git clone --mirror https://github.com/myorg/myrepo /mnt/git-cache/myrepo"]
+            # Optionally mirror additional repos:
+            # - type: "shell"
+            #   args: ["bash", "-c", "git clone --mirror https://github.com/myorg/other-repo /mnt/git-cache/other-repo"]
+
+        # Per-runner writable workspace drive for the checkout.
+        - drive_id: "workspace"
+          label: "WORKSPACE"
+          size_gb: 50
+          read_only: false
+          mount_path: "/workspace"
+
+  # After snapshot restore, set up the workspace from git-cache.
+  # This is an init_command, not a hardcoded thaw-agent boot phase.
+  init_commands:
+    # Use git clone --reference to set up workspace from the pre-populated cache.
+    # This replaces setupWorkspaceFromGitCache() (80 lines of hardcoded Go).
+    - type: "shell"
+      args: ["bash", "-c", "git clone --reference /mnt/git-cache/myrepo --dissociate --no-checkout file:///mnt/git-cache/myrepo /workspace/myorg/myrepo && git -C /workspace/myorg/myrepo remote set-url origin https://github.com/myorg/myrepo && chown -R runner:runner /workspace/myorg/myrepo"]
+      run_as_root: true
+
+  start_command:
+    command: ["/home/runner/config.sh", "--url", "https://github.com/myorg/myrepo", "--token", "${CI_RUNNER_TOKEN}", "--ephemeral", "--unattended", "--labels", "self-hosted,firecracker", "--work", "/workspace"]
+    env:
+      CI_RUNNER_TOKEN: "${ci_runner_token}"
+    run_as: "runner"
+
+credentials:
+  secrets: []
+  host_dirs: []
+  env: {}

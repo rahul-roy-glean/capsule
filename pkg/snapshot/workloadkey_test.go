@@ -7,7 +7,7 @@ import (
 func TestComputeLayerHash_Deterministic(t *testing.T) {
 	cmds := []SnapshotCommand{
 		{Type: "shell", Args: []string{"echo", "hello"}},
-		{Type: "git-clone", Args: []string{"https://github.com/org/repo"}},
+		{Type: "shell", Args: []string{"bash", "-c", "git clone --depth=1 https://github.com/org/repo /workspace"}},
 	}
 	drives := []DriveSpec{
 		{DriveID: "data", SizeGB: 10},
@@ -27,10 +27,10 @@ func TestComputeLayerHash_Deterministic(t *testing.T) {
 func TestComputeLayerHash_OrderIndependent(t *testing.T) {
 	cmds1 := []SnapshotCommand{
 		{Type: "shell", Args: []string{"echo", "hello"}},
-		{Type: "git-clone", Args: []string{"https://github.com/org/repo"}},
+		{Type: "shell", Args: []string{"bash", "-c", "git clone --depth=1 https://github.com/org/repo /workspace"}},
 	}
 	cmds2 := []SnapshotCommand{
-		{Type: "git-clone", Args: []string{"https://github.com/org/repo"}},
+		{Type: "shell", Args: []string{"bash", "-c", "git clone --depth=1 https://github.com/org/repo /workspace"}},
 		{Type: "shell", Args: []string{"echo", "hello"}},
 	}
 

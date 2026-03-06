@@ -38,7 +38,7 @@ header "1. Register snapshot config"
 # IMPORTANT: commands must match what was used in `build-snapshot.sh` so the
 # workload_key hash matches the golden chunked snapshot in GCS.
 SNAPSHOT_COMMANDS=${SNAPSHOT_COMMANDS:-'[{"type":"shell","args":["echo","dev-snapshot-ready"]}]'}
-CONFIG_RESP=$(curl -s -X POST "$CP/api/v1/snapshot-configs" \
+CONFIG_RESP=$(curl -s -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "gcs-pause-resume-test",
@@ -111,7 +111,7 @@ header "3b. TTL auto-pause behavioral test"
 TTL_SESSION="ttl-test-$(date +%s)"
 
 # Register a snapshot config with a 3-second TTL
-TTL_CONFIG_RESP=$(curl -s -X POST "$CP/api/v1/snapshot-configs" \
+TTL_CONFIG_RESP=$(curl -s -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "ttl-auto-pause-test",

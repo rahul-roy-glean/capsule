@@ -1,0 +1,47 @@
+platform:
+  gcp_project: "my-project"
+  region: "us-central1"
+  zone: "us-central1-a"
+
+microvm:
+  vcpus: 4
+  memory_mb: 8192
+  max_per_host: 16
+  idle_target: 2
+
+hosts:
+  machine_type: "n2-standard-64"
+  min_count: 2
+  max_count: 20
+  data_disk_gb: 500
+
+workload:
+  base_image: "us-docker.pkg.dev/my-project/images/gitlab-runner:latest"
+
+  layers:
+    - name: "workspace"
+      init_commands:
+        # Install gitlab-runner binary during snapshot build.
+        # (Or bake it into the base Docker image — either works.)
+        - type: "shell"
+          args: ["bash", "-c", "curl -L https://packages.gitlab.com/install/repositories/runner/gitlab-runner/script.deb.sh | bash && apt-get install -y gitlab-runner"]
+          run_as_root: true
+        - type: "shell"
+          args: ["bash", "-c", "git clone --depth=1 -b main https://gitlab.com/myorg/myrepo /workspace"]
+        - type: "shell"
+          args: ["npm", "install", "--prefix", "/workspace"]
+      refresh_interval: "6h"
+
+  # GitLab runner registration: same pattern as GitHub, different binary.
+  # The platform doesn't know or care which CI system this is.
+  # ${CI_RUNNER_TOKEN} is injected by the control-plane via MMDS.
+  start_command:
+    command: ["gitlab-runner", "run", "--working-directory", "/workspace", "--url", "https://gitlab.com", "--token", "${CI_RUNNER_TOKEN}"]
+    env:
+      CI_RUNNER_TOKEN: "${ci_runner_token}"
+    run_as: "runner"
+
+credentials:
+  secrets: []
+  host_dirs: []
+  env: {}

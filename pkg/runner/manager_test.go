@@ -1,49 +1,13 @@
 package runner
 
 import (
-	"context"
 	"fmt"
-	"net/http"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/sirupsen/logrus"
-
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/ci"
 )
-
-// mockCIAdapter implements ci.Adapter for testing
-type mockCIAdapter struct {
-	name          string
-	tokenFunc     func(ctx context.Context, opts ci.RunnerTokenOpts) (string, error)
-	runnerURL     string
-	onDrainFunc   func(ctx context.Context, runners []ci.RunnerInfo) error
-	onReleaseFunc func(ctx context.Context, runner ci.RunnerInfo) error
-}
-
-func (m *mockCIAdapter) Name() string { return m.name }
-func (m *mockCIAdapter) GetRunnerToken(ctx context.Context, opts ci.RunnerTokenOpts) (string, error) {
-	if m.tokenFunc != nil {
-		return m.tokenFunc(ctx, opts)
-	}
-	return "", nil
-}
-func (m *mockCIAdapter) RunnerURL() string { return m.runnerURL }
-func (m *mockCIAdapter) OnDrain(ctx context.Context, runners []ci.RunnerInfo) error {
-	if m.onDrainFunc != nil {
-		return m.onDrainFunc(ctx, runners)
-	}
-	return nil
-}
-func (m *mockCIAdapter) OnRelease(ctx context.Context, runner ci.RunnerInfo) error {
-	if m.onReleaseFunc != nil {
-		return m.onReleaseFunc(ctx, runner)
-	}
-	return nil
-}
-func (m *mockCIAdapter) WebhookHandler() http.Handler { return nil }
-func (m *mockCIAdapter) Close() error                 { return nil }
 
 func newTestManager(opts ...func(*Manager)) *Manager {
 	logger := logrus.New()
@@ -145,15 +109,12 @@ func TestGetStatus_Counting(t *testing.T) {
 	m := newTestManager()
 	m.config.MaxRunners = 10
 
-	// GetStatus calls snapshotCache.CurrentVersion() which requires a non-nil snapshotCache.
-	// Instead, test the counting logic directly which is the same as what GetStatus does.
 	m.runners["r1"] = &Runner{ID: "r1", State: StateIdle}
 	m.runners["r2"] = &Runner{ID: "r2", State: StateBusy}
 	m.runners["r3"] = &Runner{ID: "r3", State: StateBusy}
 	m.runners["r4"] = &Runner{ID: "r4", State: StateBooting}
 	m.runners["r5"] = &Runner{ID: "r5", State: StateIdle}
 
-	// Count idle and busy manually (same logic as GetStatus)
 	var idle, busy int
 	m.mu.RLock()
 	for _, r := range m.runners {
@@ -177,113 +138,18 @@ func TestGetStatus_Counting(t *testing.T) {
 	}
 }
 
-func TestRemoveRunnerLabels_NilAdapter(t *testing.T) {
+func TestBuildDrives_NoDrives(t *testing.T) {
 	m := newTestManager()
-	m.ciAdapter = nil
-
-	count, err := m.RemoveRunnerLabels(context.Background())
-	if err != nil {
-		t.Errorf("RemoveRunnerLabels() error = %v", err)
-	}
-	if count != 0 {
-		t.Errorf("RemoveRunnerLabels() = %d, want 0 with nil adapter", count)
-	}
-}
-
-func TestRemoveRunnerLabels_WithMockAdapter(t *testing.T) {
-	var drainedRunners []ci.RunnerInfo
-	var mu sync.Mutex
-
-	adapter := &mockCIAdapter{
-		name: "mock",
-		onDrainFunc: func(ctx context.Context, runners []ci.RunnerInfo) error {
-			mu.Lock()
-			drainedRunners = runners
-			mu.Unlock()
-			return nil
-		},
-	}
-
-	m := newTestManager(func(m *Manager) {
-		m.ciAdapter = adapter
-	})
-	m.runners["r1"] = &Runner{ID: "r1", State: StateIdle, GitHubRepo: "org/repo"}
-	m.runners["r2"] = &Runner{ID: "r2", State: StateBusy, GitHubRepo: "org/repo"}
-
-	count, err := m.RemoveRunnerLabels(context.Background())
-	if err != nil {
-		t.Errorf("RemoveRunnerLabels() error = %v", err)
-	}
-	if count != 2 {
-		t.Errorf("RemoveRunnerLabels() = %d, want 2", count)
-	}
-
-	mu.Lock()
-	if len(drainedRunners) != 2 {
-		t.Errorf("OnDrain called with %d runners, want 2", len(drainedRunners))
-	}
-	mu.Unlock()
-}
-
-func TestRemoveRunnerLabels_AdapterError(t *testing.T) {
-	adapter := &mockCIAdapter{
-		name: "mock",
-		onDrainFunc: func(ctx context.Context, runners []ci.RunnerInfo) error {
-			return fmt.Errorf("drain failed")
-		},
-	}
-
-	m := newTestManager(func(m *Manager) {
-		m.ciAdapter = adapter
-	})
-	m.runners["r1"] = &Runner{ID: "r1", State: StateIdle}
-
-	_, err := m.RemoveRunnerLabels(context.Background())
-	if err == nil {
-		t.Error("RemoveRunnerLabels() expected error from adapter")
-	}
-}
-
-func TestRemoveRunnerLabels_NoRunners(t *testing.T) {
-	adapter := &mockCIAdapter{name: "mock"}
-	m := newTestManager(func(m *Manager) {
-		m.ciAdapter = adapter
-	})
-
-	count, err := m.RemoveRunnerLabels(context.Background())
-	if err != nil {
-		t.Errorf("RemoveRunnerLabels() error = %v", err)
-	}
-	if count != 0 {
-		t.Errorf("RemoveRunnerLabels() = %d, want 0", count)
-	}
-}
-
-func TestBuildDrives_CredentialsOnly(t *testing.T) {
-	m := newTestManager(func(m *Manager) {
-		m.credentialsImage = "/path/to/creds.img"
-	})
 
 	drives := m.buildDrives(nil)
 
-	if len(drives) != 1 {
-		t.Fatalf("buildDrives(nil) returned %d drives, want 1", len(drives))
-	}
-	if drives[0].DriveID != "credentials" {
-		t.Errorf("drives[0].DriveID = %q, want %q", drives[0].DriveID, "credentials")
-	}
-	if !drives[0].IsReadOnly {
-		t.Error("credentials drive should be read-only")
-	}
-	if drives[0].IsRootDevice {
-		t.Error("credentials drive should not be root device")
+	if len(drives) != 0 {
+		t.Fatalf("buildDrives(nil) returned %d drives, want 0", len(drives))
 	}
 }
 
 func TestBuildDrives_WithExtensionDrives(t *testing.T) {
-	m := newTestManager(func(m *Manager) {
-		m.credentialsImage = "/path/to/creds.img"
-	})
+	m := newTestManager()
 
 	ext := map[string]string{
 		"git_drive":   "/path/to/git.img",
@@ -291,35 +157,27 @@ func TestBuildDrives_WithExtensionDrives(t *testing.T) {
 	}
 	drives := m.buildDrives(ext)
 
-	// credentials + 2 extension drives (sorted)
-	if len(drives) != 3 {
-		t.Fatalf("buildDrives() returned %d drives, want 3", len(drives))
-	}
-
-	// First drive is always credentials
-	if drives[0].DriveID != "credentials" {
-		t.Errorf("drives[0].DriveID = %q, want %q", drives[0].DriveID, "credentials")
+	if len(drives) != 2 {
+		t.Fatalf("buildDrives() returned %d drives, want 2", len(drives))
 	}
 
 	// Extension drives should be in sorted order
-	if drives[1].DriveID != "bazel_cache" {
-		t.Errorf("drives[1].DriveID = %q, want %q", drives[1].DriveID, "bazel_cache")
+	if drives[0].DriveID != "bazel_cache" {
+		t.Errorf("drives[0].DriveID = %q, want %q", drives[0].DriveID, "bazel_cache")
 	}
-	if drives[2].DriveID != "git_drive" {
-		t.Errorf("drives[2].DriveID = %q, want %q", drives[2].DriveID, "git_drive")
+	if drives[1].DriveID != "git_drive" {
+		t.Errorf("drives[1].DriveID = %q, want %q", drives[1].DriveID, "git_drive")
 	}
-	if drives[1].PathOnHost != "/path/to/bazel.img" {
-		t.Errorf("bazel_cache path = %q, want %q", drives[1].PathOnHost, "/path/to/bazel.img")
+	if drives[0].PathOnHost != "/path/to/bazel.img" {
+		t.Errorf("bazel_cache path = %q, want %q", drives[0].PathOnHost, "/path/to/bazel.img")
 	}
-	if drives[2].PathOnHost != "/path/to/git.img" {
-		t.Errorf("git_drive path = %q, want %q", drives[2].PathOnHost, "/path/to/git.img")
+	if drives[1].PathOnHost != "/path/to/git.img" {
+		t.Errorf("git_drive path = %q, want %q", drives[1].PathOnHost, "/path/to/git.img")
 	}
 }
 
 func TestBuildDrives_NoDrivesAreRootDevice(t *testing.T) {
-	m := newTestManager(func(m *Manager) {
-		m.credentialsImage = "/path/to/creds.img"
-	})
+	m := newTestManager()
 
 	drives := m.buildDrives(map[string]string{"ext_drive": "/path/to/ext.img"})
 
@@ -344,7 +202,6 @@ func TestSetDraining_Concurrent(t *testing.T) {
 	}
 
 	wg.Wait()
-	// Just verify no race conditions (test with -race flag)
 }
 
 func TestListRunners_FilterByState(t *testing.T) {
@@ -491,7 +348,6 @@ func TestIdempotencyTracking(t *testing.T) {
 	m := newTestManager()
 	m.recentRequests = make(map[string]*recentAllocation)
 
-	// Simulate a recent allocation
 	runner := &Runner{ID: "test-runner-1", State: StateIdle}
 	m.runners["test-runner-1"] = runner
 	m.recentRequests["req-123"] = &recentAllocation{
@@ -499,7 +355,6 @@ func TestIdempotencyTracking(t *testing.T) {
 		allocTime: time.Now(),
 	}
 
-	// Verify dedup check finds it
 	m.mu.RLock()
 	recent, ok := m.recentRequests["req-123"]
 	m.mu.RUnlock()
@@ -519,12 +374,10 @@ func TestIdempotencyCleanup(t *testing.T) {
 	m := newTestManager()
 	m.recentRequests = make(map[string]*recentAllocation)
 
-	// Add an expired entry
 	m.recentRequests["old-req"] = &recentAllocation{
 		runner:    &Runner{ID: "old-runner"},
-		allocTime: time.Now().Add(-10 * time.Minute), // 10 min ago, past 5 min TTL
+		allocTime: time.Now().Add(-10 * time.Minute),
 	}
-	// Add a fresh entry
 	m.recentRequests["new-req"] = &recentAllocation{
 		runner:    &Runner{ID: "new-runner"},
 		allocTime: time.Now(),
@@ -554,7 +407,7 @@ func TestDrainBlocksAllocation(t *testing.T) {
 
 func TestCanAddRunner_AtCapacity(t *testing.T) {
 	m := newTestManager()
-	// Fill to capacity (MaxRunners=4)
+	m.config.MaxRunners = 4
 	for i := 0; i < 4; i++ {
 		m.runners[fmt.Sprintf("runner-%d", i)] = &Runner{ID: fmt.Sprintf("runner-%d", i)}
 	}
@@ -567,17 +420,14 @@ func TestCanAddRunner_AtCapacity(t *testing.T) {
 func TestSetDraining_ChangedReport(t *testing.T) {
 	m := newTestManager()
 
-	// First set should report changed
 	if !m.SetDraining(true) {
 		t.Error("First SetDraining(true) should return changed=true")
 	}
 
-	// Same value should report not changed
 	if m.SetDraining(true) {
 		t.Error("Second SetDraining(true) should return changed=false")
 	}
 
-	// Different value should report changed
 	if !m.SetDraining(false) {
 		t.Error("SetDraining(false) after true should return changed=true")
 	}

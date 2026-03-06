@@ -80,8 +80,6 @@ sudo "$REPO_ROOT/bin/snapshot-builder" \
   --vcpus=2 \
   --memory-mb=2048 \
   --warmup-timeout=5m \
-  --repo-cache-seed-size-gb=1 \
-  --repo-cache-upper-size-gb=1 \
   --enable-chunked="$ENABLE_CHUNKED" \
   --snapshot-commands="$SNAPSHOT_COMMANDS" \
   --log-level=info \
@@ -110,10 +108,11 @@ echo "--- Snapshot files created successfully ---"
 # Copy snapshot files to the manager's snapshot cache directory
 echo ""
 echo "--- Copying snapshot files to $SNAPSHOT_DIR ---"
-for f in kernel.bin rootfs.img snapshot.mem snapshot.state repo-cache-seed.img repo-cache-upper.img credentials.img git-cache.img; do
-  if [ -f "$OUTPUT_DIR/$f" ]; then
-    cp "$OUTPUT_DIR/$f" "$SNAPSHOT_DIR/$f"
-    echo "  $f ($(du -sh "$OUTPUT_DIR/$f" | cut -f1))"
+for f in "$OUTPUT_DIR"/*.img "$OUTPUT_DIR"/snapshot.mem "$OUTPUT_DIR"/snapshot.state "$OUTPUT_DIR"/kernel.bin; do
+  if [ -f "$f" ]; then
+    fname=$(basename "$f")
+    cp "$f" "$SNAPSHOT_DIR/$fname"
+    echo "  $fname ($(du -sh "$f" | cut -f1))"
   fi
 done
 
@@ -126,8 +125,7 @@ cat > "$SNAPSHOT_DIR/metadata.json" << METADATA
   "kernel_path": "kernel.bin",
   "rootfs_path": "rootfs.img",
   "mem_path": "snapshot.mem",
-  "state_path": "snapshot.state",
-  "repo_cache_seed_path": "repo-cache-seed.img"
+  "state_path": "snapshot.state"
 }
 METADATA
 
