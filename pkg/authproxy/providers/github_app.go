@@ -75,7 +75,10 @@ func (p *githubAppProvider) InjectCredentials(req *http.Request) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "token "+token)
+	// GitHub's git HTTP protocol requires Basic auth with x-access-token as
+	// the username and the installation token as the password. The "token"
+	// header format only works for the REST API, not for git clone/fetch/push.
+	req.SetBasicAuth("x-access-token", token)
 	return nil
 }
 

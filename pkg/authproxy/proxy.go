@@ -84,6 +84,11 @@ func NewAuthProxy(runnerID string, config AuthConfig, nsPath, gatewayIP, hostVet
 	if proxyConf.ListenPort == 0 {
 		proxyConf.ListenPort = 3128
 	}
+	// Default SSLBump to true when providers exist. Without SSL bump the proxy
+	// just tunnels bytes and cannot inject credentials, making it useless.
+	if !proxyConf.SSLBump && len(providers) > 0 {
+		proxyConf.SSLBump = true
+	}
 
 	return &AuthProxy{
 		runnerID:   runnerID,
