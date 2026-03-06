@@ -1,0 +1,112 @@
+# AFS Sandbox — Option (b): No app server, thaw-agent only
+#
+# This config drops the afs_sandbox FastAPI process entirely. The thaw-agent
+# (injected by the platform at snapshot-build time) handles exec, file ops,
+# and health natively. No Python process runs inside the VM unless the user
+# starts one via /exec.
+#
+# Benefits over Option (a):
+#   - ~60MB less memory (no Python/uvicorn/FastAPI resident)
+#   - Faster snapshot restore (no process to start, thaw-agent is already running)
+#   - Fewer dependencies (no requirements.txt in the critical path)
+#   - Streaming exec output (NDJSON) instead of buffered response
+#   - No SNAPSHOT_EXCLUDES — full VM state preserved on pause
+#
+# The orchestrator must change its API calls. Migration guide:
+#
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ AFS (pods)                        │ Firecracker (native)                   │
+# ├───────────────────────────────────┼────────────────────────────────────────┤
+# │ POST /execshell                   │ POST /api/v1/runners/{id}/exec        │
+# │   {"command": "ls -la"}           │   {"command": ["sh","-c","ls -la"],   │
+# │                                   │    "timeout_seconds": 30}             │
+# │   → {"stdout":"...","stderr":"…"} │   → streaming NDJSON:                 │
+# │                                   │     {"type":"stdout","data":"...\n"}  │
+# │                                   │     {"type":"stderr","data":"...\n"}  │
+# │                                   │     {"type":"exit","code":0}          │
+# │                                   │                                       │
+# │ POST /uploadfiles                 │ POST /api/v1/runners/{id}/files/upload│
+# │   multipart form with filename=   │   ?path=/home/user/file.py            │
+# │   /home/user/file.py              │   Body: raw file bytes                │
+# │   → {"filepaths": [...]}          │   → {"path":"/home/user/file.py",    │
+# │                                   │      "size": 1234}                    │
+# │                                   │                                       │
+# │ GET /downloadfile                 │ GET /api/v1/runners/{id}/files/       │
+# │   ?filepath=/home/user/file.py    │   download?path=/home/user/file.py    │
+# │   → file bytes                    │   → file bytes (streaming)            │
+# │                                   │                                       │
+# │ GET /health                       │ GET /api/v1/runners/status            │
+# │   → {"status":"healthy"}          │   ?runner_id={id}                     │
+# │                                   │   → {"status":"running",...}          │
+# │                                   │                                       │
+# │ POST /pause                       │ POST /api/v1/runners/pause            │
+# │   {"sandbox_id":"...",            │   {"runner_id": "..."}                │
+# │    "upload_url":"..."}            │   → VM frozen in ~140ms               │
+# │   → tarball + GCS upload          │                                       │
+# │                                   │                                       │
+# │ POST /restore                     │ POST /api/v1/runners/allocate         │
+# │   {"sandbox_id":"...",            │   {"workload_key":"...",              │
+# │    "download_url":"..."}          │    "session_id":"..."}                │
+# │   → GCS download + extract        │   → VM resumed in ~165ms              │
+# │                                   │                                       │
+# │ GET /getlastexecutiontimev2       │ (not needed — platform auto-pause     │
+# │   → {"lastExecutionTime": ...}    │  tracks activity via exec/connect)    │
+# │                                   │                                       │
+# │ (not available)                   │ POST /api/v1/runners/{id}/files/write │
+# │                                   │   {"path":"/home/user/f.py",         │
+# │                                   │    "content":"...","mode":"0644"}     │
+# │                                   │                                       │
+# │ (not available)                   │ POST /api/v1/runners/{id}/files/read  │
+# │                                   │   {"path":"/home/user/f.py"}         │
+# │                                   │   → {"content":"...","size":1234}    │
+# │                                   │                                       │
+# │ (not available)                   │ POST /api/v1/runners/{id}/files/list  │
+# │                                   │   {"path":"/home/user"}              │
+# │                                   │   → [{"name":"f.py","size":...},...]  │
+# │                                   │                                       │
+# │ (not available)                   │ WS /api/v1/runners/{id}/pty           │
+# │                                   │   (interactive terminal via WebSocket)│
+# └───────────────────────────────────┴────────────────────────────────────────┘
+
+platform:
+  gcp_project: "dev-sandbox-334901"
+  region: "us-central1"
+  zone: "us-central1-a"
+
+microvm:
+  max_per_host: 32
+  idle_target: 4
+
+hosts:
+  machine_type: "n2-standard-16"
+  min_count: 2
+  max_count: 20
+  data_disk_gb: 300
+
+workload:
+  base_image: "us-central1-docker.pkg.dev/scio-engineering/glean-images/afs-sandbox:latest"
+
+  layers:
+    - name: "runtime"
+      init_commands:
+        - type: "shell"
+          args: ["bash", "-c", "mkdir -p /home/user/{upload,output,Documents,Research,Downloads} && chown -R 1000:1000 /home/user"]
+          run_as_root: true
+
+  config:
+    tier: "xs"                  # 1 vCPU, 512MB — smallest tier
+    auto_pause: true
+    ttl: 300
+    session_max_age_seconds: 86400
+    runner_user: "user"
+    workspace_size_gb: 10
+
+session:
+  enabled: true
+  ttl_seconds: 300
+  auto_pause: true
+
+credentials:
+  secrets: []
+  host_dirs: []
+  env: {}

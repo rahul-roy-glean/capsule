@@ -16,17 +16,19 @@ hosts:
   data_disk_gb: 200
 
 workload:
-  # Snapshot warmup: install the runtime and dependencies.
-  # The snapshot freezes the VM with the runtime process already initialized.
-  snapshot_commands:
-    - type: "shell"
-      args: ["npm", "install", "--prefix", "/app"]
-      run_as_root: false
-    - type: "shell"
-      # Start the runtime once so module loading is baked into the snapshot.
-      # The warm-up script starts the server, runs a health check, and exits.
-      args: ["bash", "/app/scripts/warm-runtime.sh"]
-      run_as_root: false
+  # Docker image with your function runtime (Node.js, Python, Go, etc.).
+  # The platform converts it to a Firecracker rootfs and installs thaw-agent.
+  base_image: "us-docker.pkg.dev/my-project/images/function-runtime:latest"
+
+  layers:
+    - name: "runtime"
+      init_commands:
+        - type: "shell"
+          args: ["npm", "install", "--prefix", "/app"]
+        - type: "shell"
+          # Start the runtime once so module loading is baked into the snapshot.
+          # The warm-up script starts the server, runs a health check, and exits.
+          args: ["bash", "/app/scripts/warm-runtime.sh"]
 
   # The function runtime that handles incoming invocations.
   start_command:
