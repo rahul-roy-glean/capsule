@@ -84,9 +84,10 @@ type releaseResp struct {
 
 // execEvent is one NDJSON line from the manager's streaming exec response.
 // The thaw-agent emits:
-//   {"type":"stdout","data":"...\n","ts":"..."}
-//   {"type":"stderr","data":"...\n","ts":"..."}
-//   {"type":"exit","code":0,"ts":"..."}
+//
+//	{"type":"stdout","data":"...\n","ts":"..."}
+//	{"type":"stderr","data":"...\n","ts":"..."}
+//	{"type":"exit","code":0,"ts":"..."}
 type execEvent struct {
 	Type string `json:"type"`
 	Data string `json:"data"`

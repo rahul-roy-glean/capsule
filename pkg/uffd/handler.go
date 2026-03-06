@@ -247,7 +247,7 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 	// Enable prefetch tracking if configured.
 	if cfg.EnablePrefetchTracking {
 		maxPages := cfg.MaxPrefetchPages
-		if maxPages == 0 {
+		if maxPages == 0 && cfg.ChunkStore != nil {
 			// Derive from ChunkStore LRU: prefetch should use at most 50% of
 			// the cache. Each prefetched page pulls in a full chunk (ChunkSize
 			// bytes), so cap = (cacheSize * 0.5) / chunkSize * pagesPerChunk.
@@ -518,14 +518,14 @@ func (h *Handler) handlePageFaults(uffdFd int) {
 			if currentFaults != lastFaultCount {
 				cacheStats := h.chunkStore.CacheStats()
 				h.logger.WithFields(logrus.Fields{
-					"total_faults":   currentFaults,
-					"delta":          currentFaults - lastFaultCount,
-					"chunk_fetches":  atomic.LoadUint64(&h.chunkFetches),
-					"lru_hits":       cacheStats.Hits,
-					"lru_misses":     cacheStats.Misses,
-					"lru_evictions":  cacheStats.Evictions,
-					"lru_items":      cacheStats.ItemCount,
-					"lru_size_mb":    cacheStats.Size / (1024 * 1024),
+					"total_faults":  currentFaults,
+					"delta":         currentFaults - lastFaultCount,
+					"chunk_fetches": atomic.LoadUint64(&h.chunkFetches),
+					"lru_hits":      cacheStats.Hits,
+					"lru_misses":    cacheStats.Misses,
+					"lru_evictions": cacheStats.Evictions,
+					"lru_items":     cacheStats.ItemCount,
+					"lru_size_mb":   cacheStats.Size / (1024 * 1024),
 				}).Debug("UFFD fault activity")
 				lastFaultCount = currentFaults
 			}

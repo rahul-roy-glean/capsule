@@ -80,10 +80,10 @@ func (u *SessionChunkUploader) MergeAndUploadMem(ctx context.Context, memDiffPat
 	findDirtyDuration := time.Since(start)
 
 	u.logger.WithFields(logrus.Fields{
-		"mem_diff_path":    memDiffPath,
-		"dirty_chunks":     len(dirtyChunks),
-		"base_extents":     len(baseIndex.Region.Extents),
-		"find_dirty_ms":    findDirtyDuration.Milliseconds(),
+		"mem_diff_path": memDiffPath,
+		"dirty_chunks":  len(dirtyChunks),
+		"base_extents":  len(baseIndex.Region.Extents),
+		"find_dirty_ms": findDirtyDuration.Milliseconds(),
 	}).Info("Merging dirty mem diff into base chunk index")
 
 	// Build a lookup map: chunk index -> base ManifestChunkRef
@@ -186,14 +186,14 @@ func (u *SessionChunkUploader) MergeAndUploadMem(ctx context.Context, memDiffPat
 	newIdx.Region.Extents = extents
 
 	u.logger.WithFields(logrus.Fields{
-		"extents":            len(extents),
-		"duration":           time.Since(start),
-		"find_dirty_ms":      findDirtyDuration.Milliseconds(),
-		"merge_upload_ms":    mergeUploadDuration.Milliseconds(),
-		"dirty_merged":       mergedCount,
-		"dirty_direct":       directCount,
-		"dirty_zero":         zeroCount,
-		"base_carried_fwd":   len(baseByChunkIdx) - mergedCount,
+		"extents":          len(extents),
+		"duration":         time.Since(start),
+		"find_dirty_ms":    findDirtyDuration.Milliseconds(),
+		"merge_upload_ms":  mergeUploadDuration.Milliseconds(),
+		"dirty_merged":     mergedCount,
+		"dirty_direct":     directCount,
+		"dirty_zero":       zeroCount,
+		"base_carried_fwd": len(baseByChunkIdx) - mergedCount,
 	}).Info("MergeAndUploadMem complete")
 
 	return newIdx, nil
@@ -243,9 +243,9 @@ func (u *SessionChunkUploader) mergeChunk(
 		baseFetchDur := time.Since(baseFetchStart)
 		if baseFetchDur > 500*time.Millisecond {
 			u.logger.WithFields(logrus.Fields{
-				"chunk_idx":      chunkIdx,
-				"base_hash":      baseHash[:12],
-				"base_fetch_ms":  baseFetchDur.Milliseconds(),
+				"chunk_idx":     chunkIdx,
+				"base_hash":     baseHash[:12],
+				"base_fetch_ms": baseFetchDur.Milliseconds(),
 			}).Warn("Slow base chunk fetch during merge")
 		}
 		// Overlay: non-zero diff pages replace base pages.

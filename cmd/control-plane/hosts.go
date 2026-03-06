@@ -48,15 +48,15 @@ type HostRunnerInfo struct {
 
 // Runner represents a runner instance
 type Runner struct {
-	ID             string
-	HostID         string
-	Status         string
-	InternalIP     string
-	JobID          string
-	WorkloadKey    string
-	CreatedAt      time.Time
-	StartedAt      time.Time
-	CompletedAt    time.Time
+	ID          string
+	HostID      string
+	Status      string
+	InternalIP  string
+	JobID       string
+	WorkloadKey string
+	CreatedAt   time.Time
+	StartedAt   time.Time
+	CompletedAt time.Time
 	// ReservedCPU and ReservedMemoryMB track the optimistic resource reservation
 	// made at allocate time, so ReleaseRunner can decrement them exactly.
 	ReservedCPU      int

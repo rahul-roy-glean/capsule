@@ -107,18 +107,18 @@ type ListSandboxesOutput struct {
 type ListHostsInput struct{}
 
 type HostInfo struct {
-	ID               string    `json:"id"`
-	InstanceName     string    `json:"instance_name"`
-	Zone             string    `json:"zone"`
-	Status           string    `json:"status"`
-	IdleRunners      int       `json:"idle_runners"`
-	BusyRunners      int       `json:"busy_runners"`
-	TotalCPU         int       `json:"total_cpu_millicores"`
-	UsedCPU          int       `json:"used_cpu_millicores"`
-	TotalMemoryMB    int       `json:"total_memory_mb"`
-	UsedMemoryMB     int       `json:"used_memory_mb"`
-	LastHeartbeat    time.Time `json:"last_heartbeat"`
-	SnapshotVersion  string    `json:"snapshot_version,omitempty"`
+	ID              string    `json:"id"`
+	InstanceName    string    `json:"instance_name"`
+	Zone            string    `json:"zone"`
+	Status          string    `json:"status"`
+	IdleRunners     int       `json:"idle_runners"`
+	BusyRunners     int       `json:"busy_runners"`
+	TotalCPU        int       `json:"total_cpu_millicores"`
+	UsedCPU         int       `json:"used_cpu_millicores"`
+	TotalMemoryMB   int       `json:"total_memory_mb"`
+	UsedMemoryMB    int       `json:"used_memory_mb"`
+	LastHeartbeat   time.Time `json:"last_heartbeat"`
+	SnapshotVersion string    `json:"snapshot_version,omitempty"`
 }
 
 type ListHostsOutput struct {

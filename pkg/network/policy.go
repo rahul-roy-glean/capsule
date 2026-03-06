@@ -215,10 +215,10 @@ func validatePorts(ports []PortRange) error {
 
 // Named preset names.
 const (
-	PresetUnrestricted    = "unrestricted"
-	PresetQuarantine      = "quarantine"
+	PresetUnrestricted     = "unrestricted"
+	PresetQuarantine       = "quarantine"
 	PresetRestrictedEgress = "restricted-egress"
-	PresetAgentSandbox    = "agent-sandbox"
+	PresetAgentSandbox     = "agent-sandbox"
 )
 
 // GetPreset returns a named preset policy. Returns nil for unknown names.

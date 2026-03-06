@@ -43,7 +43,7 @@ type Manager struct {
 	vms            map[string]*firecracker.VM
 	uffdHandlers   map[string]uffdStopper // layered UFFD handlers per runner (session resume)
 	snapshotCache  *snapshot.Cache
-	network *network.NATNetwork
+	network        *network.NATNetwork
 	// netnsNetwork manages per-VM network namespaces (nil if using legacy bridge mode).
 	// When set, each VM gets its own namespace with point-to-point veth routing
 	// instead of sharing the fcbr0 bridge.
@@ -154,18 +154,18 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 	}
 
 	m := &Manager{
-		config:           cfg,
-		runners:          make(map[string]*Runner),
-		recentRequests:   make(map[string]*recentAllocation),
-		vms:              make(map[string]*firecracker.VM),
-		uffdHandlers:     make(map[string]uffdStopper),
-		snapshotCache:    cache,
-		network:          natNet,
-		slotToRunner:     make(map[int]string),
-		runnerToSlot:     make(map[string]int),
-		policyEnforcers:  make(map[string]*network.PolicyEnforcer),
-		authProxies:      make(map[string]*authproxy.AuthProxy),
-		logger:           logger.WithField("component", "runner-manager"),
+		config:          cfg,
+		runners:         make(map[string]*Runner),
+		recentRequests:  make(map[string]*recentAllocation),
+		vms:             make(map[string]*firecracker.VM),
+		uffdHandlers:    make(map[string]uffdStopper),
+		snapshotCache:   cache,
+		network:         natNet,
+		slotToRunner:    make(map[int]string),
+		runnerToSlot:    make(map[string]int),
+		policyEnforcers: make(map[string]*network.PolicyEnforcer),
+		authProxies:     make(map[string]*authproxy.AuthProxy),
+		logger:          logger.WithField("component", "runner-manager"),
 	}
 
 	// Initialize runner pool if enabled
@@ -657,11 +657,11 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	}
 
 	m.logger.WithFields(logrus.Fields{
-		"runner_id":         runnerID,
-		"ip":                runner.InternalIP.String(),
-		"snapshot":          runner.SnapshotVersion,
-		"alloc_ms":          time.Since(allocStart).Milliseconds(),
-		"overlay_ms":        overlayDur.Milliseconds(),
+		"runner_id":  runnerID,
+		"ip":         runner.InternalIP.String(),
+		"snapshot":   runner.SnapshotVersion,
+		"alloc_ms":   time.Since(allocStart).Milliseconds(),
+		"overlay_ms": overlayDur.Milliseconds(),
 	}).Info("Runner allocated successfully")
 
 	return runner, nil

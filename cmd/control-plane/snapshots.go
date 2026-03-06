@@ -395,7 +395,6 @@ func (sm *SnapshotManager) cleanupBuilderVM(ctx context.Context, instanceName st
 	}
 }
 
-
 // launchSnapshotBuilderVMForKey creates a GCE instance to build a snapshot from commands JSON.
 //
 //nolint:unused // will be wired up when per-key snapshot builds are enabled
@@ -563,65 +562,6 @@ shutdown -h now
 	return nil
 }
 
-// monitorSnapshotBuild monitors the snapshot build progress
-func (sm *SnapshotManager) monitorSnapshotBuild(ctx context.Context, version, instanceName string) {
-	sm.logger.WithFields(logrus.Fields{
-		"version":  version,
-		"instance": instanceName,
-	}).Info("Monitoring snapshot build")
-
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	timeout := time.After(45 * time.Minute)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timeout:
-			sm.logger.WithField("version", version).Error("Snapshot build timed out")
-			sm.UpdateSnapshotStatus(ctx, version, "failed")
-			sm.cleanupBuilderVM(ctx, instanceName)
-			return
-		case <-ticker.C:
-			// Check if snapshot files exist in GCS
-			complete, err := sm.checkSnapshotComplete(ctx, version)
-			if err != nil {
-				sm.logger.WithError(err).Debug("Error checking snapshot completion")
-				continue
-			}
-
-			if complete {
-				sm.logger.WithField("version", version).Info("Snapshot build completed")
-				sm.UpdateSnapshotStatus(ctx, version, "ready")
-				sm.cleanupBuilderVM(ctx, instanceName)
-				return
-			}
-
-			// Check if VM is still running
-			if sm.gcpProject != "" {
-				running, err := sm.isBuilderVMRunning(ctx, instanceName)
-				if err != nil {
-					sm.logger.WithError(err).Debug("Error checking VM status")
-					continue
-				}
-				if !running {
-					// VM terminated without completing - check if snapshot exists
-					complete, _ := sm.checkSnapshotComplete(ctx, version)
-					if complete {
-						sm.UpdateSnapshotStatus(ctx, version, "ready")
-					} else {
-						sm.logger.WithField("version", version).Error("Builder VM terminated without completing snapshot")
-						sm.UpdateSnapshotStatus(ctx, version, "failed")
-					}
-					return
-				}
-			}
-		}
-	}
-}
-
 // GCTerminatedBuilderVMs deletes GCE instances matching "layer-builder-*" that
 // are in TERMINATED state. This catches VMs that were partially created but
 // never cleaned up (e.g. launch failed after Insert but before status='running').
@@ -682,7 +622,7 @@ func (sm *SnapshotManager) SnapshotToProto(s *Snapshot) *pb.Snapshot {
 		GcsPath:    s.GCSPath,
 		RepoCommit: s.RepoCommit,
 		SizeBytes:  s.SizeBytes,
-		CreatedAt:    timestamppb.New(s.CreatedAt),
+		CreatedAt:  timestamppb.New(s.CreatedAt),
 	}
 }
 
