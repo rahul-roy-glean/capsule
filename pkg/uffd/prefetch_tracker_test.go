@@ -9,7 +9,7 @@ import (
 )
 
 func TestPrefetchTracker_FirstWriteWins(t *testing.T) {
-	tracker := NewPrefetchTracker(4096)
+	tracker := NewPrefetchTracker(4096, 0)
 
 	tracker.Add(0)
 	tracker.Add(4096)
@@ -35,7 +35,7 @@ func TestPrefetchTracker_FirstWriteWins(t *testing.T) {
 }
 
 func TestPrefetchTracker_AccessOrder(t *testing.T) {
-	tracker := NewPrefetchTracker(4096)
+	tracker := NewPrefetchTracker(4096, 0)
 
 	offsets := []int64{8192, 0, 4096, 16384}
 	for _, off := range offsets {
@@ -57,7 +57,7 @@ func TestPrefetchTracker_AccessOrder(t *testing.T) {
 }
 
 func TestPrefetchTracker_GetMappingStopsTracking(t *testing.T) {
-	tracker := NewPrefetchTracker(4096)
+	tracker := NewPrefetchTracker(4096, 0)
 
 	tracker.Add(0)
 	mapping := tracker.GetMapping()
@@ -73,7 +73,7 @@ func TestPrefetchTracker_GetMappingStopsTracking(t *testing.T) {
 }
 
 func TestPrefetchTracker_EmptyReturnsNil(t *testing.T) {
-	tracker := NewPrefetchTracker(4096)
+	tracker := NewPrefetchTracker(4096, 0)
 	mapping := tracker.GetMapping()
 	if mapping != nil {
 		t.Errorf("GetMapping() = %v, want nil for empty tracker", mapping)
@@ -81,7 +81,7 @@ func TestPrefetchTracker_EmptyReturnsNil(t *testing.T) {
 }
 
 func TestPrefetchTracker_BlockSize(t *testing.T) {
-	tracker := NewPrefetchTracker(4096)
+	tracker := NewPrefetchTracker(4096, 0)
 	tracker.Add(0)
 	mapping := tracker.GetMapping()
 	if mapping.BlockSize != 4096 {
@@ -90,7 +90,7 @@ func TestPrefetchTracker_BlockSize(t *testing.T) {
 }
 
 func TestPrefetchTracker_ConcurrentAdds(t *testing.T) {
-	tracker := NewPrefetchTracker(4096)
+	tracker := NewPrefetchTracker(4096, 0)
 	const numGoroutines = 50
 	const offsetsPerGoroutine = 100
 

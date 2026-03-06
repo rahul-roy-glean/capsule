@@ -198,7 +198,16 @@ type HandlerConfig struct {
 	// retrieved via GetPrefetchMapping() and stored in snapshot metadata
 	// for replay on subsequent resumes.
 	EnablePrefetchTracking bool
+
+	// MaxPrefetchPages caps how many pages the prefetch tracker retains.
+	// 0 means derive from the ChunkStore's LRU size (50% of cache / chunk size),
+	// hard-capped at DefaultMaxPrefetchPages. Set explicitly to override.
+	MaxPrefetchPages int
 }
+
+// DefaultMaxPrefetchPages is the hard upper bound when MaxPrefetchPages is not
+// set explicitly. 128k pages × 4KB = 512MB of prefetchable guest memory.
+const DefaultMaxPrefetchPages = 131072
 
 // NewHandler creates a new UFFD handler
 func NewHandler(cfg HandlerConfig) (*Handler, error) {
@@ -237,7 +246,28 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 
 	// Enable prefetch tracking if configured.
 	if cfg.EnablePrefetchTracking {
-		h.prefetchTracker = NewPrefetchTracker(PageSize)
+		maxPages := cfg.MaxPrefetchPages
+		if maxPages == 0 {
+			// Derive from ChunkStore LRU: prefetch should use at most 50% of
+			// the cache. Each prefetched page pulls in a full chunk (ChunkSize
+			// bytes), so cap = (cacheSize * 0.5) / chunkSize * pagesPerChunk.
+			// With default 2GB cache and 4MB chunks: 256 chunks → 256*1024 = 262k pages.
+			// But we also want a reasonable upper bound per VM. Cap at 32k pages (128MB)
+			// to leave room for demand faults and other VMs sharing the cache.
+			cacheStats := cfg.ChunkStore.CacheStats()
+			chunkSize := int64(cfg.Metadata.ChunkSize)
+			if chunkSize <= 0 {
+				chunkSize = 4 * 1024 * 1024
+			}
+			halfCacheChunks := cacheStats.MaxSize / 2 / chunkSize
+			pagesPerChunk := chunkSize / PageSize
+			maxPages = int(halfCacheChunks * pagesPerChunk)
+			// Hard upper bound per VM
+			if maxPages > DefaultMaxPrefetchPages {
+				maxPages = DefaultMaxPrefetchPages
+			}
+		}
+		h.prefetchTracker = NewPrefetchTracker(PageSize, maxPages)
 	}
 
 	// Initialize OTel instruments if a Meter was provided.
