@@ -41,7 +41,7 @@ pass "Firecracker manager healthy"
 # ---------------------------------------------------------------------------
 header "1. Register snapshot config with extension drive commands"
 # ---------------------------------------------------------------------------
-CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/snapshot-configs" \
+CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "ext-drive-test",

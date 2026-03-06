@@ -2,11 +2,6 @@ platform:
   gcp_project: my-project
   region: us-west1
   zone: us-west1-b
-repository:
-  url: https://github.com/org/repo
-  branch: develop
-  github_app_id: "12345"
-  github_app_secret_name: github-app-key
 microvm:
   vcpus: 8
   memory_mb: 16384
@@ -17,21 +12,3 @@ hosts:
   min_count: 5
   max_count: 50
   data_disk_gb: 1000
-ci:
-  system: github-actions
-  github:
-    repo: org/repo
-    labels:
-      - self-hosted
-      - firecracker
-    ephemeral: true
-bazel:
-  warmup_targets: //src/...
-  repo_cache_upper_size_gb: 20
-  git_cache:
-    enabled: true
-    repos:
-      github.com/org/repo: org-repo
-    workspace_dir: /mnt/ephemeral/workspace
-  buildbarn:
-    certs_dir: /etc/glean/ci/certs/buildbarn

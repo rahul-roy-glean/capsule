@@ -19,12 +19,13 @@ hosts:
   max_count: 20
   data_disk_gb: 500
 
-# workload: required when ci.system is "none" (AI sandbox, dev env, serverless).
-# Ignored when ci.system is "github-actions".
+# workload: what runs inside the VM.
 # workload:
 #   # snapshot_commands lists warmup steps baked into the golden snapshot.
-#   # Types: "shell" | "git-clone" | "gcp-auth" (see examples/README.md for args)
+#   # Types: "shell" | "gcp-auth" | "exec" (see examples/README.md for args)
 #   snapshot_commands:
+#     - type: "shell"
+#       args: ["bash", "-c", "git clone --depth=1 -b main https://github.com/myorg/myrepo /workspace"]
 #     - type: "shell"
 #       args: ["pip3", "install", "-r", "/app/requirements.txt"]
 #       run_as_root: true
@@ -40,36 +41,6 @@ hosts:
 #   enabled: true
 #   ttl_seconds: 3600   # auto-pause after 1h idle
 #   auto_pause: true    # pause to GCS (true) vs destroy (false)
-
-# ci: add-on for CI system integration. Default: "none" (generic VM host).
-ci:
-  system: "none"        # "github-actions" | "none"
-  # github:             # only used when system == "github-actions"
-  #   repo: "myorg/myrepo"
-  #   org: "myorg"      # org-level runner registration (optional; overrides repo)
-  #   labels:
-  #     - "self-hosted"
-  #     - "firecracker"
-  #     - "bazel"
-  #   ephemeral: true
-
-# bazel: add-on for Bazel-specific snapshot warmup (ci.system: github-actions).
-# bazel:
-#   warmup_targets: "//..."
-#   repo_cache_upper_size_gb: 10
-#   git_cache:
-#     enabled: false
-#     repos: {}          # {"github.com/myorg/myrepo": "myrepo"}
-#     workspace_dir: ""  # defaults to /mnt/ephemeral/workspace
-#   buildbarn:
-#     certs_dir: ""      # host path to Buildbarn mTLS certs
-
-# repository: required when snapshot uses git-clone, or when ci.system is github-actions.
-# repository:
-#   url: "https://github.com/myorg/myrepo"
-#   branch: "main"
-#   github_app_id: ""
-#   github_app_secret_name: ""  # GCP Secret Manager reference
 
 credentials:
   secrets: []

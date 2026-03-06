@@ -77,7 +77,6 @@ func (u *Uploader) UploadSnapshot(ctx context.Context, localDir string, metadata
 		{filepath.Join(localDir, "rootfs.img"), fmt.Sprintf("%s/rootfs.img", prefix)},
 		{filepath.Join(localDir, "snapshot.mem"), fmt.Sprintf("%s/snapshot.mem", prefix)},
 		{filepath.Join(localDir, "snapshot.state"), fmt.Sprintf("%s/snapshot.state", prefix)},
-		{filepath.Join(localDir, "repo-cache-seed.img"), fmt.Sprintf("%s/repo-cache-seed.img", prefix)},
 	}
 
 	// Calculate total size

@@ -80,20 +80,20 @@ func TestRunnerKey_Match(t *testing.T) {
 		},
 		{
 			"same repo matches",
-			&RunnerKey{SnapshotVersion: "v1", GitHubRepo: "org/repo"},
-			&RunnerKey{SnapshotVersion: "v1", GitHubRepo: "org/repo"},
+			&RunnerKey{SnapshotVersion: "v1", AffinityKey: "org/repo"},
+			&RunnerKey{SnapshotVersion: "v1", AffinityKey: "org/repo"},
 			true,
 		},
 		{
 			"different repo no match",
-			&RunnerKey{SnapshotVersion: "v1", GitHubRepo: "org/repo-a"},
-			&RunnerKey{SnapshotVersion: "v1", GitHubRepo: "org/repo-b"},
+			&RunnerKey{SnapshotVersion: "v1", AffinityKey: "org/repo-a"},
+			&RunnerKey{SnapshotVersion: "v1", AffinityKey: "org/repo-b"},
 			false,
 		},
 		{
 			"empty repo matches anything",
-			&RunnerKey{SnapshotVersion: "v1", GitHubRepo: ""},
-			&RunnerKey{SnapshotVersion: "v1", GitHubRepo: "org/repo"},
+			&RunnerKey{SnapshotVersion: "v1", AffinityKey: ""},
+			&RunnerKey{SnapshotVersion: "v1", AffinityKey: "org/repo"},
 			true,
 		},
 		{

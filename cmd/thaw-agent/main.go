@@ -26,15 +26,16 @@ import (
 )
 
 var (
-	mmdsEndpoint           = flag.String("mmds-endpoint", "http://169.254.169.254", "MMDS endpoint")
-	workspaceDir           = flag.String("workspace-dir", "/workspace", "Workspace directory")
+	mmdsEndpoint   = flag.String("mmds-endpoint", "http://169.254.169.254", "MMDS endpoint")
+	workspaceDir   = flag.String("workspace-dir", "/workspace", "Workspace directory")
 	runnerDir              = flag.String("runner-dir", "", "GitHub runner directory (default: /home/<runner-user>)")
 	runnerUsername         = flag.String("runner-user", "runner", "Username for GitHub runner and file ownership (e.g., 'runner' or 'gleanuser')")
-	logLevel               = flag.String("log-level", "info", "Log level")
-	readyFile              = flag.String("ready-file", "/var/run/thaw-agent/ready", "Ready signal file")
-	skipNetwork            = flag.Bool("skip-network", false, "Skip network configuration")
+	logLevel       = flag.String("log-level", "info", "Log level")
+	readyFile      = flag.String("ready-file", "/var/run/thaw-agent/ready", "Ready signal file")
+	skipNetwork    = flag.Bool("skip-network", false, "Skip network configuration")
 	skipRunner             = flag.Bool("skip-runner", false, "Skip GitHub runner registration")
 )
+
 
 // WarmupState tracks the current warmup progress (for snapshot building)
 type WarmupState struct {
@@ -174,36 +175,22 @@ type MMDSData struct {
 			MAC       string `json:"mac"`
 		} `json:"network"`
 		Job struct {
-			Repo              string            `json:"repo"`
-			Branch            string            `json:"branch"`
-			Commit            string            `json:"commit"`
-			GitHubRunnerToken string            `json:"github_runner_token"`
-			GitToken          string            `json:"git_token"`        // Installation token for git clone auth (private repos)
-			GCPAccessToken    string            `json:"gcp_access_token"` // Short-lived GCP token for Artifact Registry auth
-			Labels            map[string]string `json:"labels"`
+			Repo          string            `json:"repo"`
+			Branch        string            `json:"branch"`
+			Commit        string            `json:"commit"`
+			GitToken      string            `json:"git_token"`
+			Labels        map[string]string `json:"labels"`
 		} `json:"job"`
 		Snapshot struct {
 			Version string `json:"version"`
 		} `json:"snapshot"`
-		GitCache struct {
-			Enabled      bool              `json:"enabled"`
-			MountPath    string            `json:"mount_path,omitempty"`
-			RepoMappings map[string]string `json:"repo_mappings,omitempty"`
-			WorkspaceDir string            `json:"workspace_dir,omitempty"`
-			// PreClonedPath is the path where the repo was pre-cloned during warmup
-			// (baked into the snapshot). Thaw-agent creates a symlink from WorkspaceDir to here.
-			PreClonedPath string `json:"pre_cloned_path,omitempty"`
-		} `json:"git_cache,omitempty"`
-		Exec struct {
+		Drives []snapshot.DriveSpec `json:"drives,omitempty"`
+		Exec   struct {
 			Command    []string          `json:"command,omitempty"`
 			Env        map[string]string `json:"env,omitempty"`
 			WorkingDir string            `json:"working_dir,omitempty"`
 			TimeoutSec int               `json:"timeout_seconds,omitempty"`
 		} `json:"exec,omitempty"`
-		Runner struct {
-			Ephemeral bool   `json:"ephemeral"`
-			CISystem  string `json:"ci_system,omitempty"`
-		} `json:"runner,omitempty"`
 		Warmup struct {
 			Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
 			Drives   []snapshot.DriveSpec       `json:"drives,omitempty"`
@@ -347,6 +334,11 @@ func main() {
 	// Initialize structured metrics logger for GCP log-based metrics
 	metrics = telemetry.NewStructuredLogger(log, "thaw-agent", mmdsData.Latest.Meta.RunnerID)
 
+	// Mount extension drives declared by the workload config.
+	setStep("extension_drives")
+	mountExtensionDrives(mmdsData)
+	bootTimer.Phase("extension_drives")
+
 	// Configure network
 	setStep("network_config")
 	if !*skipNetwork {
@@ -370,42 +362,6 @@ func main() {
 		log.WithError(err).Warn("Failed to resync clock")
 	}
 	bootTimer.Phase("clock_sync")
-
-	// Mount tmpfs for workspace if needed (rootfs is often too small)
-	if mmdsData.Latest.GitCache.WorkspaceDir != "" {
-		workspaceDir := mmdsData.Latest.GitCache.WorkspaceDir
-		if err := os.MkdirAll(workspaceDir, 0755); err == nil {
-			// Check if already mounted
-			if out, _ := exec.Command("mountpoint", "-q", workspaceDir).CombinedOutput(); len(out) > 0 || exec.Command("mountpoint", "-q", workspaceDir).Run() != nil {
-				log.WithField("path", workspaceDir).Info("Mounting tmpfs for workspace...")
-				if err := exec.Command("mount", "-t", "tmpfs", "-o", "size=3G", "tmpfs", workspaceDir).Run(); err != nil {
-					log.WithError(err).Warn("Failed to mount tmpfs for workspace")
-				}
-			}
-		}
-
-		// Create symlink to pre-cloned repo after tmpfs mount
-		// The repo is pre-cloned in the snapshot rootfs, workflow expects it at WorkspaceDir
-		preClonedRepo := getPreClonedPath(mmdsData)
-		if preClonedRepo != "" {
-			if _, err := os.Stat(filepath.Join(preClonedRepo, ".git")); err == nil {
-				symlinkPath := getWorkspaceRepoPath(mmdsData)
-				if symlinkPath != "" && symlinkPath != preClonedRepo {
-					if err := os.MkdirAll(filepath.Dir(symlinkPath), 0755); err == nil {
-						os.RemoveAll(symlinkPath) // Remove if exists
-						if err := os.Symlink(preClonedRepo, symlinkPath); err != nil {
-							log.WithError(err).Warn("Failed to create symlink to pre-cloned repo")
-						} else {
-							log.WithFields(logrus.Fields{
-								"link":   symlinkPath,
-								"target": preClonedRepo,
-							}).Info("Created symlink to pre-cloned repo")
-						}
-					}
-				}
-			}
-		}
-	}
 
 	// Check if we're in warmup mode (for snapshot building)
 	if mmdsData.Latest.Meta.Mode == "warmup" {
@@ -541,47 +497,6 @@ func main() {
 				tempData := &MMDSData{}
 				tempData.Latest = newData.Latest
 
-				preClonedRepo := getPreClonedPath(tempData)
-				globalSymlinkState.TargetPath = preClonedRepo
-
-				if preClonedRepo != "" {
-					gitPath := filepath.Join(preClonedRepo, ".git")
-					if _, err := os.Stat(gitPath); err == nil {
-						globalSymlinkState.TargetExists = true
-						symlinkPath := getWorkspaceRepoPath(tempData)
-						globalSymlinkState.SymlinkPath = symlinkPath
-
-						if symlinkPath != "" && symlinkPath != preClonedRepo {
-							log.WithFields(logrus.Fields{
-								"symlink": symlinkPath,
-								"target":  preClonedRepo,
-							}).Info("Creating symlink to pre-cloned repo after restore")
-
-							if err := os.MkdirAll(filepath.Dir(symlinkPath), 0755); err != nil {
-								globalSymlinkState.Error = fmt.Sprintf("MkdirAll failed: %v", err)
-								log.WithError(err).Error("Failed to create symlink parent dir")
-							} else {
-								os.RemoveAll(symlinkPath) // Remove if exists
-								if err := os.Symlink(preClonedRepo, symlinkPath); err != nil {
-									globalSymlinkState.Error = fmt.Sprintf("Symlink failed: %v", err)
-									log.WithError(err).Error("Failed to create post-restore symlink")
-								} else {
-									globalSymlinkState.Success = true
-									log.Info("Successfully created symlink to pre-cloned repo")
-								}
-							}
-						}
-					} else {
-						globalSymlinkState.Error = fmt.Sprintf("Target .git not found: %v", err)
-						log.WithFields(logrus.Fields{
-							"path":  gitPath,
-							"error": err,
-						}).Warn("Pre-cloned repo .git not found for symlink")
-					}
-				} else {
-					log.Debug("No pre-cloned path configured, skipping symlink")
-				}
-
 				// Reconfigure network for new slot
 				// Bug fix: Snapshot bakes slot-0's IP via kernel boot params.
 				// After restore on slot N, the guest has the wrong IP.
@@ -594,15 +509,14 @@ func main() {
 					}
 				}
 
-				// Sync clock from MMDS current_time BEFORE runner registration.
+				// Sync clock from MMDS current_time after snapshot restore.
 				// The host sets current_time when building MMDS data. Without this,
-				// config.sh fails with "clock may be out of sync" because the guest
-				// clock is stuck at snapshot creation time.
+				// the guest clock is stuck at snapshot creation time.
 				if ct := newData.Latest.Meta.CurrentTime; ct != "" {
 					if hostTime, err := time.Parse(time.RFC3339, ct); err == nil {
 						tv := syscall.Timeval{Sec: hostTime.Unix()}
 						if err := syscall.Settimeofday(&tv); err == nil {
-							log.WithField("server_time", hostTime.UTC().Format(time.RFC3339)).Info("Clock synced from MMDS after snapshot restore (pre-registration)")
+							log.WithField("server_time", hostTime.UTC().Format(time.RFC3339)).Info("Clock synced from MMDS after snapshot restore")
 						} else {
 							formatted := hostTime.UTC().Format("2006-01-02 15:04:05")
 							exec.Command("date", "-u", "-s", formatted).Run()
@@ -657,56 +571,6 @@ func main() {
 		bootTimer.Phase("start_command")
 	}
 
-	// Run CI runner registration
-	setStep("ci_registration")
-	ciSystem := mmdsData.Latest.Runner.CISystem
-	if ciSystem == "" && mmdsData.Latest.Job.GitHubRunnerToken != "" {
-		ciSystem = "github-actions" // backwards compat
-	}
-
-	if !*skipRunner {
-		switch ciSystem {
-		case "github-actions":
-			if mmdsData.Latest.Job.GitHubRunnerToken != "" {
-				log.Info("Registering GitHub Actions runner...")
-				globalRegistrationState.Attempted = true
-				// Retry registration up to 3 times with backoff.
-				// Transient GitHub API errors ("Resource temporarily unavailable")
-				// are common when multiple VMs register simultaneously.
-				var regErr error
-				for attempt := 1; attempt <= 3; attempt++ {
-					if attempt > 1 {
-						delay := time.Duration(attempt*5) * time.Second
-						log.WithFields(logrus.Fields{
-							"attempt": attempt,
-							"delay":   delay,
-						}).Info("Retrying runner registration...")
-						time.Sleep(delay)
-					}
-					regErr = registerGitHubRunner(mmdsData)
-					if regErr == nil {
-						break
-					}
-					log.WithError(regErr).WithField("attempt", attempt).Warn("Runner registration attempt failed")
-				}
-				if regErr != nil {
-					globalRegistrationState.Error = regErr.Error()
-					log.WithError(regErr).Error("Failed to register GitHub runner after all retries")
-				} else {
-					globalRegistrationState.Success = true
-				}
-			} else {
-				log.Info("GitHub Actions CI system configured but no runner token provided, skipping registration")
-			}
-		case "none", "":
-			log.Info("No CI system configured, skipping runner registration")
-		default:
-			log.WithField("ci_system", ciSystem).Warn("Unknown CI system, skipping runner registration")
-		}
-	}
-
-	bootTimer.Phase("ci_runner")
-
 	// Signal ready
 	log.Info("Signaling ready...")
 	if err := signalReady(); err != nil {
@@ -734,6 +598,55 @@ func main() {
 	select {}
 }
 
+func resolveDevice(defaultDev string, label string) string {
+	// Prefer by-label path if present.
+	byLabel := filepath.Join("/dev/disk/by-label", label)
+	if _, err := os.Stat(byLabel); err == nil {
+		return byLabel
+	}
+	// Fall back to default device path.
+	return defaultDev
+}
+
+// mountExtensionDrives mounts all extension drives declared in MMDS.
+func mountExtensionDrives(data *MMDSData) {
+	for _, drive := range data.Latest.Drives {
+		if drive.MountPath == "" {
+			continue
+		}
+		label := drive.Label
+		if label == "" {
+			label = strings.ReplaceAll(strings.ToUpper(drive.DriveID), "-", "_")
+		}
+		dev := resolveDevice("/dev/disk/by-label/"+label, label)
+
+		if err := os.MkdirAll(drive.MountPath, 0755); err != nil {
+			log.WithError(err).WithField("drive", drive.DriveID).Warn("Failed to create mount dir")
+			continue
+		}
+		// Skip if already mounted
+		if exec.Command("mountpoint", "-q", drive.MountPath).Run() == nil {
+			continue
+		}
+		opts := "ro"
+		if !drive.ReadOnly {
+			opts = "rw"
+		}
+		if output, err := exec.Command("mount", "-o", opts, dev, drive.MountPath).CombinedOutput(); err != nil {
+			log.WithError(err).WithFields(logrus.Fields{
+				"drive":  drive.DriveID,
+				"device": dev,
+				"mount":  drive.MountPath,
+				"output": strings.TrimSpace(string(output)),
+			}).Warn("Failed to mount extension drive")
+		} else {
+			log.WithFields(logrus.Fields{
+				"drive": drive.DriveID,
+				"mount": drive.MountPath,
+			}).Info("Mounted extension drive")
+		}
+	}
+}
 
 func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 	client := &http.Client{Timeout: 5 * time.Second}
@@ -795,34 +708,22 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					MAC       string `json:"mac"`
 				} `json:"network"`
 				Job struct {
-					Repo              string            `json:"repo"`
-					Branch            string            `json:"branch"`
-					Commit            string            `json:"commit"`
-					GitHubRunnerToken string            `json:"github_runner_token"`
-					GitToken          string            `json:"git_token"`
-					GCPAccessToken    string            `json:"gcp_access_token"`
-					Labels            map[string]string `json:"labels"`
+					Repo          string            `json:"repo"`
+					Branch        string            `json:"branch"`
+					Commit        string            `json:"commit"`
+					GitToken      string            `json:"git_token"`
+					Labels        map[string]string `json:"labels"`
 				} `json:"job"`
 				Snapshot struct {
 					Version string `json:"version"`
 				} `json:"snapshot"`
-				GitCache struct {
-					Enabled       bool              `json:"enabled"`
-					MountPath     string            `json:"mount_path,omitempty"`
-					RepoMappings  map[string]string `json:"repo_mappings,omitempty"`
-					WorkspaceDir  string            `json:"workspace_dir,omitempty"`
-					PreClonedPath string            `json:"pre_cloned_path,omitempty"`
-				} `json:"git_cache,omitempty"`
-				Exec struct {
+				Drives []snapshot.DriveSpec `json:"drives,omitempty"`
+				Exec   struct {
 					Command    []string          `json:"command,omitempty"`
 					Env        map[string]string `json:"env,omitempty"`
 					WorkingDir string            `json:"working_dir,omitempty"`
 					TimeoutSec int               `json:"timeout_seconds,omitempty"`
 				} `json:"exec,omitempty"`
-				Runner struct {
-					Ephemeral bool   `json:"ephemeral"`
-					CISystem  string `json:"ci_system,omitempty"`
-				} `json:"runner,omitempty"`
 				Warmup struct {
 					Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
 					Drives   []snapshot.DriveSpec       `json:"drives,omitempty"`
@@ -1358,150 +1259,6 @@ func resyncClock(mmdsData *MMDSData) error {
 	return fmt.Errorf("failed to sync clock from any source")
 }
 
-func extractRepoDir(repoURL string) string {
-	// Handle various URL formats - returns repo/repo structure for GitHub Actions compatibility
-	// GitHub Actions default checkout is: $GITHUB_WORKSPACE/{repo}/{repo}
-	// https://github.com/org/repo.git -> repo/repo
-	// askscio/scio -> scio/scio
-
-	repoURL = strings.TrimSuffix(repoURL, ".git")
-	repoURL = strings.TrimPrefix(repoURL, "https://")
-	repoURL = strings.TrimPrefix(repoURL, "http://")
-	repoURL = strings.TrimPrefix(repoURL, "git@")
-	repoURL = strings.TrimPrefix(repoURL, "github.com/")
-	repoURL = strings.TrimPrefix(repoURL, "github.com:")
-
-	// Extract just the repo name (last part)
-	parts := strings.Split(repoURL, "/")
-	repoName := parts[len(parts)-1]
-
-	// Return repo/repo format (GitHub Actions convention)
-	return filepath.Join(repoName, repoName)
-}
-
-func registerGitHubRunner(data *MMDSData) error {
-	job := data.Latest.Job
-	if job.GitHubRunnerToken == "" {
-		return fmt.Errorf("no GitHub runner token")
-	}
-
-	runnerPath := *runnerDir
-
-	// Extract repo URL for registration
-	repoURL := job.Repo
-	if !strings.HasPrefix(repoURL, "https://") {
-		repoURL = "https://github.com/" + repoURL
-	}
-
-	// Build labels - GitHub expects just label names, not key=value pairs
-	var labels []string
-	for k := range job.Labels {
-		labels = append(labels, k)
-	}
-	// Add host machine name as a label for easier debugging
-	if hostName := data.Latest.Meta.InstanceName; hostName != "" {
-		labels = append(labels, hostName)
-	}
-	labelsStr := strings.Join(labels, ",")
-
-	// Get runner user UID/GID - GitHub runner refuses to run as root
-	runnerUser, err := user.Lookup(*runnerUsername)
-	if err != nil {
-		return fmt.Errorf("runner user not found: %w", err)
-	}
-	uid, _ := strconv.ParseUint(runnerUser.Uid, 10, 32)
-	gid, _ := strconv.ParseUint(runnerUser.Gid, 10, 32)
-
-	// NOTE: Runner directory ownership is set in the Dockerfile (chown -R gleanuser:gleanuser /home/gleanuser)
-	// and preserved across snapshot restore. No recursive chown needed here.
-
-	// Build config command arguments
-	configArgs := []string{
-		"--url", repoURL,
-		"--token", job.GitHubRunnerToken,
-		"--name", data.Latest.Meta.RunnerID[:8],
-		"--labels", labelsStr,
-		"--unattended",
-		"--replace",
-	}
-	// Add --ephemeral flag if configured (defaults to true if not set)
-	if data.Latest.Runner.Ephemeral {
-		configArgs = append(configArgs, "--ephemeral")
-		log.Info("Runner configured as ephemeral (one job per VM)")
-	} else {
-		log.Info("Runner configured as persistent (multiple jobs)")
-	}
-
-	// Configure runner as 'runner' user with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-
-	configCmd := exec.CommandContext(ctx, filepath.Join(runnerPath, "config.sh"), configArgs...)
-	configCmd.Dir = runnerPath
-	configCmd.SysProcAttr = &syscall.SysProcAttr{
-		Credential: &syscall.Credential{
-			Uid: uint32(uid),
-			Gid: uint32(gid),
-		},
-	}
-	configCmd.Env = append(os.Environ(), "HOME="+runnerUser.HomeDir)
-
-	log.WithFields(logrus.Fields{
-		"url":      repoURL,
-		"name":     data.Latest.Meta.RunnerID[:8],
-		"labels":   labelsStr,
-		"uid":      uid,
-		"gid":      gid,
-		"home":     runnerUser.HomeDir,
-		"run_path": runnerPath,
-	}).Info("Configuring GitHub runner (timeout: 120s)...")
-
-	configStart := time.Now()
-	output, err := configCmd.CombinedOutput()
-	if err != nil {
-		log.WithFields(logrus.Fields{
-			"error":       err.Error(),
-			"output":      string(output),
-			"duration_ms": time.Since(configStart).Milliseconds(),
-		}).Error("config.sh failed")
-		if ctx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("runner config timed out after 120s")
-		}
-		return fmt.Errorf("runner config failed: %w (output: %s)", err, string(output))
-	}
-	log.WithFields(logrus.Fields{
-		"output":      string(output),
-		"duration_ms": time.Since(configStart).Milliseconds(),
-	}).Info("config.sh completed successfully")
-
-	// Start runner in background as 'runner' user
-	// Use setsid to create a new session so runner survives if thaw-agent exits
-	runCmd := exec.Command(filepath.Join(runnerPath, "run.sh"), "--disableupdate")
-	runCmd.Dir = runnerPath
-	runCmd.Stdout = os.Stdout
-	runCmd.Stderr = os.Stderr
-	runCmd.SysProcAttr = &syscall.SysProcAttr{
-		Credential: &syscall.Credential{
-			Uid: uint32(uid),
-			Gid: uint32(gid),
-		},
-		Setsid: true, // Create new session so runner survives parent exit
-	}
-	runCmd.Env = append(os.Environ(), "HOME="+runnerUser.HomeDir)
-
-	log.Info("Starting GitHub runner (run.sh)...")
-	runStart := time.Now()
-	if err := runCmd.Start(); err != nil {
-		return fmt.Errorf("failed to start runner: %w", err)
-	}
-	log.WithFields(logrus.Fields{
-		"pid":         runCmd.Process.Pid,
-		"duration_ms": time.Since(runStart).Milliseconds(),
-	}).Info("GitHub runner started successfully")
-
-	return nil
-}
-
 func signalReady() error {
 	readyDir := filepath.Dir(*readyFile)
 	if err := os.MkdirAll(readyDir, 0755); err != nil {
@@ -1600,43 +1357,12 @@ func runWarmupMode(data *MMDSData) error {
 			// Store stop function so it can be called after warmup to restore MMDS access
 			globalMetadataForwarderStop = stopFwd
 		}
-	} else if token := data.Latest.Job.GCPAccessToken; token != "" {
-		// Fallback: if no proxy is configured, use the legacy token-based approach
-		log.Info("Auto-configuring GCP credentials from MMDS token (legacy)")
-		if err := runGCPAuthCommand(data); err != nil {
-			log.WithError(err).Warn("Failed to auto-configure GCP credentials (non-fatal)")
-		}
 	}
 
 	for _, cmd := range data.Latest.Warmup.Commands {
 		if err := dispatchCommand(cmd, data); err != nil {
 			return fmt.Errorf("command %s failed: %w", cmd.Type, err)
 		}
-	}
-
-	// Infra finalization: GitHub Actions runner update and page pre-warm.
-	// Only relevant for github-actions CI system (or when a runner token is present).
-	ciSystem := data.Latest.Runner.CISystem
-	if ciSystem == "" && data.Latest.Job.GitHubRunnerToken != "" {
-		ciSystem = "github-actions"
-	}
-	if ciSystem == "github-actions" {
-		runnerUser, err := user.Lookup(*runnerUsername)
-		if err != nil {
-			return fmt.Errorf("runner user not found: %w", err)
-		}
-		rUID, _ := strconv.ParseUint(runnerUser.Uid, 10, 32)
-		rGID, _ := strconv.ParseUint(runnerUser.Gid, 10, 32)
-		runnerCred := &syscall.SysProcAttr{
-			Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
-		}
-		runnerHome := "HOME=" + runnerUser.HomeDir
-
-		updateWarmupState("runner_update", "Updating GitHub Actions runner...")
-		updateGitHubRunner(*runnerDir, runnerCred, runnerHome)
-
-		updateWarmupState("runner_prewarm", "Pre-warming runner pages...")
-		preWarmRunnerPages(*runnerDir, runnerCred, runnerHome)
 	}
 
 	updateWarmupState("syncing", "Syncing caches to disk...")
@@ -1671,12 +1397,6 @@ func runWarmupMode(data *MMDSData) error {
 // dispatchCommand routes a SnapshotCommand to its handler.
 func dispatchCommand(cmd snapshot.SnapshotCommand, data *MMDSData) error {
 	switch cmd.Type {
-	case "git-clone":
-		return runGitCloneCommand(cmd.Args, data)
-	case "git-pull":
-		return runGitPullCommand(cmd.Args, data)
-	case "gcp-auth":
-		return runGCPAuthCommand(data)
 	case "shell":
 		return runShellCommand(cmd.Args, cmd.RunAsRoot, data)
 	case "base-image", "platform-setup", "platform-user":
@@ -1689,8 +1409,8 @@ func dispatchCommand(cmd snapshot.SnapshotCommand, data *MMDSData) error {
 }
 
 // runShellCommand runs an arbitrary shell command with MMDS credentials
-// injected as environment variables so callers can use $GOOGLE_OAUTH_ACCESS_TOKEN,
-// $GIT_TOKEN, etc. without any extra setup steps.
+// injected as environment variables so callers can use $GIT_TOKEN, etc.
+// without any extra setup steps.
 // When runAsRoot is false the command is run as the configured runner user.
 func runShellCommand(args []string, runAsRoot bool, data *MMDSData) error {
 	if len(args) == 0 {
@@ -1701,10 +1421,6 @@ func runShellCommand(args []string, runAsRoot bool, data *MMDSData) error {
 	// route through the auth proxy without polluting the thaw-agent process.
 	env = append(env, globalProxyEnv...)
 	if data != nil {
-		if t := data.Latest.Job.GCPAccessToken; t != "" {
-			env = append(env, "GOOGLE_OAUTH_ACCESS_TOKEN="+t)
-			env = append(env, "CLOUDSDK_AUTH_ACCESS_TOKEN="+t)
-		}
 		if t := data.Latest.Job.GitToken; t != "" {
 			env = append(env, "GIT_TOKEN="+t)
 		}
@@ -1922,422 +1638,16 @@ func startMetadataForwarder(metadataHost string) (stop func(), err error) {
 	return stop, nil
 }
 
-// runGCPAuthCommand configures GCP credentials inside the microVM by:
-//   - Setting environment variables (GOOGLE_OAUTH_ACCESS_TOKEN, CLOUDSDK_AUTH_ACCESS_TOKEN)
-//   - Installing a gcloud shim at /usr/local/bin/gcloud that returns the access token
-//
-// The gcloud shim is critical because keyrings.google-artifactregistry-auth (used by
-// pip inside bazel) calls `gcloud config config-helper --format=json(credential)` to
-// obtain credentials. Since gcloud isn't installed in the microVM and there's no
-// metadata server, the shim fakes the expected responses.
-func runGCPAuthCommand(data *MMDSData) error {
-	token := data.Latest.Job.GCPAccessToken
-	if token == "" {
-		return fmt.Errorf("gcp-auth: no GCP access token in MMDS (gcp_access_token is empty)")
+func forwardConn(client gonet.Conn, upstream string) {
+	defer client.Close()
+	backend, err := gonet.Dial("tcp", upstream)
+	if err != nil {
+		return
 	}
-
-	// Set env vars for tools that check them directly.
-	os.Setenv("GOOGLE_OAUTH_ACCESS_TOKEN", token)
-	os.Setenv("CLOUDSDK_AUTH_ACCESS_TOKEN", token)
-
-	// Install a gcloud shim that returns the access token for all relevant subcommands.
-	// This makes keyrings.google-artifactregistry-auth and bazel credential helpers work
-	// without a real gcloud installation.
-	shimScript := fmt.Sprintf(`#!/bin/sh
-# Shim installed by thaw-agent for Artifact Registry auth in microVM
-# Returns the access token passed via MMDS from the host
-case "$1" in
-  auth)
-    case "$2" in
-      print-access-token) echo '%s' ;;
-      application-default) echo '%s' ;;
-      *) echo '%s' ;;
-    esac
-    ;;
-  config)
-    # keyrings.google-artifactregistry-auth calls:
-    #   gcloud config config-helper --format=json(credential)
-    # and parses credential.access_token + credential.token_expiry from JSON
-    echo '{"credential":{"access_token":"%s","token_expiry":"2099-12-31T23:59:59Z"}}'
-    ;;
-  *) echo '%s' ;;
-esac
-`, token, token, token, token, token)
-
-	shimPath := filepath.Join("/usr/local/bin", "gcloud")
-	if err := os.WriteFile(shimPath, []byte(shimScript), 0755); err != nil {
-		log.WithError(err).Warn("Failed to write gcloud shim")
-	} else {
-		log.Info("Installed gcloud shim for credential helper")
-	}
-
-	log.Info("GCP credentials configured (env vars + gcloud shim)")
-	return nil
+	defer backend.Close()
+	go io.Copy(backend, client)
+	io.Copy(client, backend)
 }
-
-// runGitCloneCommand implements the "git-clone" warmup step.
-// args[0] = repo URL, args[1] = branch (optional), args[2] = warmup targets (optional),
-// args[3] = bazelrc path relative to repo root (optional)
-func runGitCloneCommand(args []string, data *MMDSData) error {
-	if len(args) == 0 {
-		return fmt.Errorf("git-clone command requires a repo URL argument")
-	}
-	repoURL := args[0]
-	repoBranch := "main"
-	if len(args) > 1 && args[1] != "" {
-		repoBranch = args[1]
-	}
-	// Store bazelrc and warmup targets for use by the caller
-	// (they'll be read from args by runBazelFetchCommand)
-
-	// Look up runner user
-	runnerUser, err := user.Lookup(*runnerUsername)
-	if err != nil {
-		return fmt.Errorf("runner user not found: %w", err)
-	}
-	rUID, _ := strconv.ParseUint(runnerUser.Uid, 10, 32)
-	rGID, _ := strconv.ParseUint(runnerUser.Gid, 10, 32)
-	runnerCred := &syscall.SysProcAttr{
-		Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
-	}
-	runnerHome := "HOME=" + runnerUser.HomeDir
-
-	repoPath := extractRepoDir(repoURL)
-	actualRepoDir := filepath.Join("/workspace", repoPath)
-	workDir := data.Latest.GitCache.WorkspaceDir
-	if workDir == "" {
-		workDir = "/mnt/ephemeral/workdir"
-	}
-	expectedRepoDir := filepath.Join(workDir, repoPath)
-	repoDir := actualRepoDir
-
-	log.WithFields(logrus.Fields{
-		"actual_repo_dir":   actualRepoDir,
-		"expected_repo_dir": expectedRepoDir,
-	}).Info("Setting up repo directories for warmup")
-
-	updateWarmupState("connectivity_check", "Verifying network connectivity...")
-	if err := verifyConnectivity(repoURL); err != nil {
-		return fmt.Errorf("connectivity check failed: %w", err)
-	}
-
-	updateWarmupState("cloning", "Cloning repository...")
-	log.WithFields(logrus.Fields{
-		"repo_url": repoURL,
-		"branch":   repoBranch,
-		"repo_dir": repoDir,
-	}).Info("Cloning repository for warmup")
-
-	parentDir := filepath.Dir(repoDir)
-	if err := os.MkdirAll(parentDir, 0755); err != nil {
-		return fmt.Errorf("failed to create repo parent dir: %w", err)
-	}
-	os.Chown(parentDir, int(rUID), int(rGID))
-
-	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err == nil {
-		log.Info("Repository already exists, skipping clone")
-	} else {
-		cloneURL := repoURL
-		if data.Latest.Job.GitToken != "" {
-			repoPath := strings.TrimPrefix(repoURL, "https://github.com/")
-			repoPath = strings.TrimPrefix(repoPath, "github.com/")
-			cloneURL = fmt.Sprintf("https://x-access-token:%s@github.com/%s", data.Latest.Job.GitToken, repoPath)
-		} else if !strings.HasPrefix(cloneURL, "https://") && !strings.HasPrefix(cloneURL, "git@") {
-			cloneURL = "https://github.com/" + cloneURL
-		}
-		cloneEnv := append(os.Environ(), globalProxyEnv...)
-		cloneEnv = append(cloneEnv, runnerHome, "GIT_TERMINAL_PROMPT=0")
-		if err := runStreamedCommand("", cloneEnv, runnerCred,
-			"git", "clone", "--branch", repoBranch, "--depth=1", cloneURL, repoDir); err != nil {
-			return fmt.Errorf("git clone failed: %w", err)
-		}
-	}
-
-	if actualRepoDir != expectedRepoDir {
-		if err := os.MkdirAll(filepath.Dir(expectedRepoDir), 0755); err == nil {
-			os.RemoveAll(expectedRepoDir)
-			os.Symlink(actualRepoDir, expectedRepoDir)
-		}
-	}
-	return nil
-}
-
-// runGitPullCommand implements the "git-pull" warmup step for incremental builds.
-// It fetches and resets to the latest commit instead of cloning from scratch.
-// args[0] = repo URL, args[1] = branch (optional)
-// If the repo doesn't exist yet, falls back to runGitCloneCommand.
-func runGitPullCommand(args []string, data *MMDSData) error {
-	if len(args) == 0 {
-		return fmt.Errorf("git-pull command requires a repo URL argument")
-	}
-	repoURL := args[0]
-	repoBranch := "main"
-	if len(args) > 1 && args[1] != "" {
-		repoBranch = args[1]
-	}
-
-	repoPath := extractRepoDir(repoURL)
-	repoDir := filepath.Join("/workspace", repoPath)
-
-	// If the repo doesn't exist, fall back to clone
-	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err != nil {
-		log.WithField("repo_dir", repoDir).Info("Repository not found, falling back to git-clone")
-		return runGitCloneCommand(args, data)
-	}
-
-	// Look up runner user
-	runnerUser, err := user.Lookup(*runnerUsername)
-	if err != nil {
-		return fmt.Errorf("runner user not found: %w", err)
-	}
-	rUID, _ := strconv.ParseUint(runnerUser.Uid, 10, 32)
-	rGID, _ := strconv.ParseUint(runnerUser.Gid, 10, 32)
-	runnerCred := &syscall.SysProcAttr{
-		Credential: &syscall.Credential{Uid: uint32(rUID), Gid: uint32(rGID)},
-	}
-	runnerHome := "HOME=" + runnerUser.HomeDir
-
-	// Build authenticated remote URL if token is available
-	fetchURL := repoURL
-	if data.Latest.Job.GitToken != "" {
-		repoPathStr := strings.TrimPrefix(repoURL, "https://github.com/")
-		repoPathStr = strings.TrimPrefix(repoPathStr, "github.com/")
-		fetchURL = fmt.Sprintf("https://x-access-token:%s@github.com/%s", data.Latest.Job.GitToken, repoPathStr)
-	} else if !strings.HasPrefix(fetchURL, "https://") && !strings.HasPrefix(fetchURL, "git@") {
-		fetchURL = "https://github.com/" + fetchURL
-	}
-
-	updateWarmupState("pulling", "Pulling latest changes...")
-	log.WithFields(logrus.Fields{
-		"repo_url": repoURL,
-		"branch":   repoBranch,
-		"repo_dir": repoDir,
-	}).Info("Fetching latest changes for incremental warmup")
-
-	// Set remote URL (may have changed token)
-	env := append(os.Environ(), globalProxyEnv...)
-	env = append(env, runnerHome, "GIT_TERMINAL_PROMPT=0")
-	setURLCmd := exec.Command("git", "-C", repoDir, "remote", "set-url", "origin", fetchURL)
-	setURLCmd.SysProcAttr = runnerCred
-	setURLCmd.Env = env
-	setURLCmd.Run()
-
-	// Fetch the branch
-	globalWarmupLogs.Add(fmt.Sprintf("[git-pull] Fetching origin/%s", repoBranch))
-	if err := runStreamedCommand("", env, runnerCred,
-		"git", "-C", repoDir, "fetch", "origin", repoBranch); err != nil {
-		globalWarmupLogs.Add(fmt.Sprintf("[git-pull] fetch failed: %v", err))
-		return fmt.Errorf("git fetch failed: %w", err)
-	}
-
-	// Hard reset to origin/<branch> to handle force pushes
-	globalWarmupLogs.Add(fmt.Sprintf("[git-pull] Resetting to origin/%s", repoBranch))
-	if err := runStreamedCommand("", env, runnerCred,
-		"git", "-C", repoDir, "reset", "--hard", "origin/"+repoBranch); err != nil {
-		globalWarmupLogs.Add(fmt.Sprintf("[git-pull] reset failed: %v", err))
-		return fmt.Errorf("git reset failed: %w", err)
-	}
-
-	log.Info("Git pull completed successfully")
-	return nil
-}
-
-func preWarmRunnerPages(runnerPath string, cred *syscall.SysProcAttr, homeEnv string) {
-	start := time.Now()
-	log.WithField("runner_path", runnerPath).Info("Pre-warming .NET runner pages...")
-	globalWarmupLogs.Add("[phase] runner page pre-warm")
-
-	listenerBin := filepath.Join(runnerPath, "bin", "Runner.Listener")
-	if _, err := os.Stat(listenerBin); err != nil {
-		log.WithError(err).Warn("Runner.Listener binary not found, skipping pre-warm")
-		globalWarmupLogs.Add("[warn] Runner.Listener not found: " + err.Error())
-		return
-	}
-
-	// Start Runner.Listener briefly. It will fail quickly because config.sh
-	// hasn't been run (no .runner config file), but that's fine -- the .NET
-	// runtime, JIT compiler, and managed assemblies all get loaded into memory
-	// before it exits, which is exactly what we need for the snapshot.
-	// Give it up to 15 seconds -- .NET runtime typically loads within a few seconds,
-	// then Runner.Listener exits with an error because it's not configured.
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, listenerBin)
-	cmd.Dir = runnerPath
-	cmd.Env = append(os.Environ(), homeEnv, "DOTNET_EnableDiagnostics=0")
-	if cred != nil {
-		cmd.SysProcAttr = cred
-	}
-
-	out, err := cmd.CombinedOutput()
-	elapsed := time.Since(start)
-
-	// We expect it to fail (no config) -- that's fine, pages are loaded.
-	log.WithFields(logrus.Fields{
-		"duration_ms": elapsed.Milliseconds(),
-		"exit_error":  err,
-		"output":      strings.TrimSpace(string(out)),
-	}).Info("Runner.Listener pre-warm completed")
-	globalWarmupLogs.Add(fmt.Sprintf("[done] runner pre-warm completed in %dms", elapsed.Milliseconds()))
-}
-
-// updateGitHubRunner downloads the latest GitHub Actions runner release and
-// replaces the existing installation. This avoids a ~3-4 minute self-update
-// delay after snapshot restore. The runner is downloaded directly from GitHub
-// releases API rather than relying on run.sh's self-update mechanism (which
-// requires the runner to be configured and connected first).
-func updateGitHubRunner(runnerPath string, cred *syscall.SysProcAttr, homeEnv string) {
-	start := time.Now()
-	log.WithField("runner_path", runnerPath).Info("Checking for GitHub Actions runner updates...")
-	globalWarmupLogs.Add("[phase] runner update check")
-
-	binDir := filepath.Join(runnerPath, "bin")
-	if _, err := os.Stat(binDir); err != nil {
-		log.WithError(err).Warn("Runner bin dir not found, skipping update")
-		globalWarmupLogs.Add("[warn] runner bin dir not found, skipping update")
-		return
-	}
-
-	// Read current version from Runner.Listener.deps.json filename pattern or
-	// by running Runner.Listener --version.
-	currentVersion := getRunnerVersion(runnerPath, cred, homeEnv)
-	log.WithField("current_version", currentVersion).Info("Current runner version")
-
-	// Query GitHub API for latest runner release.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "GET",
-		"https://api.github.com/repos/actions/runner/releases/latest", nil)
-	if err != nil {
-		log.WithError(err).Warn("Failed to create GitHub API request")
-		return
-	}
-	req.Header.Set("Accept", "application/vnd.github.v3+json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		log.WithError(err).Warn("Failed to query GitHub releases API")
-		globalWarmupLogs.Add("[warn] failed to query GitHub releases: " + err.Error())
-		return
-	}
-	defer resp.Body.Close()
-
-	var release struct {
-		TagName string `json:"tag_name"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		log.WithError(err).Warn("Failed to parse GitHub releases response")
-		return
-	}
-
-	latestVersion := strings.TrimPrefix(release.TagName, "v")
-	log.WithFields(logrus.Fields{
-		"current": currentVersion,
-		"latest":  latestVersion,
-	}).Info("Runner version check")
-
-	if currentVersion == latestVersion {
-		log.Info("Runner is already at latest version, no update needed")
-		globalWarmupLogs.Add("[done] runner already at latest version " + latestVersion)
-		return
-	}
-
-	// Download the latest runner tarball.
-	tarballURL := fmt.Sprintf(
-		"https://github.com/actions/runner/releases/download/v%s/actions-runner-linux-x64-%s.tar.gz",
-		latestVersion, latestVersion)
-	log.WithField("url", tarballURL).Info("Downloading latest runner...")
-	globalWarmupLogs.Add("[info] downloading runner " + latestVersion)
-
-	dlCtx, dlCancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer dlCancel()
-
-	dlReq, err := http.NewRequestWithContext(dlCtx, "GET", tarballURL, nil)
-	if err != nil {
-		log.WithError(err).Warn("Failed to create download request")
-		return
-	}
-	dlResp, err := http.DefaultClient.Do(dlReq)
-	if err != nil {
-		log.WithError(err).Warn("Failed to download runner tarball")
-		globalWarmupLogs.Add("[warn] failed to download runner: " + err.Error())
-		return
-	}
-	defer dlResp.Body.Close()
-
-	if dlResp.StatusCode != 200 {
-		log.WithField("status", dlResp.StatusCode).Warn("Runner download returned non-200")
-		return
-	}
-
-	// Save tarball to temp file (world-readable so runner user can access it).
-	tmpFile, err := os.CreateTemp("", "runner-*.tar.gz")
-	if err != nil {
-		log.WithError(err).Warn("Failed to create temp file")
-		return
-	}
-	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
-
-	if _, err := io.Copy(tmpFile, dlResp.Body); err != nil {
-		tmpFile.Close()
-		log.WithError(err).Warn("Failed to save runner tarball")
-		return
-	}
-	tmpFile.Close()
-	os.Chmod(tmpPath, 0644)
-
-	log.WithField("duration_ms", time.Since(start).Milliseconds()).Info("Runner tarball downloaded")
-
-	// Extract as root over existing installation, then chown to runner user.
-	// We extract as root because the temp file is owned by root and the runner
-	// user may not have write access to all directories being overwritten.
-	extractCmd := exec.Command("tar", "-xzf", tmpPath, "-C", runnerPath)
-	if out, err := extractCmd.CombinedOutput(); err != nil {
-		log.WithFields(logrus.Fields{
-			"error":  err,
-			"output": string(out),
-		}).Warn("Failed to extract runner tarball")
-		return
-	}
-
-	// Fix ownership -- tar may extract as root, but runner needs to run as the runner user.
-	if cred != nil && cred.Credential != nil {
-		chownCmd := exec.Command("chown", "-R",
-			fmt.Sprintf("%d:%d", cred.Credential.Uid, cred.Credential.Gid), runnerPath)
-		chownCmd.Run()
-	}
-
-	elapsed := time.Since(start)
-	newVersion := getRunnerVersion(runnerPath, cred, homeEnv)
-	log.WithFields(logrus.Fields{
-		"old_version": currentVersion,
-		"new_version": newVersion,
-		"duration_ms": elapsed.Milliseconds(),
-	}).Info("Runner updated successfully")
-	globalWarmupLogs.Add(fmt.Sprintf("[done] runner updated %s -> %s in %dms", currentVersion, newVersion, elapsed.Milliseconds()))
-}
-
-// getRunnerVersion returns the installed runner version by running Runner.Listener --version.
-func getRunnerVersion(runnerPath string, cred *syscall.SysProcAttr, homeEnv string) string {
-	listenerBin := filepath.Join(runnerPath, "bin", "Runner.Listener")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, listenerBin, "--version")
-	cmd.Dir = runnerPath
-	cmd.Env = append(os.Environ(), homeEnv, "DOTNET_EnableDiagnostics=0")
-	if cred != nil {
-		cmd.SysProcAttr = cred
-	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "unknown"
-	}
-	return strings.TrimSpace(string(out))
-}
-
 // runStreamedCommand runs a command, capturing stdout/stderr line by line
 // into the warmup log buffer and the structured logger.
 func runStreamedCommand(dir string, env []string, procAttr *syscall.SysProcAttr, name string, args ...string) error {
@@ -2392,152 +1702,7 @@ func updateWarmupState(phase, message string) {
 	}).Info("Warmup progress")
 }
 
-// getPreClonedPath returns the path to the pre-cloned repo in the snapshot.
-// This is where the repo was cloned during warmup and baked into the rootfs.
-func getPreClonedPath(data *MMDSData) string {
-	if data == nil {
-		return ""
-	}
-
-	// First check explicit config
-	if data.Latest.GitCache.PreClonedPath != "" {
-		return data.Latest.GitCache.PreClonedPath
-	}
-
-	// Derive from job.repo if not explicitly set
-	// During warmup, repos are cloned to /workspace/{org}/{repo}
-	// e.g., askscio/scio -> /workspace/scio/scio
-	if data.Latest.Job.Repo != "" {
-		repoPath := extractRepoDir(data.Latest.Job.Repo)
-		return filepath.Join("/workspace", repoPath)
-	}
-
-	return ""
-}
-
-// getWorkspaceRepoPath returns the path where workflows expect to find the repo.
-// This is typically {WorkspaceDir}/{org}/{repo} following GitHub Actions conventions.
-func getWorkspaceRepoPath(data *MMDSData) string {
-	if data == nil {
-		return ""
-	}
-
-	workspaceDir := data.Latest.GitCache.WorkspaceDir
-	if workspaceDir == "" {
-		workspaceDir = "/mnt/ephemeral/workdir"
-	}
-
-	// Derive from job.repo
-	if data.Latest.Job.Repo != "" {
-		repoPath := extractRepoDir(data.Latest.Job.Repo)
-		return filepath.Join(workspaceDir, repoPath)
-	}
-
-	return ""
-}
-
-// verifyConnectivity checks that the microVM can reach the target host before
-// attempting long-running network operations like git clone. Fails fast instead
-// of waiting for a 10-minute git timeout.
-func verifyConnectivity(repoURL string) error {
-	// Determine the host to check
-	host := "github.com"
-	if strings.Contains(repoURL, "://") {
-		parts := strings.SplitN(repoURL, "://", 2)
-		if len(parts) == 2 {
-			host = strings.SplitN(parts[1], "/", 2)[0]
-		}
-	}
-
-	// Check DNS resolution - try Go's resolver first, then getent as fallback
-	log.WithField("host", host).Info("Checking DNS resolution...")
-
-	// Try Go's built-in resolver (uses /etc/resolv.conf directly, bypasses nsswitch)
-	addrs, goErr := gonet.LookupHost(host)
-	if goErr != nil {
-		// Go resolver failed - collect diagnostics
-		var diag strings.Builder
-		diag.WriteString(fmt.Sprintf("Go LookupHost error: %v. ", goErr))
-
-		if nssData, err := os.ReadFile("/etc/nsswitch.conf"); err == nil {
-			for _, line := range strings.Split(string(nssData), "\n") {
-				if strings.HasPrefix(strings.TrimSpace(line), "hosts:") {
-					diag.WriteString(fmt.Sprintf("nsswitch: %s. ", strings.TrimSpace(line)))
-					break
-				}
-			}
-		}
-		if resolvData, err := os.ReadFile("/etc/resolv.conf"); err == nil {
-			diag.WriteString(fmt.Sprintf("resolv.conf: [%s]. ", strings.TrimSpace(string(resolvData))))
-		} else {
-			diag.WriteString(fmt.Sprintf("resolv.conf read err: %v. ", err))
-		}
-		if linkTarget, err := os.Readlink("/etc/resolv.conf"); err == nil {
-			diag.WriteString(fmt.Sprintf("resolv.conf symlink->%s. ", linkTarget))
-		}
-		// ip addr
-		if addrOut, err := exec.Command("ip", "addr").CombinedOutput(); err == nil {
-			diag.WriteString(fmt.Sprintf("ip_addr: [%s]. ", strings.TrimSpace(string(addrOut))))
-		} else {
-			diag.WriteString(fmt.Sprintf("ip_addr err: %v. ", err))
-			// fallback: read /proc/net/if_inet6 or /sys
-			if ifData, err2 := os.ReadFile("/proc/net/dev"); err2 == nil {
-				diag.WriteString(fmt.Sprintf("proc_net_dev: [%s]. ", strings.TrimSpace(string(ifData))))
-			}
-		}
-		// Routes
-		if routeOut, err := exec.Command("ip", "route").CombinedOutput(); err == nil {
-			diag.WriteString(fmt.Sprintf("routes: [%s]. ", strings.TrimSpace(string(routeOut))))
-		} else {
-			diag.WriteString(fmt.Sprintf("ip_route err: %v. ", err))
-			// fallback: /proc/net/route
-			if procRoute, err2 := os.ReadFile("/proc/net/route"); err2 == nil {
-				diag.WriteString(fmt.Sprintf("proc_route: [%s]. ", strings.TrimSpace(string(procRoute))))
-			}
-		}
-		// Ping gateway
-		pingGW, pingGWErr := exec.Command("ping", "-c", "1", "-W", "2", "172.16.0.1").CombinedOutput()
-		if pingGWErr != nil {
-			diag.WriteString(fmt.Sprintf("ping_gw(172.16.0.1) failed: %s. ", strings.TrimSpace(string(pingGW))))
-		} else {
-			diag.WriteString("ping_gw OK. ")
-		}
-		// Ping 8.8.8.8
-		ping8, ping8Err := exec.Command("ping", "-c", "1", "-W", "2", "8.8.8.8").CombinedOutput()
-		if ping8Err != nil {
-			diag.WriteString(fmt.Sprintf("ping_8888 failed: %s", strings.TrimSpace(string(ping8))))
-		} else {
-			diag.WriteString("ping_8888 OK")
-		}
-
-		return fmt.Errorf("DNS resolution failed for %s: %s", host, diag.String())
-	}
-	log.WithFields(logrus.Fields{"host": host, "addrs": addrs}).Info("DNS resolution succeeded")
-
-	// Check TCP connectivity to HTTPS port
-	log.WithField("host", host).Info("Checking TCP connectivity to port 443...")
-	conn, err := gonet.DialTimeout("tcp", host+":443", 10*time.Second)
-	if err != nil {
-		// Log diagnostic info
-		log.WithError(err).Error("TCP connection failed")
-		if routeOut, _ := exec.Command("ip", "route").Output(); len(routeOut) > 0 {
-			log.WithField("routes", string(routeOut)).Debug("Current routes")
-		}
-		if resolvOut, _ := os.ReadFile("/etc/resolv.conf"); len(resolvOut) > 0 {
-			log.WithField("resolv.conf", string(resolvOut)).Debug("DNS config")
-		}
-		if pingOut, _ := exec.Command("ping", "-c", "1", "-W", "3", "8.8.8.8").CombinedOutput(); len(pingOut) > 0 {
-			log.WithField("ping_8888", string(pingOut)).Debug("Ping to 8.8.8.8")
-		}
-		return fmt.Errorf("cannot connect to %s:443: %w", host, err)
-	}
-	conn.Close()
-
-	log.WithField("host", host).Info("Connectivity check passed")
-	return nil
-}
-
-// execHandler handles POST /exec requests -- runs a command inside the VM and
+// execHandler handles POST /exec requests — runs a command inside the VM and
 // streams stdout/stderr/exit as ndjson frames.
 func execHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -2852,8 +2017,6 @@ func startHealthServer(mmdsData *MMDSData) {
 			"runner_id":    runnerID,
 			"mode":         mode,
 			"uptime":       time.Since(globalWarmupState.StartedAt).String(),
-			"registration": globalRegistrationState,
-			"symlink":      globalSymlinkState,
 		})
 	})
 
@@ -2889,7 +2052,6 @@ func startHealthServer(mmdsData *MMDSData) {
 			"mmds_error":        mmdsErr,
 			"current_runner_id": mmdsData.Latest.Meta.RunnerID,
 			"current_mode":      mmdsData.Latest.Meta.Mode,
-			"github_token_set":  mmdsData.Latest.Job.GitHubRunnerToken != "",
 		})
 	})
 
@@ -2940,38 +2102,15 @@ func startHealthServer(mmdsData *MMDSData) {
 		mounts, _ := exec.Command("mount").Output()
 		lsblk, _ := exec.Command("lsblk", "-o", "NAME,SIZE,TYPE,MOUNTPOINT").Output()
 		df, _ := exec.Command("df", "-h").Output()
-		bazelVer, _ := exec.Command("bazel", "--version").CombinedOutput()
-		goVer, _ := exec.Command("go", "version").CombinedOutput()
 		runnerCheck, _ := exec.Command("ls", "-la", "/home/runner").CombinedOutput()
-
-		// Check symlink paths
-		workdirLs, _ := exec.Command("ls", "-la", "/mnt/ephemeral/workdir").CombinedOutput()
-		workdirScioLs, _ := exec.Command("ls", "-la", "/mnt/ephemeral/workdir/scio").CombinedOutput()
-		symlinkLs, _ := exec.Command("ls", "-la", "/mnt/ephemeral/workdir/scio/scio").CombinedOutput()
-		targetLs, _ := exec.Command("ls", "-la", "/workspace/scio/scio/.git").CombinedOutput()
-
-		// Try git status in the symlink path
-		gitStatusCmd := exec.Command("git", "status")
-		gitStatusCmd.Dir = "/mnt/ephemeral/workdir/scio/scio"
-		gitStatus, _ := gitStatusCmd.CombinedOutput()
-
-		// Check git config
-		gitConfigCmd := exec.Command("cat", "/workspace/scio/scio/.git/config")
-		gitConfig, _ := gitConfigCmd.CombinedOutput()
+		workspaceLs, _ := exec.Command("ls", "-la", *workspaceDir).CombinedOutput()
 
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"mounts":            string(mounts),
-			"lsblk":             string(lsblk),
-			"df":                string(df),
-			"bazel_version":     string(bazelVer),
-			"go_version":        string(goVer),
-			"runner_dir":        string(runnerCheck),
-			"workdir_ls":        string(workdirLs),
-			"workdir_scio_ls":   string(workdirScioLs),
-			"symlink_ls":        string(symlinkLs),
-			"symlink_target_ls": string(targetLs),
-			"git_status":        string(gitStatus),
-			"git_config":        string(gitConfig),
+			"mounts":       string(mounts),
+			"lsblk":        string(lsblk),
+			"df":           string(df),
+			"runner_dir":   string(runnerCheck),
+			"workspace_ls": string(workspaceLs),
 		})
 	})
 

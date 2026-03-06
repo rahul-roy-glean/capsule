@@ -211,7 +211,7 @@ func TestPresets(t *testing.T) {
 	}{
 		{PresetUnrestricted, PolicyActionAllow, false, false},
 		{PresetQuarantine, PolicyActionDeny, false, false},
-		{PresetCIStandard, PolicyActionAllow, true, false},
+		{PresetRestrictedEgress, PolicyActionAllow, true, false},
 		{PresetAgentSandbox, PolicyActionDeny, false, false},
 	}
 
@@ -276,14 +276,14 @@ func TestResolvePolicy(t *testing.T) {
 	}
 
 	// Preset name
-	p := ResolvePolicy(PresetCIStandard, nil)
-	if p == nil || p.Name != "ci-standard" {
-		t.Fatal("expected ci-standard preset")
+	p := ResolvePolicy(PresetRestrictedEgress, nil)
+	if p == nil || p.Name != "restricted-egress" {
+		t.Fatal("expected restricted-egress preset")
 	}
 
 	// Explicit overrides preset
 	explicit := &NetworkPolicy{Name: "custom", DefaultEgressAction: PolicyActionDeny}
-	p = ResolvePolicy(PresetCIStandard, explicit)
+	p = ResolvePolicy(PresetRestrictedEgress, explicit)
 	if p.Name != "custom" {
 		t.Fatal("explicit should override preset")
 	}

@@ -61,8 +61,6 @@ type SessionMetadata struct {
 	PausedAt    time.Time `json:"paused_at"`
 	// RootfsPath is the path to the dirty rootfs overlay for this session.
 	RootfsPath string `json:"rootfs_path"`
-	// RepoCacheUpperPath is the per-runner repo cache writable layer.
-	RepoCacheUpperPath string `json:"repo_cache_upper_path"`
 	// Resource config preserved across pause/resume
 	VCPUs    int `json:"vcpus,omitempty"`
 	MemoryMB int `json:"memory_mb,omitempty"`
@@ -136,12 +134,14 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 	memDiffFile := filepath.Join(layerDir, "mem_diff.sparse")
 
 	// Create diff snapshot (pauses VM internally)
+	diffStart := time.Now()
 	if err := vm.CreateDiffSnapshot(ctx, stateFile, memDiffFile); err != nil {
 		m.mu.Lock()
 		runner.State = StateIdle
 		m.mu.Unlock()
 		return nil, fmt.Errorf("failed to create diff snapshot: %w", err)
 	}
+	diffDuration := time.Since(diffStart)
 
 	// Calculate snapshot size
 	var snapshotSize int64
@@ -151,6 +151,11 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 	if info, err := os.Stat(stateFile); err == nil {
 		snapshotSize += info.Size()
 	}
+
+	m.logger.WithFields(logrus.Fields{
+		"diff_snapshot_ms": diffDuration.Milliseconds(),
+		"snapshot_bytes":   snapshotSize,
+	}).Info("Pause: diff snapshot created")
 
 	// Write metadata.json
 	sessionDir := filepath.Join(m.sessionBaseDir(), sessionID)
@@ -176,7 +181,6 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 		CreatedAt:          runner.CreatedAt,
 		PausedAt:           time.Now(),
 		RootfsPath:         runner.RootfsOverlay,
-		RepoCacheUpperPath: runner.RepoCacheUpper,
 		VCPUs:              runner.Resources.VCPUs,
 		MemoryMB:           runner.Resources.MemoryMB,
 		TTLSeconds:         runner.TTLSeconds,
@@ -225,10 +229,13 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 			baseMemIndex.Region.DefaultFill = "zero"
 		}
 
+		mergeStart := time.Now()
 		newMemIndex, err := uploader.MergeAndUploadMem(ctx, memDiffFile, baseMemIndex)
+		mergeDuration := time.Since(mergeStart)
 		if err != nil {
 			m.logger.WithError(err).Warn("GCS mem chunk upload failed; falling back to local-only session")
 		} else {
+			m.logger.WithField("merge_upload_ms", mergeDuration.Milliseconds()).Info("Pause: MergeAndUploadMem complete")
 			// Attach prefetch mapping from UFFD handler if available.
 			if handler, ok := m.uffdHandlers[runnerID].(*uffd.Handler); ok {
 				if pm := handler.GetPrefetchMapping(); pm != nil {
@@ -416,7 +423,7 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 		m.logger.WithError(err).Warn("Failed to write session metadata")
 	}
 
-	// Stop VM and clean up resources (but NOT the rootfs overlay or repo cache — session needs them)
+	// Stop VM and clean up resources (but NOT the rootfs overlay or extension drives — session needs them)
 	vm.Stop()
 
 	m.mu.Lock()
@@ -437,7 +444,7 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 
 	m.mu.Lock()
 
-	// Release network namespace / TAP slot but keep overlay and repo cache
+	// Release network namespace / TAP slot but keep overlay and extension drives
 	if m.netnsNetwork != nil {
 		m.netnsNetwork.ReleaseNamespace(runnerID)
 		if slot, ok := m.runnerToSlot[runnerID]; ok {
@@ -560,7 +567,6 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 		CreatedAt:          runner.CreatedAt,
 		PausedAt:           time.Now(),
 		RootfsPath:         runner.RootfsOverlay,
-		RepoCacheUpperPath: runner.RepoCacheUpper,
 		VCPUs:              runner.Resources.VCPUs,
 		MemoryMB:           runner.Resources.MemoryMB,
 		TTLSeconds:         runner.TTLSeconds,
@@ -893,7 +899,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 
 	// Use the session's rootfs overlay (preserved during pause)
 	overlayPath := metadata.RootfsPath
-	repoCacheUpperPath := metadata.RepoCacheUpperPath
 
 	// Build the UFFD handler and state file path, using GCS-backed chunks when
 	// available (metadata.GCSManifestPath is set) or falling back to the local
@@ -1123,11 +1128,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
-	// Include the repo-cache-upper drive in the symlink map so Firecracker can find it.
-	if repoCacheUpperPath != "" {
-		extensionDrivePaths["repo_cache_upper"] = repoCacheUpperPath
-	}
-
 	// Setup symlinks for snapshot restore
 	m.mu.Lock()
 	cleanup, symlinkErr := m.setupSnapshotSymlinks(overlayPath, extensionDrivePaths)
@@ -1141,10 +1141,10 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		return nil, fmt.Errorf("failed to setup snapshot symlinks: %w", symlinkErr)
 	}
 
-	// Restore from snapshot with UFFD
+	// Restore from snapshot with UFFD (paused — don't resume yet)
 	var restoreErr error
 	if useNetNS {
-		restoreErr = vm.RestoreFromSnapshotWithUFFD(ctx, latestStateFile, uffdSocketPath, true)
+		restoreErr = vm.RestoreFromSnapshotWithUFFD(ctx, latestStateFile, uffdSocketPath, false)
 		cleanup()
 	} else {
 		m.mu.Lock()
@@ -1159,7 +1159,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 			m.mu.Unlock()
 			return nil, fmt.Errorf("failed to setup TAP rename: %w", tapErr)
 		}
-		restoreErr = vm.RestoreFromSnapshotWithUFFD(ctx, latestStateFile, uffdSocketPath, true)
+		restoreErr = vm.RestoreFromSnapshotWithUFFD(ctx, latestStateFile, uffdSocketPath, false)
 		tapRestore()
 		cleanup()
 	}
@@ -1208,7 +1208,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		SocketPath:     filepath.Join(m.config.SocketDir, runnerID+".sock"),
 		LogPath:        filepath.Join(m.config.LogDir, runnerID+".log"),
 		RootfsOverlay:  overlayPath,
-		RepoCacheUpper: repoCacheUpperPath,
 		SessionID:      sessionID,
 		SessionDir:     sessionDir,
 		SessionLayers:  metadata.Layers,
@@ -1225,12 +1224,25 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	m.uffdHandlers[runnerID] = uffdHandler
 	m.mu.Unlock()
 
-	// Inject MMDS data
+	// Inject MMDS data BEFORE resuming so the thaw-agent sees fresh config
 	mmdsData := m.buildMMDSData(ctx, runner, tap, AllocateRequest{
 		WorkloadKey: metadata.WorkloadKey,
 	})
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		m.logger.WithError(err).Warn("Failed to set MMDS data on resumed runner")
+	}
+
+	// Now resume the VM — thaw-agent will read the fresh MMDS data
+	if err := vm.Resume(ctx); err != nil {
+		vm.Stop()
+		uffdHandler.Stop()
+		m.mu.Lock()
+		delete(m.runners, runnerID)
+		delete(m.vms, runnerID)
+		delete(m.uffdHandlers, runnerID)
+		m.cleanupNetworkOnly(runnerID, tap.Name)
+		m.mu.Unlock()
+		return nil, fmt.Errorf("failed to resume VM after MMDS injection: %w", err)
 	}
 
 	m.logger.WithFields(logrus.Fields{
@@ -1242,7 +1254,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	return runner, nil
 }
 
-// cleanupNetworkOnly releases network resources without touching overlay or repo cache.
+// cleanupNetworkOnly releases network resources without touching overlay or extension drives.
 func (m *Manager) cleanupNetworkOnly(runnerID, _ string) {
 	if m.netnsNetwork != nil {
 		m.netnsNetwork.ReleaseNamespace(runnerID)

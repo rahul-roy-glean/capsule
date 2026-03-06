@@ -101,5 +101,5 @@ class TestHttpClient:
     def test_delete_success(self, http: HttpClient) -> None:
         mock_resp = httpx.Response(204, text="")
         with patch.object(http._client, "request", return_value=mock_resp):
-            result = http.delete("/api/v1/snapshot-configs/wk1/tags/stable")
+            result = http.delete("/api/v1/layered-configs/wk1/tags/stable")
         assert result == {"_raw": ""}

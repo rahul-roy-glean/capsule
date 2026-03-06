@@ -19,7 +19,6 @@ import (
 
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
 	_ "github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy/providers" // register providers
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/ci"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
@@ -43,15 +42,7 @@ type Manager struct {
 	vms            map[string]*firecracker.VM
 	uffdHandlers   map[string]uffdStopper // layered UFFD handlers per runner (session resume)
 	snapshotCache  *snapshot.Cache
-	network        *network.NATNetwork
-	// credentialsImage is an ext4 image containing credentials (e.g. Buildbarn certs),
-	// attached read-only to each microVM for Bazel remote cache/execution TLS config.
-	credentialsImage string
-	// gitCacheImage is an ext4 image containing git repository mirrors, attached
-	// read-only to each microVM for fast reference cloning.
-	gitCacheImage string
-	// ciAdapter provides CI system integration (runner registration, drain, etc.)
-	ciAdapter ci.Adapter
+	network *network.NATNetwork
 	// netnsNetwork manages per-VM network namespaces (nil if using legacy bridge mode).
 	// When set, each VM gets its own namespace with point-to-point veth routing
 	// instead of sharing the fcbr0 bridge.
@@ -122,7 +113,7 @@ type UnquarantineOptions struct {
 }
 
 // NewManager creates a new runner manager
-func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logger *logrus.Logger) (*Manager, error) {
+func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Manager, error) {
 	if logger == nil {
 		logger = logrus.New()
 	}
@@ -161,22 +152,6 @@ func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logge
 		}
 	}
 
-	credentialsImg, err := ensureCredentialsImage(cfg, logger.WithField("component", "runner-manager"))
-	if err != nil {
-		return nil, fmt.Errorf("failed to prepare credentials image: %w", err)
-	}
-
-	// Check if git-cache image exists (created by startup script)
-	gitCacheImg := ""
-	if cfg.Bazel.GitCacheEnabled && cfg.Bazel.GitCacheImagePath != "" {
-		if _, err := os.Stat(cfg.Bazel.GitCacheImagePath); err == nil {
-			gitCacheImg = cfg.Bazel.GitCacheImagePath
-			logger.WithField("git_cache_image", gitCacheImg).Info("Git-cache image found")
-		} else {
-			logger.WithField("git_cache_image", cfg.Bazel.GitCacheImagePath).Warn("Git-cache enabled but image not found")
-		}
-	}
-
 	m := &Manager{
 		config:           cfg,
 		runners:          make(map[string]*Runner),
@@ -185,9 +160,6 @@ func NewManager(ctx context.Context, cfg HostConfig, ciAdapter ci.Adapter, logge
 		uffdHandlers:     make(map[string]uffdStopper),
 		snapshotCache:    cache,
 		network:          natNet,
-		credentialsImage: credentialsImg,
-		gitCacheImage:    gitCacheImg,
-		ciAdapter:        ciAdapter,
 		slotToRunner:     make(map[int]string),
 		runnerToSlot:     make(map[string]int),
 		policyEnforcers:  make(map[string]*network.PolicyEnforcer),
@@ -327,7 +299,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 			poolKey = &RunnerKey{
 				SnapshotVersion: snapshotPaths.Version,
 				Platform:        "linux/amd64",
-				GitHubRepo:      req.Repo,
+				AffinityKey:     req.Repo,
 				Labels:          req.Labels,
 			}
 		}
@@ -455,22 +427,6 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	}
 	overlayDur := time.Since(overlayStart)
 
-	// Create per-runner writable repo cache layer image (upperdir/workdir lives here)
-	repoCacheStart := time.Now()
-	var repoCacheUpperPath string
-	if m.config.Bazel.RepoCacheUpperSizeGB > 0 {
-		repoCacheUpperPath = filepath.Join(m.config.WorkspaceDir, runnerID, "repo-cache-upper.img")
-		if err := os.MkdirAll(filepath.Dir(repoCacheUpperPath), 0755); err != nil {
-			m.cleanupRunner(runnerID, tap.Name, overlayPath, "")
-			return nil, fmt.Errorf("failed to create repo-cache-upper directory: %w", err)
-		}
-		if err := createExt4Image(repoCacheUpperPath, m.config.Bazel.RepoCacheUpperSizeGB, "BAZEL_REPO_UPPER"); err != nil {
-			m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
-			return nil, fmt.Errorf("failed to create repo-cache-upper image: %w", err)
-		}
-	}
-	repoCacheDur := time.Since(repoCacheStart)
-
 	// Create runner record.
 	// When using per-VM namespaces, InternalIP is set to the host-reachable
 	// veth IP (10.0.{slot}.2) so the host proxy can reach the VM's services.
@@ -488,14 +444,13 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		MAC:             tap.MAC,
 		SnapshotVersion: snapshotPaths.Version,
 		WorkloadKey:     req.WorkloadKey,
-		GitHubRepo:      req.Repo, // For pool key matching
+		PoolAffinityKey: req.Repo, // For pool key matching
 		Resources:       req.Resources,
 		CreatedAt:       time.Now(),
 		SocketPath:      filepath.Join(m.config.SocketDir, runnerID+".sock"),
 		LogPath:         filepath.Join(m.config.LogDir, runnerID+".log"),
 		MetricsPath:     filepath.Join(m.config.LogDir, runnerID+".metrics"),
 		RootfsOverlay:   overlayPath,
-		RepoCacheUpper:  repoCacheUpperPath,
 	}
 	if req.StartCommand != nil {
 		runner.ServicePort = req.StartCommand.Port
@@ -522,9 +477,6 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	extensionPaths := make(map[string]string)
 	for driveID, path := range snapshotPaths.ExtensionDriveImages {
 		extensionPaths[driveID] = path
-	}
-	if repoCacheUpperPath != "" {
-		extensionPaths["repo_cache_upper"] = repoCacheUpperPath
 	}
 	vmCfg := firecracker.VMConfig{
 		VMID:           runnerID,
@@ -558,7 +510,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	// Create VM instance
 	vm, err := firecracker.NewVM(vmCfg, m.logger.Logger)
 	if err != nil {
-		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+		m.cleanupRunner(runnerID, tap.Name, overlayPath)
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
@@ -618,11 +570,11 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 			// Recreate VM for cold boot
 			vm, err = firecracker.NewVM(vmCfg, m.logger.Logger)
 			if err != nil {
-				m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+				m.cleanupRunner(runnerID, tap.Name, overlayPath)
 				return nil, fmt.Errorf("failed to recreate VM for cold boot: %w", err)
 			}
 			if err := vm.Start(ctx); err != nil {
-				m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+				m.cleanupRunner(runnerID, tap.Name, overlayPath)
 				return nil, fmt.Errorf("failed to start VM (cold boot fallback): %w", err)
 			}
 		}
@@ -630,7 +582,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		// No snapshot available, cold boot
 		m.logger.WithField("runner_id", runnerID).Info("Starting runner (cold boot - no snapshot available)")
 		if err := vm.Start(ctx); err != nil {
-			m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+			m.cleanupRunner(runnerID, tap.Name, overlayPath)
 			return nil, fmt.Errorf("failed to start VM: %w", err)
 		}
 	}
@@ -639,7 +591,7 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 	mmdsData := m.buildMMDSData(ctx, runner, tap, req)
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
-		m.cleanupRunner(runnerID, tap.Name, overlayPath, repoCacheUpperPath)
+		m.cleanupRunner(runnerID, tap.Name, overlayPath)
 		return nil, fmt.Errorf("failed to set MMDS data: %w", err)
 	}
 
@@ -702,7 +654,6 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		"snapshot":          runner.SnapshotVersion,
 		"alloc_ms":          time.Since(allocStart).Milliseconds(),
 		"overlay_ms":        overlayDur.Milliseconds(),
-		"repo_cache_img_ms": repoCacheDur.Milliseconds(),
 	}).Info("Runner allocated successfully")
 
 	return runner, nil
@@ -719,7 +670,6 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 	data.Latest.Meta.Environment = m.config.Environment
 	data.Latest.Meta.JobID = req.RequestID
 	data.Latest.Meta.CurrentTime = time.Now().UTC().Format(time.RFC3339)
-	data.Latest.Buildbarn.CertsMountPath = m.config.Bazel.BuildbarnCertsMountPath
 	data.Latest.Network.IP = netCfg.IP
 	data.Latest.Network.Gateway = netCfg.Gateway
 	data.Latest.Network.Netmask = netCfg.Netmask
@@ -729,68 +679,8 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 	data.Latest.Job.Repo = req.Repo
 	data.Latest.Job.Branch = req.Branch
 	data.Latest.Job.Commit = req.Commit
-	data.Latest.Job.GitHubRunnerToken = req.GitHubRunnerToken
 	data.Latest.Job.Labels = req.Labels
 	data.Latest.Snapshot.Version = runner.SnapshotVersion
-
-	// Get CI runner token if adapter is configured and no token in request
-	if m.ciAdapter != nil && req.GitHubRunnerToken == "" {
-		token, err := m.ciAdapter.GetRunnerToken(ctx, ci.RunnerTokenOpts{})
-		if err != nil {
-			m.logger.WithError(err).Warn("Failed to get CI runner registration token")
-		} else if token != "" {
-			data.Latest.Job.GitHubRunnerToken = token
-			runnerURL := m.ciAdapter.RunnerURL()
-			if runnerURL != "" {
-				data.Latest.Job.Repo = runnerURL
-			}
-			if len(m.config.CI.GitHubRunnerLabels) > 0 {
-				labels := make(map[string]string)
-				for _, label := range m.config.CI.GitHubRunnerLabels {
-					labels[label] = "true"
-				}
-				data.Latest.Job.Labels = labels
-			}
-			m.logger.WithField("runner_id", runner.ID).Info("Got CI runner registration token")
-		}
-	}
-
-	// Git cache configuration
-	if m.config.Bazel.GitCacheEnabled && m.gitCacheImage != "" {
-		data.Latest.GitCache.Enabled = true
-		data.Latest.GitCache.MountPath = m.config.Bazel.GitCacheMountPath
-		data.Latest.GitCache.RepoMappings = m.config.Bazel.GitCacheRepoMappings
-
-		// Ensure Job.Repo is set for git-cache workspace setup
-		// This is needed even if GitHub runner registration fails
-		if data.Latest.Job.Repo == "" && m.config.CI.GitHubRepo != "" {
-			data.Latest.Job.Repo = m.config.CI.GitHubRepo
-		}
-
-		// Set pre-cloned path (where repo was cloned during warmup, baked into snapshot)
-		// This allows thaw-agent to create symlinks from workspace to pre-cloned repo
-		if m.config.Bazel.GitCachePreClonedPath != "" {
-			data.Latest.GitCache.PreClonedPath = m.config.Bazel.GitCachePreClonedPath
-		}
-		// Note: if PreClonedPath is not set, thaw-agent will derive it from job.repo
-	}
-
-	// Always set WorkspaceDir - needed for pre-cloned repo symlink even without git-cache
-	if m.config.Bazel.GitCacheWorkspaceDir != "" {
-		data.Latest.GitCache.WorkspaceDir = m.config.Bazel.GitCacheWorkspaceDir
-	}
-
-	// Runner configuration
-	data.Latest.Runner.Ephemeral = m.config.CI.GitHubRunnerEphemeral
-	if m.ciAdapter != nil {
-		data.Latest.Runner.CISystem = m.ciAdapter.Name()
-	}
-
-	// Set exec mode when explicitly requested via ci_system=none
-	if req.CISystem == "none" {
-		data.Latest.Meta.Mode = "exec"
-		data.Latest.Runner.CISystem = "none"
-	}
 
 	// Populate start_command for user service startup
 	if req.StartCommand != nil {
@@ -855,12 +745,9 @@ func (m *Manager) ReleaseRunner(runnerID string, destroy bool) error {
 		if runner.RootfsOverlay != "" {
 			os.Remove(runner.RootfsOverlay)
 		}
-		if runner.RepoCacheUpper != "" {
-			os.Remove(runner.RepoCacheUpper)
-		}
 		os.Remove(filepath.Join(m.config.SocketDir, runnerID+".sock"))
 	} else {
-		m.cleanupRunner(runnerID, runner.TapDevice, runner.RootfsOverlay, runner.RepoCacheUpper)
+		m.cleanupRunner(runnerID, runner.TapDevice, runner.RootfsOverlay)
 	}
 
 	// Clean up session snapshot files if this runner had a session
@@ -888,7 +775,6 @@ type quarantineManifest struct {
 	LogPath              string    `json:"log_path"`
 	MetricsPath          string    `json:"metrics_path"`
 	RootfsOverlay        string    `json:"rootfs_overlay"`
-	RepoCacheUpper       string    `json:"repo_cache_upper"`
 	SnapshotVersion      string    `json:"snapshot_version"`
 	BlockEgressRequested bool      `json:"block_egress_requested"`
 	PauseVMRequested     bool      `json:"pause_vm_requested"`
@@ -932,7 +818,6 @@ func (m *Manager) QuarantineRunner(ctx context.Context, runnerID string, opts Qu
 	logPath := r.LogPath
 	metricsPath := r.MetricsPath
 	rootfsOverlay := r.RootfsOverlay
-	repoCacheUpper := r.RepoCacheUpper
 	snapshotVersion := r.SnapshotVersion
 	m.mu.Unlock()
 
@@ -943,7 +828,6 @@ func (m *Manager) QuarantineRunner(ctx context.Context, runnerID string, opts Qu
 	_ = os.Symlink(logPath, filepath.Join(quarantineDir, "runner.log"))
 	_ = os.Symlink(metricsPath, filepath.Join(quarantineDir, "runner.metrics"))
 	_ = os.Symlink(rootfsOverlay, filepath.Join(quarantineDir, "rootfs-overlay.img"))
-	_ = os.Symlink(repoCacheUpper, filepath.Join(quarantineDir, "repo-cache-upper.img"))
 
 	var errs []error
 	egressBlocked := false
@@ -986,7 +870,6 @@ func (m *Manager) QuarantineRunner(ctx context.Context, runnerID string, opts Qu
 		LogPath:              logPath,
 		MetricsPath:          metricsPath,
 		RootfsOverlay:        rootfsOverlay,
-		RepoCacheUpper:       repoCacheUpper,
 		SnapshotVersion:      snapshotVersion,
 		BlockEgressRequested: blockEgress,
 		PauseVMRequested:     pauseVM,
@@ -1288,7 +1171,7 @@ func errorsToStrings(errs []error) []string {
 }
 
 // cleanupRunner cleans up runner resources
-func (m *Manager) cleanupRunner(runnerID, tapDevice, overlayPath, repoCacheUpperPath string) {
+func (m *Manager) cleanupRunner(runnerID, tapDevice, overlayPath string) {
 	if m.netnsNetwork != nil {
 		// Per-VM namespace mode: release the entire namespace
 		m.netnsNetwork.ReleaseNamespace(runnerID)
@@ -1311,11 +1194,6 @@ func (m *Manager) cleanupRunner(runnerID, tapDevice, overlayPath, repoCacheUpper
 		os.Remove(overlayPath)
 	}
 
-	// Remove repo cache upper image
-	if repoCacheUpperPath != "" {
-		os.Remove(repoCacheUpperPath)
-	}
-
 	// Remove socket
 	socketPath := filepath.Join(m.config.SocketDir, runnerID+".sock")
 	os.Remove(socketPath)
@@ -1336,16 +1214,9 @@ func (m *Manager) findAvailableSlot() int {
 // extensionDrivePaths maps driveID to host path for extension drives.
 // The credentials drive is always included.
 func (m *Manager) buildDrives(extensionDrivePaths map[string]string) []firecracker.Drive {
-	drives := []firecracker.Drive{
-		{
-			DriveID:      "credentials",
-			PathOnHost:   m.credentialsImage,
-			IsRootDevice: false,
-			IsReadOnly:   true,
-		},
-	}
+	var drives []firecracker.Drive
 
-	// Append extension drives in deterministic order (sorted by driveID).
+	// All drives come from extensionDrivePaths in deterministic order (sorted by driveID).
 	driveIDs := make([]string, 0, len(extensionDrivePaths))
 	for id := range extensionDrivePaths {
 		driveIDs = append(driveIDs, id)
@@ -1396,7 +1267,6 @@ func (m *Manager) setupSnapshotSymlinks(overlayPath string, extensionDrivePaths 
 		target string // actual path on host
 	}{
 		{"rootfs.img", overlayPath},
-		{"credentials.img", m.credentialsImage},
 	}
 	// Add extension drives by driveID. The snapshot-builder bakes in paths using
 	// driveID+".img" (e.g. "bazel_output.img"), so we must match that exactly.
@@ -1498,108 +1368,6 @@ func (m *Manager) setupSnapshotTAPRename(currentTAP string) (func(), error) {
 	}
 
 	return restore, nil
-}
-
-func createExt4Image(path string, sizeGB int, label string) error {
-	if sizeGB <= 0 {
-		return fmt.Errorf("invalid sizeGB: %d", sizeGB)
-	}
-	if err := exec.Command("truncate", "-s", fmt.Sprintf("%dG", sizeGB), path).Run(); err != nil {
-		return fmt.Errorf("truncate failed: %w", err)
-	}
-	if output, err := exec.Command("mkfs.ext4", "-F", "-L", label, "-E", "lazy_itable_init=1,lazy_journal_init=1", path).CombinedOutput(); err != nil {
-		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(output), err)
-	}
-	return nil
-}
-
-func ensureCredentialsImage(cfg HostConfig, log *logrus.Entry) (string, error) {
-	sharedDir := filepath.Join(cfg.WorkspaceDir, "_shared")
-	if err := os.MkdirAll(sharedDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create shared dir: %w", err)
-	}
-
-	imgPath := filepath.Join(sharedDir, "credentials.img")
-	sizeMB := cfg.Bazel.BuildbarnCertsImageSizeMB
-	if sizeMB <= 0 {
-		sizeMB = 32
-	}
-
-	seedDir := cfg.Bazel.BuildbarnCertsDir
-	if seedDir == "" {
-		if _, err := os.Stat(imgPath); err == nil {
-			return imgPath, nil
-		}
-		if err := createExt4ImageMB(imgPath, sizeMB, "CREDENTIALS"); err != nil {
-			return "", err
-		}
-		_ = os.Chmod(imgPath, 0600)
-		return imgPath, nil
-	}
-
-	if err := createExt4ImageMB(imgPath, sizeMB, "CREDENTIALS"); err != nil {
-		return "", err
-	}
-	if err := seedExt4ImageFromDir(imgPath, seedDir); err != nil {
-		if log != nil {
-			log.WithError(err).WithFields(logrus.Fields{
-				"seed_dir": seedDir,
-				"image":    imgPath,
-			}).Warn("Failed to seed credentials image; continuing with empty image")
-		}
-	}
-	_ = os.Chmod(imgPath, 0600)
-	return imgPath, nil
-}
-
-func createExt4ImageMB(path string, sizeMB int, label string) error {
-	if sizeMB <= 0 {
-		return fmt.Errorf("invalid sizeMB: %d", sizeMB)
-	}
-	if err := exec.Command("truncate", "-s", fmt.Sprintf("%dM", sizeMB), path).Run(); err != nil {
-		return fmt.Errorf("truncate failed: %w", err)
-	}
-	if output, err := exec.Command("mkfs.ext4", "-F", "-L", label, "-E", "lazy_itable_init=1,lazy_journal_init=1", path).CombinedOutput(); err != nil {
-		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(output), err)
-	}
-	return nil
-}
-
-func seedExt4ImageFromDir(imgPath, seedDir string) error {
-	info, err := os.Stat(seedDir)
-	if err != nil {
-		return fmt.Errorf("seed dir stat failed: %w", err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("seed dir is not a directory: %s", seedDir)
-	}
-
-	mountPoint := filepath.Join(filepath.Dir(imgPath), "mnt-buildbarn-certs")
-	if err := os.MkdirAll(mountPoint, 0755); err != nil {
-		return fmt.Errorf("failed to create mount point: %w", err)
-	}
-	defer os.RemoveAll(mountPoint)
-
-	if output, err := exec.Command("mount", "-o", "loop", imgPath, mountPoint).CombinedOutput(); err != nil {
-		return fmt.Errorf("mount loop failed: %s: %w", string(output), err)
-	}
-	defer func() {
-		_ = exec.Command("umount", mountPoint).Run()
-	}()
-
-	if _, err := exec.LookPath("rsync"); err == nil {
-		cmd := exec.Command("rsync", "-a", "--delete", seedDir+string(os.PathSeparator), mountPoint+string(os.PathSeparator))
-		if output, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("rsync failed: %s: %w", string(output), err)
-		}
-		return nil
-	}
-
-	cmd := exec.Command("cp", "-a", seedDir+string(os.PathSeparator)+".", mountPoint+string(os.PathSeparator))
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("cp -a failed: %s: %w", string(output), err)
-	}
-	return nil
 }
 
 // GetRunner returns a runner by ID
@@ -1809,36 +1577,6 @@ func (m *Manager) PauseSessionRunners(ctx context.Context) (int, error) {
 	return paused, nil
 }
 
-// RemoveRunnerLabels removes custom labels from all runners on this host.
-// This is called when entering drain mode to prevent the CI system from scheduling new jobs.
-func (m *Manager) RemoveRunnerLabels(ctx context.Context) (int, error) {
-	if m.ciAdapter == nil {
-		m.logger.Debug("CI adapter not configured, skipping label removal")
-		return 0, nil
-	}
-
-	m.mu.RLock()
-	var runners []ci.RunnerInfo
-	for _, r := range m.runners {
-		runners = append(runners, ci.RunnerInfo{
-			ID:   r.ID,
-			Name: r.ID,
-			Repo: r.GitHubRepo,
-		})
-	}
-	m.mu.RUnlock()
-
-	if len(runners) == 0 {
-		return 0, nil
-	}
-
-	m.logger.WithField("runner_count", len(runners)).Info("Draining runners via CI adapter")
-	if err := m.ciAdapter.OnDrain(ctx, runners); err != nil {
-		return 0, err
-	}
-	return len(runners), nil
-}
-
 // Close shuts down the manager and all runners
 func (m *Manager) Close() error {
 	m.mu.Lock()
@@ -1859,11 +1597,6 @@ func (m *Manager) Close() error {
 	for id, vm := range m.vms {
 		m.logger.WithField("runner_id", id).Debug("Stopping VM")
 		vm.Stop()
-	}
-
-	// Close CI adapter
-	if m.ciAdapter != nil {
-		m.ciAdapter.Close()
 	}
 
 	// Cleanup network
@@ -1970,8 +1703,8 @@ func (m *Manager) getRunnerVMStats(ctx context.Context, runnerID string) (*VMSta
 	// Estimate memory usage from config
 	memoryUsage := int64(runner.Resources.MemoryMB) * 1024 * 1024
 
-	// Disk usage would be the overlay size, but for now just estimate
-	diskUsage := int64(m.config.Bazel.RepoCacheUpperSizeGB) * 1024 * 1024 * 1024
+	// Disk usage: estimate from runner disk allocation
+	diskUsage := int64(runner.Resources.DiskGB) * 1024 * 1024 * 1024
 
 	return &VMStats{
 		MemoryUsageBytes: memoryUsage,
@@ -2084,7 +1817,7 @@ func (m *Manager) ReleaseRunnerWithOptions(ctx context.Context, runnerID string,
 			key: &RunnerKey{
 				SnapshotVersion: runner.SnapshotVersion,
 				Platform:        "linux/amd64",
-				GitHubRepo:      runner.GitHubRepo,
+				AffinityKey:     runner.PoolAffinityKey,
 			},
 		}
 

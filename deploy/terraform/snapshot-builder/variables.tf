@@ -61,12 +61,6 @@ variable "repo_branch" {
   default     = "main"
 }
 
-variable "bazel_version" {
-  description = "Bazel version for snapshot warmup"
-  type        = string
-  default     = "8.5.1"
-}
-
 variable "fetch_targets" {
   description = "Bazel fetch target pattern"
   type        = string

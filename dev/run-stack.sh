@@ -118,7 +118,6 @@ MGR_CMD="$REPO_ROOT/bin/firecracker-manager \
   --http-port=9080 \
   --grpc-port=50052 \
   --use-netns \
-  --ci-system=none \
   --snapshot-cache=$SNAPSHOT_DIR \
   --socket-dir=/tmp/fc-dev/sockets \
   --workspace-dir=/tmp/fc-dev/workspaces \

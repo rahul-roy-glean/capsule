@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
+	cigithub "github.com/rahul-roy-glean/bazel-firecracker/pkg/ci/github"
 	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/tiers"
 )
@@ -51,6 +53,9 @@ var (
 	mcpPort      = flag.Int("mcp-port", 0, "MCP server port (0 = disabled)")
 	mcpAuthToken = flag.String("mcp-auth-token", "", "Bearer token for MCP authentication (or MCP_AUTH_TOKEN env var)")
 )
+
+//go:embed schema.sql
+var schemaSQL string
 
 func main() {
 	flag.Parse()
@@ -179,8 +184,23 @@ func main() {
 	jobQueue.SetConfigCache(configCache)
 	layeredConfigRegistry := NewLayeredConfigRegistry(db, snapshotManager, logger)
 	layeredConfigRegistry.SetConfigCache(configCache)
+	layeredConfigRegistry.tagRegistry = tagRegistry
 	layerBuildScheduler := NewLayerBuildScheduler(db, snapshotManager, logger, 4)
 	layeredConfigRegistry.SetLayerBuilder(layerBuildScheduler)
+
+	// Wire CI webhook adapter for GitHub Actions webhook routing.
+	// The webhook-only adapter does not require GitHub App credentials.
+	var webhookAdapter *cigithub.Adapter
+	ciSystemEnv := os.Getenv("CI_SYSTEM")
+	if ciSystemEnv == "" || ciSystemEnv == "github-actions" {
+		webhookAdapter = cigithub.NewWebhookAdapter(logger)
+		webhookAdapter.SetWebhookDeps(cigithub.WebhookDeps{
+			JobQueue:       jobQueue,
+			RunnerReleaser: scheduler,
+			RunnerLookup:   &jobQueueRunnerLookup{hr: hostRegistry},
+			Logger:         logger,
+		})
+	}
 
 	// Load existing state from DB (best-effort)
 	if err := hostRegistry.LoadFromDB(ctx); err != nil {
@@ -248,10 +268,11 @@ func main() {
 	httpMux.HandleFunc("/api/v1/versions/fleet", controlPlaneServer.HandleGetFleetConvergence)
 	// Canary report endpoint (Phase 6)
 	httpMux.HandleFunc("/api/v1/canary/report", controlPlaneServer.HandleCanaryReport)
-	// Register webhook handler conditionally based on CI system config
-	ciSystemEnv := os.Getenv("CI_SYSTEM")
-	if ciSystemEnv == "" || ciSystemEnv == "github-actions" {
-		httpMux.HandleFunc("/webhook/github", controlPlaneServer.HandleGitHubWebhook)
+	// Register webhook handler via CI adapter (replaces hardcoded CI_SYSTEM check)
+	if webhookAdapter != nil {
+		if h := webhookAdapter.WebhookHandler(); h != nil {
+			httpMux.Handle(webhookAdapter.WebhookPath(), h)
+		}
 	}
 
 	httpServer := &http.Server{
@@ -381,310 +402,11 @@ func apiLoggingMiddleware(logger *logrus.Logger, next http.Handler) http.Handler
 }
 
 func initSchema(db *sql.DB) error {
-	schema := `
-	CREATE TABLE IF NOT EXISTS hosts (
-		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-		instance_name VARCHAR(255) NOT NULL,
-		zone VARCHAR(50) NOT NULL,
-		status VARCHAR(20) NOT NULL DEFAULT 'starting',
-		idle_runners INT NOT NULL DEFAULT 0,
-		busy_runners INT NOT NULL DEFAULT 0,
-		snapshot_version VARCHAR(50),
-		snapshot_synced_at TIMESTAMP,
-		last_heartbeat TIMESTAMP,
-		grpc_address VARCHAR(255),
-		http_address VARCHAR(255),
-		created_at TIMESTAMP DEFAULT NOW(),
-		UNIQUE(instance_name)
-	);
-
-	CREATE TABLE IF NOT EXISTS runners (
-		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-		host_id UUID REFERENCES hosts(id),
-		status VARCHAR(20) NOT NULL DEFAULT 'initializing',
-		internal_ip VARCHAR(15),
-		github_runner_id VARCHAR(255),
-		job_id VARCHAR(255),
-		created_at TIMESTAMP DEFAULT NOW(),
-		started_at TIMESTAMP,
-		completed_at TIMESTAMP
-	);
-
-	CREATE TABLE IF NOT EXISTS snapshots (
-		version VARCHAR(50) PRIMARY KEY,
-		status VARCHAR(20) NOT NULL DEFAULT 'building',
-		gcs_path VARCHAR(255),
-		bazel_version VARCHAR(20),
-		repo_commit VARCHAR(40),
-		size_bytes BIGINT,
-		created_at TIMESTAMP DEFAULT NOW(),
-		metrics JSONB
-	);
-
-	CREATE TABLE IF NOT EXISTS jobs (
-		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-		github_workflow_run_id BIGINT,
-		github_job_id BIGINT,
-		repo VARCHAR(255),
-		branch VARCHAR(255),
-		commit_sha VARCHAR(40),
-		status VARCHAR(20) NOT NULL DEFAULT 'queued',
-		runner_id UUID REFERENCES runners(id),
-		labels JSONB,
-		queued_at TIMESTAMP DEFAULT NOW(),
-		started_at TIMESTAMP,
-		completed_at TIMESTAMP
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_hosts_status ON hosts(status);
-	CREATE INDEX IF NOT EXISTS idx_runners_status ON runners(status);
-	CREATE INDEX IF NOT EXISTS idx_runners_host_id ON runners(host_id);
-	CREATE INDEX IF NOT EXISTS idx_snapshots_status ON snapshots(status);
-	CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-	`
-
-	if _, err := db.Exec(schema); err != nil {
-		return err
+	if _, err := db.Exec(schemaSQL); err != nil {
+		return fmt.Errorf("schema exec: %w", err)
 	}
 
-	// Backwards-compatible migrations (no-ops if already applied)
-	migrations := []string{
-		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS idle_runners INT NOT NULL DEFAULT 0`,
-		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS busy_runners INT NOT NULL DEFAULT 0`,
-		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS http_address VARCHAR(255)`,
-		// Phase 1: Multi-repo support
-		`ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS repo VARCHAR(255) DEFAULT ''`,
-		`ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS repo_slug VARCHAR(255) DEFAULT ''`,
-		`CREATE INDEX IF NOT EXISTS idx_snapshots_repo_slug ON snapshots(repo_slug)`,
-		// Repos table
-		`CREATE TABLE IF NOT EXISTS repos (
-			slug VARCHAR(255) PRIMARY KEY,
-			url VARCHAR(512) NOT NULL,
-			branch VARCHAR(255) DEFAULT 'main',
-			bazel_version VARCHAR(32) DEFAULT '',
-			warmup_targets VARCHAR(1024) DEFAULT '//...',
-			build_schedule VARCHAR(64) DEFAULT '',
-			max_concurrent_runners INT DEFAULT 0,
-			current_version VARCHAR(255),
-			auto_rollout BOOLEAN DEFAULT true,
-			created_at TIMESTAMP DEFAULT NOW()
-		)`,
-		// Version assignments table
-		`CREATE TABLE IF NOT EXISTS version_assignments (
-			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-			repo_slug VARCHAR(255) NOT NULL,
-			host_id UUID REFERENCES hosts(id),
-			version VARCHAR(255) NOT NULL,
-			status VARCHAR(32) DEFAULT 'assigned',
-			assigned_at TIMESTAMP DEFAULT NOW(),
-			synced_at TIMESTAMP,
-			UNIQUE(repo_slug, host_id)
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_version_assignments_repo ON version_assignments(repo_slug)`,
-		`CREATE INDEX IF NOT EXISTS idx_version_assignments_host ON version_assignments(host_id)`,
-		// Rename chunk_key -> workload_key in existing tables (idempotent: no-op if column doesn't exist or target already exists)
-		`DO $$ BEGIN ALTER TABLE snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
-		`DO $$ BEGIN ALTER TABLE version_assignments RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
-		`DO $$ BEGIN ALTER TABLE session_snapshots RENAME COLUMN chunk_key TO workload_key; EXCEPTION WHEN undefined_column THEN NULL; WHEN duplicate_column THEN NULL; WHEN others THEN NULL; END $$`,
-		// Add workload_key column to snapshots (for fresh installs without chunk_key)
-		`ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) DEFAULT ''`,
-		`CREATE INDEX IF NOT EXISTS idx_snapshots_workload_key ON snapshots(workload_key)`,
-		// Add workload_key column to version_assignments
-		`ALTER TABLE version_assignments ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) NOT NULL DEFAULT ''`,
-		`CREATE INDEX IF NOT EXISTS idx_version_assignments_workload ON version_assignments(workload_key)`,
-		// Session snapshots tracking for pause/resume
-		`CREATE TABLE IF NOT EXISTS session_snapshots (
-			session_id    TEXT PRIMARY KEY,
-			runner_id     TEXT NOT NULL,
-			workload_key     VARCHAR(16) NOT NULL,
-			host_id       UUID REFERENCES hosts(id),
-			status        VARCHAR(20) NOT NULL DEFAULT 'active',
-			layer_count   INT DEFAULT 0,
-			total_size_bytes BIGINT DEFAULT 0,
-			metadata      JSONB,
-			created_at    TIMESTAMP DEFAULT NOW(),
-			paused_at     TIMESTAMP,
-			expires_at    TIMESTAMP
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_session_workload ON session_snapshots(workload_key)`,
-		`CREATE INDEX IF NOT EXISTS idx_session_host ON session_snapshots(host_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_session_status ON session_snapshots(status)`,
-		// runner_id lookups on session_snapshots (HandleRunnerStatus, HandleConnectRunner)
-		`CREATE INDEX IF NOT EXISTS idx_session_runner ON session_snapshots(runner_id)`,
-		// Expiry cleanup: scan suspended sessions past their TTL
-		`CREATE INDEX IF NOT EXISTS idx_session_expires ON session_snapshots(status, expires_at) WHERE status = 'suspended'`,
-		// Drop legacy repo index and columns (workload_key replaced repo-based routing)
-		`DROP INDEX IF EXISTS idx_runners_repo_status`,
-		// jobs: queue drain (WHERE status='queued' ORDER BY queued_at)
-		`CREATE INDEX IF NOT EXISTS idx_jobs_queued ON jobs(status, queued_at) WHERE status = 'queued'`,
-		// jobs: completion by github_job_id
-		`CREATE INDEX IF NOT EXISTS idx_jobs_github_job_id ON jobs(github_job_id)`,
-		// snapshots: workload_key + status + created_at for version lookups
-		`CREATE INDEX IF NOT EXISTS idx_snapshots_workload_status ON snapshots(workload_key, status, created_at DESC)`,
-		// version_assignments: compound for subquery in GetFleetConvergence
-		`CREATE INDEX IF NOT EXISTS idx_version_assignments_workload_host ON version_assignments(workload_key, host_id)`,
-		// Add workload_key column to runners
-		`ALTER TABLE runners ADD COLUMN IF NOT EXISTS workload_key VARCHAR(16) DEFAULT ''`,
-		`CREATE INDEX IF NOT EXISTS idx_runners_workload_key ON runners(workload_key)`,
-		// Host resource tracking for bin-packing scheduler
-		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS total_cpu_millicores INT DEFAULT 0`,
-		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS used_cpu_millicores INT DEFAULT 0`,
-		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS total_memory_mb INT DEFAULT 0`,
-		`ALTER TABLE hosts ADD COLUMN IF NOT EXISTS used_memory_mb INT DEFAULT 0`,
-		// Drop host_summary view that depends on total_slots/used_slots before dropping the columns
-		`DROP VIEW IF EXISTS host_summary`,
-		`ALTER TABLE hosts DROP COLUMN IF EXISTS total_slots`,
-		`ALTER TABLE hosts DROP COLUMN IF EXISTS used_slots`,
-		// Recreate host_summary view without slot columns
-		`CREATE OR REPLACE VIEW host_summary AS
-		 SELECT
-		     COUNT(*) as total_hosts,
-		     COUNT(*) FILTER (WHERE status = 'ready') as ready_hosts,
-		     COUNT(*) FILTER (WHERE status = 'draining') as draining_hosts,
-		     COUNT(*) FILTER (WHERE status = 'unhealthy') as unhealthy_hosts,
-		     SUM(idle_runners) as idle_runners,
-		     SUM(busy_runners) as busy_runners
-		 FROM hosts
-		 WHERE last_heartbeat > NOW() - INTERVAL '2 minutes'`,
-		// Drop unused repo/branch columns from runners
-		`ALTER TABLE runners DROP COLUMN IF EXISTS repo`,
-		`ALTER TABLE runners DROP COLUMN IF EXISTS branch`,
-		// Layered snapshot pipeline tables
-		`CREATE TABLE IF NOT EXISTS snapshot_layers (
-			layer_hash           VARCHAR(64) PRIMARY KEY,
-			parent_layer_hash    VARCHAR(64) REFERENCES snapshot_layers(layer_hash),
-			config_name          VARCHAR(255) NOT NULL,
-			depth                INT NOT NULL DEFAULT 0,
-			init_commands        JSONB NOT NULL DEFAULT '[]',
-			refresh_commands     JSONB DEFAULT '[]',
-			drives               JSONB DEFAULT '[]',
-			refresh_interval     VARCHAR(64) DEFAULT '',
-			current_version      VARCHAR(255),
-			status               VARCHAR(32) DEFAULT 'pending',
-			created_at           TIMESTAMP DEFAULT NOW(),
-			updated_at           TIMESTAMP DEFAULT NOW()
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_layers_parent ON snapshot_layers(parent_layer_hash)`,
-		`CREATE INDEX IF NOT EXISTS idx_layers_status ON snapshot_layers(status)`,
-		`CREATE TABLE IF NOT EXISTS snapshot_builds (
-			build_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-			layer_hash        VARCHAR(64) NOT NULL REFERENCES snapshot_layers(layer_hash),
-			version           VARCHAR(255) NOT NULL,
-			status            VARCHAR(32) DEFAULT 'queued',
-			build_type        VARCHAR(16) DEFAULT 'init',
-			instance_name     VARCHAR(255),
-			parent_version    VARCHAR(255),
-			started_at        TIMESTAMP,
-			completed_at      TIMESTAMP,
-			failure_reason    TEXT,
-			retry_count       INT DEFAULT 0,
-			max_retries       INT DEFAULT 3,
-			created_at        TIMESTAMP DEFAULT NOW(),
-			UNIQUE(layer_hash, version)
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_builds_status ON snapshot_builds(status, created_at)`,
-		`CREATE INDEX IF NOT EXISTS idx_builds_layer ON snapshot_builds(layer_hash)`,
-		`CREATE TABLE IF NOT EXISTS layered_configs (
-			config_id              VARCHAR(64) PRIMARY KEY,
-			display_name           VARCHAR(255) NOT NULL,
-			config_json            TEXT NOT NULL,
-			leaf_layer_hash        VARCHAR(64),
-			leaf_workload_key      VARCHAR(16),
-			tier                   VARCHAR(8) DEFAULT 'm',
-			ci_system              VARCHAR(64) DEFAULT '',
-			github_app_id          VARCHAR(255) DEFAULT '',
-			github_app_secret      VARCHAR(255) DEFAULT '',
-			start_command          TEXT DEFAULT '',
-			runner_ttl_seconds     INT DEFAULT 0,
-			session_max_age_seconds INT DEFAULT 86400,
-			auto_pause             BOOLEAN DEFAULT false,
-			auto_rollout           BOOLEAN DEFAULT true,
-			max_concurrent_runners INT DEFAULT 0,
-			build_schedule         VARCHAR(64) DEFAULT '',
-			created_at             TIMESTAMP DEFAULT NOW(),
-			updated_at             TIMESTAMP DEFAULT NOW()
-		)`,
-		// Indexes for layered_configs lookups
-		`CREATE INDEX IF NOT EXISTS idx_layered_configs_leaf_wk ON layered_configs(leaf_workload_key)`,
-		`CREATE INDEX IF NOT EXISTS idx_layered_configs_leaf_hash ON layered_configs(leaf_layer_hash)`,
-		// Network policy columns on layered_configs
-		`ALTER TABLE layered_configs ADD COLUMN IF NOT EXISTS network_policy JSONB DEFAULT NULL`,
-		`ALTER TABLE layered_configs ADD COLUMN IF NOT EXISTS network_policy_preset VARCHAR(64) DEFAULT ''`,
-		// Mapping table: repo → workload_key for CI webhook routing.
-		// This is a CI integration concern, not part of the core config model.
-		`CREATE TABLE IF NOT EXISTS repo_workload_mappings (
-			repo          VARCHAR(512) PRIMARY KEY,
-			workload_key  VARCHAR(16) NOT NULL,
-			source        VARCHAR(32) DEFAULT 'auto',
-			created_at    TIMESTAMP DEFAULT NOW()
-		)`,
-		// Reattach build support: track old layer hash/version for drive reuse
-		`ALTER TABLE snapshot_builds ADD COLUMN IF NOT EXISTS old_layer_hash VARCHAR(64)`,
-		`ALTER TABLE snapshot_builds ADD COLUMN IF NOT EXISTS old_layer_version VARCHAR(255)`,
-		// config_id links a build to the owning layered_configs row for tier/credential lookups
-		`ALTER TABLE snapshot_builds ADD COLUMN IF NOT EXISTS config_id VARCHAR(64)`,
-		// All-chain drives: union of drives across all layers in a config
-		`ALTER TABLE snapshot_layers ADD COLUMN IF NOT EXISTS all_chain_drives JSONB DEFAULT '[]'`,
-		// Re-activate layers that are referenced by a config but were incorrectly deactivated.
-		`UPDATE snapshot_layers SET status='active' WHERE status='inactive'
-			AND layer_hash IN (
-				WITH RECURSIVE config_layers AS (
-					SELECT sl.layer_hash, sl.parent_layer_hash
-					FROM snapshot_layers sl
-					JOIN layered_configs lc ON lc.leaf_layer_hash = sl.layer_hash
-					UNION ALL
-					SELECT sl.layer_hash, sl.parent_layer_hash
-					FROM snapshot_layers sl
-					JOIN config_layers cl ON cl.parent_layer_hash = sl.layer_hash
-				)
-				SELECT layer_hash FROM config_layers
-			)`,
-		// Deactivate orphaned layers not referenced by any config and cancel their active builds.
-		// Walk the parent chain from each config's leaf_layer_hash to find all referenced layers.
-		`UPDATE snapshot_layers SET status='inactive' WHERE status IN ('active', 'pending')
-			AND layer_hash NOT IN (
-				WITH RECURSIVE config_layers AS (
-					SELECT sl.layer_hash, sl.parent_layer_hash
-					FROM snapshot_layers sl
-					JOIN layered_configs lc ON lc.leaf_layer_hash = sl.layer_hash
-					UNION ALL
-					SELECT sl.layer_hash, sl.parent_layer_hash
-					FROM snapshot_layers sl
-					JOIN config_layers cl ON cl.parent_layer_hash = sl.layer_hash
-				)
-				SELECT layer_hash FROM config_layers
-			)`,
-		`UPDATE snapshot_builds SET status='cancelled' WHERE status IN ('queued','waiting_parent','running')
-			AND layer_hash IN (SELECT layer_hash FROM snapshot_layers WHERE status='inactive')`,
-		// Snapshot tags for template versioning (WS6)
-		`CREATE TABLE IF NOT EXISTS snapshot_tags (
-			tag           VARCHAR(64) NOT NULL,
-			workload_key  VARCHAR(16) NOT NULL,
-			version       VARCHAR(255) NOT NULL,
-			description   TEXT DEFAULT '',
-			created_at    TIMESTAMP DEFAULT NOW(),
-			PRIMARY KEY (tag, workload_key)
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_snapshot_tags_workload ON snapshot_tags(workload_key)`,
-		// Denormalize config_id into snapshot_builds for efficient query joins
-		`ALTER TABLE snapshot_builds ADD COLUMN IF NOT EXISTS config_id VARCHAR(64) DEFAULT ''`,
-		// Prevent duplicate active builds per layer
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_builds_one_active_per_layer
-			ON snapshot_builds (layer_hash) WHERE status IN ('queued', 'waiting_parent', 'running')`,
-	}
-	logger := logrus.WithField("component", "migrations")
-	for i, stmt := range migrations {
-		result, err := db.Exec(stmt)
-		if err != nil {
-			return err
-		}
-		if n, _ := result.RowsAffected(); n > 0 {
-			logger.WithFields(logrus.Fields{
-				"migration": i,
-				"rows":      n,
-			}).Info("Migration applied")
-		}
-	}
+	logger := logrus.WithField("component", "schema")
 
 	// Log layer statuses for debugging
 	rows, err := db.Query(`SELECT layer_hash, config_name, status FROM snapshot_layers ORDER BY config_name`)
@@ -791,21 +513,6 @@ func (s *ControlPlaneServer) GetSnapshot(ctx context.Context, req *pb.GetSnapsho
 	return s.snapshotManager.SnapshotToProto(snapshot), nil
 }
 
-// TriggerSnapshotBuild implements the gRPC TriggerSnapshotBuild method
-func (s *ControlPlaneServer) TriggerSnapshotBuild(ctx context.Context, req *pb.TriggerSnapshotBuildRequest) (*pb.TriggerSnapshotBuildResponse, error) {
-	buildID, err := s.snapshotManager.TriggerBuild(ctx, req.Repo, req.Branch, req.BazelVersion)
-	if err != nil {
-		return &pb.TriggerSnapshotBuildResponse{
-			Status: "error: " + err.Error(),
-		}, nil
-	}
-
-	return &pb.TriggerSnapshotBuildResponse{
-		BuildId: buildID,
-		Status:  "queued",
-	}, nil
-}
-
 // HTTP Handlers
 
 func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Request) {
@@ -839,7 +546,6 @@ func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Req
 // HandleAllocateRunner handles manual runner allocation requests.
 // POST /api/v1/runners/allocate
 // Body: {"workload_key": "abc123", "labels": {"firecracker": "true"}}
-// ci_system is resolved from the snapshot config registered for the workload_key.
 func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1284,11 +990,6 @@ func (s *ControlPlaneServer) HandleGetSnapshots(w http.ResponseWriter, r *http.R
 		"count":           len(snapshots),
 		"current_version": s.snapshotManager.GetCurrentVersion(),
 	})
-}
-
-func (s *ControlPlaneServer) HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
-	handler := NewGitHubWebhookHandler(s.scheduler, s.hostRegistry, s.jobQueue, s.logger.Logger)
-	handler.HandleWebhook(w, r)
 }
 
 // HandleGetDesiredVersions returns the desired snapshot versions for a host.

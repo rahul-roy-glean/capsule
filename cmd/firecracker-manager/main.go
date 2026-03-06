@@ -33,8 +33,6 @@ import (
 	"go.opentelemetry.io/otel/metric"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/ci"
-	cigithub "github.com/rahul-roy-glean/bazel-firecracker/pkg/ci/github"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
 	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/runner"
@@ -52,10 +50,6 @@ var (
 	logDir               = flag.String("log-dir", "/var/log/firecracker", "Directory for VM logs")
 	snapshotBucket       = flag.String("snapshot-bucket", "", "GCS bucket for snapshots")
 	snapshotCache        = flag.String("snapshot-cache", "/mnt/data/snapshots", "Local snapshot cache path")
-	repoCacheUpperSizeGB = flag.Int("repo-cache-upper-size-gb", 10, "Size in GB of the per-runner repo cache writable layer (upper)")
-	buildbarnCertsDir    = flag.String("buildbarn-certs-dir", "", "Host directory containing Buildbarn certs to mount into microVMs (e.g. /etc/glean/ci/certs)")
-	buildbarnCertsMount  = flag.String("buildbarn-certs-mount", "/etc/bazel-firecracker/certs/buildbarn", "Guest mount path for Buildbarn certs inside the microVM")
-	buildbarnCertsSizeMB = flag.Int("buildbarn-certs-image-size-mb", 32, "Size in MB of the generated Buildbarn certs ext4 image")
 	quarantineDir        = flag.String("quarantine-dir", "/mnt/data/quarantine", "Directory to store quarantined runner manifests and debug metadata")
 	microVMSubnet        = flag.String("microvm-subnet", "172.16.0.0/24", "Subnet for microVMs")
 	extInterface         = flag.String("ext-interface", "eth0", "External network interface")
@@ -64,24 +58,7 @@ var (
 	controlPlane         = flag.String("control-plane", "", "Control plane address")
 	logLevel             = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 
-	// Git cache flags
-	gitCacheEnabled       = flag.Bool("git-cache-enabled", false, "Enable git-cache reference cloning for faster repo setup")
-	gitCacheDir           = flag.String("git-cache-dir", "/mnt/data/git-cache", "Host directory containing git mirrors")
-	gitCacheImagePath     = flag.String("git-cache-image", "/mnt/data/git-cache.img", "Path to git-cache block device image")
-	gitCacheMountPath     = flag.String("git-cache-mount", "/mnt/git-cache", "Mount path inside microVMs for git-cache")
-	gitCacheRepos         = flag.String("git-cache-repos", "", "Comma-separated repo mappings (e.g. 'github.com/org/repo:repo-dir,github.com/org/other:other-dir')")
-	gitCacheWorkspaceDir  = flag.String("git-cache-workspace", "/mnt/ephemeral/workdir", "Target directory for cloned repos inside microVMs")
-	gitCachePreClonedPath = flag.String("git-cache-pre-cloned", "", "Path where repo was pre-cloned in snapshot (default: derived from repo URL)")
-
-	// GitHub runner auto-registration flags (Option C)
-	githubRunnerEnabled   = flag.Bool("github-runner-enabled", false, "Enable automatic GitHub runner registration at VM boot")
-	githubRepo            = flag.String("github-repo", "", "GitHub repository for runner registration (e.g., askscio/scio)")
-	githubOrg             = flag.String("github-org", "", "GitHub organization for org-level runner registration (e.g., askscio). If set, uses org-level API instead of repo-level")
-	githubRunnerLabels    = flag.String("github-runner-labels", "self-hosted,firecracker,Linux,X64", "Comma-separated runner labels")
-	githubRunnerEphemeral = flag.Bool("runner-ephemeral", true, "Whether runners are ephemeral (one job per VM) or persistent")
-	githubAppID           = flag.String("github-app-id", "", "GitHub App ID for authentication")
-	githubAppSecret       = flag.String("github-app-secret", "", "Secret Manager secret name containing GitHub App private key")
-	gcpProject            = flag.String("gcp-project", "", "GCP project for Secret Manager")
+	gcpProject            = flag.String("gcp-project", "", "GCP project")
 
 	// Chunked snapshot flags (BuildBuddy-style lazy loading)
 	useChunkedSnapshots = flag.Bool("use-chunked-snapshots", false, "Enable chunked snapshot restore with UFFD (lazy memory) and FUSE (lazy disk)")
@@ -93,9 +70,6 @@ var (
 
 	// Network namespace mode (alternative to slot-based TAPs)
 	useNetNS = flag.Bool("use-netns", false, "Use network namespaces instead of slot-based TAP devices (simplifies snapshot restore)")
-
-	// CI system adapter flag
-	ciSystem = flag.String("ci-system", "github-actions", "CI system integration (github-actions, none)")
 
 	// Runner pooling flags (VM reuse across tasks)
 	poolEnabled           = flag.Bool("pool-enabled", false, "Enable runner pooling for VM reuse across tasks")
@@ -152,48 +126,7 @@ func main() {
 		*controlPlane = getMetadataAttribute("control-plane")
 	}
 
-	// Parse git-cache repo mappings
-	gitCacheRepoMappings := make(map[string]string)
-	if *gitCacheRepos != "" {
-		for _, mapping := range strings.Split(*gitCacheRepos, ",") {
-			parts := strings.SplitN(strings.TrimSpace(mapping), ":", 2)
-			if len(parts) == 2 {
-				gitCacheRepoMappings[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-			}
-		}
-	}
-
-	// Get git-cache enabled from metadata if not set via flag
-	gitCacheEnabledVal := *gitCacheEnabled
-	if !gitCacheEnabledVal {
-		if v := getMetadataAttribute("git-cache-enabled"); v == "true" {
-			gitCacheEnabledVal = true
-		}
-	}
-
-	// Get GitHub runner config from metadata if not set via flags
-	githubRunnerEnabledVal := *githubRunnerEnabled
-	if !githubRunnerEnabledVal {
-		if v := getMetadataAttribute("github-runner-enabled"); v == "true" {
-			githubRunnerEnabledVal = true
-		}
-	}
-	githubRepoVal := *githubRepo
-	if githubRepoVal == "" {
-		githubRepoVal = getMetadataAttribute("github-repo")
-	}
-	githubOrgVal := *githubOrg
-	if githubOrgVal == "" {
-		githubOrgVal = getMetadataAttribute("github-org")
-	}
-	githubAppIDVal := *githubAppID
-	if githubAppIDVal == "" {
-		githubAppIDVal = getMetadataAttribute("github-app-id")
-	}
-	githubAppSecretVal := *githubAppSecret
-	if githubAppSecretVal == "" {
-		githubAppSecretVal = getMetadataAttribute("github-app-secret")
-	}
+	// Get GCP project
 	gcpProjectVal := *gcpProject
 	if gcpProjectVal == "" {
 		gcpProjectVal = getMetadataAttribute("gcp-project")
@@ -201,26 +134,6 @@ func main() {
 			// Try to get from project metadata
 			gcpProjectVal = getProjectMetadata()
 		}
-	}
-
-	// Parse GitHub runner labels
-	var githubRunnerLabelsVal []string
-	labelsStr := *githubRunnerLabels
-	if labelsStr == "" {
-		labelsStr = getMetadataAttribute("github-runner-labels")
-	}
-	if labelsStr != "" {
-		for _, label := range strings.Split(labelsStr, ",") {
-			if l := strings.TrimSpace(label); l != "" {
-				githubRunnerLabelsVal = append(githubRunnerLabelsVal, l)
-			}
-		}
-	}
-
-	// Parse runner ephemeral setting (defaults to true)
-	runnerEphemeralVal := *githubRunnerEphemeral
-	if ephemeralStr := getMetadataAttribute("runner-ephemeral"); ephemeralStr != "" {
-		runnerEphemeralVal = strings.ToLower(ephemeralStr) == "true"
 	}
 
 	// Create runner manager config
@@ -250,30 +163,6 @@ func main() {
 		PoolMaxRunnerMemoryGB:  *poolMaxRunnerMemoryGB,
 		PoolMaxRunnerDiskGB:    *poolMaxRunnerDiskGB,
 		PoolRecycleTimeoutSecs: *poolRecycleTimeout,
-		// Bazel-specific settings
-		Bazel: runner.BazelConfig{
-			RepoCacheUpperSizeGB:      *repoCacheUpperSizeGB,
-			BuildbarnCertsDir:         *buildbarnCertsDir,
-			BuildbarnCertsMountPath:   *buildbarnCertsMount,
-			BuildbarnCertsImageSizeMB: *buildbarnCertsSizeMB,
-			GitCacheEnabled:           gitCacheEnabledVal,
-			GitCacheDir:               *gitCacheDir,
-			GitCacheImagePath:         *gitCacheImagePath,
-			GitCacheMountPath:         *gitCacheMountPath,
-			GitCacheRepoMappings:      gitCacheRepoMappings,
-			GitCacheWorkspaceDir:      *gitCacheWorkspaceDir,
-			GitCachePreClonedPath:     *gitCachePreClonedPath,
-		},
-		// CI system settings
-		CI: runner.CIConfig{
-			GitHubRunnerEnabled:   githubRunnerEnabledVal,
-			GitHubRepo:            githubRepoVal,
-			GitHubOrg:             githubOrgVal,
-			GitHubRunnerLabels:    githubRunnerLabelsVal,
-			GitHubRunnerEphemeral: runnerEphemeralVal,
-			GitHubAppID:           githubAppIDVal,
-			GitHubAppSecret:       githubAppSecretVal,
-		},
 	}
 
 	// Enable cloud-backed session chunks using the snapshot bucket.
@@ -287,44 +176,6 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	// Construct CI adapter
-	var ciAdapter ci.Adapter
-	ciSystemVal := *ciSystem
-	if ciSystemVal == "" {
-		ciSystemVal = getMetadataAttribute("ci-system")
-		if ciSystemVal == "" {
-			ciSystemVal = "github-actions" // default for backwards compat
-		}
-	}
-
-	switch ciSystemVal {
-	case "github-actions":
-		if githubAppIDVal != "" && githubAppSecretVal != "" {
-			adapter, err := cigithub.NewAdapter(ctx, cigithub.Config{
-				AppID:      githubAppIDVal,
-				AppSecret:  githubAppSecretVal,
-				GCPProject: gcpProjectVal,
-				Repo:       githubRepoVal,
-				Org:        githubOrgVal,
-				Labels:     githubRunnerLabelsVal,
-				Ephemeral:  runnerEphemeralVal,
-			}, logger)
-			if err != nil {
-				log.WithError(err).Warn("Failed to create GitHub CI adapter, falling back to no-op")
-				ciAdapter = ci.NewNoopAdapter()
-			} else {
-				ciAdapter = adapter
-				log.Info("GitHub Actions CI adapter initialized")
-			}
-		} else {
-			log.Info("GitHub App not configured, using no-op CI adapter")
-			ciAdapter = ci.NewNoopAdapter()
-		}
-	default:
-		log.WithField("ci_system", ciSystemVal).Info("Using no-op CI adapter")
-		ciAdapter = ci.NewNoopAdapter()
-	}
 
 	// Create runner manager (optionally with chunked snapshot support)
 	var mgr *runner.Manager
@@ -340,7 +191,6 @@ func main() {
 
 		chunkedCfg := runner.ChunkedManagerConfig{
 			HostConfig:          cfg,
-			CIAdapter:           ciAdapter,
 			UseChunkedSnapshots: *useChunkedSnapshots,
 			UseNetNS:            *useNetNS,
 			ChunkCacheSizeBytes: int64(*chunkCacheSizeGB) * 1024 * 1024 * 1024,
@@ -363,7 +213,7 @@ func main() {
 		log.Info("Chunked mode: deferring all downloads until first manifest sync")
 	} else {
 		var err error
-		mgr, err = runner.NewManager(ctx, cfg, ciAdapter, logger)
+		mgr, err = runner.NewManager(ctx, cfg, logger)
 		if err != nil {
 			log.WithError(err).Fatal("Failed to create runner manager")
 		}
@@ -929,14 +779,6 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				if hbResp.ShouldDrain {
 					wasDraining = true
 
-					// Remove labels from GitHub runners to prevent new jobs being scheduled
-					labelsRemoved, err := mgr.RemoveRunnerLabels(ctx)
-					if err != nil {
-						log.WithError(err).WithField("labels_removed", labelsRemoved).Warn("Failed to remove some runner labels")
-					} else if labelsRemoved > 0 {
-						log.WithField("labels_removed", labelsRemoved).Info("Removed labels from GitHub runners")
-					}
-
 					// Drain idle runners (terminate them)
 					drained, err := mgr.DrainIdleRunners(ctx)
 					if err != nil {
@@ -958,7 +800,6 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				}
 			} else if hbResp.ShouldDrain && !wasDraining {
 				wasDraining = true
-				_, _ = mgr.RemoveRunnerLabels(ctx)
 				_, _ = mgr.DrainIdleRunners(ctx)
 				_, _ = mgr.PauseSessionRunners(ctx)
 			}

@@ -73,24 +73,6 @@ if [ ! -f "$KERNEL_FILE" ]; then
 fi
 echo "Kernel: $KERNEL_FILE"
 
-# --- 6. Create placeholder block device images ---
-# The firecracker-manager attaches these as drives; they need to exist even
-# if they're empty for dev.
-echo ""
-echo "--- Creating placeholder block images ---"
-for img_spec in "repo-cache-seed.img:64M" "repo-cache-upper.img:64M" "credentials.img:32M" "git-cache.img:64M"; do
-  img_name="${img_spec%%:*}"
-  img_size="${img_spec##*:}"
-  img_path="$SNAPSHOT_DIR/$img_name"
-  if [ ! -f "$img_path" ]; then
-    truncate -s "$img_size" "$img_path"
-    mkfs.ext4 -F "$img_path" > /dev/null 2>&1
-    echo "  Created $img_name ($img_size)"
-  else
-    echo "  $img_name already exists, skipping"
-  fi
-done
-
 echo ""
 echo "=== Dev rootfs build complete ==="
 echo "Contents of $SNAPSHOT_DIR:"

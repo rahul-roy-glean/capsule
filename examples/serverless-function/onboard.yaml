@@ -3,10 +3,6 @@ platform:
   region: "us-central1"
   zone: "us-central1-a"
 
-repository:
-  url: "https://github.com/myorg/my-functions"
-  branch: "main"
-
 microvm:
   vcpus: 2
   memory_mb: 1024           # Small footprint per function instance
@@ -18,9 +14,6 @@ hosts:
   min_count: 2
   max_count: 20
   data_disk_gb: 200
-
-ci:
-  system: "none"
 
 workload:
   # Snapshot warmup: install the runtime and dependencies.

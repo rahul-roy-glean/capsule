@@ -58,8 +58,6 @@ func main() {
 		fmt.Printf("  GCP Project:  %s\n", cfg.Platform.GCPProject)
 		fmt.Printf("  Region:       %s\n", cfg.Platform.Region)
 		fmt.Printf("  Zone:         %s\n", cfg.Platform.Zone)
-		fmt.Printf("  Repository:   %s\n", cfg.Repository.URL)
-		fmt.Printf("  CI System:    %s\n", cfg.CI.System)
 		fmt.Printf("  Max Hosts:    %d\n", cfg.Hosts.MaxCount)
 		fmt.Printf("  Max VMs/Host: %d\n", cfg.MicroVM.MaxPerHost)
 		os.Exit(0)
