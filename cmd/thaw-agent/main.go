@@ -1466,6 +1466,26 @@ func configureAuthProxy(data *MMDSData) (stopForwarder func(), err error) {
 		} else {
 			log.Info("Installed auth proxy CA certificate")
 		}
+
+		// Also import into Java's keystore so Bazel/Java clients trust the proxy CA.
+		// Java uses its own trust store and ignores system CA certificates.
+		javaKeystore := "/etc/ssl/certs/java/cacerts"
+		if _, statErr := os.Stat(javaKeystore); statErr == nil {
+			keytoolArgs := []string{
+				"-importcert",
+				"-noprompt",
+				"-trustcacerts",
+				"-alias", "auth-proxy",
+				"-file", certPath,
+				"-keystore", javaKeystore,
+				"-storepass", "changeit",
+			}
+			if out, err := exec.Command("keytool", keytoolArgs...).CombinedOutput(); err != nil {
+				log.WithError(err).WithField("output", string(out)).Warn("keytool import failed (Java/Bazel TLS through proxy may fail)")
+			} else {
+				log.Info("Installed auth proxy CA certificate into Java keystore")
+			}
+		}
 	}
 
 	// 2. Build proxy environment variables for child processes.

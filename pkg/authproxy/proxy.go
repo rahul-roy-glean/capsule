@@ -308,7 +308,21 @@ func (p *AuthProxy) handleConnect(clientConn net.Conn, connectReq *http.Request)
 	fmt.Fprint(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 
 	if !p.proxyConf.SSLBump {
-		// No SSL bump: tunnel bytes directly (no credential injection).
+		p.tunnel(clientConn, targetHost)
+		return
+	}
+
+	// Only MITM hosts that have a matching credential provider.
+	// For all other hosts, tunnel bytes directly — avoids breaking
+	// clients with their own CA stores (e.g., Java/Bazel).
+	hasProvider := false
+	for _, prov := range p.providers {
+		if prov.Matches(hostname) {
+			hasProvider = true
+			break
+		}
+	}
+	if !hasProvider {
 		p.tunnel(clientConn, targetHost)
 		return
 	}

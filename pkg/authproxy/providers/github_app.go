@@ -23,6 +23,7 @@ func init() {
 // them as Authorization headers for matching hosts.
 type githubAppProvider struct {
 	hosts          []string
+	repos          []string // optional: only inject credentials for these repos (e.g. "owner/repo")
 	appID          string
 	secretRef      string // "sm://project/secret" or plain secret name
 	installationID string // optional: specific installation ID
@@ -54,8 +55,20 @@ func newGitHubAppProvider(cfg authproxy.ProviderConfig) (authproxy.CredentialPro
 		hosts = []string{"github.com", "api.github.com"}
 	}
 
+	// Parse repos list from comma-separated config value (e.g. "owner/repo,owner/other").
+	var repos []string
+	if r := cfg.Config["repos"]; r != "" {
+		for _, repo := range strings.Split(r, ",") {
+			repo = strings.TrimSpace(repo)
+			if repo != "" {
+				repos = append(repos, repo)
+			}
+		}
+	}
+
 	return &githubAppProvider{
 		hosts:          hosts,
+		repos:          repos,
 		appID:          appID,
 		secretRef:      secretRef,
 		installationID: cfg.Config["installation_id"],
@@ -71,6 +84,10 @@ func (p *githubAppProvider) Matches(host string) bool {
 }
 
 func (p *githubAppProvider) InjectCredentials(req *http.Request) error {
+	if len(p.repos) > 0 && !p.matchesRepo(req) {
+		return nil // not a request for a configured repo, skip injection
+	}
+
 	token, err := p.getToken()
 	if err != nil {
 		return err
@@ -80,6 +97,30 @@ func (p *githubAppProvider) InjectCredentials(req *http.Request) error {
 	// header format only works for the REST API, not for git clone/fetch/push.
 	req.SetBasicAuth("x-access-token", token)
 	return nil
+}
+
+// matchesRepo checks if the request URL targets one of the configured repos.
+// Matches patterns:
+//   - github.com/{owner}/{repo}[/...]
+//   - api.github.com/repos/{owner}/{repo}[/...]
+func (p *githubAppProvider) matchesRepo(req *http.Request) bool {
+	path := strings.TrimPrefix(req.URL.Path, "/")
+
+	host := req.URL.Host
+	if host == "" {
+		host = req.Host
+	}
+	// api.github.com paths start with /repos/{owner}/{repo}/...
+	if strings.Contains(host, "api.github.com") {
+		path = strings.TrimPrefix(path, "repos/")
+	}
+
+	for _, repo := range p.repos {
+		if path == repo || strings.HasPrefix(path, repo+"/") || strings.HasPrefix(path, repo+".git") {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *githubAppProvider) Start(ctx context.Context) error {
