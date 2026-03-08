@@ -50,12 +50,14 @@ CONFIG_RESP=$(curl -s -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "rootfs-durability-test",
-    "commands": '"$SNAPSHOT_COMMANDS"',
-    "runner_ttl_seconds": 300,
-    "auto_pause": true,
-    "session_max_age_seconds": 3600
+    "layers": [{"name":"base","init_commands":'"$SNAPSHOT_COMMANDS"'}],
+    "config": {
+      "ttl": 300,
+      "auto_pause": true,
+      "session_max_age_seconds": 3600
+    }
   }')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.workload_key')
+WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.leaf_workload_key')
 echo "  workload_key=$WORKLOAD_KEY"
 
 if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then

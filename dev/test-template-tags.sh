@@ -14,11 +14,13 @@ CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "tag-test",
-    "commands": [{"type":"shell","command":"echo tag-test"}],
-    "runner_ttl_seconds": 60,
-    "auto_pause": false
+    "layers": [{"name":"base","init_commands":[{"type":"shell","args":["echo","tag-test"]}]}],
+    "config": {
+      "ttl": 60,
+      "auto_pause": false
+    }
   }')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.workload_key')
+WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.leaf_workload_key')
 echo "Registered config: workload_key=$WORKLOAD_KEY"
 
 if [ -z "$WORKLOAD_KEY" ] || [ "$WORKLOAD_KEY" = "null" ]; then

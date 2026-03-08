@@ -110,11 +110,13 @@ CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "auth-proxy-test",
-    "commands": [{"type":"shell","command":"echo auth-proxy-test"}],
-    "runner_ttl_seconds": 120,
-    "auto_pause": false
+    "layers": [{"name":"base","init_commands":[{"type":"shell","args":["echo","auth-proxy-test"]}]}],
+    "config": {
+      "ttl": 120,
+      "auto_pause": false
+    }
   }')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.workload_key')
+WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.leaf_workload_key')
 echo "  workload_key=$WORKLOAD_KEY"
 
 if [ -z "$WORKLOAD_KEY" ] || [ "$WORKLOAD_KEY" = "null" ]; then

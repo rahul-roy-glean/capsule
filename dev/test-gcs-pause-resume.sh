@@ -38,16 +38,18 @@ header "1. Register snapshot config"
 # IMPORTANT: commands must match what was used in `build-snapshot.sh` so the
 # workload_key hash matches the golden chunked snapshot in GCS.
 SNAPSHOT_COMMANDS=${SNAPSHOT_COMMANDS:-'[{"type":"shell","args":["echo","dev-snapshot-ready"]}]'}
-CONFIG_RESP=$(curl -s -X POST "$CP/api/v1/layered-configs" \
+CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "gcs-pause-resume-test",
-    "commands": '"$SNAPSHOT_COMMANDS"',
-    "runner_ttl_seconds": 300,
-    "auto_pause": true,
-    "session_max_age_seconds": 3600
+    "layers": [{"name":"base","init_commands":'"$SNAPSHOT_COMMANDS"'}],
+    "config": {
+      "ttl": 300,
+      "auto_pause": true,
+      "session_max_age_seconds": 3600
+    }
   }')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.workload_key')
+WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.leaf_workload_key')
 echo "  workload_key=$WORKLOAD_KEY"
 
 if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then
@@ -115,12 +117,14 @@ TTL_CONFIG_RESP=$(curl -s -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "ttl-auto-pause-test",
-    "commands": '"$SNAPSHOT_COMMANDS"',
-    "runner_ttl_seconds": 3,
-    "auto_pause": true,
-    "session_max_age_seconds": 3600
+    "layers": [{"name":"base","init_commands":'"$SNAPSHOT_COMMANDS"'}],
+    "config": {
+      "ttl": 3,
+      "auto_pause": true,
+      "session_max_age_seconds": 3600
+    }
   }')
-TTL_WORKLOAD_KEY=$(echo "$TTL_CONFIG_RESP" | jq -r '.workload_key')
+TTL_WORKLOAD_KEY=$(echo "$TTL_CONFIG_RESP" | jq -r '.leaf_workload_key')
 echo "  TTL test workload_key=$TTL_WORKLOAD_KEY"
 
 TTL_ALLOC_RESP=$(curl -s -X POST "$CP/api/v1/runners/allocate" \

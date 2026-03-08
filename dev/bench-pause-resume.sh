@@ -32,15 +32,17 @@ elapsed_ms() {
 }
 
 register_config() {
-  curl -s -X POST "$CP/api/v1/layered-configs" \
+  curl -sf -X POST "$CP/api/v1/layered-configs" \
     -H 'Content-Type: application/json' \
     -d '{
       "display_name": "bench-pause-resume",
-      "commands": '"$SNAPSHOT_COMMANDS"',
-      "runner_ttl_seconds": 600,
-      "auto_pause": true,
-      "session_max_age_seconds": 3600
-    }' | jq -r '.workload_key'
+      "layers": [{"name":"base","init_commands":'"$SNAPSHOT_COMMANDS"'}],
+      "config": {
+        "ttl": 600,
+        "auto_pause": true,
+        "session_max_age_seconds": 3600
+      }
+    }' | jq -r '.leaf_workload_key'
 }
 
 allocate() {
