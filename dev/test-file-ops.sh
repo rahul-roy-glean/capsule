@@ -86,10 +86,11 @@ READ_RESP=$(curl -sf -X POST "$MGR/api/v1/runners/$RUNNER_ID/files/read" \
 echo "$READ_RESP"
 
 CONTENT=$(echo "$READ_RESP" | jq -r '.content')
-if [ "$CONTENT" != "hello file ops" ]; then
-  echo "OK: content matches (with trailing newline)"
-else
+if [ "$CONTENT" = "hello file ops" ]; then
   echo "OK: content='$CONTENT'"
+else
+  echo "FAIL: expected content 'hello file ops', got '$CONTENT'"
+  exit 1
 fi
 
 # --- 5. Test /files/stat ---

@@ -18,9 +18,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SNAPSHOT_DIR="/tmp/fc-dev/snapshots"
-OUTPUT_DIR="/tmp/fc-dev/snapshot-build"
-LOG_DIR="/tmp/fc-dev/logs"
+SNAPSHOT_DIR="${SNAPSHOT_DIR:-/tmp/fc-dev/snapshots}"
+OUTPUT_DIR="${OUTPUT_DIR:-/tmp/fc-dev/snapshot-build}"
+LOG_DIR="${LOG_DIR:-/tmp/fc-dev/logs}"
 
 cd "$REPO_ROOT"
 export PATH="/usr/local/go/bin:$PATH"
@@ -38,13 +38,19 @@ if [ ! -f "$SNAPSHOT_DIR/kernel.bin" ]; then
   exit 1
 fi
 
-if [ ! -f "$SNAPSHOT_DIR/rootfs.img" ]; then
-  echo "FAIL: rootfs.img not found. Run 'make dev-build' first."
+if [ ! -e /dev/kvm ]; then
+  echo "FAIL: /dev/kvm not found. KVM is required."
   exit 1
 fi
 
-if [ ! -e /dev/kvm ]; then
-  echo "FAIL: /dev/kvm not found. KVM is required."
+BASE_IMAGE=${BASE_IMAGE:-}
+RUNNER_USER=${RUNNER_USER:-}
+ROOTFS_SIZE_GB=${ROOTFS_SIZE_GB:-}
+THAW_AGENT_PATH=${THAW_AGENT_PATH:-}
+EXTRA_SNAPSHOT_BUILDER_FLAGS=${EXTRA_SNAPSHOT_BUILDER_FLAGS:-}
+
+if [ -z "$BASE_IMAGE" ] && [ ! -f "$SNAPSHOT_DIR/rootfs.img" ]; then
+  echo "FAIL: rootfs.img not found. Run 'make dev-build' first, or set BASE_IMAGE=<image>."
   exit 1
 fi
 
@@ -64,25 +70,52 @@ ENABLE_CHUNKED=${ENABLE_CHUNKED:-false}
 echo "Snapshot commands: $SNAPSHOT_COMMANDS"
 echo "GCS bucket: $GCS_BUCKET"
 echo "Enable chunked: $ENABLE_CHUNKED"
+if [ -n "$BASE_IMAGE" ]; then
+  echo "Base image: $BASE_IMAGE"
+else
+  echo "Rootfs path: $SNAPSHOT_DIR/rootfs.img"
+fi
 echo "Output dir: $OUTPUT_DIR"
 echo ""
 
 # Run snapshot-builder (needs root for networking + TAP devices).
 echo "--- Running snapshot-builder ---"
+BUILDER_FLAGS=(
+  --gcs-bucket="$GCS_BUCKET"
+  --gcs-prefix="$GCS_PREFIX"
+  --output-dir="$OUTPUT_DIR"
+  --kernel-path="$SNAPSHOT_DIR/kernel.bin"
+  --firecracker-bin=/usr/local/bin/firecracker
+  --vcpus=2
+  --memory-mb=2048
+  --warmup-timeout=5m
+  --enable-chunked="$ENABLE_CHUNKED"
+  --snapshot-commands="$SNAPSHOT_COMMANDS"
+  --log-level=info
+)
+
+if [ -n "$BASE_IMAGE" ]; then
+  BUILDER_FLAGS+=(--base-image="$BASE_IMAGE")
+else
+  BUILDER_FLAGS+=(--rootfs-path="$SNAPSHOT_DIR/rootfs.img")
+fi
+
+if [ -n "$RUNNER_USER" ]; then
+  BUILDER_FLAGS+=(--runner-user="$RUNNER_USER")
+fi
+
+if [ -n "$ROOTFS_SIZE_GB" ]; then
+  BUILDER_FLAGS+=(--rootfs-size-gb="$ROOTFS_SIZE_GB")
+fi
+
+if [ -n "$THAW_AGENT_PATH" ]; then
+  BUILDER_FLAGS+=(--thaw-agent-path="$THAW_AGENT_PATH")
+fi
+
 set +e
 sudo "$REPO_ROOT/bin/snapshot-builder" \
-  --gcs-bucket="$GCS_BUCKET" \
-  --gcs-prefix="$GCS_PREFIX" \
-  --output-dir="$OUTPUT_DIR" \
-  --kernel-path="$SNAPSHOT_DIR/kernel.bin" \
-  --rootfs-path="$SNAPSHOT_DIR/rootfs.img" \
-  --firecracker-bin=/usr/local/bin/firecracker \
-  --vcpus=2 \
-  --memory-mb=2048 \
-  --warmup-timeout=5m \
-  --enable-chunked="$ENABLE_CHUNKED" \
-  --snapshot-commands="$SNAPSHOT_COMMANDS" \
-  --log-level=info \
+  "${BUILDER_FLAGS[@]}" \
+  ${EXTRA_SNAPSHOT_BUILDER_FLAGS:+$EXTRA_SNAPSHOT_BUILDER_FLAGS} \
   2>&1 | tee "$LOG_DIR/snapshot-builder.log"
 BUILD_EXIT=$?
 set -e

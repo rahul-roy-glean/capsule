@@ -40,18 +40,18 @@ type SnapshotMetrics struct {
 
 // SnapshotManager manages snapshot lifecycle
 type SnapshotManager struct {
-	db             *sql.DB
-	gcsClient      *storage.Client
-	gcsBucket      string
-	gcsPrefix      string // top-level prefix for all GCS paths (e.g. "v1")
-	gcpProject     string
-	gcpZone        string
-	builderImage   string // GCE image for snapshot builder VM
-	builderNetwork string // VPC network for builder VM
+	db                    *sql.DB
+	gcsClient             *storage.Client
+	gcsBucket             string
+	gcsPrefix             string // top-level prefix for all GCS paths (e.g. "v1")
+	gcpProject            string
+	gcpZone               string
+	builderImage          string // GCE image for snapshot builder VM
+	builderNetwork        string // VPC network for builder VM
 	builderServiceAccount string // GCE service account email for builder VMs
-	logger         *logrus.Entry
-	mu             sync.RWMutex
-	currentVersion string
+	logger                *logrus.Entry
+	mu                    sync.RWMutex
+	currentVersion        string
 }
 
 // NewSnapshotManager creates a new snapshot manager
@@ -455,6 +455,7 @@ rm -rf firecracker.tgz "release-v${FC_VERSION}-${ARCH}"
 # Setup KVM
 modprobe kvm_intel || modprobe kvm_amd || true
 chmod 666 /dev/kvm || true
+modprobe tun || true
 
 # Download kernel and rootfs from GCS
 echo "Downloading kernel and rootfs..."
