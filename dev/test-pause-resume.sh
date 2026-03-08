@@ -3,8 +3,8 @@
 # Usage: make dev-test-pause-resume
 #
 # Prerequisites:
-#   - Stack running: make dev-stack (or dev-stack-local)
-#   - Snapshot built: make dev-snapshot (or dev-snapshot-local)
+#   - Stack running: make dev-stack
+#   - Snapshot built: make dev-snapshot
 set -euo pipefail
 
 CP=http://localhost:8080
