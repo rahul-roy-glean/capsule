@@ -96,9 +96,11 @@ type ChunkedSnapshotMetadata struct {
 	MemFilePath string `json:"mem_file_path,omitempty"`
 	// ExtensionDrives holds chunks for extension block devices, keyed by DriveID.
 	ExtensionDrives map[string]ExtensionDrive `json:"extension_drives,omitempty"`
-	// RootfsSourceHash is the SHA-256 hash of the original base rootfs.img used
-	// to build this snapshot. Used by incremental builds to detect rootfs changes
-	// and fall back to cold boot when the base image has been updated.
+	// RootfsSourceHash is a SHA-256 fingerprint of the effective rootfs
+	// provenance inputs used to build this snapshot, such as the source
+	// rootfs image or base-image configuration, thaw-agent binary, and any
+	// requested resize. Used by restore paths to detect rootfs changes and
+	// fall back to cold boot when resuming would use stale rootfs content.
 	RootfsSourceHash string `json:"rootfs_source_hash,omitempty"`
 	// Layer fields for layered snapshot builds.
 	LayerHash       string `json:"layer_hash,omitempty"`

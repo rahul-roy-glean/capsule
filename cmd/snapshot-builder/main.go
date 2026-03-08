@@ -178,9 +178,8 @@ func run(logger *logrus.Logger) error {
 	log.WithField("workload_key", workloadKey).Info("Computed workload key from snapshot commands")
 
 	// Layer mode: use layer_hash as GCS directory key
-	effectiveWorkloadKey := workloadKey
-	if *layerHash != "" {
-		effectiveWorkloadKey = *layerHash
+	effectiveWorkloadKey := resolveSnapshotLookupKey(workloadKey, *layerHash)
+	if effectiveWorkloadKey != workloadKey {
 		log.WithFields(logrus.Fields{
 			"layer_hash":             *layerHash,
 			"effective_workload_key": effectiveWorkloadKey,
@@ -341,8 +340,9 @@ func run(logger *logrus.Logger) error {
 	// Paths used by both paths and for final snapshot creation
 	workingRootfs := filepath.Join(*outputDir, "rootfs.img")
 
-	// rootfsSourceHash is lazily computed and stored in chunked metadata
-	// so future incremental builds can detect rootfs changes.
+	// rootfsSourceHash is lazily computed from the effective rootfs provenance
+	// inputs and stored in chunked metadata so future restores can detect when
+	// they would resume against stale rootfs content.
 	var rootfsSourceHash string
 
 	// expectedRunnerID is the runner_id we expect to see in warmup status.
@@ -379,7 +379,7 @@ func run(logger *logrus.Logger) error {
 		} else {
 			log.Info("Attempting incremental restore from previous snapshot...")
 			var incrementalErr error
-			vm, fuseDisk, fuseExtDisks, incrUffdHandler, incrementalErr = restoreFromPreviousSnapshot(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken, commands, newDrives, expectedRunnerID, authProxy, authProxyAddr)
+			vm, fuseDisk, fuseExtDisks, incrUffdHandler, incrementalErr = restoreFromPreviousSnapshot(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, effectiveWorkloadKey, gitToken, gcpAccessToken, commands, newDrives, expectedRunnerID, authProxy, authProxyAddr)
 			if incrementalErr != nil {
 				log.WithError(incrementalErr).Warn("Incremental restore failed, falling back to cold boot")
 				vm = nil
@@ -700,11 +700,11 @@ func run(logger *logrus.Logger) error {
 		// Compute rootfs source hash for storing in metadata (enables incremental change detection).
 		// Only needed at upload time — the incremental path hashes independently for comparison.
 		if rootfsSourceHash == "" {
-			if h, err := hashFile(*rootfsPath); err == nil {
+			if h, err := computeRootfsSourceHash(*rootfsPath, *baseImage, *runnerUser, *thawAgentPath, *rootfsSizeGB); err == nil {
 				rootfsSourceHash = h
-				log.WithField("hash", rootfsSourceHash[:12]).Info("Base rootfs hash computed for metadata")
+				log.WithField("hash", rootfsSourceHash[:12]).Info("Rootfs provenance hash computed for metadata")
 			} else {
-				log.WithError(err).Warn("Failed to hash base rootfs, future incremental builds won't detect rootfs changes")
+				log.WithError(err).Warn("Failed to compute rootfs provenance hash, future incremental builds won't detect rootfs changes")
 			}
 		}
 
@@ -1115,6 +1115,13 @@ func copyFile(src, dst string) error {
 	return cmd.Run()
 }
 
+func resolveSnapshotLookupKey(workloadKey, layerHash string) string {
+	if layerHash != "" {
+		return layerHash
+	}
+	return workloadKey
+}
+
 // hashFile computes SHA-256 of a file and returns hex string.
 func hashFile(path string) (string, error) {
 	f, err := os.Open(path)
@@ -1127,6 +1134,54 @@ func hashFile(path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func computeRootfsSourceHash(rootfsPath, baseImage, runnerUser, thawAgentPath string, rootfsSizeGB int) (string, error) {
+	var payload any
+	if baseImage != "" {
+		thawAgentHash, err := hashFile(thawAgentPath)
+		if err != nil {
+			return "", fmt.Errorf("hash thaw-agent binary: %w", err)
+		}
+		payload = struct {
+			SchemaVersion string `json:"schema_version"`
+			Mode          string `json:"mode"`
+			BaseImage     string `json:"base_image"`
+			RunnerUser    string `json:"runner_user"`
+			ThawAgentHash string `json:"thaw_agent_hash"`
+			RootfsSizeGB  int    `json:"rootfs_size_gb"`
+		}{
+			SchemaVersion: "rootfs-source-hash-v2",
+			Mode:          "base-image",
+			BaseImage:     baseImage,
+			RunnerUser:    runnerUser,
+			ThawAgentHash: thawAgentHash,
+			RootfsSizeGB:  rootfsSizeGB,
+		}
+	} else {
+		rootfsHash, err := hashFile(rootfsPath)
+		if err != nil {
+			return "", fmt.Errorf("hash rootfs image: %w", err)
+		}
+		payload = struct {
+			SchemaVersion string `json:"schema_version"`
+			Mode          string `json:"mode"`
+			RootfsHash    string `json:"rootfs_hash"`
+			RootfsSizeGB  int    `json:"rootfs_size_gb"`
+		}{
+			SchemaVersion: "rootfs-source-hash-v2",
+			Mode:          "rootfs-image",
+			RootfsHash:    rootfsHash,
+			RootfsSizeGB:  rootfsSizeGB,
+		}
+	}
+
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal rootfs provenance payload: %w", err)
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func createExt4Image(path string, sizeGB int, label string) error {
@@ -1262,6 +1317,7 @@ func restoreFromPreviousSnapshot(
 	logger *logrus.Logger,
 	log *logrus.Entry,
 	vmID, tapName, guestMAC, bootArgs string,
+	restoreWorkloadKey string,
 	gitToken, gcpAccessToken string,
 	commands []snapshot.SnapshotCommand,
 	newDrives []snapshot.DriveSpec,
@@ -1288,18 +1344,18 @@ func restoreFromPreviousSnapshot(
 	}
 
 	// Resolve the current version via pointer file, then load its metadata.
-	wk := snapshot.ComputeWorkloadKey(commands)
-	currentVersion, err := chunkStore.ReadCurrentVersion(ctx, wk)
+	currentVersion, err := chunkStore.ReadCurrentVersion(ctx, restoreWorkloadKey)
 	if err != nil {
 		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("failed to resolve current version for workload key %q: %w", wk, err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to resolve current version for workload key %q: %w", restoreWorkloadKey, err)
 	}
-	chunkedMeta, err := chunkStore.LoadChunkedMetadata(ctx, wk, currentVersion)
+	chunkedMeta, err := chunkStore.LoadChunkedMetadata(ctx, restoreWorkloadKey, currentVersion)
 	if err != nil {
 		chunkStore.Close()
 		return nil, nil, nil, nil, fmt.Errorf("no previous chunked snapshot found for version %s: %w", currentVersion, err)
 	}
 	log.WithFields(logrus.Fields{
+		"workload_key":     restoreWorkloadKey,
 		"version":          chunkedMeta.Version,
 		"rootfs_chunks":    len(chunkedMeta.RootfsChunks),
 		"extension_drives": len(chunkedMeta.ExtensionDrives),
@@ -1309,10 +1365,10 @@ func restoreFromPreviousSnapshot(
 	// If it has (e.g. new thaw-agent binary, new packages), we must cold boot
 	// to pick up the changes — snapshot restore uses the old rootfs.
 	if chunkedMeta.RootfsSourceHash != "" {
-		currentHash, err := hashFile(*rootfsPath)
+		currentHash, err := computeRootfsSourceHash(*rootfsPath, *baseImage, *runnerUser, *thawAgentPath, *rootfsSizeGB)
 		if err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to hash current rootfs: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("failed to compute current rootfs provenance hash: %w", err)
 		}
 		if currentHash != chunkedMeta.RootfsSourceHash {
 			chunkStore.Close()
@@ -1690,6 +1746,29 @@ func reattachFromParent(
 		"parent_version": *parentVersion,
 		"rootfs_chunks":  len(parentMeta.RootfsChunks),
 	}).Info("Loaded parent layer metadata for reattach")
+
+	// Check if the current build would produce a different rootfs than the
+	// parent snapshot was built from. If so, restoring the old VM state would
+	// resume against stale rootfs content and must fall back to cold boot.
+	if parentMeta.RootfsSourceHash != "" {
+		currentHash, err := computeRootfsSourceHash(*rootfsPath, *baseImage, *runnerUser, *thawAgentPath, *rootfsSizeGB)
+		if err != nil {
+			chunkStore.Close()
+			return nil, nil, nil, nil, fmt.Errorf("failed to compute current rootfs provenance hash: %w", err)
+		}
+		if currentHash != parentMeta.RootfsSourceHash {
+			chunkStore.Close()
+			log.WithFields(logrus.Fields{
+				"previous": parentMeta.RootfsSourceHash[:12],
+				"current":  currentHash[:12],
+			}).Warn("Base rootfs has changed, reattach restore would use stale image")
+			return nil, nil, nil, nil, fmt.Errorf("rootfs changed (previous=%s current=%s)", parentMeta.RootfsSourceHash[:12], currentHash[:12])
+		}
+		log.WithField("hash", currentHash[:12]).Info("Base rootfs unchanged, safe to restore parent snapshot")
+	} else {
+		chunkStore.Close()
+		return nil, nil, nil, nil, fmt.Errorf("parent snapshot has no rootfs source hash, cannot verify rootfs unchanged — forcing cold boot")
+	}
 
 	// 2. Load old layer metadata (for extension drives) — optional for init builds
 	var oldLayerMeta *snapshot.ChunkedSnapshotMetadata
