@@ -21,6 +21,21 @@ func TestValidateBuildModeRejectsIncrementalWithoutChunked(t *testing.T) {
 	}
 }
 
+func TestValidateBaseImagePolicy(t *testing.T) {
+	if err := validateBaseImagePolicy(false, "ubuntu:22.04"); err != nil {
+		t.Fatalf("validateBaseImagePolicy(non-incremental) returned error: %v", err)
+	}
+	if err := validateBaseImagePolicy(true, ""); err != nil {
+		t.Fatalf("validateBaseImagePolicy(no-base-image) returned error: %v", err)
+	}
+	if err := validateBaseImagePolicy(true, "ubuntu@sha256:1111111111111111111111111111111111111111111111111111111111111111"); err != nil {
+		t.Fatalf("validateBaseImagePolicy(pinned) returned error: %v", err)
+	}
+	if err := validateBaseImagePolicy(true, "ubuntu:22.04"); err == nil {
+		t.Fatal("validateBaseImagePolicy(unpinned incremental) returned nil, want error")
+	}
+}
+
 func TestShouldPublishCurrentPointerRejectsMissingUpload(t *testing.T) {
 	err := shouldPublishCurrentPointer(false)
 	if err == nil {
