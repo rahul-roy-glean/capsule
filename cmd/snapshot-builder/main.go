@@ -29,6 +29,8 @@ import (
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/uffd"
 )
 
+var errBaseImageNotPinned = errors.New("base image is not digest-pinned")
+
 var (
 	gcsBucket      = flag.String("gcs-bucket", "", "GCS bucket for snapshots")
 	outputDir      = flag.String("output-dir", "/tmp/snapshot", "Output directory for snapshot files")
@@ -347,6 +349,7 @@ func run(logger *logrus.Logger) error {
 	// inputs and stored in chunked metadata so future restores can detect when
 	// they would resume against stale rootfs content.
 	var rootfsSourceHash string
+	var rootfsFlavorForProvenance rootfsFlavor
 
 	// expectedRunnerID is the runner_id we expect to see in warmup status.
 	// For reattach/incremental builds (restoring from parent snapshot), we set
@@ -410,9 +413,12 @@ func run(logger *logrus.Logger) error {
 		if *baseImage != "" {
 			// Build rootfs from Docker image: pull → export → inject platform shim → ext4
 			log.WithField("base_image", *baseImage).Info("Building rootfs from Docker image...")
-			if err := buildRootfsFromImage(*baseImage, workingRootfs, *runnerUser, log); err != nil {
+			var buildFlavor rootfsFlavor
+			buildFlavor, err = buildRootfsFromImage(*baseImage, workingRootfs, *runnerUser, log)
+			if err != nil {
 				return fmt.Errorf("build rootfs from Docker image: %w", err)
 			}
+			rootfsFlavorForProvenance = buildFlavor
 		} else {
 			// Legacy path: copy pre-baked rootfs.img
 			log.Info("Creating working rootfs from pre-baked image...")
@@ -704,9 +710,15 @@ func run(logger *logrus.Logger) error {
 		// Compute rootfs source hash for storing in metadata (enables incremental change detection).
 		// Only needed at upload time — the incremental path hashes independently for comparison.
 		if rootfsSourceHash == "" {
-			if h, err := computeRootfsSourceHash(*rootfsPath, *baseImage, *runnerUser, *thawAgentPath, *rootfsSizeGB); err == nil {
+			provenanceFlavor := rootfsFlavor("")
+			if *baseImage != "" {
+				provenanceFlavor = rootfsFlavorForProvenance
+			}
+			if h, err := computeRootfsSourceHash(*rootfsPath, *baseImage, *runnerUser, *thawAgentPath, *rootfsSizeGB, provenanceFlavor); err == nil {
 				rootfsSourceHash = h
 				log.WithField("hash", rootfsSourceHash[:12]).Info("Rootfs provenance hash computed for metadata")
+			} else if errors.Is(err, errBaseImageNotPinned) {
+				log.WithField("base_image", *baseImage).Warn("Base image is not digest-pinned; future incremental restores will fall back to cold boot")
 			} else {
 				log.WithError(err).Warn("Failed to compute rootfs provenance hash, future incremental builds won't detect rootfs changes")
 			}
@@ -724,6 +736,7 @@ func run(logger *logrus.Logger) error {
 				CreatedAt:        time.Now(),
 				ChunkSize:        snapshot.DefaultChunkSize,
 				RootfsSourceHash: rootfsSourceHash,
+				RootfsFlavor:     string(rootfsFlavorForProvenance),
 			}
 			// Populate layer fields if in layer mode
 			if *layerHash != "" {
@@ -873,6 +886,7 @@ func run(logger *logrus.Logger) error {
 				return fmt.Errorf("build chunked snapshot: %w", err)
 			}
 			chunkedMeta.RootfsSourceHash = rootfsSourceHash
+			chunkedMeta.RootfsFlavor = string(rootfsFlavorForProvenance)
 			chunkedMeta.Commands = commands
 			// Populate layer fields if in layer mode
 			if *layerHash != "" {
@@ -1140,26 +1154,41 @@ func hashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func computeRootfsSourceHash(rootfsPath, baseImage, runnerUser, thawAgentPath string, rootfsSizeGB int) (string, error) {
+func computeRootfsSourceHash(rootfsPath, baseImage, runnerUser, thawAgentPath string, rootfsSizeGB int, flavor rootfsFlavor) (string, error) {
 	var payload any
 	if baseImage != "" {
+		pinnedBaseImage, err := normalizePinnedBaseImage(baseImage)
+		if err != nil {
+			return "", err
+		}
+		if flavor == "" {
+			return "", fmt.Errorf("rootfs flavor is required for base-image provenance")
+		}
 		thawAgentHash, err := hashFile(thawAgentPath)
 		if err != nil {
 			return "", fmt.Errorf("hash thaw-agent binary: %w", err)
+		}
+		platformShimHash, err := computePlatformShimFingerprint(flavor, runnerUser)
+		if err != nil {
+			return "", fmt.Errorf("compute platform shim fingerprint: %w", err)
 		}
 		payload = struct {
 			SchemaVersion string `json:"schema_version"`
 			Mode          string `json:"mode"`
 			BaseImage     string `json:"base_image"`
+			RootfsFlavor  string `json:"rootfs_flavor"`
 			RunnerUser    string `json:"runner_user"`
 			ThawAgentHash string `json:"thaw_agent_hash"`
+			PlatformHash  string `json:"platform_hash"`
 			RootfsSizeGB  int    `json:"rootfs_size_gb"`
 		}{
 			SchemaVersion: "rootfs-source-hash-v2",
 			Mode:          "base-image",
-			BaseImage:     baseImage,
+			BaseImage:     pinnedBaseImage,
+			RootfsFlavor:  string(flavor),
 			RunnerUser:    runnerUser,
 			ThawAgentHash: thawAgentHash,
+			PlatformHash:  platformShimHash,
 			RootfsSizeGB:  rootfsSizeGB,
 		}
 	} else {
@@ -1186,6 +1215,13 @@ func computeRootfsSourceHash(rootfsPath, baseImage, runnerUser, thawAgentPath st
 	}
 	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+func normalizePinnedBaseImage(baseImage string) (string, error) {
+	if !strings.Contains(baseImage, "@sha256:") {
+		return "", fmt.Errorf("%w: %s", errBaseImageNotPinned, baseImage)
+	}
+	return baseImage, nil
 }
 
 func createExt4Image(path string, sizeGB int, label string) error {
@@ -1294,7 +1330,8 @@ func restoreFromPreviousSnapshot(
 	// If it has (e.g. new thaw-agent binary, new packages), we must cold boot
 	// to pick up the changes — snapshot restore uses the old rootfs.
 	if chunkedMeta.RootfsSourceHash != "" {
-		currentHash, err := computeRootfsSourceHash(*rootfsPath, *baseImage, *runnerUser, *thawAgentPath, *rootfsSizeGB)
+		provenanceFlavor := rootfsFlavor(chunkedMeta.RootfsFlavor)
+		currentHash, err := computeRootfsSourceHash(*rootfsPath, *baseImage, *runnerUser, *thawAgentPath, *rootfsSizeGB, provenanceFlavor)
 		if err != nil {
 			chunkStore.Close()
 			return nil, nil, nil, nil, fmt.Errorf("failed to compute current rootfs provenance hash: %w", err)
@@ -1682,7 +1719,8 @@ func reattachFromParent(
 	// parent snapshot was built from. If so, restoring the old VM state would
 	// resume against stale rootfs content and must fall back to cold boot.
 	if parentMeta.RootfsSourceHash != "" {
-		currentHash, err := computeRootfsSourceHash(*rootfsPath, *baseImage, *runnerUser, *thawAgentPath, *rootfsSizeGB)
+		provenanceFlavor := rootfsFlavor(parentMeta.RootfsFlavor)
+		currentHash, err := computeRootfsSourceHash(*rootfsPath, *baseImage, *runnerUser, *thawAgentPath, *rootfsSizeGB, provenanceFlavor)
 		if err != nil {
 			chunkStore.Close()
 			return nil, nil, nil, nil, fmt.Errorf("failed to compute current rootfs provenance hash: %w", err)
@@ -2085,17 +2123,17 @@ func injectProxyMMDS(mmdsData map[string]interface{}, proxy *authproxy.AuthProxy
 //  2. Create a container and export its filesystem
 //  3. Create an ext4 image and populate it from the export
 //  4. Inject the platform shim (systemd init, thaw-agent, networking)
-func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.Entry) error {
+func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.Entry) (rootfsFlavor, error) {
 	log.WithField("image", imageURI).Info("Pulling Docker image...")
 	if output, err := exec.Command("docker", "pull", "--platform=linux/amd64", imageURI).CombinedOutput(); err != nil {
-		return fmt.Errorf("docker pull failed: %s: %w", string(output), err)
+		return "", fmt.Errorf("docker pull failed: %s: %w", string(output), err)
 	}
 
 	// Export container filesystem to tar
 	log.Info("Exporting container filesystem...")
 	containerID, err := exec.Command("docker", "create", "--platform=linux/amd64", imageURI, "/bin/true").Output()
 	if err != nil {
-		return fmt.Errorf("docker create failed: %w", err)
+		return "", fmt.Errorf("docker create failed: %w", err)
 	}
 	cid := strings.TrimSpace(string(containerID))
 	defer exec.Command("docker", "rm", cid).Run()
@@ -2103,14 +2141,14 @@ func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.E
 	tarPath := outputPath + ".tar"
 	tarFile, err := os.Create(tarPath)
 	if err != nil {
-		return fmt.Errorf("failed to create tar file: %w", err)
+		return "", fmt.Errorf("failed to create tar file: %w", err)
 	}
 
 	exportCmd := exec.Command("docker", "export", cid)
 	exportCmd.Stdout = tarFile
 	if err := exportCmd.Run(); err != nil {
 		tarFile.Close()
-		return fmt.Errorf("docker export failed: %w", err)
+		return "", fmt.Errorf("docker export failed: %w", err)
 	}
 	tarFile.Close()
 	defer os.Remove(tarPath)
@@ -2119,28 +2157,28 @@ func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.E
 	rootfsSizeGB := 8
 	log.WithField("size_gb", rootfsSizeGB).Info("Creating ext4 rootfs image...")
 	if err := exec.Command("truncate", "-s", fmt.Sprintf("%dG", rootfsSizeGB), outputPath).Run(); err != nil {
-		return fmt.Errorf("truncate failed: %w", err)
+		return "", fmt.Errorf("truncate failed: %w", err)
 	}
 	if output, err := exec.Command("mkfs.ext4", "-F", outputPath).CombinedOutput(); err != nil {
-		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(output), err)
+		return "", fmt.Errorf("mkfs.ext4 failed: %s: %w", string(output), err)
 	}
 
 	// Mount and populate
 	mountDir := outputPath + ".mnt"
 	if err := os.MkdirAll(mountDir, 0755); err != nil {
-		return fmt.Errorf("failed to create mount dir: %w", err)
+		return "", fmt.Errorf("failed to create mount dir: %w", err)
 	}
 	defer os.RemoveAll(mountDir)
 
 	if output, err := exec.Command("mount", "-o", "loop", outputPath, mountDir).CombinedOutput(); err != nil {
-		return fmt.Errorf("mount failed: %s: %w", string(output), err)
+		return "", fmt.Errorf("mount failed: %s: %w", string(output), err)
 	}
 	defer exec.Command("umount", mountDir).Run()
 
 	// Extract container filesystem
 	log.Info("Extracting container filesystem into rootfs...")
 	if output, err := exec.Command("tar", "xf", tarPath, "-C", mountDir).CombinedOutput(); err != nil {
-		return fmt.Errorf("tar extract failed: %s: %w", string(output), err)
+		return "", fmt.Errorf("tar extract failed: %s: %w", string(output), err)
 	}
 
 	// Extract Docker image ENV variables before injecting platform shim.
@@ -2162,12 +2200,13 @@ func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.E
 
 	// Inject platform shim
 	log.Info("Injecting platform shim (systemd, thaw-agent, networking)...")
-	if err := injectPlatformShim(mountDir, runnerUser, *thawAgentPath, dockerEnv, log); err != nil {
-		return fmt.Errorf("platform shim injection failed: %w", err)
+	flavor, err := injectPlatformShim(mountDir, runnerUser, *thawAgentPath, dockerEnv, log)
+	if err != nil {
+		return "", fmt.Errorf("platform shim injection failed: %w", err)
 	}
 
 	log.Info("Rootfs built from Docker image successfully")
-	return nil
+	return flavor, nil
 }
 
 // injectPlatformShim installs the minimal components needed to run a Firecracker
@@ -2175,44 +2214,44 @@ func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.E
 // dockerEnv contains ENV variables extracted from the Docker image config
 // (e.g., ["PATH=/opt/venv/bin:/usr/bin", "HOME=/home/user"]) that are written
 // to /etc/environment so all processes in the VM inherit them.
-func injectPlatformShim(rootfsDir, runnerUser, thawAgentBin string, dockerEnv []string, log *logrus.Entry) error {
+func injectPlatformShim(rootfsDir, runnerUser, thawAgentBin string, dockerEnv []string, log *logrus.Entry) (rootfsFlavor, error) {
 	cleanupBindMounts := bindRootfsSystemDirs(rootfsDir, log)
 	defer cleanupBindMounts()
 
 	flavor, err := detectRootfsFlavor(rootfsDir)
 	if err != nil {
-		return err
+		return "", err
 	}
 	log.WithField("flavor", flavor).Info("Detected rootfs flavor for platform shim")
 
 	if err := seedRootfsResolvConf(rootfsDir); err != nil {
-		return fmt.Errorf("seed rootfs resolv.conf: %w", err)
+		return "", fmt.Errorf("seed rootfs resolv.conf: %w", err)
 	}
 	if err := ensurePlatformDependencies(rootfsDir, flavor, log); err != nil {
-		return err
+		return "", err
 	}
 	if err := installThawAgentBinary(rootfsDir, thawAgentBin); err != nil {
-		return err
+		return "", err
 	}
 	if err := configureFlavorPlatform(rootfsDir, flavor, runnerUser); err != nil {
-		return err
+		return "", err
 	}
 	if err := writeCommonRootfsFiles(rootfsDir, dockerEnv, log); err != nil {
-		return err
+		return "", err
 	}
 	if err := createRunnerUser(rootfsDir, flavor, runnerUser); err != nil {
-		return err
+		return "", err
 	}
 	if err := ensureWorkspaceOwnership(rootfsDir, runnerUser); err != nil {
-		return err
+		return "", err
 	}
 	if err := validateInjectedRootfs(rootfsDir, flavor, runnerUser); err != nil {
-		return fmt.Errorf("platform shim validation failed: %w", err)
+		return "", fmt.Errorf("platform shim validation failed: %w", err)
 	}
 
 	log.WithFields(logrus.Fields{
 		"runner_user": runnerUser,
 		"flavor":      flavor,
 	}).Info("Platform shim injected successfully")
-	return nil
+	return flavor, nil
 }
