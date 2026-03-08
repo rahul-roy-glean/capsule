@@ -224,11 +224,6 @@ func run(logger *logrus.Logger) error {
 	// Network constants shared by both cold boot and incremental paths
 	vmID := "snapshot-builder"
 	socketPath := filepath.Join(*outputDir, vmID+".sock")
-	tapName := "tap-slot-0"         // Must match manager's slot naming for snapshot compatibility
-	guestIP := "172.16.0.2"         // Slot 0 always gets .2
-	guestMAC := "AA:FC:00:00:00:02" // Deterministic MAC based on slot
-	// hostIP is a package-level constant (172.16.0.1)
-	netmask := "255.255.255.0"
 
 	cleanupSocket := func() {
 		if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
@@ -238,18 +233,26 @@ func run(logger *logrus.Logger) error {
 	defer cleanupSocket()
 
 	log.Info("Setting up network for warmup VM...")
-	if err := setupWarmupNetwork(tapName, hostIP); err != nil {
-		return fmt.Errorf("setup warmup network: %w", err)
+	builderNet, err := setupBuilderNetwork(vmID, logger)
+	if err != nil {
+		return fmt.Errorf("setup builder network: %w", err)
 	}
 	defer func() {
-		if err := cleanupWarmupNetwork(tapName); err != nil {
-			log.WithError(err).WithField("tap_name", tapName).Warn("Failed to cleanup warmup network")
+		if err := builderNet.cleanup(); err != nil {
+			log.WithError(err).Warn("Failed to cleanup builder network")
 		}
 	}()
+	tapName := builderNet.tapName()     // Must match snapshot contract inside namespace
+	guestIP := builderNet.guestIP()     // Slot 0 guest IP remains 172.16.0.2
+	guestMAC := builderNet.guestMAC()   // Deterministic MAC from tap allocation
+	pollIP := builderNet.pollIP()       // Host-reachable IP for thaw-agent polling
+	gatewayIP := builderNet.gatewayIP() // Guest-visible gateway, typically 172.16.0.1
+	netmask := builderNet.netmask()     // Guest-visible netmask
+	firecrackerNetNSPath := builderNet.firecrackerNetNSPath()
 
 	// Start auth proxy if configured. The proxy provides:
-	// 1. GCP metadata server emulation on hostIP:80 (for keyrings.google-artifactregistry-auth)
-	// 2. HTTPS MITM proxy on hostIP:3128 (injects auth headers for matched hosts)
+	// 1. GCP metadata server emulation on gatewayIP:80 (for keyrings.google-artifactregistry-auth)
+	// 2. HTTPS MITM proxy on gatewayIP:3128 (injects auth headers for matched hosts)
 	var authProxy *authproxy.AuthProxy
 	var authProxyAddr string // e.g. "http://172.16.0.1:3128"
 	if *authConfigJSON != "" {
@@ -265,9 +268,9 @@ func run(logger *logrus.Logger) error {
 		if proxyPort == 0 {
 			proxyPort = 3128
 		}
-		authProxyAddr = fmt.Sprintf("http://%s:%d", hostIP, proxyPort)
+		authProxyAddr = fmt.Sprintf("http://%s:%d", gatewayIP, proxyPort)
 		var proxyErr error
-		authProxy, proxyErr = authproxy.NewAuthProxy("snapshot-builder", authCfg, "", hostIP, "", log)
+		authProxy, proxyErr = authproxy.NewAuthProxy("snapshot-builder", authCfg, firecrackerNetNSPath, gatewayIP, "", log)
 		if proxyErr != nil {
 			return fmt.Errorf("create auth proxy: %w", proxyErr)
 		}
@@ -285,7 +288,7 @@ func run(logger *logrus.Logger) error {
 	}
 
 	bootArgs := fmt.Sprintf("console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off",
-		guestIP, hostIP, netmask)
+		guestIP, gatewayIP, netmask)
 
 	// Track FUSE disks for cleanup and incremental chunking
 	var vm *firecracker.VM
@@ -358,7 +361,7 @@ func run(logger *logrus.Logger) error {
 			// Restore from parent layer: parent's VM state (+ old layer's extension drives if reattach)
 			log.Info("Attempting restore from parent layer...")
 			var reattachErr error
-			vm, fuseDisk, fuseExtDisks, incrUffdHandler, reattachErr = reattachFromParent(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken, commands, newDrives, expectedRunnerID, authProxy, authProxyAddr)
+			vm, fuseDisk, fuseExtDisks, incrUffdHandler, reattachErr = reattachFromParent(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, firecrackerNetNSPath, gitToken, gcpAccessToken, commands, newDrives, expectedRunnerID, authProxy, authProxyAddr)
 			if reattachErr != nil {
 				log.WithError(reattachErr).Warn("Reattach failed, falling back to cold boot")
 				vm = nil
@@ -379,7 +382,7 @@ func run(logger *logrus.Logger) error {
 		} else {
 			log.Info("Attempting incremental restore from previous snapshot...")
 			var incrementalErr error
-			vm, fuseDisk, fuseExtDisks, incrUffdHandler, incrementalErr = restoreFromPreviousSnapshot(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, effectiveWorkloadKey, gitToken, gcpAccessToken, commands, newDrives, expectedRunnerID, authProxy, authProxyAddr)
+			vm, fuseDisk, fuseExtDisks, incrUffdHandler, incrementalErr = restoreFromPreviousSnapshot(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, firecrackerNetNSPath, effectiveWorkloadKey, gitToken, gcpAccessToken, commands, newDrives, expectedRunnerID, authProxy, authProxyAddr)
 			if incrementalErr != nil {
 				log.WithError(incrementalErr).Warn("Incremental restore failed, falling back to cold boot")
 				vm = nil
@@ -488,7 +491,8 @@ func run(logger *logrus.Logger) error {
 				Version:           "V1",
 				NetworkInterfaces: []string{"eth0"},
 			},
-			Drives: drives,
+			Drives:    drives,
+			NetNSPath: firecrackerNetNSPath,
 		}
 
 		var err error
@@ -515,7 +519,7 @@ func run(logger *logrus.Logger) error {
 	warmupCtx, warmupCancel := context.WithTimeout(ctx, *warmupTimeout)
 	defer warmupCancel()
 
-	if err := waitForWarmup(warmupCtx, vm, guestIP, expectedRunnerID, log); err != nil {
+	if err := waitForWarmup(warmupCtx, vm, pollIP, expectedRunnerID, log); err != nil {
 		stopVM("warmup failure")
 		return fmt.Errorf("warmup failed: %w", err)
 	}
@@ -1226,82 +1230,6 @@ func getGitCommit(dir string) string {
 	return commit
 }
 
-// setupWarmupNetwork creates the TAP device and connects it to the existing bridge.
-// The host is expected to have a bridge (fcbr0) with IP 172.16.0.1/24 already configured.
-func setupWarmupNetwork(tapName, hostIP string) error {
-	// Create TAP device
-	if output, err := exec.Command("ip", "tuntap", "add", "dev", tapName, "mode", "tap").CombinedOutput(); err != nil {
-		// Might already exist, try to continue
-		if !strings.Contains(string(output), "exists") {
-			return fmt.Errorf("failed to create tap: %s: %w", string(output), err)
-		}
-	}
-
-	// Try to connect TAP to existing bridge (fcbr0)
-	// This is the preferred setup when the host already has a bridge configured
-	bridgeName := "fcbr0"
-	if output, err := exec.Command("ip", "link", "set", tapName, "master", bridgeName).CombinedOutput(); err != nil {
-		// If bridge doesn't exist, fall back to standalone TAP with its own IP
-		fmt.Printf("Note: Could not add TAP to bridge %s (%s), using standalone network\n", bridgeName, strings.TrimSpace(string(output)))
-		// Configure TAP IP directly
-		if output, err := exec.Command("ip", "addr", "add", hostIP+"/24", "dev", tapName).CombinedOutput(); err != nil {
-			if !strings.Contains(string(output), "exists") {
-				return fmt.Errorf("failed to add ip: %s: %w", string(output), err)
-			}
-		}
-	}
-
-	// Match TAP/bridge MTU to the host's outbound interface (GCP uses 1460, not 1500)
-	hostMTU := "1460" // safe default for GCP
-	if mtuBytes, err := os.ReadFile("/sys/class/net/" + getDefaultIface() + "/mtu"); err == nil {
-		hostMTU = strings.TrimSpace(string(mtuBytes))
-	}
-	exec.Command("ip", "link", "set", tapName, "mtu", hostMTU).Run()
-	if bridgeName == "fcbr0" {
-		exec.Command("ip", "link", "set", bridgeName, "mtu", hostMTU).Run()
-	}
-
-	// Bring TAP up
-	if output, err := exec.Command("ip", "link", "set", tapName, "up").CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to bring tap up: %s: %w", string(output), err)
-	}
-
-	// Enable IP forwarding
-	os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
-
-	// Setup NAT for outbound traffic (guest needs internet for warmup)
-	// These rules may already exist from bridge setup, but adding them again is harmless
-	exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "172.16.0.0/24", "-j", "MASQUERADE").Run()
-	exec.Command("iptables", "-A", "FORWARD", "-i", tapName, "-j", "ACCEPT").Run()
-	exec.Command("iptables", "-A", "FORWARD", "-o", tapName, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT").Run()
-
-	// Clamp TCP MSS to path MTU. The guest may have MTU 1500 (default) while the host
-	// outbound interface uses 1460 (GCP). Without this, large TCP segments from the guest
-	// get dropped after NAT because they exceed the host MTU and DF is set.
-	exec.Command("iptables", "-t", "mangle", "-A", "FORWARD", "-p", "tcp",
-		"--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu").Run()
-
-	return nil
-}
-
-// cleanupWarmupNetwork removes the TAP device and iptables rules.
-func cleanupWarmupNetwork(tapName string) error {
-	var errs []error
-	for _, cmd := range [][]string{
-		{"ip", "link", "set", tapName, "down"},
-		{"ip", "tuntap", "del", "dev", tapName, "mode", "tap"},
-		{"iptables", "-t", "nat", "-D", "POSTROUTING", "-s", "172.16.0.0/24", "-j", "MASQUERADE"},
-		{"iptables", "-D", "FORWARD", "-i", tapName, "-j", "ACCEPT"},
-		{"iptables", "-D", "FORWARD", "-o", tapName, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"},
-		{"iptables", "-t", "mangle", "-D", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"},
-	} {
-		if output, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput(); err != nil {
-			errs = append(errs, fmt.Errorf("%s failed: %s: %w", strings.Join(cmd, " "), strings.TrimSpace(string(output)), err))
-		}
-	}
-	return errors.Join(errs...)
-}
-
 // snapshotSymlinkDir matches the path used by the manager for snapshot symlinks.
 // Firecracker opens drive backing files at the paths baked into the snapshot state,
 // which are /tmp/snapshot/*.img.
@@ -1317,6 +1245,7 @@ func restoreFromPreviousSnapshot(
 	logger *logrus.Logger,
 	log *logrus.Entry,
 	vmID, tapName, guestMAC, bootArgs string,
+	netnsPath string,
 	restoreWorkloadKey string,
 	gitToken, gcpAccessToken string,
 	commands []snapshot.SnapshotCommand,
@@ -1561,6 +1490,7 @@ func restoreFromPreviousSnapshot(
 			Version:           "V1",
 			NetworkInterfaces: []string{"eth0"},
 		},
+		NetNSPath: netnsPath,
 	}
 
 	vm, err := firecracker.NewVM(vmCfg, logger)
@@ -1712,6 +1642,7 @@ func reattachFromParent(
 	logger *logrus.Logger,
 	log *logrus.Entry,
 	vmID, tapName, guestMAC, bootArgs string,
+	netnsPath string,
 	gitToken, gcpAccessToken string,
 	commands []snapshot.SnapshotCommand,
 	newDrives []snapshot.DriveSpec,
@@ -2007,7 +1938,8 @@ func reattachFromParent(
 			Version:           "V1",
 			NetworkInterfaces: []string{"eth0"},
 		},
-		Drives: vmDrives,
+		Drives:    vmDrives,
+		NetNSPath: netnsPath,
 	}
 	vm, err := firecracker.NewVM(vmCfg, logger)
 	if err != nil {
