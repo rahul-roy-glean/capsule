@@ -414,7 +414,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		s.hostRegistry.mu.Unlock()
 		return &AllocateRunnerResponse{
 			HostID:      host.ID,
-			HostAddress: host.GRPCAddress,
+			HostAddress: host.HTTPAddress,
 			Error:       resp.Error,
 		}, fmt.Errorf("host agent returned error: %s", resp.Error)
 	}
@@ -437,7 +437,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	return &AllocateRunnerResponse{
 		RunnerID:    resp.Runner.GetId(),
 		HostID:      host.ID,
-		HostAddress: host.GRPCAddress,
+		HostAddress: host.HTTPAddress,
 		InternalIP:  resp.Runner.GetInternalIp(),
 		SessionID:   resp.GetSessionId(),
 		Resumed:     resp.GetResumed(),

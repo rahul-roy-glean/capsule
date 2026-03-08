@@ -175,6 +175,15 @@ func main() {
 	// Create services
 	hostRegistry := NewHostRegistry(db, logger)
 	snapshotManager := NewSnapshotManager(ctx, db, *gcsBucket, *gcsPrefix, gcpProjectVal, gcpZoneVal, logger)
+	if v := os.Getenv("BUILDER_NETWORK"); v != "" {
+		snapshotManager.builderNetwork = v
+	}
+	if v := os.Getenv("BUILDER_IMAGE"); v != "" {
+		snapshotManager.builderImage = v
+	}
+	if v := os.Getenv("BUILDER_SERVICE_ACCOUNT"); v != "" {
+		snapshotManager.builderServiceAccount = v
+	}
 	configCache := NewConfigCache(db, logger)
 	tagRegistry := NewSnapshotTagRegistry(db, logger)
 	scheduler := NewScheduler(hostRegistry, db, snapshotManager, tagRegistry, logger)

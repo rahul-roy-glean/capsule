@@ -61,6 +61,6 @@ GitLab and Buildkite don't need label removal -- they use queue-based scheduling
 
 ```bash
 cp examples/ci-gitlab-runners/onboard.yaml my-gitlab.yaml
-# Edit: set gcp_project, repository.url, adjust start_command
+# Edit my-gitlab.yaml: set platform.gcp_project and workload/start_command values
 make onboard CONFIG=my-gitlab.yaml
 ```

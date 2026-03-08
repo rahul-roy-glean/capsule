@@ -68,6 +68,11 @@ var (
 
 	// Auth proxy: transparent credential injection for the warmup VM
 	authConfigJSON = flag.String("auth-config", "", "JSON auth proxy config (AuthConfig). When set, starts an auth proxy on the host to provide GCP metadata and HTTPS credential injection.")
+
+	// Path to a pre-built thaw-agent binary to inject into the rootfs.
+	// If empty or the file does not exist, snapshot-builder will attempt to
+	// build thaw-agent from source (requires Go toolchain on the host).
+	thawAgentPath = flag.String("thaw-agent-path", "/usr/local/bin/thaw-agent", "Path to thaw-agent binary (if missing, builds from source)")
 )
 
 func main() {
@@ -398,6 +403,7 @@ func main() {
 			VCPUs:          *vcpus,
 			MemoryMB:       *memoryMB,
 			BootArgs:       bootArgs,
+			LogPath:        filepath.Join(*outputDir, vmID+".log"),
 			NetworkIface: &firecracker.NetworkInterface{
 				IfaceID:     "eth0",
 				HostDevName: tapName,
@@ -2046,7 +2052,7 @@ func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.E
 
 	// Inject platform shim
 	log.Info("Injecting platform shim (systemd, thaw-agent, networking)...")
-	if err := injectPlatformShim(mountDir, runnerUser, dockerEnv, log); err != nil {
+	if err := injectPlatformShim(mountDir, runnerUser, *thawAgentPath, dockerEnv, log); err != nil {
 		return fmt.Errorf("platform shim injection failed: %w", err)
 	}
 
@@ -2059,18 +2065,64 @@ func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.E
 // dockerEnv contains ENV variables extracted from the Docker image config
 // (e.g., ["PATH=/opt/venv/bin:/usr/bin", "HOME=/home/user"]) that are written
 // to /etc/environment so all processes in the VM inherit them.
-func injectPlatformShim(rootfsDir, runnerUser string, dockerEnv []string, log *logrus.Entry) error {
+func injectPlatformShim(rootfsDir, runnerUser, thawAgentBin string, dockerEnv []string, log *logrus.Entry) error {
+	// 0. Set up bind mounts so chroot has working DNS and device access for package installs.
+	bindMounts := []struct{ src, dst string }{
+		{"/proc", filepath.Join(rootfsDir, "proc")},
+		{"/sys", filepath.Join(rootfsDir, "sys")},
+		{"/dev", filepath.Join(rootfsDir, "dev")},
+	}
+	for _, m := range bindMounts {
+		os.MkdirAll(m.dst, 0755)
+		if out, err := exec.Command("mount", "--bind", m.src, m.dst).CombinedOutput(); err != nil {
+			log.WithField("output", string(out)).Warnf("failed to bind-mount %s", m.src)
+		}
+	}
+	defer func() {
+		for i := len(bindMounts) - 1; i >= 0; i-- {
+			exec.Command("umount", "-l", bindMounts[i].dst).Run()
+		}
+	}()
+
+	// Copy host resolv.conf into the chroot for DNS resolution.
+	resolvPath := filepath.Join(rootfsDir, "etc/resolv.conf")
+	if hostResolv, err := os.ReadFile("/etc/resolv.conf"); err == nil {
+		os.WriteFile(resolvPath, hostResolv, 0644)
+	} else {
+		// Fallback to Google DNS if host resolv.conf is unavailable.
+		os.WriteFile(resolvPath, []byte("nameserver 8.8.8.8\nnameserver 8.8.4.4\n"), 0644)
+	}
+
 	// 1. Ensure systemd is installed (check for /lib/systemd/systemd)
 	systemdPath := filepath.Join(rootfsDir, "lib/systemd/systemd")
 	if _, err := os.Stat(systemdPath); os.IsNotExist(err) {
-		// Install systemd via chroot apt-get (requires the image to be Debian/Ubuntu-based)
 		log.Info("Installing systemd in rootfs...")
-		installCmd := exec.Command("chroot", rootfsDir, "/bin/sh", "-c",
-			"apt-get update -qq && apt-get install -y -qq --no-install-recommends systemd systemd-sysv dbus iproute2 sudo")
-		installCmd.Env = []string{"DEBIAN_FRONTEND=noninteractive", "PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
+
+		// Detect distro: Alpine uses apk, Debian/Ubuntu uses apt-get
+		var installCmd *exec.Cmd
+		if _, err := os.Stat(filepath.Join(rootfsDir, "etc/alpine-release")); err == nil {
+			log.Info("Detected Alpine-based image, using apk...")
+			installCmd = exec.Command("chroot", rootfsDir, "/bin/sh", "-c",
+				"apk add --no-cache openrc dbus iproute2 sudo")
+			installCmd.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
+		} else {
+			installCmd = exec.Command("chroot", rootfsDir, "/bin/sh", "-c",
+				"apt-get update -qq && apt-get install -y -qq --no-install-recommends systemd systemd-sysv dbus iproute2 sudo")
+			installCmd.Env = []string{"DEBIAN_FRONTEND=noninteractive", "PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
+		}
+
 		if output, err := installCmd.CombinedOutput(); err != nil {
-			log.WithField("output", string(output)).Warn("systemd install failed (image may not be Debian-based)")
-			return fmt.Errorf("systemd installation failed: %w", err)
+			log.WithField("output", string(output)).Warn("init system install failed")
+			return fmt.Errorf("init system installation failed: %w", err)
+		}
+
+		// For Alpine with OpenRC, create a systemd-compatible /lib/systemd/systemd shim
+		if _, err := os.Stat(filepath.Join(rootfsDir, "etc/alpine-release")); err == nil {
+			os.MkdirAll(filepath.Join(rootfsDir, "lib/systemd"), 0755)
+			// OpenRC uses /sbin/init; create the symlink so the rest of the pipeline finds it
+			if _, err := os.Stat(filepath.Join(rootfsDir, "sbin/init")); err == nil {
+				os.Symlink("/sbin/init", filepath.Join(rootfsDir, "lib/systemd/systemd"))
+			}
 		}
 	}
 
@@ -2082,8 +2134,13 @@ func injectPlatformShim(rootfsDir, runnerUser string, dockerEnv []string, log *l
 		os.Symlink("/lib/systemd/systemd", filepath.Join(rootfsDir, "sbin/init"))
 	}
 
-	// 3. Copy thaw-agent binary (statically linked, available at /usr/local/bin/thaw-agent on the builder VM)
-	thawAgentSrc := "/usr/local/bin/thaw-agent"
+	// 3. Copy thaw-agent binary into rootfs.
+	// In the Docker image, thaw-agent is at /usr/local/bin/thaw-agent.
+	// Override with --thaw-agent-path for local dev.
+	thawAgentSrc := thawAgentBin
+	if _, err := os.Stat(thawAgentSrc); os.IsNotExist(err) {
+		return fmt.Errorf("thaw-agent binary not found at %s (build with 'make thaw-agent' or set --thaw-agent-path)", thawAgentSrc)
+	}
 	thawAgentDst := filepath.Join(rootfsDir, "usr/local/bin/thaw-agent")
 	os.MkdirAll(filepath.Dir(thawAgentDst), 0755)
 	if err := copyFile(thawAgentSrc, thawAgentDst); err != nil {
@@ -2091,17 +2148,86 @@ func injectPlatformShim(rootfsDir, runnerUser string, dockerEnv []string, log *l
 	}
 	os.Chmod(thawAgentDst, 0755)
 
-	// 4. Write thaw-agent systemd service
-	serviceDir := filepath.Join(rootfsDir, "etc/systemd/system")
-	os.MkdirAll(serviceDir, 0755)
-	serviceContent := fmt.Sprintf(`[Unit]
+	isAlpine := false
+	if _, err := os.Stat(filepath.Join(rootfsDir, "etc/alpine-release")); err == nil {
+		isAlpine = true
+	}
+
+	// 4. Write thaw-agent service and configure init system
+	if isAlpine {
+		// OpenRC init script for thaw-agent
+		initScript := fmt.Sprintf(`#!/sbin/openrc-run
+
+name="thaw-agent"
+description="Thaw Agent - MicroVM initialization"
+command="/usr/local/bin/thaw-agent"
+command_args="--runner-user=%s"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/thaw-agent/stdout.log"
+error_log="/var/log/thaw-agent/stderr.log"
+
+depend() {
+	need net
+	after firewall
+}
+`, runnerUser)
+		initDir := filepath.Join(rootfsDir, "etc/init.d")
+		os.MkdirAll(initDir, 0755)
+		initPath := filepath.Join(initDir, "thaw-agent")
+		if err := os.WriteFile(initPath, []byte(initScript), 0755); err != nil {
+			return fmt.Errorf("failed to write thaw-agent init script: %w", err)
+		}
+		// Enable at default runlevel
+		runlevelDir := filepath.Join(rootfsDir, "etc/runlevels/default")
+		os.MkdirAll(runlevelDir, 0755)
+		os.Symlink("/etc/init.d/thaw-agent", filepath.Join(runlevelDir, "thaw-agent"))
+
+		// 5. Alpine networking: configure eth0 via /etc/network/interfaces (ifupdown)
+		interfacesContent := `auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet manual
+`
+		os.MkdirAll(filepath.Join(rootfsDir, "etc/network"), 0755)
+		os.WriteFile(filepath.Join(rootfsDir, "etc/network/interfaces"), []byte(interfacesContent), 0644)
+
+		// 6. Configure OpenRC defaults: enable networking and serial console
+		for _, svc := range []string{"networking", "hostname"} {
+			os.Symlink("/etc/init.d/"+svc, filepath.Join(runlevelDir, svc))
+		}
+		// Boot-level services
+		bootDir := filepath.Join(rootfsDir, "etc/runlevels/boot")
+		os.MkdirAll(bootDir, 0755)
+		for _, svc := range []string{"procfs", "sysfs", "devfs", "hwclock", "modules", "sysctl", "hostname", "bootmisc", "syslog"} {
+			os.Symlink("/etc/init.d/"+svc, filepath.Join(bootDir, svc))
+		}
+
+		// Write a complete inittab for Firecracker. Docker images ship with a
+		// container-oriented inittab (or none at all) that doesn't invoke OpenRC,
+		// so we always overwrite it with one that boots properly in a VM.
+		inittabContent := `# Firecracker microVM inittab (busybox init + OpenRC)
+::sysinit:/sbin/openrc sysinit
+::sysinit:/sbin/openrc boot
+::wait:/sbin/openrc default
+::shutdown:/sbin/openrc shutdown
+ttyS0::respawn:/sbin/getty -L ttyS0 115200 vt100
+`
+		inittabPath := filepath.Join(rootfsDir, "etc/inittab")
+		os.WriteFile(inittabPath, []byte(inittabContent), 0644)
+	} else {
+		// systemd service for thaw-agent
+		serviceDir := filepath.Join(rootfsDir, "etc/systemd/system")
+		os.MkdirAll(serviceDir, 0755)
+		serviceContent := fmt.Sprintf(`[Unit]
 Description=Thaw Agent - MicroVM initialization
 After=network.target
 Wants=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/thaw-agent --sandbox-user=%s
+ExecStart=/usr/local/bin/thaw-agent --runner-user=%s
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal+console
@@ -2112,29 +2238,30 @@ Environment=HOME=/root
 [Install]
 WantedBy=multi-user.target
 `, runnerUser)
-	if err := os.WriteFile(filepath.Join(serviceDir, "thaw-agent.service"), []byte(serviceContent), 0644); err != nil {
-		return fmt.Errorf("failed to write thaw-agent.service: %w", err)
-	}
-	// Enable the service
-	wantsDir := filepath.Join(serviceDir, "multi-user.target.wants")
-	os.MkdirAll(wantsDir, 0755)
-	os.Symlink("/etc/systemd/system/thaw-agent.service", filepath.Join(wantsDir, "thaw-agent.service"))
+		if err := os.WriteFile(filepath.Join(serviceDir, "thaw-agent.service"), []byte(serviceContent), 0644); err != nil {
+			return fmt.Errorf("failed to write thaw-agent.service: %w", err)
+		}
+		// Enable the service
+		wantsDir := filepath.Join(serviceDir, "multi-user.target.wants")
+		os.MkdirAll(wantsDir, 0755)
+		os.Symlink("/etc/systemd/system/thaw-agent.service", filepath.Join(wantsDir, "thaw-agent.service"))
 
-	// 5. Write network config (static IP, configured at runtime by thaw-agent)
-	networkDir := filepath.Join(rootfsDir, "etc/systemd/network")
-	os.MkdirAll(networkDir, 0755)
-	networkContent := `[Match]
+		// 5. Write network config (static IP, configured at runtime by thaw-agent)
+		networkDir := filepath.Join(rootfsDir, "etc/systemd/network")
+		os.MkdirAll(networkDir, 0755)
+		networkContent := `[Match]
 Name=eth0
 
 [Network]
 DHCP=no
 `
-	os.WriteFile(filepath.Join(networkDir, "10-eth0.network"), []byte(networkContent), 0644)
+		os.WriteFile(filepath.Join(networkDir, "10-eth0.network"), []byte(networkContent), 0644)
 
-	// 6. Configure systemd defaults
-	exec.Command("chroot", rootfsDir, "systemctl", "set-default", "multi-user.target").Run()
-	exec.Command("chroot", rootfsDir, "systemctl", "mask",
-		"systemd-resolved.service", "systemd-timesyncd.service").Run()
+		// 6. Configure systemd defaults
+		exec.Command("chroot", rootfsDir, "systemctl", "set-default", "multi-user.target").Run()
+		exec.Command("chroot", rootfsDir, "systemctl", "mask",
+			"systemd-resolved.service", "systemd-timesyncd.service").Run()
+	}
 
 	// 7. Create required directories
 	for _, dir := range []string{
@@ -2149,10 +2276,11 @@ DHCP=no
 	}
 
 	// 8. Create runner user if it doesn't exist (no sudo access by default).
-	// The runner user runs user-level commands (git clone, builds, etc.).
-	// Only thaw-agent (running as root via systemd) and commands explicitly
-	// marked with run_as_root: true get root privileges.
-	exec.Command("chroot", rootfsDir, "useradd", "-m", "-s", "/bin/bash", runnerUser).Run()
+	if isAlpine {
+		exec.Command("chroot", rootfsDir, "adduser", "-D", "-s", "/bin/sh", "-h", "/home/"+runnerUser, runnerUser).Run()
+	} else {
+		exec.Command("chroot", rootfsDir, "useradd", "-m", "-s", "/bin/bash", runnerUser).Run()
+	}
 	// Ensure the runner user owns its workspace
 	exec.Command("chroot", rootfsDir, "chown", "-R", runnerUser+":"+runnerUser, "/workspace").Run()
 
@@ -2174,8 +2302,10 @@ DHCP=no
 		os.WriteFile(nsswitchPath, []byte(fixed), 0644)
 	}
 
-	// 10. Enable serial console for Firecracker
-	exec.Command("chroot", rootfsDir, "systemctl", "enable", "serial-getty@ttyS0.service").Run()
+	// 10. Enable serial console for Firecracker (systemd only; Alpine handled via inittab above)
+	if !isAlpine {
+		exec.Command("chroot", rootfsDir, "systemctl", "enable", "serial-getty@ttyS0.service").Run()
+	}
 
 	// 11. Write Docker image ENV variables to /etc/environment so all processes
 	// (including start_command, login shells, etc.) inherit them. Docker ENV

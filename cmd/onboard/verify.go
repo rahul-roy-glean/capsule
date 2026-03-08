@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -19,94 +18,92 @@ func stepVerify(cfg *Config, logger *logrus.Logger, planOnly bool) error {
 		return nil
 	}
 
-	// Get host instances
-	log.Info("Checking host instances...")
-	cmd := exec.Command("gcloud", "compute", "instances", "list",
-		"--project", cfg.Platform.GCPProject,
-		"--filter", "name~firecracker-runner",
-		"--format", "value(name,networkInterfaces[0].networkIP,status)")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to list instances: %w\n%s", err, string(output))
+	if cfg.ResolvedControlPlaneURL == "" {
+		if cfg.ResolvedControlPlaneIP == "" {
+			ip, err := resolveControlPlaneServiceIP()
+			if err != nil {
+				return err
+			}
+			cfg.ResolvedControlPlaneIP = ip
+		}
+		cfg.ResolvedControlPlaneURL = "http://" + cfg.ResolvedControlPlaneIP + ":8080"
 	}
 
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if len(lines) == 0 || (len(lines) == 1 && lines[0] == "") {
-		return fmt.Errorf("no host instances found")
-	}
+	return withControlPlanePortForward(func(baseURL string) error {
+		client := &http.Client{Timeout: 10 * time.Second}
 
-	log.WithField("count", len(lines)).Info("Found host instances")
-
-	// Health check each host
-	healthyHosts := 0
-	client := &http.Client{Timeout: 5 * time.Second}
-
-	for _, line := range lines {
-		parts := strings.Fields(line)
-		if len(parts) < 3 {
-			continue
-		}
-		name, ip, status := parts[0], parts[1], parts[2]
-
-		log.WithFields(logrus.Fields{
-			"name":   name,
-			"ip":     ip,
-			"status": status,
-		}).Info("Checking host")
-
-		if status != "RUNNING" {
-			log.WithField("name", name).Warn("Host not running")
-			continue
-		}
-
-		healthURL := fmt.Sprintf("http://%s:8080/health", ip)
-		resp, err := client.Get(healthURL)
+		log.Info("Checking control-plane health...")
+		resp, err := client.Get(baseURL + "/health")
 		if err != nil {
-			log.WithError(err).WithField("name", name).Warn("Health check failed")
-			continue
+			return fmt.Errorf("control-plane health check failed: %w", err)
 		}
 		resp.Body.Close()
-
-		if resp.StatusCode == http.StatusOK {
-			healthyHosts++
-			log.WithField("name", name).Info("Host healthy")
-		} else {
-			log.WithFields(logrus.Fields{
-				"name":   name,
-				"status": resp.StatusCode,
-			}).Warn("Host unhealthy")
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("control-plane health returned %d", resp.StatusCode)
 		}
-	}
 
-	if healthyHosts == 0 {
-		return fmt.Errorf("no healthy hosts found")
-	}
-
-	log.WithFields(logrus.Fields{
-		"healthy": healthyHosts,
-		"total":   len(lines),
-	}).Info("Host verification complete")
-
-	// Check pool stats on first healthy host
-	for _, line := range lines {
-		parts := strings.Fields(line)
-		if len(parts) < 3 || parts[2] != "RUNNING" {
-			continue
-		}
-		ip := parts[1]
-		readyURL := fmt.Sprintf("http://%s:8080/ready", ip)
-		resp, err := client.Get(readyURL)
+		log.Info("Checking registered hosts...")
+		resp, err = client.Get(baseURL + "/api/v1/hosts")
 		if err != nil {
-			continue
+			return fmt.Errorf("failed to get hosts: %w", err)
 		}
 		defer resp.Body.Close()
+		var hosts struct {
+			Count int `json:"count"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&hosts); err != nil {
+			return fmt.Errorf("failed to decode hosts response: %w", err)
+		}
+		if hosts.Count == 0 {
+			return fmt.Errorf("control plane reports zero healthy hosts")
+		}
+		log.WithField("host_count", hosts.Count).Info("Host verification complete")
 
-		var readyData map[string]interface{}
-		json.NewDecoder(resp.Body).Decode(&readyData)
-		log.WithField("ready_data", readyData).Info("Host readiness status")
-		break
-	}
+		if cfg.ResolvedWorkloadKey == "" {
+			log.Info("No workload key available, skipping allocation probe")
+			return nil
+		}
 
-	log.Info("Verification complete!")
-	return nil
+		log.WithField("workload_key", cfg.ResolvedWorkloadKey).Info("Allocating verification runner...")
+		reqBody := fmt.Sprintf(`{"workload_key":"%s"}`, cfg.ResolvedWorkloadKey)
+		resp, err = client.Post(baseURL+"/api/v1/runners/allocate", "application/json", strings.NewReader(reqBody))
+		if err != nil {
+			return fmt.Errorf("verification allocation failed: %w", err)
+		}
+		defer resp.Body.Close()
+		var alloc struct {
+			RunnerID string `json:"runner_id"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&alloc); err != nil {
+			return fmt.Errorf("failed to decode allocation response: %w", err)
+		}
+		if alloc.RunnerID == "" {
+			return fmt.Errorf("verification allocation returned empty runner_id")
+		}
+
+		for i := 0; i < 30; i++ {
+			statusResp, err := client.Get(baseURL + "/api/v1/runners/status?runner_id=" + alloc.RunnerID)
+			if err == nil {
+				if statusResp.StatusCode == http.StatusOK {
+					statusResp.Body.Close()
+					log.WithField("runner_id", alloc.RunnerID).Info("Verification runner became ready")
+					break
+				}
+				statusResp.Body.Close()
+			}
+			if i == 29 {
+				return fmt.Errorf("verification runner %s did not become ready in time", alloc.RunnerID)
+			}
+			time.Sleep(5 * time.Second)
+		}
+
+		releaseBody := fmt.Sprintf(`{"runner_id":"%s"}`, alloc.RunnerID)
+		resp, err = client.Post(baseURL+"/api/v1/runners/release", "application/json", strings.NewReader(releaseBody))
+		if err != nil {
+			return fmt.Errorf("failed to release verification runner: %w", err)
+		}
+		resp.Body.Close()
+		log.WithField("runner_id", alloc.RunnerID).Info("Verification runner released")
+		return nil
+	})
 }

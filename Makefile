@@ -1,4 +1,4 @@
-.PHONY: all build test clean proto docker-build docker-push terraform-init terraform-plan terraform-apply
+.PHONY: all build test clean proto docker-build docker-push docker-push-control-plane docker-push-snapshot-builder terraform-init terraform-plan terraform-apply
 .PHONY: packer-init packer-validate packer-build firecracker-manager-linux release-host-image mig-rolling-update
 .PHONY: onboard onboard-validate onboard-plan bin-onboard
 .PHONY: firecracker-manager control-plane snapshot-builder thaw-agent
@@ -50,7 +50,7 @@ thaw-agent:
 	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/thaw-agent ./cmd/thaw-agent
 
 bin-onboard:
-	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/onboard ./cmd/onboard
+	$(GO) build $(GOFLAGS) -o bin/onboard ./cmd/onboard
 
 bench-allocate:
 	$(GO) build $(GOFLAGS) -o bin/bench-allocate ./cmd/bench-allocate
@@ -120,9 +120,13 @@ docker-build-snapshot-builder:
 		-t $(REGISTRY)/firecracker-snapshot-builder:latest \
 		-f deploy/docker/Dockerfile.snapshot-builder .
 
-docker-push:
+docker-push: docker-push-control-plane docker-push-snapshot-builder
+
+docker-push-control-plane:
 	docker push $(REGISTRY)/firecracker-control-plane:$(VERSION)
 	docker push $(REGISTRY)/firecracker-control-plane:latest
+
+docker-push-snapshot-builder:
 	docker push $(REGISTRY)/firecracker-snapshot-builder:$(VERSION)
 	docker push $(REGISTRY)/firecracker-snapshot-builder:latest
 

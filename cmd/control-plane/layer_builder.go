@@ -621,6 +621,9 @@ func (s *LayerBuildScheduler) onLeafLayerComplete(ctx context.Context, layerHash
 	if autoRollout {
 		s.logger.WithField("version", version).Info("Auto-rollout: setting active snapshot")
 		s.snapshotManager.SetActiveSnapshotForKey(ctx, workloadKey, version)
+		if err := s.snapshotManager.AssignVersion(ctx, workloadKey, nil, version); err != nil {
+			return fmt.Errorf("failed to assign fleet-wide desired version: %w", err)
+		}
 	}
 
 	return nil
@@ -1126,7 +1129,7 @@ shutdown -h now
 			},
 			ServiceAccounts: []*computepb.ServiceAccount{
 				{
-					Email:  proto.String("default"),
+					Email:  proto.String(sm.builderServiceAccountEmail()),
 					Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"},
 				},
 			},

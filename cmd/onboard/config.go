@@ -1,10 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 	"gopkg.in/yaml.v3"
 )
 
@@ -27,14 +30,28 @@ type Config struct {
 	Workload    WorkloadConfig    `yaml:"workload"`
 	Session     SessionConfig     `yaml:"session"`
 	Credentials CredentialsConfig `yaml:"credentials"`
+
+	ResolvedDBPassword     string `yaml:"-"`
+	ResolvedStateBucket    string `yaml:"-"`
+	ResolvedControlPlaneIP string `yaml:"-"`
+	ResolvedControlPlaneURL string `yaml:"-"`
+	ResolvedConfigID       string `yaml:"-"`
+	ResolvedWorkloadKey    string `yaml:"-"`
 }
 
 // --- Core fields ---
 
 type PlatformConfig struct {
-	GCPProject string `yaml:"gcp_project"`
-	Region     string `yaml:"region"`
-	Zone       string `yaml:"zone"`
+	GCPProject         string `yaml:"gcp_project"`
+	Region             string `yaml:"region"`
+	Zone               string `yaml:"zone"`
+	Environment        string `yaml:"environment"`
+	ControlPlaneDomain string `yaml:"control_plane_domain"`
+	TerraformStateBucket string `yaml:"terraform_state_bucket"`
+	TerraformStatePrefix string `yaml:"terraform_state_prefix"`
+	DBPassword          string `yaml:"db_password"`
+	GitHubWebhookSecret string `yaml:"github_webhook_secret"`
+	AdminCIDRs          []string `yaml:"admin_cidrs"`
 }
 
 type MicroVMConfig struct {
@@ -45,10 +62,12 @@ type MicroVMConfig struct {
 }
 
 type HostsConfig struct {
-	MachineType string `yaml:"machine_type"`
-	MinCount    int    `yaml:"min_count"`
-	MaxCount    int    `yaml:"max_count"`
-	DataDiskGB  int    `yaml:"data_disk_gb"`
+	MachineType     string `yaml:"machine_type"`
+	MinCount        int    `yaml:"min_count"`
+	MaxCount        int    `yaml:"max_count"`
+	DataDiskGB      int    `yaml:"data_disk_gb"`
+	ChunkCacheSizeGB int   `yaml:"chunk_cache_size_gb"`
+	MemCacheSizeGB   int   `yaml:"mem_cache_size_gb"`
 }
 
 // --- Workload: what runs inside the VM ---
@@ -60,10 +79,29 @@ type WorkloadConfig struct {
 	// Valid types: "shell", "gcp-auth", "exec" (see examples/README.md for args).
 	SnapshotCommands []SnapshotCommandConfig `yaml:"snapshot_commands"`
 
+	// Layered workload schema used by the examples and control-plane API.
+	BaseImage string             `yaml:"base_image"`
+	Layers    []snapshot.LayerDef `yaml:"layers"`
+	Config    WorkloadRuntimeConfig `yaml:"config"`
+
 	// StartCommand describes the service to launch inside the VM after restore.
 	// The thaw-agent starts Command, waits for GET HealthPath on Port to return 2xx,
 	// then signals host readiness.
 	StartCommand StartCommandConfig `yaml:"start_command"`
+}
+
+type WorkloadRuntimeConfig struct {
+	AutoPause            *bool                `yaml:"auto_pause"`
+	TTL                  int                  `yaml:"ttl"`
+	Tier                 string               `yaml:"tier"`
+	AutoRollout          *bool                `yaml:"auto_rollout"`
+	SessionMaxAgeSeconds int                  `yaml:"session_max_age_seconds"`
+	RootfsSizeGB         int                  `yaml:"rootfs_size_gb"`
+	RunnerUser           string               `yaml:"runner_user"`
+	WorkspaceSizeGB      int                  `yaml:"workspace_size_gb"`
+	NetworkPolicyPreset  string               `yaml:"network_policy_preset"`
+	NetworkPolicy        json.RawMessage      `yaml:"network_policy"`
+	Auth                 *authproxy.AuthConfig `yaml:"auth"`
 }
 
 // SnapshotCommandConfig is one warmup step baked into the golden snapshot.
@@ -79,6 +117,8 @@ type StartCommandConfig struct {
 	Command    []string `yaml:"command"`
 	Port       int      `yaml:"port"`
 	HealthPath string   `yaml:"health_path"`
+	Env        map[string]string `yaml:"env"`
+	RunAs      string            `yaml:"run_as"`
 }
 
 // --- Session: optional persistent cross-host sessions ---
@@ -138,6 +178,9 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.Platform.Zone == "" {
 		cfg.Platform.Zone = cfg.Platform.Region + "-a"
 	}
+	if cfg.Platform.Environment == "" {
+		cfg.Platform.Environment = "dev"
+	}
 	if cfg.MicroVM.VCPUs == 0 {
 		cfg.MicroVM.VCPUs = 4
 	}
@@ -162,6 +205,12 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.Hosts.DataDiskGB == 0 {
 		cfg.Hosts.DataDiskGB = 500
 	}
+	if cfg.Hosts.ChunkCacheSizeGB == 0 {
+		cfg.Hosts.ChunkCacheSizeGB = 8
+	}
+	if cfg.Hosts.MemCacheSizeGB == 0 {
+		cfg.Hosts.MemCacheSizeGB = 8
+	}
 
 	return &cfg, nil
 }
@@ -171,9 +220,15 @@ func (c *Config) Validate() error {
 	if c.Platform.GCPProject == "" {
 		return fmt.Errorf("platform.gcp_project is required")
 	}
+	if len(c.Workload.Layers) == 0 && len(c.Workload.SnapshotCommands) == 0 {
+		return fmt.Errorf("workload must define either workload.layers or workload.snapshot_commands")
+	}
+	if len(c.Credentials.Secrets) > 0 || len(c.Credentials.HostDirs) > 0 || len(c.Credentials.Env) > 0 {
+		return fmt.Errorf("cmd/onboard does not yet translate the top-level credentials block into runtime drives or Secret Manager mounts; express credentials inside workload layers/drives for now")
+	}
 
 	// Check toolchain availability.
-	for _, tool := range []string{"gcloud", "terraform"} {
+	for _, tool := range []string{"gcloud", "terraform", "packer", "docker", "helm", "kubectl", "python3"} {
 		if _, err := lookPath(tool); err != nil {
 			return fmt.Errorf("required tool not found: %s", tool)
 		}

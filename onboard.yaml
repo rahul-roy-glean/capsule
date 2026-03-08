@@ -1,48 +1,48 @@
-# Onboard configuration for bazel-firecracker platform
-# Fill in your project-specific values and run: make onboard CONFIG=onboard.yaml
-# See examples/ for complete configurations for each use case.
-
 platform:
-  gcp_project: "my-project"
+  gcp_project: "dev-sandbox-334901"
   region: "us-central1"
   zone: "us-central1-a"
+  # terraform_state_bucket: "my-project-firecracker-tfstate"
+  # terraform_state_prefix: "firecracker"
+  # admin_cidrs: ["203.0.113.10/32"]
+  # control_plane_domain: "cp.example.com"  # Set to enable Ingress; omit to skip
 
 microvm:
-  vcpus: 4
-  memory_mb: 8192
-  max_per_host: 16
-  idle_target: 2
+  max_per_host: 32
+  idle_target: 4
 
 hosts:
-  machine_type: "n2-standard-64"
+  machine_type: "n2-standard-16"
   min_count: 2
   max_count: 20
-  data_disk_gb: 500
+  data_disk_gb: 300
 
-# workload: what runs inside the VM.
-# workload:
-#   # snapshot_commands lists warmup steps baked into the golden snapshot.
-#   # Types: "shell" | "gcp-auth" | "exec" (see examples/README.md for args)
-#   snapshot_commands:
-#     - type: "shell"
-#       args: ["bash", "-c", "git clone --depth=1 -b main https://github.com/myorg/myrepo /workspace"]
-#     - type: "shell"
-#       args: ["pip3", "install", "-r", "/app/requirements.txt"]
-#       run_as_root: true
-#   # start_command: the service the VM runs after restore.
-#   # thaw-agent starts command, waits for GET health_path on port to return 2xx.
-#   start_command:
-#     command: ["python3", "/app/server.py"]
-#     port: 8080
-#     health_path: "/health"
+workload:
+  base_image: "us-central1-docker.pkg.dev/scio-engineering/glean-images/afs-sandbox:latest"
 
-# session: optional, for workloads that persist state across requests.
-# session:
-#   enabled: true
-#   ttl_seconds: 3600   # auto-pause after 1h idle
-#   auto_pause: true    # pause to GCS (true) vs destroy (false)
+  layers:
+    - name: "runtime"
+      init_commands:
+        - type: "shell"
+          args: ["bash", "-c", "mkdir -p /home/user/{upload,output,Documents,Research,Downloads} && chown -R 1000:1000 /home/user"]
+          run_as_root: true
+
+  config:
+    tier: "xs"                  # 1 vCPU, 512MB — smallest tier
+    auto_pause: true
+    ttl: 300
+    session_max_age_seconds: 86400
+    runner_user: "user"
+    workspace_size_gb: 10
+
+session:
+  enabled: true
+  ttl_seconds: 300
+  auto_pause: true
 
 credentials:
+  # Reserved for future wrapper-level translation. Leave empty for now and express
+  # credentials inside workload layers/drives or workload.config.auth.
   secrets: []
   host_dirs: []
   env: {}

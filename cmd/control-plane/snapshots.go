@@ -48,6 +48,7 @@ type SnapshotManager struct {
 	gcpZone        string
 	builderImage   string // GCE image for snapshot builder VM
 	builderNetwork string // VPC network for builder VM
+	builderServiceAccount string // GCE service account email for builder VMs
 	logger         *logrus.Entry
 	mu             sync.RWMutex
 	currentVersion string
@@ -84,6 +85,13 @@ func (sm *SnapshotManager) gcsPath(path string) string {
 		return sm.gcsPrefix + "/" + path
 	}
 	return path
+}
+
+func (sm *SnapshotManager) builderServiceAccountEmail() string {
+	if sm.builderServiceAccount != "" {
+		return sm.builderServiceAccount
+	}
+	return "default"
 }
 
 // GetCurrentVersion returns the current active snapshot version
@@ -538,7 +546,7 @@ shutdown -h now
 			},
 			ServiceAccounts: []*computepb.ServiceAccount{
 				{
-					Email:  proto.String("default"),
+					Email:  proto.String(sm.builderServiceAccountEmail()),
 					Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"},
 				},
 			},

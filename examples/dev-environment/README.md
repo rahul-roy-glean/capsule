@@ -43,18 +43,20 @@ session:
 
 ## Snapshot commands
 
-Customize `workload.snapshot_commands` for your stack:
+Customize the `workload.layers` section for your stack:
 
 ```yaml
-snapshot_commands:
-  - type: "shell"
-    args: ["bash", "-c", "git clone --depth=1 -b main https://github.com/myorg/myrepo /workspace"]
-  - type: "shell"
-    args: ["bash", "/setup/install-toolchain.sh"]
-    run_as_root: true
-  - type: "shell"
-    args: ["bash", "/setup/warm-lsp.sh"]
-    run_as_root: false
+workload:
+  layers:
+    - name: "workspace"
+      init_commands:
+        - type: "shell"
+          args: ["bash", "-c", "git clone --depth=1 -b main https://github.com/myorg/myrepo /workspace"]
+        - type: "shell"
+          args: ["bash", "/setup/install-toolchain.sh"]
+          run_as_root: true
+        - type: "shell"
+          args: ["bash", "/setup/warm-lsp.sh"]
 ```
 
 The `install-toolchain.sh` script should install your language toolchain, extensions, and any IDE dependencies. The `warm-lsp.sh` script should start the language server and trigger an initial index so it's warm at restore time.
@@ -63,8 +65,7 @@ The `install-toolchain.sh` script should install your language toolchain, extens
 
 ```bash
 cp examples/dev-environment/onboard.yaml my-devenv.yaml
-# Edit my-devenv.yaml: set platform.gcp_project, repository.url
-# Customize workload.snapshot_commands for your toolchain
+# Edit my-devenv.yaml: set platform.gcp_project and workload values
 make onboard CONFIG=my-devenv.yaml
 ```
 
@@ -73,9 +74,13 @@ make onboard CONFIG=my-devenv.yaml
 After onboarding, allocate a session via the API:
 
 ```bash
-curl -X POST https://<control-plane>/v1/runners/allocate \
+curl -X POST http://<control-plane>:8080/api/v1/runners/allocate \
   -H "Content-Type: application/json" \
-  -d '{"session_id": "user-alice", "workload_key": "<your-key>", "resources": {"vcpus": 4, "memory_mb": 8192}}'
+  -d '{"session_id": "user-alice", "workload_key": "<your-workload-key>"}'
 ```
 
-The response includes the host IP and port to connect code-server.
+The response includes the host HTTP address. Connect to the proxied IDE via:
+
+```bash
+http://<host-http-address>/api/v1/runners/<runner-id>/proxy/
+```

@@ -80,7 +80,7 @@ resource "google_compute_instance_template" "firecracker_host" {
     chunk-cache-size-gb    = var.chunk_cache_size_gb
     mem-cache-size-gb      = var.mem_cache_size_gb
     use-netns              = var.use_netns ? "true" : "false"
-    otel-collector-addr    = var.otel_collector_addr
+    otel-collector-endpoint = var.otel_collector_addr
   }
 
   metadata_startup_script = <<-EOF
