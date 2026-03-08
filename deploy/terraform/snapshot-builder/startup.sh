@@ -71,32 +71,7 @@ if [ -n "$SNAPSHOT_BUCKET" ]; then
   chmod +x /usr/local/bin/thaw-agent 2>/dev/null || true
 fi
 
-# ---- 5. Setup networking: bridge, IP forwarding, NAT, MTU clamping ----
-echo "Setting up bridge networking..."
-HOST_MTU=$(cat /sys/class/net/$(ip route | grep default | awk '{print $5}' | head -1)/mtu)
-ip link add fcbr0 type bridge || true
-ip link set fcbr0 mtu "$HOST_MTU"
-ip addr add 172.16.0.1/24 dev fcbr0 || true
-ip link set fcbr0 up
-echo "Bridge MTU set to $HOST_MTU (matching host interface)"
-
-# Enable IP forwarding
-echo 1 > /proc/sys/net/ipv4/ip_forward
-echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
-
-# Setup NAT
-PRIMARY_IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
-iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -o "$PRIMARY_IFACE" -j MASQUERADE
-iptables -A FORWARD -i fcbr0 -o "$PRIMARY_IFACE" -j ACCEPT
-iptables -A FORWARD -i "$PRIMARY_IFACE" -o fcbr0 -m state --state RELATED,ESTABLISHED -j ACCEPT
-
-# Clamp TCP MSS to path MTU (GCP uses 1460, guests may assume 1500)
-iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-
-mkdir -p /etc/iptables
-iptables-save > /etc/iptables/rules.v4 || true
-
-# Load tun module
+# ---- 5. Load tun module; snapshot-builder configures per-build netns itself ----
 modprobe tun || true
 
 # ---- 6/7. Run or prepare snapshot-builder ----

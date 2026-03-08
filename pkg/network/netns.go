@@ -702,6 +702,8 @@ func (n *NetNSNetwork) Cleanup() error {
 	exec.Command("iptables", "-D", "FORWARD",
 		"-d", vethSupernet, "-i", n.externalIface,
 		"-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT").Run()
+	exec.Command("iptables", "-t", "mangle", "-D", "FORWARD",
+		"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu").Run()
 
 	return nil
 }
