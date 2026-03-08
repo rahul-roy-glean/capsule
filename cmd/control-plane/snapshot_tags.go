@@ -125,7 +125,8 @@ func (r *SnapshotTagRegistry) PromoteTag(ctx context.Context, workloadKey, tag s
 		return "", err
 	}
 	_, err = r.db.ExecContext(ctx, `
-		UPDATE snapshot_configs SET current_version = $1 WHERE workload_key = $2
+		UPDATE snapshot_layers SET current_version = $1, updated_at = NOW()
+		WHERE layer_hash = (SELECT leaf_layer_hash FROM layered_configs WHERE leaf_workload_key = $2 LIMIT 1)
 	`, version, workloadKey)
 	if err != nil {
 		return "", fmt.Errorf("failed to promote tag: %w", err)
@@ -135,7 +136,7 @@ func (r *SnapshotTagRegistry) PromoteTag(ctx context.Context, workloadKey, tag s
 
 // HTTP Handlers
 
-// HandleTags handles /api/v1/snapshot-configs/{wk}/tags and /api/v1/snapshot-configs/{wk}/tags/{tag}
+// HandleTags handles /api/v1/layered-configs/{wk}/tags and /api/v1/layered-configs/{wk}/tags/{tag}
 func (r *SnapshotTagRegistry) HandleTags(w http.ResponseWriter, req *http.Request, workloadKey, subpath string) {
 	// subpath is everything after "tags", e.g. "" or "/{tag}"
 	tag := strings.TrimPrefix(subpath, "/")
@@ -164,7 +165,7 @@ func (r *SnapshotTagRegistry) HandleTags(w http.ResponseWriter, req *http.Reques
 	}
 }
 
-// HandlePromote handles POST /api/v1/snapshot-configs/{wk}/promote
+// HandlePromote handles POST /api/v1/layered-configs/{wk}/promote
 func (r *SnapshotTagRegistry) HandlePromote(w http.ResponseWriter, req *http.Request, workloadKey string) {
 	if req.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)

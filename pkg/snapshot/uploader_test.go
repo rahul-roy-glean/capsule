@@ -114,22 +114,20 @@ func TestParallelUploadErrorCollection(t *testing.T) {
 		{
 			name: "all_succeed",
 			fileErrors: map[string]error{
-				"kernel.bin":          nil,
-				"rootfs.img":          nil,
-				"snapshot.mem":        nil,
-				"snapshot.state":      nil,
-				"repo-cache-seed.img": nil,
+				"kernel.bin":     nil,
+				"rootfs.img":     nil,
+				"snapshot.mem":   nil,
+				"snapshot.state": nil,
 			},
 			wantErr: false,
 		},
 		{
 			name: "one_failure",
 			fileErrors: map[string]error{
-				"kernel.bin":          nil,
-				"rootfs.img":          fmt.Errorf("upload failed"),
-				"snapshot.mem":        nil,
-				"snapshot.state":      nil,
-				"repo-cache-seed.img": nil,
+				"kernel.bin":     nil,
+				"rootfs.img":     fmt.Errorf("upload failed"),
+				"snapshot.mem":   nil,
+				"snapshot.state": nil,
 			},
 			wantErr:   true,
 			wantCount: 1,
@@ -137,14 +135,13 @@ func TestParallelUploadErrorCollection(t *testing.T) {
 		{
 			name: "all_fail",
 			fileErrors: map[string]error{
-				"kernel.bin":          fmt.Errorf("fail1"),
-				"rootfs.img":          fmt.Errorf("fail2"),
-				"snapshot.mem":        fmt.Errorf("fail3"),
-				"snapshot.state":      fmt.Errorf("fail4"),
-				"repo-cache-seed.img": fmt.Errorf("fail5"),
+				"kernel.bin":     fmt.Errorf("fail1"),
+				"rootfs.img":     fmt.Errorf("fail2"),
+				"snapshot.mem":   fmt.Errorf("fail3"),
+				"snapshot.state": fmt.Errorf("fail4"),
 			},
 			wantErr:   true,
-			wantCount: 5,
+			wantCount: 4,
 		},
 	}
 
@@ -203,11 +200,10 @@ func TestUploadSnapshotSizeCalculation(t *testing.T) {
 
 	// Create test files of known sizes
 	testFiles := map[string]int{
-		"kernel.bin":          1024,
-		"rootfs.img":          2048,
-		"snapshot.mem":        4096,
-		"snapshot.state":      512,
-		"repo-cache-seed.img": 8192,
+		"kernel.bin":     1024,
+		"rootfs.img":     2048,
+		"snapshot.mem":   4096,
+		"snapshot.state": 512,
 	}
 
 	for name, size := range testFiles {
@@ -226,7 +222,6 @@ func TestUploadSnapshotSizeCalculation(t *testing.T) {
 		{filepath.Join(dir, "rootfs.img"), "v1/rootfs.img"},
 		{filepath.Join(dir, "snapshot.mem"), "v1/snapshot.mem"},
 		{filepath.Join(dir, "snapshot.state"), "v1/snapshot.state"},
-		{filepath.Join(dir, "repo-cache-seed.img"), "v1/repo-cache-seed.img"},
 	}
 
 	var totalSize int64
@@ -237,7 +232,7 @@ func TestUploadSnapshotSizeCalculation(t *testing.T) {
 		}
 	}
 
-	expectedSize := int64(1024 + 2048 + 4096 + 512 + 8192)
+	expectedSize := int64(1024 + 2048 + 4096 + 512)
 	if totalSize != expectedSize {
 		t.Errorf("Total size: got %d, want %d", totalSize, expectedSize)
 	}
@@ -296,7 +291,7 @@ func TestUploadSnapshotSizeWithMissingFiles(t *testing.T) {
 	// Only create some files
 	os.WriteFile(filepath.Join(dir, "kernel.bin"), make([]byte, 100), 0644)
 	os.WriteFile(filepath.Join(dir, "rootfs.img"), make([]byte, 200), 0644)
-	// snapshot.mem, snapshot.state, repo-cache-seed.img don't exist
+	// snapshot.mem, snapshot.state don't exist
 
 	files := []struct {
 		local  string
@@ -306,7 +301,6 @@ func TestUploadSnapshotSizeWithMissingFiles(t *testing.T) {
 		{filepath.Join(dir, "rootfs.img"), "v1/rootfs.img"},
 		{filepath.Join(dir, "snapshot.mem"), "v1/snapshot.mem"},
 		{filepath.Join(dir, "snapshot.state"), "v1/snapshot.state"},
-		{filepath.Join(dir, "repo-cache-seed.img"), "v1/repo-cache-seed.img"},
 	}
 
 	var totalSize int64
@@ -511,7 +505,7 @@ func TestUploadSnapshotE2E(t *testing.T) {
 
 	// Create temp dir with small test files
 	dir := t.TempDir()
-	for _, name := range []string{"kernel.bin", "rootfs.img", "snapshot.mem", "snapshot.state", "repo-cache-seed.img"} {
+	for _, name := range []string{"kernel.bin", "rootfs.img", "snapshot.mem", "snapshot.state"} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("test-"+name), 0644); err != nil {
 			t.Fatalf("Failed to create test file: %v", err)
 		}

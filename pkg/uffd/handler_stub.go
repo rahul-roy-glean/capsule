@@ -28,6 +28,8 @@ type HandlerConfig struct {
 	MaxConsecutiveFailures int
 	OnFatal                func(error)
 	Meter                  metric.Meter
+	FaultConcurrency       int
+	EnablePrefetchTracking bool
 }
 
 // NewHandler returns an error on non-Linux platforms
@@ -63,4 +65,23 @@ func (h *Handler) SocketPath() string {
 // WaitForConnection is a stub
 func (h *Handler) WaitForConnection(timeout time.Duration) error {
 	return fmt.Errorf("UFFD is only supported on Linux")
+}
+
+// GetPrefetchMapping is a stub
+func (h *Handler) GetPrefetchMapping() *snapshot.PrefetchMapping { return nil }
+
+// Mappings is a stub
+func (h *Handler) Mappings() []GuestRegionUFFDMapping { return nil }
+
+// Connected is a stub
+func (h *Handler) Connected() <-chan struct{} { return nil }
+
+// SetPrefetcher is a stub
+func (h *Handler) SetPrefetcher(p *Prefetcher) {}
+
+// GuestRegionUFFDMapping is a stub for non-Linux platforms
+type GuestRegionUFFDMapping struct {
+	BaseHostVirtAddr uintptr `json:"base_host_virt_addr"`
+	Size             uintptr `json:"size"`
+	Offset           uintptr `json:"offset"`
 }

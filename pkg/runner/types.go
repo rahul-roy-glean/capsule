@@ -36,10 +36,8 @@ type Runner struct {
 	TapDevice               string
 	MAC                     string
 	SnapshotVersion         string
-	GitHubRunnerID          string
-	GitHubRepo              string // Repository for pool key matching
+	PoolAffinityKey         string // Opaque key for pool reuse matching (e.g. repo name)
 	WorkloadKey             string // Workload key for snapshot routing in multi-snapshot support
-	CISystem                string // CI system used for this runner (e.g., "github-actions")
 	JobID                   string
 	Resources               Resources
 	CreatedAt               time.Time
@@ -50,7 +48,6 @@ type Runner struct {
 	LogPath                 string
 	MetricsPath             string
 	RootfsOverlay           string
-	RepoCacheUpper          string
 	QuarantineReason        string
 	QuarantinedAt           time.Time
 	QuarantineDir           string
@@ -110,14 +107,12 @@ type AllocateRequest struct {
 	SnapshotVersion     string // Explicit snapshot version; skips current-pointer.json lookup when set
 	Resources           Resources
 	Labels              map[string]string
-	GitHubRunnerToken   string
-	CISystem            string                 // CI system identifier
 	StartCommand        *snapshot.StartCommand // Optional: user service to start inside the VM
 	SessionID           string                 // optional: bind to session for pause/resume
 	TTLSeconds          int                    // idle timeout from snapshot config
 	AutoPause           bool                   // pause on TTL vs destroy
 	SnapshotTag         string                 // optional: named tag to resolve snapshot version
-	NetworkPolicyPreset string                 // optional: named preset (e.g., "ci-standard")
+	NetworkPolicyPreset string                 // optional: named preset (e.g., "restricted-egress")
 	NetworkPolicy       *network.NetworkPolicy // optional: full policy override
 	AuthConfig          *authproxy.AuthConfig  // optional: auth proxy configuration
 }
@@ -134,11 +129,6 @@ type MMDSData struct {
 			Mode         string `json:"mode,omitempty"`         // "warmup", "exec", or empty for normal runner
 			CurrentTime  string `json:"current_time,omitempty"` // RFC3339 timestamp from host for clock sync
 		} `json:"meta"`
-		Buildbarn struct {
-			// CertsMountPath is where Buildbarn mTLS certs will be mounted inside the microVM.
-			// Some existing setups use /etc/glean/ci/certs; this is configurable.
-			CertsMountPath string `json:"certs_mount_path,omitempty"`
-		} `json:"buildbarn,omitempty"`
 		Network struct {
 			IP        string `json:"ip"`
 			Gateway   string `json:"gateway"`
@@ -148,34 +138,14 @@ type MMDSData struct {
 			MAC       string `json:"mac"`
 		} `json:"network"`
 		Job struct {
-			Repo              string            `json:"repo"`
-			Branch            string            `json:"branch"`
-			Commit            string            `json:"commit"`
-			GitHubRunnerToken string            `json:"github_runner_token"`
-			GitToken          string            `json:"git_token"` // Installation token for git clone auth (private repos)
-			Labels            map[string]string `json:"labels"`
+			Repo   string            `json:"repo"`
+			Branch string            `json:"branch"`
+			Commit string            `json:"commit"`
+			Labels map[string]string `json:"labels"`
 		} `json:"job"`
-		Runner struct {
-			Ephemeral bool   `json:"ephemeral"`
-			CISystem  string `json:"ci_system,omitempty"`
-		} `json:"runner,omitempty"`
 		Snapshot struct {
 			Version string `json:"version"`
 		} `json:"snapshot"`
-		GitCache struct {
-			// Enabled indicates whether git-cache reference cloning is available
-			Enabled bool `json:"enabled"`
-			// MountPath is where the git-cache block device is mounted inside the microVM
-			MountPath string `json:"mount_path,omitempty"`
-			// RepoMappings maps repo URLs/names to their cache paths inside MountPath
-			// e.g. {"github.com/org/repo": "org-repo"} means /mnt/git-cache/org-repo
-			RepoMappings map[string]string `json:"repo_mappings,omitempty"`
-			// WorkspaceDir is the target directory for cloned repositories
-			WorkspaceDir string `json:"workspace_dir,omitempty"`
-			// PreClonedPath is the path where the repo was pre-cloned during warmup
-			// (baked into the snapshot rootfs). Thaw-agent creates a symlink from WorkspaceDir to here.
-			PreClonedPath string `json:"pre_cloned_path,omitempty"`
-		} `json:"git_cache,omitempty"`
 		Exec struct {
 			Command    []string          `json:"command,omitempty"`
 			Env        map[string]string `json:"env,omitempty"`
@@ -190,54 +160,17 @@ type MMDSData struct {
 			Env        map[string]string `json:"env,omitempty"`
 			RunAs      string            `json:"run_as,omitempty"`
 		} `json:"start_command,omitempty"`
+		// Drives lists extension drives to mount inside the VM.
+		// Populated from DriveSpec metadata in the snapshot.
+		Drives []snapshot.DriveSpec `json:"drives,omitempty"`
+		Warmup struct {
+			Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
+		} `json:"warmup,omitempty"`
 	} `json:"latest"`
 }
 
-// CredentialSecret defines a secret to fetch from GCP Secret Manager.
-type CredentialSecret struct {
-	Name       string `json:"name"`        // Human-readable name
-	SecretName string `json:"secret_name"` // Full Secret Manager path
-	Target     string `json:"target"`      // Target path inside credentials drive
-}
-
-// CredentialHostDir defines a host directory to include in the credentials drive.
-type CredentialHostDir struct {
-	Name     string `json:"name"`      // Human-readable name
-	HostPath string `json:"host_path"` // Path on the host
-	Target   string `json:"target"`    // Target path inside credentials drive
-}
-
-// CIConfig holds optional CI system integration settings.
-// When CISystem is empty or "none", the platform operates as a generic VM host.
-type CIConfig struct {
-	CISystem              string
-	GitHubRunnerEnabled   bool
-	GitHubRepo            string
-	GitHubOrg             string
-	GitHubRunnerLabels    []string
-	GitHubRunnerEphemeral bool
-	GitHubAppID           string
-	GitHubAppSecret       string
-}
-
-// BazelConfig holds optional Bazel-specific settings for CI workloads.
-type BazelConfig struct {
-	RepoCacheUpperSizeGB      int
-	BuildbarnCertsDir         string
-	BuildbarnCertsMountPath   string
-	BuildbarnCertsImageSizeMB int
-	GitCacheEnabled           bool
-	GitCacheDir               string
-	GitCacheImagePath         string
-	GitCacheMountPath         string
-	GitCacheRepoMappings      map[string]string
-	GitCacheWorkspaceDir      string
-	GitCachePreClonedPath     string
-}
-
 // HostConfig holds configuration for the host agent.
-// Core fields handle generic VM lifecycle. CI and Bazel-specific settings
-// are isolated in the CI and Bazel sub-structs respectively.
+// Core fields handle generic VM lifecycle.
 type HostConfig struct {
 	HostID            string
 	InstanceName      string
@@ -250,12 +183,6 @@ type HostConfig struct {
 	LogDir            string
 	SnapshotBucket    string
 	SnapshotCachePath string
-
-	// Credentials configuration
-	CredentialsSecrets     []CredentialSecret
-	CredentialsHostDirs    []CredentialHostDir
-	CredentialsEnv         map[string]string
-	CredentialsImageSizeMB int
 
 	QuarantineDir string
 	// SessionDir is the base directory for session snapshot storage (pause/resume).
@@ -286,11 +213,4 @@ type HostConfig struct {
 	SessionChunkBucket string
 	// GCSPrefix is the top-level prefix for all GCS paths (e.g. "v1").
 	GCSPrefix string
-
-	// CI holds optional CI system integration settings.
-	// When CI.CISystem is empty or "none", the platform operates as a generic VM host.
-	CI CIConfig
-
-	// Bazel holds optional Bazel-specific settings for CI workloads.
-	Bazel BazelConfig
 }

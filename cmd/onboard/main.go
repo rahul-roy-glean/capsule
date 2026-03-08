@@ -14,6 +14,7 @@ var (
 	configPath = flag.String("config", "onboard.yaml", "Path to onboard configuration file")
 	stepsFlag  = flag.String("steps", "", "Comma-separated list of steps to run (default: all)")
 	dryRun     = flag.Bool("dry-run", false, "Validate configuration without executing steps")
+	planMode   = flag.Bool("plan", false, "Preview what each step would do without applying changes")
 	logLevel   = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	verbose    = flag.Bool("verbose", false, "Enable verbose output")
 )
@@ -58,8 +59,6 @@ func main() {
 		fmt.Printf("  GCP Project:  %s\n", cfg.Platform.GCPProject)
 		fmt.Printf("  Region:       %s\n", cfg.Platform.Region)
 		fmt.Printf("  Zone:         %s\n", cfg.Platform.Zone)
-		fmt.Printf("  Repository:   %s\n", cfg.Repository.URL)
-		fmt.Printf("  CI System:    %s\n", cfg.CI.System)
 		fmt.Printf("  Max Hosts:    %d\n", cfg.Hosts.MaxCount)
 		fmt.Printf("  Max VMs/Host: %d\n", cfg.MicroVM.MaxPerHost)
 		os.Exit(0)
@@ -83,7 +82,12 @@ func main() {
 	}
 
 	// Execute steps
-	log.WithField("steps", len(stepsToRun)).Info("Starting onboard steps")
+	mode := "apply"
+	if *planMode {
+		mode = "plan"
+		log.Info("Plan mode - previewing what each step would do (no changes will be applied)")
+	}
+	log.WithFields(logrus.Fields{"steps": len(stepsToRun), "mode": mode}).Info("Starting onboard steps")
 	startTime := time.Now()
 
 	for i, step := range stepsToRun {
@@ -94,7 +98,7 @@ func main() {
 		stepLog.Infof("Starting: %s", step.Description)
 
 		stepStart := time.Now()
-		if err := step.Run(cfg, logger); err != nil {
+		if err := step.Run(cfg, logger, *planMode); err != nil {
 			stepLog.WithError(err).Error("Step failed")
 			os.Exit(1)
 		}
@@ -102,5 +106,9 @@ func main() {
 		stepLog.WithField("duration", time.Since(stepStart).Round(time.Second)).Info("Step completed")
 	}
 
-	log.WithField("total_duration", time.Since(startTime).Round(time.Second)).Info("Onboard completed successfully!")
+	if *planMode {
+		log.WithField("total_duration", time.Since(startTime).Round(time.Second)).Info("Plan complete. Review the output above, then run without --plan to apply.")
+	} else {
+		log.WithField("total_duration", time.Since(startTime).Round(time.Second)).Info("Onboard completed successfully!")
+	}
 }

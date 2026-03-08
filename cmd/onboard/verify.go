@@ -11,8 +11,13 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func stepVerify(cfg *Config, logger *logrus.Logger) error {
+func stepVerify(cfg *Config, logger *logrus.Logger, planOnly bool) error {
 	log := logger.WithField("step", "verify")
+
+	if planOnly {
+		log.Info("Skipped (nothing to verify in plan mode)")
+		return nil
+	}
 
 	// Get host instances
 	log.Info("Checking host instances...")

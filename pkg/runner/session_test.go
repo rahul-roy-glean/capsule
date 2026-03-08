@@ -139,17 +139,16 @@ func TestResetTTL_NonexistentRunner(t *testing.T) {
 
 func TestSessionMetadata_JSON(t *testing.T) {
 	meta := SessionMetadata{
-		SessionID:          "sess-abc",
-		WorkloadKey:        "chunk123",
-		RunnerID:           "runner-1",
-		HostID:             "host-1",
-		Layers:             2,
-		CreatedAt:          time.Now().Truncate(time.Second),
-		PausedAt:           time.Now().Truncate(time.Second),
-		RootfsPath:         "/tmp/overlay.img",
-		RepoCacheUpperPath: "/tmp/upper.img",
-		TTLSeconds:         30,
-		AutoPause:          true,
+		SessionID:   "sess-abc",
+		WorkloadKey: "chunk123",
+		RunnerID:    "runner-1",
+		HostID:      "host-1",
+		Layers:      2,
+		CreatedAt:   time.Now().Truncate(time.Second),
+		PausedAt:    time.Now().Truncate(time.Second),
+		RootfsPath:  "/tmp/overlay.img",
+		TTLSeconds:  30,
+		AutoPause:   true,
 	}
 
 	data, err := json.Marshal(meta)

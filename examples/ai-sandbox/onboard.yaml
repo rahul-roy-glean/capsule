@@ -3,10 +3,6 @@ platform:
   region: "us-central1"
   zone: "us-central1-a"
 
-repository:
-  url: "https://github.com/myorg/my-sandbox-app"
-  branch: "main"
-
 microvm:
   vcpus: 8
   memory_mb: 16384          # 16GB — room for model weights in RAM
@@ -19,19 +15,21 @@ hosts:
   max_count: 20
   data_disk_gb: 500
 
-ci:
-  system: "none"
-
 workload:
-  # Steps baked into the golden snapshot during warmup.
-  # The snapshot builder boots a VM, runs these in order, then freezes it.
-  snapshot_commands:
-    - type: "shell"
-      args: ["pip3", "install", "-r", "/app/requirements.txt"]
-      run_as_root: true
-    - type: "shell"
-      args: ["python3", "/app/preload_weights.py"]
-      run_as_root: false
+  # Docker image with your sandbox runtime, Python, and model dependencies.
+  # The platform converts it to a Firecracker rootfs and installs thaw-agent.
+  base_image: "us-docker.pkg.dev/my-project/images/ai-sandbox:latest"
+
+  layers:
+    - name: "runtime"
+      init_commands:
+        - type: "shell"
+          args: ["pip3", "install", "-r", "/app/requirements.txt"]
+          run_as_root: true
+        - type: "shell"
+          # Pre-load model weights into memory so they're baked into the snapshot.
+          # On restore, the model is already in RAM — no loading delay.
+          args: ["python3", "/app/preload_weights.py"]
 
   # The service that runs inside the VM after each restore.
   # The thaw-agent starts this, waits for GET /health on port 8080 to return 2xx,

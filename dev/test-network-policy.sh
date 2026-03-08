@@ -6,7 +6,7 @@
 #   2. Policy on layered configs (DB integration)
 #   3. Allocation with policy preset / custom policy
 #   4. Policy enforcement (deny-default blocks, allow-default permits)
-#   5. RFC1918 blocking under ci-standard
+#   5. RFC1918 blocking under restricted-egress
 #   6. Deny-default blocks + allowed CIDR works (positive+negative)
 #   7. Quarantine overrides policy, unquarantine restores it
 #   8. Emergency egress block (host-level kill switch)
@@ -205,7 +205,7 @@ CONFIG_PRESET_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
   -d '{
     "display_name": "netpol-ci-test",
     "layers": [{"name": "base", "init_commands": [{"type":"shell","args":["echo","netpol-ci"]}]}],
-    "config": {"runner_ttl_seconds": 120, "auto_pause": false, "network_policy_preset": "ci-standard"}
+    "config": {"runner_ttl_seconds": 120, "auto_pause": false, "network_policy_preset": "restricted-egress"}
   }')
 CONFIG_PRESET_ID=$(echo "$CONFIG_PRESET_RESP" | jq -r '.config_id')
 CONFIG_IDS+=("$CONFIG_PRESET_ID")
@@ -213,10 +213,10 @@ GET_PRESET_RESP=$(curl -sf "$CP/api/v1/layered-configs/$CONFIG_PRESET_ID")
 NP_PRESET2=$(echo "$GET_PRESET_RESP" | jq -r '.config.network_policy_preset // ""')
 echo "  preset=$NP_PRESET2"
 
-if [ "$NP_PRESET2" = "ci-standard" ]; then
-  pass "Config stored network_policy_preset=ci-standard"
+if [ "$NP_PRESET2" = "restricted-egress" ]; then
+  pass "Config stored network_policy_preset=restricted-egress"
 else
-  fail "Expected preset ci-standard, got '$NP_PRESET2'"
+  fail "Expected preset restricted-egress, got '$NP_PRESET2'"
 fi
 
 # ---------------------------------------------------------------------------
@@ -267,25 +267,25 @@ echo "  (released unrestricted runner to free capacity)"
 RUNNER_IDS=("${RUNNER_IDS[@]/$RUNNER_ID/}")
 
 # =========================================================================
-# PART 2: ci-standard preset enforcement
+# PART 2: restricted-egress preset enforcement
 # =========================================================================
 
 # ---------------------------------------------------------------------------
-header "6. Allocate runner with ci-standard preset"
+header "6. Allocate runner with restricted-egress preset"
 # ---------------------------------------------------------------------------
 RUNNER_ID_CI=$(allocate_and_wait "{
   \"ci_system\":\"none\",
   \"workload_key\":\"$WORKLOAD_KEY\",
-  \"network_policy_preset\":\"ci-standard\"
+  \"network_policy_preset\":\"restricted-egress\"
 }")
 if [ "$RUNNER_ID_CI" != "ALLOC_FAILED" ]; then
-  pass "Runner allocated with ci-standard preset"
+  pass "Runner allocated with restricted-egress preset"
 else
-  fail "Failed to allocate ci-standard runner"; exit 1
+  fail "Failed to allocate restricted-egress runner"; exit 1
 fi
 
 # ---------------------------------------------------------------------------
-header "7. Verify ci-standard policy is applied"
+header "7. Verify restricted-egress policy is applied"
 # ---------------------------------------------------------------------------
 sleep 1
 CI_RESP=$(curl -s "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID_CI")
@@ -295,39 +295,39 @@ CI_ACTION=$(echo "$CI_RESP" | jq -r '.policy.default_egress_action // ""')
 echo "  version=$CI_VER name=$CI_NAME action=$CI_ACTION"
 
 [ "$CI_VER" = "1" ] && pass "Policy version 1" || fail "Expected version 1, got $CI_VER"
-[ "$CI_NAME" = "ci-standard" ] && pass "Policy name is ci-standard" || fail "Expected ci-standard, got '$CI_NAME'"
+[ "$CI_NAME" = "restricted-egress" ] && pass "Policy name is restricted-egress" || fail "Expected restricted-egress, got '$CI_NAME'"
 [ "$CI_ACTION" = "allow" ] && pass "default_egress_action=allow" || fail "Expected allow, got '$CI_ACTION'"
 
 # ---------------------------------------------------------------------------
-header "8. ci-standard: external egress works"
+header "8. restricted-egress: external egress works"
 # ---------------------------------------------------------------------------
 # Wait for thaw-agent to be reachable before testing network policy
 if ! wait_for_exec "$RUNNER_ID_CI"; then
-  fail "ci-standard: thaw-agent exec unreachable (cannot test network policy)"
+  fail "restricted-egress: thaw-agent exec unreachable (cannot test network policy)"
   dump_netns_iptables "$RUNNER_ID_CI"
 else
   EXEC_CI=$(vm_tcp_check "$RUNNER_ID_CI" "8.8.8.8" "53")
   if echo "$EXEC_CI" | grep -q "NET_OK"; then
-    pass "ci-standard: external egress works"
+    pass "restricted-egress: external egress works"
   elif echo "$EXEC_CI" | grep -q "EXEC_PROXY_FAILED"; then
-    fail "ci-standard: exec proxy failed (transport issue, not policy)"
+    fail "restricted-egress: exec proxy failed (transport issue, not policy)"
     dump_netns_iptables "$RUNNER_ID_CI"
   else
-    fail "ci-standard: external egress blocked"
+    fail "restricted-egress: external egress blocked"
     dump_netns_iptables "$RUNNER_ID_CI"
   fi
 fi
 
 # ---------------------------------------------------------------------------
-header "8b. ci-standard: RFC1918 is blocked"
+header "8b. restricted-egress: RFC1918 is blocked"
 # ---------------------------------------------------------------------------
 RFC_EXEC=$(vm_tcp_check_blocked "$RUNNER_ID_CI" "10.0.0.1" "80")
 if echo "$RFC_EXEC" | grep -q "NET_BLOCKED"; then
-  pass "ci-standard: RFC1918 (10.0.0.1) blocked"
+  pass "restricted-egress: RFC1918 (10.0.0.1) blocked"
 elif echo "$RFC_EXEC" | grep -q "NET_OK"; then
-  fail "ci-standard: RFC1918 NOT blocked (10.0.0.1 reachable)"
+  fail "restricted-egress: RFC1918 NOT blocked (10.0.0.1 reachable)"
 else
-  pass "ci-standard: RFC1918 appears blocked (timeout/no response)"
+  pass "restricted-egress: RFC1918 appears blocked (timeout/no response)"
 fi
 
 # =========================================================================
@@ -408,12 +408,12 @@ else
   pass "Emergency block: egress appears blocked (timeout)"
 fi
 
-# Unquarantine to clean up, then release ci-standard runner to free capacity
+# Unquarantine to clean up, then release restricted-egress runner to free capacity
 curl -sf -X POST "$MGR/api/v1/runners/unquarantine?runner_id=$RUNNER_ID_CI&unblock_egress=true&resume_vm=false" > /dev/null
 curl -sf -X POST "$CP/api/v1/runners/release" \
   -H 'Content-Type: application/json' \
   -d "{\"runner_id\":\"$RUNNER_ID_CI\"}" > /dev/null 2>&1 || true
-echo "  (released ci-standard runner to free capacity)"
+echo "  (released restricted-egress runner to free capacity)"
 RUNNER_IDS=("${RUNNER_IDS[@]/$RUNNER_ID_CI/}")
 
 # =========================================================================

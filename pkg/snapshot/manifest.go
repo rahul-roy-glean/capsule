@@ -52,6 +52,9 @@ type ChunkIndex struct {
 		DefaultFill      string             `json:"default_fill"` // "zero"
 		Extents          []ManifestChunkRef `json:"extents"`
 	} `json:"region"`
+	// PrefetchMapping records page fault access order from a previous run
+	// for replay during subsequent resumes (access-pattern prefetching).
+	PrefetchMapping *PrefetchMapping `json:"prefetch_mapping,omitempty"`
 }
 
 // ManifestChunkRef is a reference to a single extent in a ChunkIndex.
@@ -117,6 +120,7 @@ func ChunkIndexToMetadata(idx *ChunkIndex) *ChunkedSnapshotMetadata {
 	}
 
 	meta.MemChunks = refs
+	meta.MemPrefetchMapping = idx.PrefetchMapping
 	return meta
 }
 

@@ -1,4 +1,2 @@
 platform:
   gcp_project: defaults-project
-repository:
-  url: https://github.com/org/defaults

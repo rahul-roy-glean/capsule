@@ -215,10 +215,10 @@ func validatePorts(ports []PortRange) error {
 
 // Named preset names.
 const (
-	PresetUnrestricted = "unrestricted"
-	PresetQuarantine   = "quarantine"
-	PresetCIStandard   = "ci-standard"
-	PresetAgentSandbox = "agent-sandbox"
+	PresetUnrestricted     = "unrestricted"
+	PresetQuarantine       = "quarantine"
+	PresetRestrictedEgress = "restricted-egress"
+	PresetAgentSandbox     = "agent-sandbox"
 )
 
 // GetPreset returns a named preset policy. Returns nil for unknown names.
@@ -228,8 +228,8 @@ func GetPreset(name string) *NetworkPolicy {
 		return presetUnrestricted()
 	case PresetQuarantine:
 		return presetQuarantine()
-	case PresetCIStandard:
-		return presetCIStandard()
+	case PresetRestrictedEgress:
+		return presetRestrictedEgress()
 	case PresetAgentSandbox:
 		return presetAgentSandbox()
 	default:
@@ -257,9 +257,9 @@ func presetQuarantine() *NetworkPolicy {
 	}
 }
 
-func presetCIStandard() *NetworkPolicy {
+func presetRestrictedEgress() *NetworkPolicy {
 	return &NetworkPolicy{
-		Name:                "ci-standard",
+		Name:                "restricted-egress",
 		DefaultEgressAction: PolicyActionAllow,
 		DeniedEgress: []EgressRule{
 			{

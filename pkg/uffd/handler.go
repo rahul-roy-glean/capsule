@@ -135,6 +135,21 @@ type Handler struct {
 	wg        sync.WaitGroup
 	connected chan struct{} // closed when Firecracker connects
 
+	// Concurrent fault handling: when faultSem is non-nil, page faults are
+	// dispatched to goroutines gated by this buffered channel (semaphore).
+	// When nil, faults are handled serially (legacy behavior).
+	faultSem chan struct{}
+
+	// Prefetch tracking: records page fault order for replay on next resume.
+	// nil when tracking is disabled.
+	prefetchTracker *PrefetchTracker
+
+	// Prefetcher: replays recorded access patterns from a previous run.
+	// Set via SetPrefetcher() before the UFFD connection is established.
+	// The handler wires the UFFD fd and mappings into the prefetcher
+	// when Firecracker connects.
+	prefetcher *Prefetcher
+
 	// Fault policy
 	consecutiveFailures    uint64 // atomic
 	killOnce               sync.Once
@@ -169,7 +184,30 @@ type HandlerConfig struct {
 	// Meter is an OTel metric.Meter for fault-service instrumentation.
 	// If nil, no metrics are recorded.
 	Meter metric.Meter
+
+	// FaultConcurrency controls how many page faults can be serviced in
+	// parallel. 0 or 1 means serial (legacy behavior). Values > 1 enable
+	// concurrent fault dispatch via a bounded goroutine pool, eliminating
+	// head-of-line blocking when one fault is waiting on a GCS fetch.
+	// Recommended: 32.
+	FaultConcurrency int
+
+	// EnablePrefetchTracking enables recording page fault access order.
+	// When true, the handler creates a PrefetchTracker that records the
+	// first access to each page offset. The recorded mapping can be
+	// retrieved via GetPrefetchMapping() and stored in snapshot metadata
+	// for replay on subsequent resumes.
+	EnablePrefetchTracking bool
+
+	// MaxPrefetchPages caps how many pages the prefetch tracker retains.
+	// 0 means derive from the ChunkStore's LRU size (50% of cache / chunk size),
+	// hard-capped at DefaultMaxPrefetchPages. Set explicitly to override.
+	MaxPrefetchPages int
 }
+
+// DefaultMaxPrefetchPages is the hard upper bound when MaxPrefetchPages is not
+// set explicitly. 128k pages × 4KB = 512MB of prefetchable guest memory.
+const DefaultMaxPrefetchPages = 131072
 
 // NewHandler creates a new UFFD handler
 func NewHandler(cfg HandlerConfig) (*Handler, error) {
@@ -199,6 +237,37 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 		faultTimeout:           faultTimeout,
 		maxConsecutiveFailures: maxConsecutiveFailures,
 		logger:                 cfg.Logger.WithField("component", "uffd-handler"),
+	}
+
+	// Enable concurrent fault handling if configured.
+	if cfg.FaultConcurrency > 1 {
+		h.faultSem = make(chan struct{}, cfg.FaultConcurrency)
+	}
+
+	// Enable prefetch tracking if configured.
+	if cfg.EnablePrefetchTracking {
+		maxPages := cfg.MaxPrefetchPages
+		if maxPages == 0 && cfg.ChunkStore != nil {
+			// Derive from ChunkStore LRU: prefetch should use at most 50% of
+			// the cache. Each prefetched page pulls in a full chunk (ChunkSize
+			// bytes), so cap = (cacheSize * 0.5) / chunkSize * pagesPerChunk.
+			// With default 2GB cache and 4MB chunks: 256 chunks → 256*1024 = 262k pages.
+			// But we also want a reasonable upper bound per VM. Cap at 32k pages (128MB)
+			// to leave room for demand faults and other VMs sharing the cache.
+			cacheStats := cfg.ChunkStore.CacheStats()
+			chunkSize := int64(cfg.Metadata.ChunkSize)
+			if chunkSize <= 0 {
+				chunkSize = 4 * 1024 * 1024
+			}
+			halfCacheChunks := cacheStats.MaxSize / 2 / chunkSize
+			pagesPerChunk := chunkSize / PageSize
+			maxPages = int(halfCacheChunks * pagesPerChunk)
+			// Hard upper bound per VM
+			if maxPages > DefaultMaxPrefetchPages {
+				maxPages = DefaultMaxPrefetchPages
+			}
+		}
+		h.prefetchTracker = NewPrefetchTracker(PageSize, maxPages)
 	}
 
 	// Initialize OTel instruments if a Meter was provided.
@@ -338,9 +407,24 @@ func (h *Handler) handleConnection(conn net.Conn) {
 	h.mappings = mappings
 	h.buildChunkLookup()
 
+	nonZeroChunks := 0
+	for i := range h.metadata.MemChunks {
+		if !h.metadata.MemChunks[i].IsZeroChunk() {
+			nonZeroChunks++
+		}
+	}
+
+	// Wire the prefetcher with the UFFD fd and mappings before signaling
+	// connection (the prefetcher's copy workers wait on h.connected).
+	if h.prefetcher != nil {
+		h.prefetcher.SetUFFD(uffdFd, mappings)
+	}
+
 	h.logger.WithFields(logrus.Fields{
-		"fd":       uffdFd,
-		"mappings": len(mappings),
+		"fd":              uffdFd,
+		"mappings":        len(mappings),
+		"total_chunks":    len(h.metadata.MemChunks),
+		"non_zero_chunks": nonZeroChunks,
 	}).Info("Received UFFD file descriptor and memory mappings")
 
 	// Handle page faults
@@ -424,8 +508,30 @@ func (h *Handler) handlePageFaults(uffdFd int) {
 	// Pre-allocate message buffer outside the hot loop to avoid
 	// per-fault heap allocation. uffd_msg is 32 bytes on x86_64.
 	var msgBuf [uffdMsgSize]byte
+	var lastFaultLog time.Time
+	var lastFaultCount uint64
 
 	for {
+		// Periodic fault activity log (every 5s if there were faults)
+		if time.Since(lastFaultLog) > 5*time.Second {
+			currentFaults := atomic.LoadUint64(&h.pageFaults)
+			if currentFaults != lastFaultCount {
+				cacheStats := h.chunkStore.CacheStats()
+				h.logger.WithFields(logrus.Fields{
+					"total_faults":  currentFaults,
+					"delta":         currentFaults - lastFaultCount,
+					"chunk_fetches": atomic.LoadUint64(&h.chunkFetches),
+					"lru_hits":      cacheStats.Hits,
+					"lru_misses":    cacheStats.Misses,
+					"lru_evictions": cacheStats.Evictions,
+					"lru_items":     cacheStats.ItemCount,
+					"lru_size_mb":   cacheStats.Size / (1024 * 1024),
+				}).Debug("UFFD fault activity")
+				lastFaultCount = currentFaults
+			}
+			lastFaultLog = time.Now()
+		}
+
 		select {
 		case <-h.ctx.Done():
 			return
@@ -466,9 +572,24 @@ func (h *Handler) handlePageFaults(uffdFd int) {
 		address := binary.LittleEndian.Uint64(msgBuf[16:24])
 		atomic.AddUint64(&h.pageFaults, 1)
 
-		// Handle the page fault
-		if err := h.handleSingleFault(uffdFd, address); err != nil {
-			h.logger.WithError(err).WithField("address", fmt.Sprintf("0x%x", address)).Error("Failed to handle page fault")
+		if h.faultSem != nil {
+			// Concurrent mode: dispatch to a goroutine gated by semaphore.
+			// Extract address before dispatch to avoid data race on msgBuf.
+			addr := address
+			h.wg.Add(1)
+			h.faultSem <- struct{}{} // blocks when pool is full
+			go func() {
+				defer h.wg.Done()
+				defer func() { <-h.faultSem }()
+				if err := h.handleSingleFault(uffdFd, addr); err != nil {
+					h.logger.WithError(err).WithField("address", fmt.Sprintf("0x%x", addr)).Error("Failed to handle page fault")
+				}
+			}()
+		} else {
+			// Serial mode (legacy): handle inline.
+			if err := h.handleSingleFault(uffdFd, address); err != nil {
+				h.logger.WithError(err).WithField("address", fmt.Sprintf("0x%x", address)).Error("Failed to handle page fault")
+			}
 		}
 	}
 }
@@ -531,12 +652,22 @@ func (h *Handler) handleSingleFault(uffdFd int, address uint64) error {
 
 	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffdFd), UFFDIO_COPY, uintptr(unsafe.Pointer(&cp)))
 	if errno != 0 {
+		// EEXIST means another goroutine already resolved this page — not an error.
+		if errno == unix.EEXIST {
+			return nil
+		}
 		return fmt.Errorf("UFFDIO_COPY failed: %w", errno)
 	}
 
 	if h.faultServiceHist != nil {
 		h.faultServiceHist.Record(context.Background(), time.Since(faultStart).Seconds())
 	}
+
+	// Record access for prefetch replay on subsequent resumes.
+	if h.prefetchTracker != nil {
+		h.prefetchTracker.Add(int64(offset))
+	}
+
 	return nil
 }
 
@@ -554,6 +685,10 @@ func (h *Handler) zeroFault(uffdFd int, pageAddr uint64) error {
 
 	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffdFd), UFFDIO_COPY, uintptr(unsafe.Pointer(&cp)))
 	if errno != 0 {
+		// EEXIST means another goroutine already resolved this page — not an error.
+		if errno == unix.EEXIST {
+			return nil
+		}
 		return fmt.Errorf("UFFDIO_COPY (zero page) failed: %w", errno)
 	}
 
@@ -617,13 +752,44 @@ func (h *Handler) getPageData(ctx context.Context, offset uint64) ([]byte, error
 	return chunkData[pageOffset : pageOffset+PageSize], nil
 }
 
-// Stop stops the UFFD handler
+// Stop stops the UFFD handler and any associated prefetcher.
 func (h *Handler) Stop() {
 	h.cancel()
 	if h.listener != nil {
 		h.listener.Close()
 	}
 	h.wg.Wait()
+	if h.prefetcher != nil {
+		h.prefetcher.Stop()
+	}
+}
+
+// GetPrefetchMapping stops the prefetch tracker and returns the recorded
+// access-order mapping. Returns nil if tracking was not enabled.
+func (h *Handler) GetPrefetchMapping() *snapshot.PrefetchMapping {
+	if h.prefetchTracker == nil {
+		return nil
+	}
+	return h.prefetchTracker.GetMapping()
+}
+
+// Mappings returns the guest memory region mappings received from Firecracker.
+// These are available after the UFFD connection is established.
+func (h *Handler) Mappings() []GuestRegionUFFDMapping {
+	return h.mappings
+}
+
+// Connected returns a channel that is closed when Firecracker connects to the
+// UFFD handler. Used by the Prefetcher to know when UFFDIO_COPY is available.
+func (h *Handler) Connected() <-chan struct{} {
+	return h.connected
+}
+
+// SetPrefetcher registers a Prefetcher to be wired up when Firecracker connects.
+// Must be called before Start(). The handler will call SetUFFD on the prefetcher
+// with the fd and mappings when the connection is established.
+func (h *Handler) SetPrefetcher(p *Prefetcher) {
+	h.prefetcher = p
 }
 
 // Stats returns handler statistics

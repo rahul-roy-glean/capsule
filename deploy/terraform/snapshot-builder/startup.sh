@@ -14,7 +14,6 @@ FIRECRACKER_VERSION=$(meta firecracker-version "1.14.2")
 DEBUG_MODE=$(meta debug-mode "false")
 REPO_URL=$(meta repo-url "")
 REPO_BRANCH=$(meta repo-branch "main")
-BAZEL_VERSION=$(meta bazel-version "8.5.1")
 FETCH_TARGETS=$(meta fetch-targets "//...")
 GITHUB_APP_ID=$(meta github-app-id "")
 GITHUB_APP_SECRET=$(meta github-app-secret "")
@@ -59,12 +58,17 @@ fi
 echo "Firecracker artifacts:"
 ls -lah /opt/firecracker/
 
-# ---- 4. Download snapshot-builder binary from GCS ----
+# ---- 4. Download snapshot-builder and thaw-agent binaries from GCS ----
 echo "Downloading snapshot-builder binary..."
 if [ -n "$SNAPSHOT_BUCKET" ]; then
   gcloud storage cp "gs://${SNAPSHOT_BUCKET}/build-artifacts/snapshot-builder" /usr/local/bin/snapshot-builder 2>/dev/null \
     || echo "WARNING: snapshot-builder binary not found in GCS"
   chmod +x /usr/local/bin/snapshot-builder 2>/dev/null || true
+
+  echo "Downloading thaw-agent binary..."
+  gcloud storage cp "gs://${SNAPSHOT_BUCKET}/build-artifacts/thaw-agent" /usr/local/bin/thaw-agent 2>/dev/null \
+    || echo "WARNING: thaw-agent binary not found in GCS"
+  chmod +x /usr/local/bin/thaw-agent 2>/dev/null || true
 fi
 
 # ---- 5. Setup networking: bridge, IP forwarding, NAT, MTU clamping ----
@@ -112,7 +116,6 @@ meta() {
 SNAPSHOT_BUCKET=$(meta snapshot-bucket "")
 REPO_URL=$(meta repo-url "")
 REPO_BRANCH=$(meta repo-branch "main")
-BAZEL_VERSION=$(meta bazel-version "8.5.1")
 FETCH_TARGETS=$(meta fetch-targets "//...")
 GITHUB_APP_ID=$(meta github-app-id "")
 GITHUB_APP_SECRET=$(meta github-app-secret "")
@@ -130,7 +133,6 @@ CMD=(/usr/local/bin/snapshot-builder
 
 [ -n "$REPO_URL" ]          && CMD+=("-repo-url=$REPO_URL")
 [ -n "$REPO_BRANCH" ]       && CMD+=("-repo-branch=$REPO_BRANCH")
-[ -n "$BAZEL_VERSION" ]     && CMD+=("-bazel-version=$BAZEL_VERSION")
 [ -n "$FETCH_TARGETS" ]     && CMD+=("-fetch-targets=$FETCH_TARGETS")
 [ -n "$GITHUB_APP_ID" ]     && CMD+=("-github-app-id=$GITHUB_APP_ID")
 [ -n "$GITHUB_APP_SECRET" ] && CMD+=("-github-app-secret=$GITHUB_APP_SECRET")

@@ -15,11 +15,12 @@ type LayeredHandler struct{}
 
 // LayeredHandlerConfig holds configuration for the layered UFFD handler
 type LayeredHandlerConfig struct {
-	SocketPath    string
-	GoldenMemPath string
-	DiffLayers    []string
-	PageCacheSize int
-	Logger        *logrus.Logger
+	SocketPath       string
+	GoldenMemPath    string
+	DiffLayers       []string
+	PageCacheSize    int
+	Logger           *logrus.Logger
+	FaultConcurrency int
 }
 
 // NewLayeredHandler returns an error on non-Linux platforms

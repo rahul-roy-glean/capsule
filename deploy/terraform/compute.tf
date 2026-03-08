@@ -16,19 +16,6 @@ locals {
   host_image = var.use_custom_host_image ? data.google_compute_image.host[0].self_link : data.google_compute_image.ubuntu.self_link
 }
 
-# Data snapshot containing Firecracker snapshots + git-cache
-# Built by data-snapshot-builder, labeled as "current=true"
-# When use_data_snapshot is false, hosts will download from GCS (slower)
-data "google_compute_snapshot" "runner_data" {
-  count   = var.use_data_snapshot ? 1 : 0
-  name    = var.data_snapshot_name
-  project = var.project_id
-}
-
-locals {
-  # Use snapshot if available, otherwise null (startup script will download from GCS)
-  data_snapshot = var.use_data_snapshot ? data.google_compute_snapshot.runner_data[0].self_link : null
-}
 
 # Instance template for Firecracker hosts
 resource "google_compute_instance_template" "firecracker_host" {
@@ -57,9 +44,7 @@ resource "google_compute_instance_template" "firecracker_host" {
     auto_delete  = true
   }
 
-  # Data disk for snapshots, git-cache, and workspaces
-  # When use_data_snapshot=true: Created from snapshot (fast, ~30s, all data pre-populated)
-  # When use_data_snapshot=false: Empty disk, startup script downloads from GCS (slower)
+  # Data disk for snapshots and workspaces
   disk {
     device_name  = "data"
     type         = "PERSISTENT"
@@ -67,8 +52,6 @@ resource "google_compute_instance_template" "firecracker_host" {
     disk_size_gb = var.host_data_disk_size_gb
     boot         = false
     auto_delete  = true
-    # Create from snapshot if available - disk comes pre-populated with all artifacts!
-    source_snapshot = local.data_snapshot
   }
 
   network_interface {
@@ -86,22 +69,12 @@ resource "google_compute_instance_template" "firecracker_host" {
     microvm-subnet        = var.microvm_subnet
     environment           = var.environment
     control-plane         = var.control_plane_addr
-    git-cache-enabled     = var.git_cache_enabled ? "true" : "false"
-    git-cache-repos       = join(",", [for k, v in var.git_cache_repos : "${k}:${v}"])
-    git-cache-workspace   = var.git_cache_workspace_dir
     github-app-id         = var.github_app_id
     github-app-secret     = var.github_app_secret
-    github-runner-labels  = var.github_runner_labels
     github-repo           = var.github_repo
-    github-runner-enabled   = var.github_runner_enabled ? "true" : "false"
-    buildbarn-certs-project = var.buildbarn_certs_project != "" ? var.buildbarn_certs_project : var.project_id
-    buildbarn-certs-dir     = var.buildbarn_certs_dir
-    buildbarn-certs         = jsonencode(var.buildbarn_certs)
     max-runners             = var.max_runners_per_host
     idle-target           = var.idle_runners_target
     runner-ephemeral      = var.runner_ephemeral ? "true" : "false"
-    # Indicates whether data disk was created from snapshot (fast) or empty (needs GCS download)
-    use-data-snapshot     = var.use_data_snapshot ? "true" : "false"
     use-chunked-snapshots  = var.use_chunked_snapshots ? "true" : "false"
     enable-session-chunks  = var.enable_session_chunks ? "true" : "false"
     chunk-cache-size-gb    = var.chunk_cache_size_gb
@@ -118,8 +91,6 @@ resource "google_compute_instance_template" "firecracker_host" {
     echo "Starting Firecracker host initialization..."
 
     # Get key metadata
-    USE_DATA_SNAPSHOT=$(curl -sf -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/use-data-snapshot || echo "false")
     SNAPSHOT_BUCKET=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/snapshot-bucket || echo "")
 
@@ -130,108 +101,64 @@ resource "google_compute_instance_template" "firecracker_host" {
       echo "Waiting for data disk... ($i/30)"
       sleep 2
     done
-    
+
     # Mount the data disk
     mkdir -p /mnt/data
-    
-    if [ "$USE_DATA_SNAPSHOT" = "true" ]; then
-      #######################################################################
-      # FAST PATH: Disk created from snapshot - all data is already there!
-      # Just mount and go. (~30 seconds total startup)
-      #######################################################################
-      echo "Data disk created from snapshot - mounting directly..."
-      
-      if [ -b "$DATA_DISK" ]; then
-        # Disk from snapshot is already formatted, just mount it
-        mount "$DATA_DISK" /mnt/data
-        echo "$DATA_DISK /mnt/data xfs defaults,nofail 0 0" >> /etc/fstab
 
-        # Verify expected files exist
-        if [ -d "/mnt/data/snapshots" ] && [ -f "/mnt/data/git-cache.img" ]; then
-          echo "Snapshot data verified OK:"
-          ls -la /mnt/data/
-          ls -la /mnt/data/snapshots/
-          if [ -f "/mnt/data/metadata.json" ]; then
-            echo "Snapshot metadata:"
-            cat /mnt/data/metadata.json
-          fi
-        else
-          echo "WARNING: Expected snapshot data not found, may need to fall back to GCS"
-        fi
-      else
-        echo "ERROR: Data disk not found at $DATA_DISK"
-        exit 1
-      fi
-      
+    if [ -b "$DATA_DISK" ]; then
+      echo "Formatting data disk..."
+      mkfs.xfs -f -L RUNNER_DATA "$DATA_DISK"
+      mount "$DATA_DISK" /mnt/data
+      echo "$DATA_DISK /mnt/data xfs defaults,nofail 0 0" >> /etc/fstab
+    elif [ -b "/dev/sdb" ]; then
+      mkfs.xfs -f -L RUNNER_DATA /dev/sdb
+      mount /dev/sdb /mnt/data
+      echo "/dev/sdb /mnt/data xfs defaults,nofail 0 0" >> /etc/fstab
     else
-      #######################################################################
-      # SLOW PATH: Empty disk - need to download from GCS
-      # (~5-15 minutes depending on data size)
-      #######################################################################
-      echo "Empty data disk - downloading artifacts from GCS (slow path)..."
-      
-      if [ -b "$DATA_DISK" ]; then
-        echo "Formatting data disk..."
-        mkfs.xfs -f -L RUNNER_DATA "$DATA_DISK"
-        mount "$DATA_DISK" /mnt/data
-        echo "$DATA_DISK /mnt/data xfs defaults,nofail 0 0" >> /etc/fstab
-      elif [ -b "/dev/sdb" ]; then
-        mkfs.xfs -f -L RUNNER_DATA /dev/sdb
-        mount /dev/sdb /mnt/data
-        echo "/dev/sdb /mnt/data xfs defaults,nofail 0 0" >> /etc/fstab
-      else
-        echo "WARNING: No data disk found"
+      echo "WARNING: No data disk found"
+    fi
+
+    # Create directories
+    mkdir -p /mnt/data/snapshots
+
+    # Download from GCS
+    if [ -n "$SNAPSHOT_BUCKET" ]; then
+      echo "Downloading Firecracker snapshot artifacts from GCS..."
+
+      # Resolve versioned directory via pointer file (use curl + metadata API for speed)
+      SNAPSHOT_VERSION=""
+      TOKEN=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])" 2>/dev/null || true)
+      if [ -n "$TOKEN" ]; then
+        SNAPSHOT_VERSION=$(curl -s -H "Authorization: Bearer $TOKEN" \
+          "https://storage.googleapis.com/$SNAPSHOT_BUCKET/current-pointer.json" | \
+          python3 -c "import sys,json; print(json.load(sys.stdin)['version'])" 2>/dev/null || true)
       fi
-      
-      # Create directories
-      mkdir -p /mnt/data/snapshots
-      
-      # Download from GCS
-      if [ -n "$SNAPSHOT_BUCKET" ]; then
-        echo "Downloading Firecracker snapshot artifacts from GCS..."
-
-        # Resolve versioned directory via pointer file (use curl + metadata API for speed)
-        SNAPSHOT_VERSION=""
-        TOKEN=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])" 2>/dev/null || true)
-        if [ -n "$TOKEN" ]; then
-          SNAPSHOT_VERSION=$(curl -s -H "Authorization: Bearer $TOKEN" \
-            "https://storage.googleapis.com/$SNAPSHOT_BUCKET/current-pointer.json" | \
-            python3 -c "import sys,json; print(json.load(sys.stdin)['version'])" 2>/dev/null || true)
+      if [ -z "$SNAPSHOT_VERSION" ]; then
+        # Fallback to gcloud CLI
+        POINTER_FILE=$(mktemp)
+        if gcloud storage cp "gs://$SNAPSHOT_BUCKET/current-pointer.json" "$POINTER_FILE" 2>/dev/null; then
+          SNAPSHOT_VERSION=$(python3 -c "import json; print(json.load(open('$POINTER_FILE'))['version'])" 2>/dev/null || true)
         fi
-        if [ -z "$SNAPSHOT_VERSION" ]; then
-          # Fallback to gcloud CLI
-          POINTER_FILE=$(mktemp)
-          if gcloud storage cp "gs://$SNAPSHOT_BUCKET/current-pointer.json" "$POINTER_FILE" 2>/dev/null; then
-            SNAPSHOT_VERSION=$(python3 -c "import json; print(json.load(open('$POINTER_FILE'))['version'])" 2>/dev/null || true)
-          fi
-          rm -f "$POINTER_FILE"
-        fi
+        rm -f "$POINTER_FILE"
+      fi
 
-        SNAPSHOT_DIR=""
-        if [ -n "$SNAPSHOT_VERSION" ]; then
-          echo "Resolved current pointer to version: $SNAPSHOT_VERSION"
-          SNAPSHOT_DIR="gs://$SNAPSHOT_BUCKET/$SNAPSHOT_VERSION"
-        else
-          echo "No pointer file found, falling back to current/ directory"
-          SNAPSHOT_DIR="gs://$SNAPSHOT_BUCKET/current"
-        fi
+      SNAPSHOT_DIR=""
+      if [ -n "$SNAPSHOT_VERSION" ]; then
+        echo "Resolved current pointer to version: $SNAPSHOT_VERSION"
+        SNAPSHOT_DIR="gs://$SNAPSHOT_BUCKET/$SNAPSHOT_VERSION"
+      else
+        echo "No pointer file found, falling back to current/ directory"
+        SNAPSHOT_DIR="gs://$SNAPSHOT_BUCKET/current"
+      fi
 
-        # Download snapshot artifacts (parallel composite download is faster than streaming)
-        gcloud storage rsync -r "$SNAPSHOT_DIR/" /mnt/data/snapshots/ || true
+      # Download snapshot artifacts (parallel composite download is faster than streaming)
+      gcloud storage rsync -r "$SNAPSHOT_DIR/" /mnt/data/snapshots/ || true
 
-        # Decompress snapshot.mem.zst in background while other setup continues
-        if [ -f "/mnt/data/snapshots/snapshot.mem.zst" ] && [ ! -f "/mnt/data/snapshots/snapshot.mem" ]; then
-          echo "Decompressing snapshot.mem.zst in background..."
-          zstd -d /mnt/data/snapshots/snapshot.mem.zst -o /mnt/data/snapshots/snapshot.mem --no-progress &
-          ZSTD_PID=$!
-        fi
-
-        # Download git-cache.img if it exists
-        GIT_CACHE_GCS="gs://$SNAPSHOT_BUCKET/git-cache/current/git-cache.img"
-        if gcloud storage ls "$GIT_CACHE_GCS" 2>/dev/null; then
-          echo "Downloading git-cache.img from GCS..."
-          gcloud storage cp "$GIT_CACHE_GCS" /mnt/data/git-cache.img
-        fi
+      # Decompress snapshot.mem.zst in background while other setup continues
+      if [ -f "/mnt/data/snapshots/snapshot.mem.zst" ] && [ ! -f "/mnt/data/snapshots/snapshot.mem" ]; then
+        echo "Decompressing snapshot.mem.zst in background..."
+        zstd -d /mnt/data/snapshots/snapshot.mem.zst -o /mnt/data/snapshots/snapshot.mem --no-progress &
+        ZSTD_PID=$!
       fi
     fi
 
@@ -298,47 +225,12 @@ LOGROTATE
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/max-runners || echo "16")
     IDLE_TARGET=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/idle-target || echo "2")
-    RUNNER_LABELS=$(curl -sf -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/github-runner-labels || echo "self-hosted,firecracker,Linux,X64")
     RUNNER_EPHEMERAL=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/runner-ephemeral || echo "true")
     GITHUB_REPO=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/github-repo || echo "")
-    GITHUB_RUNNER_ENABLED=$(curl -sf -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/github-runner-enabled || echo "false")
-    GIT_CACHE_ENABLED=$(curl -sf -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/git-cache-enabled || echo "false")
-    GIT_CACHE_WORKSPACE=$(curl -sf -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/git-cache-workspace || echo "/mnt/ephemeral/workspace")
     CONTROL_PLANE=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/control-plane || echo "")
-
-    # Fetch Buildbarn mTLS certs from Secret Manager (if configured)
-    BUILDBARN_CERTS_DIR=$(curl -sf -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/buildbarn-certs-dir || echo "/etc/glean/ci/certs")
-    BUILDBARN_CERTS_JSON=$(curl -sf -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/buildbarn-certs || echo "{}")
-    BUILDBARN_PROJECT=$(curl -sf -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/buildbarn-certs-project || echo "")
-
-    if [ "$BUILDBARN_CERTS_JSON" != "{}" ] && [ -n "$BUILDBARN_PROJECT" ]; then
-      echo "Fetching Buildbarn mTLS certs from project $BUILDBARN_PROJECT..."
-      mkdir -p "$BUILDBARN_CERTS_DIR"
-      FETCH_OK=true
-      for entry in $(echo "$BUILDBARN_CERTS_JSON" | python3 -c "import sys,json; [print(f'{k}={v}') for k,v in json.load(sys.stdin).items()]"); do
-        FILENAME="$${entry%%=*}"
-        SECRET="$${entry#*=}"
-        if ! gcloud secrets versions access latest --secret="$SECRET" --project="$BUILDBARN_PROJECT" > "$BUILDBARN_CERTS_DIR/$FILENAME"; then
-          echo "WARNING: Failed to fetch secret $SECRET"
-          FETCH_OK=false
-        fi
-      done
-      if [ "$FETCH_OK" = "true" ]; then
-        echo "Buildbarn certs fetched to $BUILDBARN_CERTS_DIR"
-      else
-        echo "WARNING: Some Buildbarn certs failed to fetch"
-      fi
-    fi
 
     USE_CHUNKED_SNAPSHOTS=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/use-chunked-snapshots || echo "false")
@@ -356,34 +248,15 @@ LOGROTATE
     EXEC_START="/usr/local/bin/firecracker-manager"
     EXEC_START="$EXEC_START --max-runners=$MAX_RUNNERS"
     EXEC_START="$EXEC_START --idle-target=$IDLE_TARGET"
-    EXEC_START="$EXEC_START --github-runner-labels=$RUNNER_LABELS"
     EXEC_START="$EXEC_START --runner-ephemeral=$RUNNER_EPHEMERAL"
     EXEC_START="$EXEC_START --snapshot-cache=/mnt/data/snapshots"
     EXEC_START="$EXEC_START --workspace-dir=/mnt/data/workspaces"
-    EXEC_START="$EXEC_START --git-cache-image=/mnt/data/git-cache.img"
 
-    # Add Buildbarn certs dir if certs were fetched
-    if [ -d "$BUILDBARN_CERTS_DIR" ] && [ "$(ls -A $BUILDBARN_CERTS_DIR 2>/dev/null)" ]; then
-      EXEC_START="$EXEC_START --buildbarn-certs-dir=$BUILDBARN_CERTS_DIR"
-    fi
-
-    # Add git-cache flags if enabled
-    if [ "$GIT_CACHE_ENABLED" = "true" ]; then
-      GIT_CACHE_REPOS_CFG=$(curl -sf -H "Metadata-Flavor: Google" \
-        http://metadata.google.internal/computeMetadata/v1/instance/attributes/git-cache-repos || echo "")
-      EXEC_START="$EXEC_START --git-cache-enabled=true"
-      EXEC_START="$EXEC_START --git-cache-workspace=$GIT_CACHE_WORKSPACE"
-      if [ -n "$GIT_CACHE_REPOS_CFG" ]; then
-        EXEC_START="$EXEC_START --git-cache-repos=$GIT_CACHE_REPOS_CFG"
-      fi
-    fi
-    
-    # Add GitHub runner flags if enabled
-    if [ "$GITHUB_RUNNER_ENABLED" = "true" ] && [ -n "$GITHUB_REPO" ]; then
-      EXEC_START="$EXEC_START --github-runner-enabled=true"
+    # Add GitHub repo if configured
+    if [ -n "$GITHUB_REPO" ]; then
       EXEC_START="$EXEC_START --github-repo=$GITHUB_REPO"
     fi
-    
+
     # Add control plane if configured
     if [ -n "$CONTROL_PLANE" ]; then
       EXEC_START="$EXEC_START --control-plane=$CONTROL_PLANE"
@@ -412,23 +285,24 @@ LOGROTATE
       EXEC_START="$EXEC_START --use-netns"
     fi
 
-    # OTel collector endpoint for host telemetry
-    OTEL_ADDR=$(curl -sf -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/otel-collector-addr || echo "")
+    # Read OTel collector endpoint from metadata (empty = OTel disabled)
+    OTEL_ENDPOINT=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/otel-collector-endpoint || echo "")
     ENVIRONMENT=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/environment || echo "dev")
 
-    OTEL_ENV_LINES=""
-    if [ -n "$OTEL_ADDR" ]; then
-      OTEL_ENV_LINES="Environment=OTEL_EXPORTER_OTLP_ENDPOINT=$OTEL_ADDR
-Environment=ENVIRONMENT=$ENVIRONMENT"
+    # Build environment lines for the systemd override
+    ENV_LINES=""
+    if [ -n "$OTEL_ENDPOINT" ]; then
+      ENV_LINES="Environment=OTEL_EXPORTER_OTLP_ENDPOINT=$OTEL_ENDPOINT"
+      ENV_LINES="$ENV_LINES\nEnvironment=ENVIRONMENT=$ENVIRONMENT"
     fi
 
     cat > /etc/systemd/system/firecracker-manager.service.d/override.conf << OVERRIDE
 [Service]
 ExecStart=
 ExecStart=$EXEC_START
-$OTEL_ENV_LINES
+$([ -n "$ENV_LINES" ] && echo -e "$ENV_LINES")
 OVERRIDE
 
     # Wait for background decompression before starting firecracker-manager
@@ -446,7 +320,6 @@ OVERRIDE
     STARTUP_END=$(date +%s)
     STARTUP_DURATION=$((STARTUP_END - STARTUP_START))
     echo "Firecracker host initialization complete in $${STARTUP_DURATION}s"
-    echo "  Data source: $([ "$USE_DATA_SNAPSHOT" = "true" ] && echo "disk snapshot (fast)" || echo "GCS download (slow)")"
   EOF
 
   lifecycle {

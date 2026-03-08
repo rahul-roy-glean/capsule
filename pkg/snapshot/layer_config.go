@@ -31,7 +31,6 @@ type LayeredConfig struct {
 		AutoPause            bool                  `json:"auto_pause,omitempty" yaml:"auto_pause"`
 		TTL                  int                   `json:"ttl,omitempty" yaml:"ttl"`
 		Tier                 string                `json:"tier,omitempty" yaml:"tier"`
-		CISystem             string                `json:"ci_system,omitempty" yaml:"ci_system"`
 		AutoRollout          bool                  `json:"auto_rollout,omitempty" yaml:"auto_rollout"`
 		SessionMaxAgeSeconds int                   `json:"session_max_age_seconds,omitempty" yaml:"session_max_age_seconds"`
 		RootfsSizeGB         int                   `json:"rootfs_size_gb,omitempty" yaml:"rootfs_size_gb"`       // rootfs size for layer 0 (default 8)
@@ -41,9 +40,7 @@ type LayeredConfig struct {
 		NetworkPolicy        json.RawMessage       `json:"network_policy,omitempty" yaml:"network_policy"`
 		Auth                 *authproxy.AuthConfig `json:"auth,omitempty" yaml:"auth"`
 	} `json:"config" yaml:"config"`
-	StartCommand    *StartCommand `json:"start_command,omitempty" yaml:"start_command"`
-	GitHubAppID     string        `json:"github_app_id,omitempty" yaml:"github_app_id"`
-	GitHubAppSecret string        `json:"github_app_secret,omitempty" yaml:"github_app_secret"`
+	StartCommand *StartCommand `json:"start_command,omitempty" yaml:"start_command"`
 }
 
 // LayerMaterialized is a LayerDef with computed hash chain info.

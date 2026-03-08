@@ -3,6 +3,7 @@ package snapshot
 import (
 	"container/list"
 	"sync"
+	"sync/atomic"
 )
 
 const numShards = 64
@@ -12,8 +13,11 @@ const numShards = 64
 // when many goroutines (UFFD handlers, FUSE disks, eager fetchers) access
 // the cache concurrently.
 type LRUCache struct {
-	shards  [numShards]*lruShard
-	maxSize int64
+	shards    [numShards]*lruShard
+	maxSize   int64
+	hits      atomic.Int64
+	misses    atomic.Int64
+	evictions atomic.Int64
 }
 
 // lruShard is a single shard of the LRU cache with its own lock.
@@ -23,6 +27,7 @@ type lruShard struct {
 	items   map[string]*list.Element
 	order   *list.List
 	mu      sync.Mutex
+	parent  *LRUCache
 }
 
 type cacheEntry struct {
@@ -47,6 +52,7 @@ func NewLRUCache(maxSizeBytes int64) *LRUCache {
 			maxSize: shardMax,
 			items:   make(map[string]*list.Element),
 			order:   list.New(),
+			parent:  c,
 		}
 	}
 	return c
@@ -69,8 +75,10 @@ func (c *LRUCache) Get(key string) ([]byte, bool) {
 
 	if elem, ok := s.items[key]; ok {
 		s.order.MoveToFront(elem)
+		c.hits.Add(1)
 		return elem.Value.(*cacheEntry).data, true
 	}
+	c.misses.Add(1)
 	return nil, false
 }
 
@@ -114,6 +122,9 @@ func (s *lruShard) evictOldest() {
 	elem := s.order.Back()
 	if elem != nil {
 		s.removeElement(elem)
+		if s.parent != nil {
+			s.parent.evictions.Add(1)
+		}
 	}
 }
 
@@ -182,6 +193,9 @@ func (c *LRUCache) Stats() CacheStats {
 		Size:      c.Size(),
 		MaxSize:   c.maxSize,
 		ItemCount: c.Len(),
+		Hits:      c.hits.Load(),
+		Misses:    c.misses.Load(),
+		Evictions: c.evictions.Load(),
 	}
 }
 
@@ -190,4 +204,7 @@ type CacheStats struct {
 	Size      int64
 	MaxSize   int64
 	ItemCount int
+	Hits      int64
+	Misses    int64
+	Evictions int64
 }

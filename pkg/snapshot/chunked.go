@@ -77,7 +77,6 @@ var ErrChunkCorruption = errors.New("chunk corruption detected")
 // Instead of storing full files, we store references to content-addressed chunks.
 type ChunkedSnapshotMetadata struct {
 	Version       string            `json:"version"`
-	BazelVersion  string            `json:"bazel_version,omitempty"`
 	RepoCommit    string            `json:"repo_commit,omitempty"`
 	Repo          string            `json:"repo,omitempty"`
 	WorkloadKey   string            `json:"workload_key,omitempty"`
@@ -96,7 +95,6 @@ type ChunkedSnapshotMetadata struct {
 	// MemChunks will be empty/nil for new-style snapshots.
 	MemFilePath string `json:"mem_file_path,omitempty"`
 	// ExtensionDrives holds chunks for extension block devices, keyed by DriveID.
-	// Replaces the old RepoCacheSeedChunks field.
 	ExtensionDrives map[string]ExtensionDrive `json:"extension_drives,omitempty"`
 	// RootfsSourceHash is the SHA-256 hash of the original base rootfs.img used
 	// to build this snapshot. Used by incremental builds to detect rootfs changes
@@ -108,6 +106,16 @@ type ChunkedSnapshotMetadata struct {
 	ParentVersion   string `json:"parent_version,omitempty"`
 	LayerDepth      int    `json:"layer_depth,omitempty"`
 	LayerName       string `json:"layer_name,omitempty"`
+	// MemPrefetchMapping records the page fault access pattern from a previous
+	// run for replay during subsequent resumes (access-pattern prefetching).
+	MemPrefetchMapping *PrefetchMapping `json:"mem_prefetch_mapping,omitempty"`
+}
+
+// PrefetchMapping records page fault order for replay during subsequent resumes.
+// Stored as part of ChunkedSnapshotMetadata for access-pattern prefetching.
+type PrefetchMapping struct {
+	Offsets   []int64 `json:"offsets"`    // sorted by access order
+	BlockSize int64   `json:"block_size"` // page size used during recording (typically 4096)
 }
 
 // ChunkRef references a single chunk by its content hash
@@ -1152,7 +1160,7 @@ producerLoop:
 
 // ChunkedSnapshotBuilder creates chunked snapshots from existing snapshot files
 type ChunkedSnapshotBuilder struct {
-	store    *ChunkStore // disk chunks (rootfs, kernel, state, repo-cache-seed)
+	store    *ChunkStore // disk chunks (rootfs, kernel, state, extension drives)
 	memStore *ChunkStore // memory chunks (UFFD); nil falls back to store
 	logger   *logrus.Entry
 	// MemBackend controls how memory is stored: "chunked" (UFFD lazy via MemChunks,

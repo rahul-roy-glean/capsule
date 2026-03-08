@@ -117,40 +117,6 @@ variable "use_custom_host_image" {
   default     = false
 }
 
-# Data snapshot configuration
-# When enabled, the data disk is created from a pre-built snapshot containing
-# all Firecracker artifacts + git-cache. This is MUCH faster than downloading from GCS.
-variable "use_data_snapshot" {
-  description = "Create data disk from snapshot instead of downloading from GCS. Set to true after running data-snapshot-builder."
-  type        = bool
-  default     = false
-}
-
-variable "data_snapshot_name" {
-  description = "Name of the GCP disk snapshot to use for data disk (created by data-snapshot-builder)"
-  type        = string
-  default     = ""
-}
-
-# Git cache configuration
-variable "git_cache_enabled" {
-  description = "Enable git-cache for fast reference cloning in microVMs"
-  type        = bool
-  default     = false
-}
-
-variable "git_cache_repos" {
-  description = "Map of git repositories to cache. Key is repo URL pattern, value is cache directory name. E.g. {'github.com/org/repo': 'repo'}"
-  type        = map(string)
-  default     = {}
-}
-
-variable "git_cache_workspace_dir" {
-  description = "Base directory for cloned repos inside microVMs. Final path: {this}/{repo}/{repo}"
-  type        = string
-  default     = "/mnt/ephemeral/workspace"
-}
-
 variable "github_app_id" {
   description = "GitHub App ID for generating installation tokens (for private repos)"
   type        = string
@@ -163,22 +129,10 @@ variable "github_app_secret" {
   default     = ""
 }
 
-variable "github_runner_labels" {
-  description = "Comma-separated labels for GitHub Actions runners (e.g., 'self-hosted,firecracker,Linux,X64,bazel')"
-  type        = string
-  default     = "self-hosted,firecracker,Linux,X64"
-}
-
 variable "github_repo" {
   description = "GitHub repository for runner registration (e.g., 'askscio/scio')"
   type        = string
   default     = ""
-}
-
-variable "github_runner_enabled" {
-  description = "Enable automatic GitHub runner registration in microVMs"
-  type        = bool
-  default     = false
 }
 
 # MicroVM configuration per host
@@ -262,6 +216,12 @@ variable "enable_monitoring_alerts" {
   default     = false
 }
 
+variable "otel_collector_endpoint" {
+  description = "OpenTelemetry Collector OTLP/gRPC endpoint reachable from host VMs (e.g. 10.0.16.17:4317). Empty = OTel disabled (no-op)."
+  type        = string
+  default     = ""
+}
+
 variable "monitoring_notification_channels" {
   description = "List of notification channel IDs for alerts (e.g., Slack, PagerDuty)"
   type        = list(string)
@@ -303,25 +263,6 @@ variable "github_org" {
   description = "GitHub organization for org-level runner registration. If set, uses org-level API instead of repo-level."
   type        = string
   default     = ""
-}
-
-# Buildbarn remote build configuration
-variable "buildbarn_certs_project" {
-  description = "GCP project containing Buildbarn cert secrets. Defaults to var.project_id if not set."
-  type        = string
-  default     = ""
-}
-
-variable "buildbarn_certs_dir" {
-  description = "Directory on the host VM to store fetched Buildbarn mTLS certs"
-  type        = string
-  default     = "/etc/glean/ci/certs"
-}
-
-variable "buildbarn_certs" {
-  description = "Map of local filename to Secret Manager secret name for Buildbarn mTLS certs. Leave empty to disable. E.g. {'ca.crt': 'my-ca-cert', 'client.crt': 'my-client-cert', 'client.pem': 'my-client-key'}"
-  type        = map(string)
-  default     = {}
 }
 
 # Snapshot automation configuration

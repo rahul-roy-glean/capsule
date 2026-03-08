@@ -1,0 +1,91 @@
+platform:
+  gcp_project: "my-project"
+  region: "us-central1"
+  zone: "us-central1-a"
+
+microvm:
+  vcpus: 8
+  memory_mb: 16384
+  max_per_host: 8
+  idle_target: 2
+
+hosts:
+  machine_type: "n2-standard-64"
+  min_count: 2
+  max_count: 20
+  data_disk_gb: 500
+
+workload:
+  base_image: "us-docker.pkg.dev/my-project/images/ci-runner:latest"
+
+  layers:
+    # Layer 1: Bazel workspace with fetched dependencies
+    - name: "bazel-workspace"
+      init_commands:
+        - type: "shell"
+          args: ["bash", "-c", "git clone --depth=1 -b main https://github.com/myorg/myrepo /workspace"]
+        - type: "gcp-auth"
+          args: ["my-sa@my-project.iam.gserviceaccount.com"]
+        - type: "shell"
+          args: ["bazel", "fetch", "//..."]
+      refresh_interval: "on_push"
+
+      # Extension drives declared at the layer level.
+      # snapshot-builder creates, populates, and chunks them.
+      # At runtime they appear as block devices in the VM.
+      drives:
+        # Read-only Bazel repository cache seed, shared across all VMs.
+        # snapshot-builder runs `bazel fetch` with --repository_cache pointed here.
+        - drive_id: "artifact_cache_seed"
+          label: "ARTIFACT_CACHE_SEED"
+          size_gb: 20
+          read_only: true
+          mount_path: "/mnt/artifact-cache-seed"
+          commands:
+            - type: "shell"
+              args: ["bazel", "fetch", "--repository_cache=/mnt/artifact-cache-seed", "//..."]
+
+        # Per-runner writable overlay for the artifact cache.
+        # read_only: false tells the manager to create a fresh copy per allocation.
+        # thaw-agent mounts it and sets up overlayfs over the seed.
+        - drive_id: "artifact_cache_upper"
+          label: "ARTIFACT_CACHE_UPPER"
+          size_gb: 10
+          read_only: false
+          mount_path: "/mnt/artifact-cache-upper"
+
+        # Credentials drive: Buildbarn mTLS certs, .netrc, git-credentials.
+        # Populated at snapshot-build time from the host's cert directory.
+        - drive_id: "credentials"
+          label: "CREDENTIALS"
+          size_gb: 1
+          read_only: true
+          mount_path: "/mnt/credentials"
+          commands:
+            - type: "shell"
+              args: ["bash", "-c", "cp -r /host-certs/* /mnt/credentials/certs/ && cp /host-netrc/.netrc /mnt/credentials/netrc"]
+              run_as_root: true
+
+  # After each snapshot restore, thaw-agent:
+  # 1. Auto-mounts all drives by label at their declared mount_path
+  # 2. Sets up overlayfs: seed (ro) + upper (rw) → /mnt/ephemeral/caches/repository
+  # 3. Runs start_command
+  #
+  # The overlay setup is expressed as an init_command, not hardcoded:
+  init_commands:
+    - type: "shell"
+      args: ["bash", "-c", "mount -t overlay overlay -o lowerdir=/mnt/artifact-cache-seed,upperdir=/mnt/artifact-cache-upper/upper,workdir=/mnt/artifact-cache-upper/work /mnt/ephemeral/caches/repository"]
+      run_as_root: true
+    # Symlink credentials into expected locations
+    - type: "shell"
+      args: ["bash", "-c", "ln -sf /mnt/credentials/netrc /home/runner/.netrc && ln -sf /mnt/credentials/certs/buildbarn /etc/bazel-firecracker/certs/buildbarn"]
+      run_as_root: true
+
+  start_command:
+    command: ["/home/runner/config.sh", "--url", "https://github.com/myorg/myrepo", "--token", "${CI_RUNNER_TOKEN}", "--ephemeral", "--unattended", "--labels", "self-hosted,firecracker,bazel,buildbarn"]
+    env:
+      CI_RUNNER_TOKEN: "${ci_runner_token}"
+    run_as: "runner"
+
+session:
+  enabled: false

@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+
+	cigithub "github.com/rahul-roy-glean/bazel-firecracker/pkg/ci/github"
 )
 
 // JobQueue manages job lifecycle from queued through completion with retry.
@@ -35,7 +37,7 @@ func (jq *JobQueue) SetConfigCache(cc *ConfigCache) {
 }
 
 // EnqueueJob inserts a new job row from a webhook event and returns the job ID.
-func (jq *JobQueue) EnqueueJob(ctx context.Context, event *WorkflowJobEvent) (string, error) {
+func (jq *JobQueue) EnqueueJob(ctx context.Context, event *cigithub.WorkflowJobEvent) (string, error) {
 	labelsJSON, err := json.Marshal(event.WorkflowJob.Labels)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal labels: %w", err)
@@ -43,7 +45,7 @@ func (jq *JobQueue) EnqueueJob(ctx context.Context, event *WorkflowJobEvent) (st
 
 	var jobID string
 	err = jq.db.QueryRowContext(ctx, `
-		INSERT INTO jobs (github_workflow_run_id, github_job_id, repo, branch, commit_sha, status, labels)
+		INSERT INTO jobs (ci_run_id, ci_job_id, repo, branch, commit_sha, status, labels)
 		VALUES ($1, $2, $3, $4, $5, 'queued', $6)
 		RETURNING id
 	`, event.WorkflowJob.RunID, event.WorkflowJob.ID, event.Repository.FullName,
@@ -53,9 +55,9 @@ func (jq *JobQueue) EnqueueJob(ctx context.Context, event *WorkflowJobEvent) (st
 	}
 
 	jq.logger.WithFields(logrus.Fields{
-		"job_id":        jobID,
-		"github_job_id": event.WorkflowJob.ID,
-		"repo":          event.Repository.FullName,
+		"job_id":    jobID,
+		"ci_job_id": event.WorkflowJob.ID,
+		"repo":      event.Repository.FullName,
 	}).Info("Job enqueued")
 
 	return jobID, nil
@@ -78,7 +80,7 @@ func (jq *JobQueue) jobRetryLoop(ctx context.Context) {
 
 func (jq *JobQueue) processQueuedJobs(ctx context.Context) {
 	rows, err := jq.db.QueryContext(ctx, `
-		SELECT id, github_workflow_run_id, github_job_id, repo, branch, commit_sha, labels, queued_at
+		SELECT id, ci_run_id, ci_job_id, repo, branch, commit_sha, labels, queued_at
 		FROM jobs WHERE status='queued' ORDER BY queued_at LIMIT 10
 	`)
 	if err != nil {
@@ -89,11 +91,11 @@ func (jq *JobQueue) processQueuedJobs(ctx context.Context) {
 
 	for rows.Next() {
 		var jobID, repo, branch, commitSHA string
-		var githubRunID, githubJobID int64
+		var ciRunID, ciJobID int64
 		var labelsJSON []byte
 		var queuedAt time.Time
 
-		if err := rows.Scan(&jobID, &githubRunID, &githubJobID, &repo, &branch, &commitSHA, &labelsJSON, &queuedAt); err != nil {
+		if err := rows.Scan(&jobID, &ciRunID, &ciJobID, &repo, &branch, &commitSHA, &labelsJSON, &queuedAt); err != nil {
 			jq.logger.WithError(err).Error("Failed to scan job row")
 			continue
 		}
@@ -101,9 +103,9 @@ func (jq *JobQueue) processQueuedJobs(ctx context.Context) {
 		// Check if job has been queued too long
 		if time.Since(queuedAt) > 5*time.Minute {
 			jq.logger.WithFields(logrus.Fields{
-				"job_id":        jobID,
-				"github_job_id": githubJobID,
-				"queued_since":  queuedAt,
+				"job_id":       jobID,
+				"ci_job_id":    ciJobID,
+				"queued_since": queuedAt,
 			}).Error("Job exceeded queue timeout, marking failed")
 
 			_, _ = jq.db.ExecContext(ctx, `UPDATE jobs SET status='failed' WHERE id=$1`, jobID)
@@ -120,7 +122,7 @@ func (jq *JobQueue) processQueuedJobs(ctx context.Context) {
 
 		// Attempt allocation
 		req := AllocateRunnerRequest{
-			RequestID:   fmt.Sprintf("gh-%d", githubJobID),
+			RequestID:   fmt.Sprintf("gh-%d", ciJobID),
 			WorkloadKey: workloadKey,
 			Labels:      labelsToMap(parseLabels(labelsJSON)),
 		}
@@ -128,8 +130,8 @@ func (jq *JobQueue) processQueuedJobs(ctx context.Context) {
 		resp, err := jq.scheduler.AllocateRunner(ctx, req)
 		if err != nil {
 			jq.logger.WithError(err).WithFields(logrus.Fields{
-				"job_id":        jobID,
-				"github_job_id": githubJobID,
+				"job_id":    jobID,
+				"ci_job_id": ciJobID,
 			}).Debug("Allocation attempt failed, will retry")
 			continue
 		}
@@ -152,17 +154,17 @@ func (jq *JobQueue) processQueuedJobs(ctx context.Context) {
 }
 
 // CompleteJob marks a job as completed.
-func (jq *JobQueue) CompleteJob(ctx context.Context, githubJobID int64, runnerName string) error {
+func (jq *JobQueue) CompleteJob(ctx context.Context, ciJobID int64, runnerName string) error {
 	result, err := jq.db.ExecContext(ctx, `
-		UPDATE jobs SET status='completed', completed_at=NOW() WHERE github_job_id=$1 AND status IN ('assigned','in_progress')
-	`, githubJobID)
+		UPDATE jobs SET status='completed', completed_at=NOW() WHERE ci_job_id=$1 AND status IN ('assigned','in_progress')
+	`, ciJobID)
 	if err != nil {
 		return fmt.Errorf("failed to complete job: %w", err)
 	}
 
 	rows, _ := result.RowsAffected()
 	jq.logger.WithFields(logrus.Fields{
-		"github_job_id": githubJobID,
+		"ci_job_id":     ciJobID,
 		"runner_name":   runnerName,
 		"rows_affected": rows,
 	}).Info("Job completed")
@@ -171,17 +173,17 @@ func (jq *JobQueue) CompleteJob(ctx context.Context, githubJobID int64, runnerNa
 }
 
 // UpdateJobInProgress marks a job as in_progress.
-func (jq *JobQueue) UpdateJobInProgress(ctx context.Context, githubJobID int64, runnerName string) error {
+func (jq *JobQueue) UpdateJobInProgress(ctx context.Context, ciJobID int64, runnerName string) error {
 	_, err := jq.db.ExecContext(ctx, `
-		UPDATE jobs SET status='in_progress', started_at=NOW() WHERE github_job_id=$1 AND status='assigned'
-	`, githubJobID)
+		UPDATE jobs SET status='in_progress', started_at=NOW() WHERE ci_job_id=$1 AND status='assigned'
+	`, ciJobID)
 	if err != nil {
 		return fmt.Errorf("failed to update job to in_progress: %w", err)
 	}
 
 	jq.logger.WithFields(logrus.Fields{
-		"github_job_id": githubJobID,
-		"runner_name":   runnerName,
+		"ci_job_id":   ciJobID,
+		"runner_name": runnerName,
 	}).Info("Job in progress")
 
 	return nil

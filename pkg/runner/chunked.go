@@ -9,13 +9,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/ci"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/fuse"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
@@ -55,9 +55,6 @@ type ChunkedManager struct {
 type ChunkedManagerConfig struct {
 	HostConfig
 
-	// CIAdapter is the CI system adapter (may be nil for no-op)
-	CIAdapter ci.Adapter
-
 	// UseChunkedSnapshots enables chunked snapshot restore
 	UseChunkedSnapshots bool
 
@@ -93,7 +90,7 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 	}
 
 	// Create base manager
-	baseManager, err := NewManager(ctx, cfg.HostConfig, cfg.CIAdapter, logger)
+	baseManager, err := NewManager(ctx, cfg.HostConfig, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -171,6 +168,7 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 			baseManager.setupExtensionFUSEDisk = cm.setupExtensionFUSEDiskForRunner
 			baseManager.getDirtyRootfsDiskChunks = cm.getDirtyRootfsDiskChunksCallback
 			baseManager.setupRootfsFUSEDisk = cm.setupRootfsFUSEDiskForRunner
+			baseManager.cleanupFUSEDisks = cm.cleanupFUSEDisksForRunner
 			cm.chunkedLogger.Info("GCS-backed session pause/resume enabled (stores wired)")
 		}
 
@@ -453,10 +451,12 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		// Legacy: UFFD lazy memory loading from dedicated memory chunk store.
 		uffdSocketPath = filepath.Join(cm.config.SocketDir, runnerID+".uffd.sock")
 		uffdHandler, err = uffd.NewHandler(uffd.HandlerConfig{
-			SocketPath: uffdSocketPath,
-			ChunkStore: cm.memChunkStore,
-			Metadata:   meta,
-			Logger:     cm.logger.Logger,
+			SocketPath:             uffdSocketPath,
+			ChunkStore:             cm.memChunkStore,
+			Metadata:               meta,
+			Logger:                 cm.logger.Logger,
+			FaultConcurrency:       32,
+			EnablePrefetchTracking: true,
 		})
 		if err != nil {
 			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, nil)
@@ -541,7 +541,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		}).Debug("Fetched vmstate from chunk store")
 	}
 
-	// In chunked mode, rootfs and repo-cache-seed are served via FUSE, memory
+	// In chunked mode, rootfs and extension drives are served via FUSE, memory
 	// via UFFD, and state was eagerly fetched above. The only traditional local
 	// file we need is the kernel. It is normally fetched by SyncManifest on the
 	// first heartbeat, but if allocation races ahead we fetch it on demand here.
@@ -913,7 +913,6 @@ func (cm *ChunkedManager) setupChunkedSymlinks(rootfsPath string, extensionDrive
 		target string
 	}{
 		{"rootfs.img", rootfsPath},
-		{"credentials.img", cm.credentialsImage},
 	}
 	// Add extension drives by driveID. The snapshot-builder bakes in paths using
 	// driveID+".img" (e.g. "bazel_output.img"), so we must match that exactly.
@@ -1271,6 +1270,27 @@ func (cm *ChunkedManager) getDirtyRootfsDiskChunksCallback(runnerID string) map[
 	return disk.GetDirtyChunks()
 }
 
+// cleanupFUSEDisksForRunner unmounts and removes all FUSE disks for a runner.
+// Called during pause/checkpoint after VM stop so the next resume can create
+// fresh mounts without collisions.
+func (cm *ChunkedManager) cleanupFUSEDisksForRunner(runnerID string) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if disk, ok := cm.fuseDisks[runnerID]; ok {
+		disk.Unmount()
+		delete(cm.fuseDisks, runnerID)
+		cm.chunkedLogger.WithField("runner_id", runnerID).Debug("Cleaned up rootfs FUSE disk during pause")
+	}
+	if extDisks, ok := cm.fuseExtensionDisks[runnerID]; ok {
+		for driveID, disk := range extDisks {
+			disk.Unmount()
+			cm.chunkedLogger.WithFields(logrus.Fields{"runner_id": runnerID, "drive_id": driveID}).Debug("Cleaned up extension FUSE disk during pause")
+		}
+		delete(cm.fuseExtensionDisks, runnerID)
+	}
+}
+
 // setupRootfsFUSEDiskForRunner creates and mounts a FUSE-backed rootfs disk.
 // Used by Manager.ResumeFromSession for GCS-backed cross-host resume.
 func (cm *ChunkedManager) setupRootfsFUSEDiskForRunner(runnerID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (string, error) {
@@ -1305,4 +1325,18 @@ func (cm *ChunkedManager) setupRootfsFUSEDiskForRunner(runnerID string, chunks [
 	}).Info("FUSE rootfs disk mounted for session resume")
 
 	return fuseDisk.DiskImagePath(), nil
+}
+
+// createExt4Image creates a sparse ext4 filesystem image of the given size.
+func createExt4Image(path string, sizeGB int, label string) error {
+	if sizeGB <= 0 {
+		return fmt.Errorf("invalid sizeGB: %d", sizeGB)
+	}
+	if err := exec.Command("truncate", "-s", fmt.Sprintf("%dG", sizeGB), path).Run(); err != nil {
+		return fmt.Errorf("truncate failed: %w", err)
+	}
+	if output, err := exec.Command("mkfs.ext4", "-F", "-L", label, "-E", "lazy_itable_init=1,lazy_journal_init=1", path).CombinedOutput(); err != nil {
+		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(output), err)
+	}
+	return nil
 }

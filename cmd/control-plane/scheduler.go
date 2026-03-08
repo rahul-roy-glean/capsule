@@ -108,8 +108,6 @@ type AllocateRunnerRequest struct {
 	RequestID           string
 	WorkloadKey         string
 	Labels              map[string]string
-	GitHubRunnerToken   string
-	CISystem            string
 	SessionID           string
 	VCPUs               int
 	MemoryMB            int
@@ -139,9 +137,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// Derive repo slug for multi-repo support
 	workloadKey := req.WorkloadKey
 
-	// Look up config for fairness checks, ci_system, start_command, tier, and TTL/auto_pause.
+	// Look up config for fairness checks, start_command, tier, and TTL/auto_pause.
 	// Uses in-memory cache first, falls back to DB on miss.
-	var ciSystem string
 	var tierName string
 	var startCmd *snapshot.StartCommand
 	var runnerTTLSeconds int
@@ -155,7 +152,6 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		}
 		if wc != nil {
 			tierName = wc.Tier
-			ciSystem = wc.CISystem
 			startCmd = wc.StartCommand
 			runnerTTLSeconds = wc.RunnerTTLSeconds
 			autoPause = wc.AutoPause
@@ -180,7 +176,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			var npPreset sql.NullString
 			var npJSON sql.NullString
 
-			err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, ci_system, start_command, tier, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy FROM layered_configs WHERE leaf_workload_key = $1`, workloadKey).Scan(&maxConcurrent, &ciSystem, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON)
+			err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, start_command, tier, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy FROM layered_configs WHERE leaf_workload_key = $1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON)
 			if err == nil {
 				if tierCol.Valid && tierCol.String != "" {
 					tierName = tierCol.String
@@ -346,15 +342,13 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 
 	// Build the proto request
 	protoReq := &pb.AllocateRunnerRequest{
-		RequestId:         req.RequestID,
-		Labels:            req.Labels,
-		GithubRunnerToken: req.GitHubRunnerToken,
-		WorkloadKey:       workloadKey,
-		CiSystem:          ciSystem,
-		SessionId:         req.SessionID,
-		SnapshotVersion:   snapshotVersion,
-		TtlSeconds:        int32(runnerTTLSeconds),
-		AutoPause:         autoPause,
+		RequestId:       req.RequestID,
+		Labels:          req.Labels,
+		WorkloadKey:     workloadKey,
+		SessionId:       req.SessionID,
+		SnapshotVersion: snapshotVersion,
+		TtlSeconds:      int32(runnerTTLSeconds),
+		AutoPause:       autoPause,
 	}
 	// Pass network policy fields via labels (proto fields 17-18 not in
 	// generated wire descriptor; labels are serialized reliably).

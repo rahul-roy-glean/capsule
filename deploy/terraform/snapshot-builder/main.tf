@@ -93,7 +93,6 @@ resource "google_compute_instance" "snapshot_builder" {
     snapshot-bucket     = var.snapshot_bucket
     repo-url            = var.repo_url
     repo-branch         = var.repo_branch
-    bazel-version       = var.bazel_version
     fetch-targets       = var.fetch_targets
     github-app-id       = var.github_app_id
     github-app-secret   = var.github_app_secret

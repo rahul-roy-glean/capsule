@@ -285,7 +285,7 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 		       COALESCE(sl.all_chain_drives, sl.drives) AS all_chain_drives,
 		       sl.config_name,
 		       parent_sl.current_version AS parent_current_version,
-		       lc.tier, lc.github_app_id, lc.github_app_secret,
+		       lc.tier,
 		       sb.old_layer_hash, sb.old_layer_version,
 		       lc.config_json,
 		       sb.retry_count, sb.max_retries
@@ -316,8 +316,6 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 		configName           string
 		parentCurrentVersion sql.NullString
 		tier                 sql.NullString
-		githubAppID          sql.NullString
-		githubAppSecret      sql.NullString
 		oldLayerHash         string
 		oldLayerVersion      string
 		configJSON           sql.NullString
@@ -332,7 +330,7 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 		if err := rows.Scan(&b.buildID, &b.layerHash, &b.version, &b.buildType, &b.parentVersion,
 			&b.parentLayerHash, &b.initCmdsJSON, &b.refreshCmdsJSON, &b.drivesJSON, &b.allChainDrivesJSON,
 			&b.configName,
-			&b.parentCurrentVersion, &b.tier, &b.githubAppID, &b.githubAppSecret,
+			&b.parentCurrentVersion, &b.tier,
 			&oldHash, &oldVer, &b.configJSON, &b.retryCount, &b.maxRetries); err != nil {
 			continue
 		}
@@ -383,15 +381,6 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 			}
 		}
 
-		githubAppID := ""
-		githubAppSecret := ""
-		if b.githubAppID.Valid {
-			githubAppID = b.githubAppID.String
-		}
-		if b.githubAppSecret.Valid {
-			githubAppSecret = b.githubAppSecret.String
-		}
-
 		// Extract base-image and runner-user from init commands
 		baseImage := ""
 		runnerUser := ""
@@ -419,7 +408,7 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 
 		err := s.launchLayerBuildVM(ctx, instanceName, b.layerHash, commandsJSON, b.version,
 			parentWorkloadKey, parentVersion, b.allChainDrivesJSON, b.buildType,
-			githubAppID, githubAppSecret, snapshotVCPUs, snapshotMemoryMB,
+			snapshotVCPUs, snapshotMemoryMB,
 			baseImage, runnerUser, b.oldLayerHash, b.oldLayerVersion, authConfigJSON)
 		if err != nil {
 			s.logger.WithError(err).WithField("build_id", b.buildID).Error("Failed to launch layer build VM")
@@ -624,8 +613,8 @@ func (s *LayerBuildScheduler) onLeafLayerComplete(ctx context.Context, layerHash
 	// Insert into snapshots table for the rollout pipeline
 	metricsJSON, _ := json.Marshal(SnapshotMetrics{})
 	s.db.ExecContext(ctx, `
-		INSERT INTO snapshots (version, status, workload_key, gcs_path, bazel_version, repo_commit, size_bytes, metrics)
-		VALUES ($1, 'ready', $2, '', '', '', 0, $3)
+		INSERT INTO snapshots (version, status, workload_key, gcs_path, repo_commit, size_bytes, metrics)
+		VALUES ($1, 'ready', $2, '', '', 0, $3)
 		ON CONFLICT (version) DO NOTHING
 	`, version, workloadKey, string(metricsJSON))
 
@@ -978,7 +967,7 @@ func hasRefreshCommands(layer snapshot.LayerMaterialized) bool {
 // launchLayerBuildVM creates a GCE instance to build a layer snapshot.
 // It builds its own startup script with all layer-specific flags instead of
 // delegating to launchSnapshotBuilderVMForKey.
-func (s *LayerBuildScheduler) launchLayerBuildVM(ctx context.Context, instanceName, layerHash, commandsJSON, version, parentWorkloadKey, parentVersion, drivesJSON, buildType, githubAppID, githubAppSecret string, snapshotVCPUs, snapshotMemoryMB int, baseImage, runnerUser, oldLayerHash, oldLayerVersion, authConfigJSON string) error {
+func (s *LayerBuildScheduler) launchLayerBuildVM(ctx context.Context, instanceName, layerHash, commandsJSON, version, parentWorkloadKey, parentVersion, drivesJSON, buildType string, snapshotVCPUs, snapshotMemoryMB int, baseImage, runnerUser, oldLayerHash, oldLayerVersion, authConfigJSON string) error {
 	if s.snapshotManager.gcpProject == "" {
 		s.logger.Warn("GCP project not configured, skipping VM launch")
 		return nil
@@ -999,13 +988,6 @@ func (s *LayerBuildScheduler) launchLayerBuildVM(ctx context.Context, instanceNa
 
 	sm := s.snapshotManager
 	gcsBase := sm.gcsPath("build-artifacts")
-
-	// Build optional flags
-	githubFlags := ""
-	if githubAppID != "" && githubAppSecret != "" {
-		githubFlags = fmt.Sprintf(`--github-app-id="%s" --github-app-secret="%s" --gcp-project="%s"`,
-			githubAppID, githubAppSecret, sm.gcpProject)
-	}
 
 	// Layer-specific flags
 	layerFlags := fmt.Sprintf(`--layer-hash="%s" --layer-drives='%s' --build-type="%s"`,
@@ -1061,6 +1043,24 @@ gcloud storage cp "gs://%s/%s/%s/rootfs.img" /opt/firecracker/rootfs.img 2>/dev/
     || gcloud storage cp "gs://%s/%s/rootfs.img" /opt/firecracker/rootfs.img 2>/dev/null \
     || echo "INFO: rootfs.img not in GCS (expected for child/reattach layers)"
 
+# Setup KVM
+modprobe kvm_intel || modprobe kvm_amd || true
+chmod 666 /dev/kvm || true
+
+# Setup networking: bridge, IP forwarding, NAT
+HOST_MTU=$(cat /sys/class/net/$(ip route | grep default | awk '{print $5}' | head -1)/mtu)
+ip link add fcbr0 type bridge || true
+ip link set fcbr0 mtu "$HOST_MTU"
+ip addr add 172.16.0.1/24 dev fcbr0 || true
+ip link set fcbr0 up
+echo 1 > /proc/sys/net/ipv4/ip_forward
+PRIMARY_IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
+iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -o "$PRIMARY_IFACE" -j MASQUERADE
+iptables -A FORWARD -i fcbr0 -o "$PRIMARY_IFACE" -j ACCEPT
+iptables -A FORWARD -i "$PRIMARY_IFACE" -o fcbr0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+modprobe tun || true
+
 # Download snapshot-builder binary (always download fresh to pick up new deploys)
 gcloud storage cp gs://%s/%s/snapshot-builder /usr/local/bin/snapshot-builder
 chmod +x /usr/local/bin/snapshot-builder
@@ -1082,10 +1082,10 @@ SNAPSHOT_COMMANDS=$(echo '%s' | base64 -d)
     --vcpus=%d \
     --memory-mb=%d \
     --version="%s" \
-    %s %s
+    %s
 echo "Layer build complete, shutting down..."
 shutdown -h now
-`, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, layerHash, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, base64.StdEncoding.EncodeToString([]byte(commandsJSON)), authConfigSetup, sm.gcsBucket, sm.gcsPrefix, snapshotVCPUs, snapshotMemoryMB, version, githubFlags, layerFlags)
+`, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, layerHash, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, base64.StdEncoding.EncodeToString([]byte(commandsJSON)), authConfigSetup, sm.gcsBucket, sm.gcsPrefix, snapshotVCPUs, snapshotMemoryMB, version, layerFlags)
 
 	// Size the builder VM. Round up to a valid N2 vCPU count (powers of 2
 	// starting at 2, except 1 is also valid but too small for builds).

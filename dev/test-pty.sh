@@ -36,7 +36,7 @@ fi
 header "1. Register snapshot config"
 # ---------------------------------------------------------------------------
 SNAPSHOT_COMMANDS=${SNAPSHOT_COMMANDS:-'[{"type":"shell","args":["echo","dev-snapshot-ready"]}]'}
-CONFIG_RESP=$(curl -s -X POST "$CP/api/v1/snapshot-configs" \
+CONFIG_RESP=$(curl -s -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "rootfs-durability-test",

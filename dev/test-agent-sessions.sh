@@ -165,29 +165,40 @@ fi
 # =========================================================================
 
 # ---------------------------------------------------------------------------
-header "1. Register snapshot config"
+header "1. Discover workload key"
 # ---------------------------------------------------------------------------
-CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/snapshot-configs" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "display_name": "agent-sandbox-test",
-    "commands": [
-      {"type":"shell","args":["bash","-c","rm -rf /workspace/markupsafe && git clone --depth=1 --branch main https://github.com/pallets/markupsafe /workspace/markupsafe"]},
-      {"type":"shell","args":["bash","-c","rm -rf /workspace/camelcase && git clone --depth=1 --branch main https://github.com/sindresorhus/camelcase /workspace/camelcase"]},
-      {"type":"shell","args":["pip3","install","--break-system-packages","markupsafe"],"run_as_root":true}
-    ],
-    "runner_ttl_seconds": 300,
-    "auto_pause": true,
-    "session_max_age_seconds": 3600,
-    "network_policy_preset": "ci-standard"
-  }')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.workload_key')
+# The snapshot-builder computes the workload_key from the snapshot commands hash.
+# Extract it from the snapshot-builder log, or from the snapshot version string
+# (format: vYYYYMMDD-HHMMSS-<workload_key>).
+WORKLOAD_KEY=""
+
+# Method 1: extract from snapshot-builder log (most reliable)
+BUILDER_LOG="/tmp/fc-dev/logs/agent-snapshot-builder.log"
+if [ -f "$BUILDER_LOG" ]; then
+  WORKLOAD_KEY=$(grep -o '"workload_key":"[^"]*"' "$BUILDER_LOG" | head -1 | cut -d'"' -f4)
+  if [ -n "$WORKLOAD_KEY" ]; then
+    echo "  Extracted from snapshot-builder log"
+  fi
+fi
+
+# Method 2: extract from local metadata.json version field (vDATE-TIME-KEY)
+if [ -z "$WORKLOAD_KEY" ] && [ -f "/tmp/fc-dev/snapshots/metadata.json" ]; then
+  VERSION=$(jq -r '.version // empty' /tmp/fc-dev/snapshots/metadata.json 2>/dev/null || true)
+  if [ -n "$VERSION" ]; then
+    # Version format: v20260303-133715-3d2eb2a0448d29cb → extract last segment
+    WORKLOAD_KEY=$(echo "$VERSION" | rev | cut -d'-' -f1 | rev)
+    if [ -n "$WORKLOAD_KEY" ]; then
+      echo "  Extracted from metadata.json version: $VERSION"
+    fi
+  fi
+fi
+
 echo "  workload_key=$WORKLOAD_KEY"
 
 if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then
-  pass "Snapshot config registered"
+  pass "Workload key discovered: $WORKLOAD_KEY"
 else
-  fail "Snapshot config registration failed"; exit 1
+  fail "Could not discover workload key from snapshot-builder log or metadata.json"; exit 1
 fi
 
 # ---------------------------------------------------------------------------
@@ -202,7 +213,7 @@ for i in $(seq 1 30); do
       \"ci_system\":\"none\",
       \"workload_key\":\"$WORKLOAD_KEY\",
       \"session_id\":\"$SESSION_ID\",
-      \"network_policy_preset\":\"ci-standard\"
+      \"network_policy_preset\":\"restricted-egress\"
     }")
   RUNNER_ID=$(echo "$ALLOC_RESP" | jq -r '.runner_id // empty')
   if [ -n "$RUNNER_ID" ] && [ "$RUNNER_ID" != "null" ]; then
@@ -541,7 +552,7 @@ RESUME_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
     \"ci_system\":\"none\",
     \"workload_key\":\"$WORKLOAD_KEY\",
     \"session_id\":\"$SESSION_ID\",
-    \"network_policy_preset\":\"ci-standard\"
+    \"network_policy_preset\":\"restricted-egress\"
   }")
 echo "Response: $RESUME_RESP"
 
@@ -683,7 +694,7 @@ RESUME2_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
     \"ci_system\":\"none\",
     \"workload_key\":\"$WORKLOAD_KEY\",
     \"session_id\":\"$SESSION_ID\",
-    \"network_policy_preset\":\"ci-standard\"
+    \"network_policy_preset\":\"restricted-egress\"
   }")
 echo "Response: $RESUME2_RESP"
 
@@ -767,8 +778,8 @@ POLICY_NAME=$(echo "$POLICY_RESP" | jq -r '.policy.name // ""')
 POLICY_VER=$(echo "$POLICY_RESP" | jq -r '.version // 0')
 echo "  Policy: name=$POLICY_NAME version=$POLICY_VER"
 
-if [ "$POLICY_NAME" = "ci-standard" ]; then
-  pass "ci-standard network policy applied"
+if [ "$POLICY_NAME" = "restricted-egress" ]; then
+  pass "restricted-egress network policy applied"
 elif [ "$POLICY_VER" != "0" ]; then
   pass "Network policy applied (name=$POLICY_NAME)"
 else
@@ -789,11 +800,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-header "26. Verify RFC1918 blocked (ci-standard)"
+header "26. Verify RFC1918 blocked (restricted-egress)"
 # ---------------------------------------------------------------------------
 RFC_OUT=$(vm_tcp_check_blocked "$RESUME2_RUNNER_ID" "10.0.0.1" "80")
 if echo "$RFC_OUT" | grep -q "NET_BLOCKED"; then
-  pass "RFC1918 (10.0.0.1) blocked by ci-standard"
+  pass "RFC1918 (10.0.0.1) blocked by restricted-egress"
 elif echo "$RFC_OUT" | grep -q "NET_OK"; then
   fail "RFC1918 NOT blocked (10.0.0.1 reachable)"
 else
