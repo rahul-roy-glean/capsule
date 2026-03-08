@@ -58,12 +58,17 @@ fi
 echo "Firecracker artifacts:"
 ls -lah /opt/firecracker/
 
-# ---- 4. Download snapshot-builder binary from GCS ----
+# ---- 4. Download snapshot-builder and thaw-agent binaries from GCS ----
 echo "Downloading snapshot-builder binary..."
 if [ -n "$SNAPSHOT_BUCKET" ]; then
   gcloud storage cp "gs://${SNAPSHOT_BUCKET}/build-artifacts/snapshot-builder" /usr/local/bin/snapshot-builder 2>/dev/null \
     || echo "WARNING: snapshot-builder binary not found in GCS"
   chmod +x /usr/local/bin/snapshot-builder 2>/dev/null || true
+
+  echo "Downloading thaw-agent binary..."
+  gcloud storage cp "gs://${SNAPSHOT_BUCKET}/build-artifacts/thaw-agent" /usr/local/bin/thaw-agent 2>/dev/null \
+    || echo "WARNING: thaw-agent binary not found in GCS"
+  chmod +x /usr/local/bin/thaw-agent 2>/dev/null || true
 fi
 
 # ---- 5. Setup networking: bridge, IP forwarding, NAT, MTU clamping ----

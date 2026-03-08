@@ -234,6 +234,10 @@ func main() {
 		if err := json.Unmarshal([]byte(*authConfigJSON), &authCfg); err != nil {
 			log.WithError(err).Fatal("Failed to parse --auth-config JSON")
 		}
+		log.WithFields(logrus.Fields{
+			"providers": len(authCfg.Providers),
+			"ssl_bump":  authCfg.Proxy.SSLBump,
+		}).Info("Auth proxy config loaded")
 		proxyPort := authCfg.Proxy.ListenPort
 		if proxyPort == 0 {
 			proxyPort = 3128
@@ -247,11 +251,14 @@ func main() {
 		if proxyErr = authProxy.Start(ctx); proxyErr != nil {
 			log.WithError(proxyErr).Fatal("Failed to start auth proxy")
 		}
+		log.WithField("proxy_addr", authProxyAddr).Info("Auth proxy started")
 		defer authProxy.Stop()
 		// Note: DNAT to 169.254.169.254 doesn't work because Firecracker's MMDS
 		// intercepts all traffic to that IP before it reaches the tap interface.
 		// Instead, we pass the metadata host (gatewayIP) via MMDS and set
 		// GCE_METADATA_HOST in the guest so google-auth talks directly to the proxy.
+	} else {
+		log.Warn("No --auth-config provided, auth proxy disabled (git clone of private repos will fail)")
 	}
 
 	bootArgs := fmt.Sprintf("console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off",
@@ -1899,9 +1906,9 @@ func reattachFromParent(
 		os.Remove(c)
 	}
 
-	newRunnerID := fmt.Sprintf("snapshot-builder-reattach-%s", uuid.New().String()[:8])
 	mmdsData := buildWarmupMMDS(commands, gitToken, newDrives)
-	mmdsData["latest"].(map[string]interface{})["meta"].(map[string]interface{})["runner_id"] = newRunnerID
+	// Use the caller-provided runnerID so waitForWarmup's expectedRunnerID matches.
+	mmdsData["latest"].(map[string]interface{})["meta"].(map[string]interface{})["runner_id"] = runnerID
 	injectProxyMMDS(mmdsData, authProxy, authProxyAddr, hostIP)
 
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {

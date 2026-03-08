@@ -1046,6 +1046,24 @@ gcloud storage cp "gs://%s/%s/%s/rootfs.img" /opt/firecracker/rootfs.img 2>/dev/
     || gcloud storage cp "gs://%s/%s/rootfs.img" /opt/firecracker/rootfs.img 2>/dev/null \
     || echo "INFO: rootfs.img not in GCS (expected for child/reattach layers)"
 
+# Setup KVM
+modprobe kvm_intel || modprobe kvm_amd || true
+chmod 666 /dev/kvm || true
+
+# Setup networking: bridge, IP forwarding, NAT
+HOST_MTU=$(cat /sys/class/net/$(ip route | grep default | awk '{print $5}' | head -1)/mtu)
+ip link add fcbr0 type bridge || true
+ip link set fcbr0 mtu "$HOST_MTU"
+ip addr add 172.16.0.1/24 dev fcbr0 || true
+ip link set fcbr0 up
+echo 1 > /proc/sys/net/ipv4/ip_forward
+PRIMARY_IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
+iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -o "$PRIMARY_IFACE" -j MASQUERADE
+iptables -A FORWARD -i fcbr0 -o "$PRIMARY_IFACE" -j ACCEPT
+iptables -A FORWARD -i "$PRIMARY_IFACE" -o fcbr0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+modprobe tun || true
+
 # Download snapshot-builder binary (always download fresh to pick up new deploys)
 gcloud storage cp gs://%s/%s/snapshot-builder /usr/local/bin/snapshot-builder
 chmod +x /usr/local/bin/snapshot-builder
