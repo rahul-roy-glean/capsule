@@ -62,6 +62,20 @@ func TestValidateInjectedRootfsDebianLike(t *testing.T) {
 	}
 }
 
+func TestValidateInjectedRootfsDebianLikeWithRootfsLocalSymlinks(t *testing.T) {
+	rootfs := buildValidRootfsFixture(t, rootfsFlavorDebianLike, "runner")
+
+	mustSymlinkRootfs(t, rootfs, "/etc/systemd/system/thaw-agent.service", "/etc/systemd/system/multi-user.target.wants/thaw-agent.service")
+	mustWriteRootfsFile(t, rootfs, "/lib/systemd/system/multi-user.target", "fixture\n")
+	mustSymlinkRootfs(t, rootfs, "/lib/systemd/system/multi-user.target", "/etc/systemd/system/default.target")
+	mustWriteRootfsFile(t, rootfs, "/lib/systemd/system/serial-getty@.service", "fixture\n")
+	mustSymlinkRootfs(t, rootfs, "/lib/systemd/system/serial-getty@.service", "/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service")
+
+	if err := validateInjectedRootfs(rootfs, rootfsFlavorDebianLike, "runner"); err != nil {
+		t.Fatalf("validateInjectedRootfs(debian-like symlinks) returned error: %v", err)
+	}
+}
+
 func TestValidateInjectedRootfsMissingRequiredBinary(t *testing.T) {
 	rootfs := buildValidRootfsFixture(t, rootfsFlavorDebianLike, "runner")
 	if err := os.Remove(filepath.Join(rootfs, strings.TrimPrefix(binaryFixturePath("mountpoint"), "/"))); err != nil {
@@ -194,5 +208,19 @@ func mustWriteExecutable(t *testing.T, rootfs, rel, content string) {
 	}
 	if err := os.WriteFile(path, []byte(content), 0755); err != nil {
 		t.Fatalf("write executable %s: %v", rel, err)
+	}
+}
+
+func mustSymlinkRootfs(t *testing.T, rootfs, target, link string) {
+	t.Helper()
+	linkPath := filepath.Join(rootfs, strings.TrimPrefix(link, "/"))
+	if err := os.MkdirAll(filepath.Dir(linkPath), 0755); err != nil {
+		t.Fatalf("mkdir for symlink %s: %v", link, err)
+	}
+	if err := os.RemoveAll(linkPath); err != nil {
+		t.Fatalf("remove existing path for symlink %s: %v", link, err)
+	}
+	if err := os.Symlink(target, linkPath); err != nil {
+		t.Fatalf("symlink %s -> %s: %v", link, target, err)
 	}
 }

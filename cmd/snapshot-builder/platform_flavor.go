@@ -526,7 +526,27 @@ func binaryExistsInRootfs(rootfsDir, binary string) bool {
 }
 
 func pathExistsInRootfs(rootfsDir, relPath string) bool {
-	_, err := os.Stat(filepath.Join(rootfsDir, strings.TrimPrefix(relPath, "/")))
+	path := filepath.Join(rootfsDir, strings.TrimPrefix(relPath, "/"))
+	info, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return true
+	}
+
+	target, err := os.Readlink(path)
+	if err != nil {
+		return false
+	}
+
+	var resolved string
+	if filepath.IsAbs(target) {
+		resolved = filepath.Join(rootfsDir, strings.TrimPrefix(target, "/"))
+	} else {
+		resolved = filepath.Join(filepath.Dir(path), target)
+	}
+	_, err = os.Stat(filepath.Clean(resolved))
 	return err == nil
 }
 
