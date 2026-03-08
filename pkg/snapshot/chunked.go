@@ -102,6 +102,11 @@ type ChunkedSnapshotMetadata struct {
 	// requested resize. Used by restore paths to detect rootfs changes and
 	// fall back to cold boot when resuming would use stale rootfs content.
 	RootfsSourceHash string `json:"rootfs_source_hash,omitempty"`
+	// RootfsFlavor records the detected rootfs family used for a base-image
+	// build (for example "debian-like" or "alpine-like"). Used alongside
+	// RootfsSourceHash to scope restore-safety checks to the relevant platform
+	// shim contract. Empty for legacy prebuilt rootfs.img snapshots.
+	RootfsFlavor string `json:"rootfs_flavor,omitempty"`
 	// Layer fields for layered snapshot builds.
 	LayerHash       string `json:"layer_hash,omitempty"`
 	ParentLayerHash string `json:"parent_layer_hash,omitempty"`

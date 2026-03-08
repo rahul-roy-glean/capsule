@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -51,6 +54,8 @@ var commonRequiredBinaries = []string{
 	"chown",
 	"update-ca-certificates",
 }
+
+const platformShimSchemaVersion = "platform-shim-v2"
 
 func getFlavorConfig(flavor rootfsFlavor) (flavorConfig, error) {
 	switch flavor {
@@ -246,24 +251,7 @@ func configureDebianLikeRootfs(rootfsDir, runnerUser string) error {
 	if err := os.MkdirAll(serviceDir, 0755); err != nil {
 		return fmt.Errorf("create systemd service dir: %w", err)
 	}
-	serviceContent := fmt.Sprintf(`[Unit]
-Description=Thaw Agent - MicroVM initialization
-After=network.target
-Wants=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/thaw-agent --runner-user=%s
-Restart=on-failure
-RestartSec=5
-StandardOutput=journal+console
-StandardError=journal+console
-Environment=LOG_LEVEL=info
-Environment=HOME=/root
-
-[Install]
-WantedBy=multi-user.target
-`, runnerUser)
+	serviceContent := renderDebianThawAgentService(runnerUser)
 	if err := os.WriteFile(filepath.Join(serviceDir, "thaw-agent.service"), []byte(serviceContent), 0644); err != nil {
 		return fmt.Errorf("write thaw-agent.service: %w", err)
 	}
@@ -280,12 +268,7 @@ WantedBy=multi-user.target
 	if err := os.MkdirAll(networkDir, 0755); err != nil {
 		return fmt.Errorf("create systemd network dir: %w", err)
 	}
-	networkContent := `[Match]
-Name=eth0
-
-[Network]
-DHCP=no
-`
+	networkContent := renderDebianNetworkConfig()
 	if err := os.WriteFile(filepath.Join(networkDir, "10-eth0.network"), []byte(networkContent), 0644); err != nil {
 		return fmt.Errorf("write 10-eth0.network: %w", err)
 	}
@@ -328,22 +311,7 @@ func configureAlpineRootfs(rootfsDir, runnerUser string) error {
 		return fmt.Errorf("create /init symlink: %w", err)
 	}
 
-	initScript := fmt.Sprintf(`#!/sbin/openrc-run
-
-name="thaw-agent"
-description="Thaw Agent - MicroVM initialization"
-command="/usr/local/bin/thaw-agent"
-command_args="--runner-user=%s"
-command_background=true
-pidfile="/run/${RC_SVCNAME}.pid"
-output_log="/var/log/thaw-agent/stdout.log"
-error_log="/var/log/thaw-agent/stderr.log"
-
-depend() {
-	need net
-	after firewall
-}
-`, runnerUser)
+	initScript := renderAlpineThawAgentInitScript(runnerUser)
 	initDir := filepath.Join(rootfsDir, "etc/init.d")
 	if err := os.MkdirAll(initDir, 0755); err != nil {
 		return fmt.Errorf("create init.d dir: %w", err)
@@ -360,12 +328,7 @@ depend() {
 		return fmt.Errorf("enable thaw-agent in default runlevel: %w", err)
 	}
 
-	interfacesContent := `auto lo
-iface lo inet loopback
-
-auto eth0
-iface eth0 inet manual
-`
+	interfacesContent := renderAlpineInterfacesConfig()
 	if err := os.MkdirAll(filepath.Join(rootfsDir, "etc/network"), 0755); err != nil {
 		return fmt.Errorf("create network dir: %w", err)
 	}
@@ -396,13 +359,7 @@ iface eth0 inet manual
 		}
 	}
 
-	inittabContent := `# Firecracker microVM inittab (busybox init + OpenRC)
-::sysinit:/sbin/openrc sysinit
-::sysinit:/sbin/openrc boot
-::wait:/sbin/openrc default
-::shutdown:/sbin/openrc shutdown
-ttyS0::respawn:/sbin/getty -L ttyS0 115200 vt100
-`
+	inittabContent := renderAlpineInittab()
 	if err := os.WriteFile(filepath.Join(rootfsDir, "etc/inittab"), []byte(inittabContent), 0644); err != nil {
 		return fmt.Errorf("write /etc/inittab: %w", err)
 	}
@@ -612,4 +569,121 @@ func firstExistingRootfsPath(rootfsDir string, candidates []string) (string, err
 		}
 	}
 	return "", fmt.Errorf("none of the candidate paths exist: %s", strings.Join(candidates, ", "))
+}
+
+func computePlatformShimFingerprint(flavor rootfsFlavor, runnerUser string) (string, error) {
+	cfg, err := getFlavorConfig(flavor)
+	if err != nil {
+		return "", err
+	}
+
+	payload := struct {
+		SchemaVersion      string   `json:"schema_version"`
+		Flavor             string   `json:"flavor"`
+		CommonRequiredPath []string `json:"common_required_paths"`
+		CommonRequiredBins []string `json:"common_required_bins"`
+		RequiredPaths      []string `json:"required_paths"`
+		RequiredBinaries   []string `json:"required_binaries"`
+		InstallCommand     string   `json:"install_command"`
+		RunnerUser         string   `json:"runner_user"`
+		ServiceTemplate    string   `json:"service_template,omitempty"`
+		NetworkTemplate    string   `json:"network_template,omitempty"`
+		InitTemplate       string   `json:"init_template,omitempty"`
+		InterfacesTemplate string   `json:"interfaces_template,omitempty"`
+		InittabTemplate    string   `json:"inittab_template,omitempty"`
+	}{
+		SchemaVersion:      platformShimSchemaVersion,
+		Flavor:             string(flavor),
+		CommonRequiredPath: commonRequiredPaths,
+		CommonRequiredBins: commonRequiredBinaries,
+		RequiredPaths:      cfg.requiredPaths,
+		RequiredBinaries:   cfg.requiredBinaries,
+		InstallCommand:     cfg.installCommand,
+		RunnerUser:         runnerUser,
+	}
+
+	switch flavor {
+	case rootfsFlavorDebianLike:
+		payload.ServiceTemplate = renderDebianThawAgentService(runnerUser)
+		payload.NetworkTemplate = renderDebianNetworkConfig()
+	case rootfsFlavorAlpineLike:
+		payload.InitTemplate = renderAlpineThawAgentInitScript(runnerUser)
+		payload.InterfacesTemplate = renderAlpineInterfacesConfig()
+		payload.InittabTemplate = renderAlpineInittab()
+	}
+
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func renderDebianThawAgentService(runnerUser string) string {
+	return fmt.Sprintf(`[Unit]
+Description=Thaw Agent - MicroVM initialization
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/thaw-agent --runner-user=%s
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal+console
+StandardError=journal+console
+Environment=LOG_LEVEL=info
+Environment=HOME=/root
+
+[Install]
+WantedBy=multi-user.target
+`, runnerUser)
+}
+
+func renderDebianNetworkConfig() string {
+	return `[Match]
+Name=eth0
+
+[Network]
+DHCP=no
+`
+}
+
+func renderAlpineThawAgentInitScript(runnerUser string) string {
+	return fmt.Sprintf(`#!/sbin/openrc-run
+
+name="thaw-agent"
+description="Thaw Agent - MicroVM initialization"
+command="/usr/local/bin/thaw-agent"
+command_args="--runner-user=%s"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/thaw-agent/stdout.log"
+error_log="/var/log/thaw-agent/stderr.log"
+
+depend() {
+	need net
+	after firewall
+}
+`, runnerUser)
+}
+
+func renderAlpineInterfacesConfig() string {
+	return `auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet manual
+`
+}
+
+func renderAlpineInittab() string {
+	return `# Firecracker microVM inittab (busybox init + OpenRC)
+::sysinit:/sbin/openrc sysinit
+::sysinit:/sbin/openrc boot
+::wait:/sbin/openrc default
+::shutdown:/sbin/openrc shutdown
+ttyS0::respawn:/sbin/getty -L ttyS0 115200 vt100
+`
 }
