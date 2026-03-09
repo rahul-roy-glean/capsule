@@ -1,10 +1,24 @@
 # Examples
 
-Each subdirectory is a self-contained `onboard.yaml` for a specific use case. Copy the closest example, fill in your project values, and run:
+Each subdirectory is an executable `onboard.yaml` for a specific workload type.
+
+Start from the closest example, fill in your GCP project and workload-specific values, and
+run:
 
 ```bash
 make onboard CONFIG=<your-config>.yaml
 ```
+
+The currently supported example wrapper fields are:
+
+- `platform`
+- `microvm`
+- `hosts`
+- `workload.base_image`
+- `workload.layers`
+- `workload.config`
+- `workload.start_command`
+- `session`
 
 ## Use cases
 
@@ -88,18 +102,29 @@ Drives are created by snapshot-builder, chunked for lazy loading, and attached
 to every VM. `read_only: false` drives get a fresh copy per allocation. A
 default 50GB workspace drive is auto-injected if no drives are declared.
 
-### 5. `credentials` — secrets injected into the VM
+### 5. `auth` and `drives` — credentials and mounted data
 
-```yaml
-credentials:
-  secrets:
-    - name: "api-key"
-      secret_name: "projects/my-project/secrets/api-key/versions/latest"
-      target: "api.key"
-```
+Credentialed workloads should currently express mounted data and runtime auth through:
 
-Secrets are fetched from GCP Secret Manager and placed on a read-only
-credentials drive inside the VM.
+- `workload.layers[].drives`
+- `workload.config.auth`
+
+The top-level `credentials` wrapper remains reserved and should be left empty in example
+configs for now.
+
+## Mapping The Example Schema
+
+The wrapper fields in `examples/*/onboard.yaml` map to the current system like this:
+
+| Example field | Current meaning |
+|---|---|
+| `platform`, `microvm`, `hosts` | deployment-time sizing and infrastructure inputs |
+| `workload.base_image` | `LayeredConfig.base_image` |
+| `workload.layers` | `LayeredConfig.layers` |
+| `workload.start_command` | `LayeredConfig.start_command` |
+| `workload.config` | `LayeredConfig.config` |
+| `session` | runtime/session behavior to preserve when allocating with `session_id` |
+| `credentials` | reserved; keep empty until wrapper-level credential translation exists |
 
 ## `init_commands` reference
 

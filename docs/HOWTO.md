@@ -1,327 +1,215 @@
 # How-To Guides
 
-Operational recipes for common tasks.
+Operational recipes for the current layered-workload runtime.
 
-## Table of Contents
+## Deploy From Scratch
 
-- [Deploy from scratch](#deploy-from-scratch)
-- [Build and update host images](#build-and-update-host-images)
-- [Create a new snapshot](#create-a-new-snapshot)
-- [Enable GitHub Actions runner registration](#enable-github-actions-runner-registration)
-- [Roll out a host image update](#roll-out-a-host-image-update)
-- [Automate snapshot freshness checks](#automate-snapshot-freshness-checks)
-- [Scale the cluster](#scale-the-cluster)
-- [Monitor and debug](#monitor-and-debug)
-- [Inject credentials into microVMs](#inject-credentials-into-microvms)
+Follow [docs/setup.md](setup.md). That is the supported zero-to-live path.
 
----
+## Register A Layered Config
 
-## Deploy from scratch
-
-The `onboard` tool automates the full deployment. If you prefer manual steps, follow the sections below in order.
-
-### Using onboard (recommended)
+Create a config payload:
 
 ```bash
-# 1. Copy and edit the config
-cp onboard.yaml my-config.yaml
-vim my-config.yaml   # fill in project, repo, GitHub app details
+cat > layered-config.json <<'EOF'
+{
+  "display_name": "my-workload",
+  "base_image": "ubuntu:22.04",
+  "layers": [
+    {
+      "name": "deps",
+      "init_commands": [
+        {"type": "shell", "args": ["bash", "-lc", "apt-get update && apt-get install -y curl"]}
+      ]
+    }
+  ],
+  "config": {
+    "tier": "m",
+    "auto_pause": true,
+    "ttl": 300,
+    "auto_rollout": true
+  },
+  "start_command": {
+    "command": ["bash", "-lc", "python3 -m http.server 8080"],
+    "port": 8080,
+    "health_path": "/"
+  }
+}
+EOF
 
-# 2. Validate (dry run)
-make onboard-validate CONFIG=my-config.yaml
-
-# 3. Deploy
-make onboard CONFIG=my-config.yaml
+curl -sS -X POST "${CONTROL_PLANE_BASE}/api/v1/layered-configs" \
+  -H "Content-Type: application/json" \
+  --data @layered-config.json
 ```
 
-### Manual deployment
+This returns:
+
+- `config_id`
+- `leaf_workload_key`
+- materialized layer metadata
+
+## Trigger A Build
 
 ```bash
-# 1. Set environment variables
-export PROJECT_ID=your-project-id
-export DB_PASSWORD=$(openssl rand -base64 24)
-
-# 2. Deploy GCP infrastructure
-make terraform-init
-make terraform-apply PROJECT_ID=$PROJECT_ID DB_PASSWORD=$DB_PASSWORD
-
-# 3. Build the host VM image
-make packer-build PROJECT_ID=$PROJECT_ID
-
-# 4. Build and push control plane container
-make docker-build PROJECT_ID=$PROJECT_ID
-make docker-push PROJECT_ID=$PROJECT_ID
-
-# 5. Deploy control plane to GKE
-gcloud container clusters get-credentials \
-  firecracker-runner-dev-control-plane \
-  --region us-central1 --project $PROJECT_ID
-make k8s-deploy
-
-# 6. Create initial Firecracker snapshot
-make snapshot-builder
-./bin/snapshot-builder \
-  --repo-url=https://github.com/your-org/your-repo \
-  --repo-branch=main \
-  --gcs-bucket=$PROJECT_ID-firecracker-snapshots
-
-# 7. Roll out hosts
-make mig-rolling-update PROJECT_ID=$PROJECT_ID
+curl -sS -X POST "${CONTROL_PLANE_BASE}/api/v1/layered-configs/${CONFIG_ID}/build"
 ```
 
----
-
-## Build and update host images
-
-The host image is a GCE image built with Packer. It contains the `firecracker-manager` binary, Firecracker, and the Linux kernel.
+Inspect the current state:
 
 ```bash
-# Cross-compile the manager for Linux and build the GCE image
-make release-host-image PROJECT_ID=$PROJECT_ID
+curl -sS "${CONTROL_PLANE_BASE}/api/v1/layered-configs/${CONFIG_ID}"
 ```
 
-This runs `make firecracker-manager-linux` then `packer build`. The image is published to the `firecracker-host` image family.
+Useful variants:
 
----
+- force rebuild: `POST /api/v1/layered-configs/{config_id}/build?force=true`
+- clean rebuild: `POST /api/v1/layered-configs/{config_id}/build?clean=true`
+- refresh one layer: `POST /api/v1/layered-configs/{config_id}/layers/{layer_name}/refresh`
 
-## Create a new snapshot
-
-Snapshots contain the microVM state (memory + disk) with a fully warmed Bazel environment.
+## Allocate A Runner
 
 ```bash
-# Build the snapshot-builder binary
-make snapshot-builder
-
-# Create a snapshot and upload to GCS
-./bin/snapshot-builder \
-  --repo-url=https://github.com/your-org/your-repo \
-  --repo-branch=main \
-  --gcs-bucket=$PROJECT_ID-firecracker-snapshots \
-  --vcpus=4 \
-  --memory-mb=8192
-
-# For private repos, provide GitHub App credentials
-./bin/snapshot-builder \
-  --repo-url=https://github.com/your-org/private-repo \
-  --repo-branch=main \
-  --gcs-bucket=$PROJECT_ID-firecracker-snapshots \
-  --github-app-id=$GITHUB_APP_ID \
-  --github-app-secret=projects/$PROJECT_ID/secrets/github-app-key/versions/latest
+curl -sS -X POST "${CONTROL_PLANE_BASE}/api/v1/runners/allocate" \
+  -H "Content-Type: application/json" \
+  -d "{\"workload_key\":\"${WORKLOAD_KEY}\"}"
 ```
 
-The snapshot is uploaded to `gs://$BUCKET/current/` and a versioned copy at `gs://$BUCKET/v{date}-{hash}/`.
+Fields supported by the current API include:
 
----
+- `workload_key`
+- `session_id`
+- `snapshot_tag`
+- `network_policy_preset`
 
-## Enable GitHub Actions runner registration
-
-Runners can auto-register with GitHub when a microVM boots.
-
-### 1. Create a GitHub App
-
-1. Go to your org's GitHub settings -> Developer settings -> GitHub Apps
-2. Create a new app with these permissions:
-   - **Repository permissions:** Administration (Read & Write) -- for repo-level registration
-   - **Organization permissions:** Self-hosted runners (Read & Write) -- for org-level registration
-3. Install the app on your organization or repository
-4. Note the App ID and download the private key
-
-### 2. Store the private key in Secret Manager
+## Check Runner Status
 
 ```bash
-gcloud secrets create github-app-key \
-  --project=$PROJECT_ID \
-  --data-file=path/to/private-key.pem
+curl -sS "${CONTROL_PLANE_BASE}/api/v1/runners/status?runner_id=${RUNNER_ID}"
 ```
 
-### 3. Enable in Terraform
+Expected responses:
+
+- `202` while the VM is still starting
+- `200` once the runner is ready
+- `404` after release or if the ID is unknown
+
+## Access The User Service
+
+The allocate API returns the host HTTP address. Use the host proxy path:
 
 ```bash
-terraform apply \
-  -var="project_id=$PROJECT_ID" \
-  -var="db_password=$DB_PASSWORD" \
-  -var="github_runner_enabled=true" \
-  -var="github_repo=your-org/your-repo" \
-  -var="github_org=your-org" \
-  -var="github_app_id=$GITHUB_APP_ID" \
-  -var="github_app_secret=projects/$PROJECT_ID/secrets/github-app-key/versions/latest" \
-  -var="github_runner_labels=self-hosted,firecracker,Linux,X64,bazel"
+curl -sS "http://${HOST_HTTP}/api/v1/runners/${RUNNER_ID}/proxy/"
 ```
 
-### 4. Use in workflows
+Other useful host-side endpoints:
 
-```yaml
-jobs:
-  build:
-    runs-on: [self-hosted, firecracker]
-    steps:
-      - uses: actions/checkout@v4
-      - run: bazel build //...
-```
+- `POST /api/v1/runners/{id}/exec`
+- `GET /api/v1/runners/{id}/service-logs`
+- `POST /api/v1/runners/{id}/pause`
+- `POST /api/v1/runners/{id}/connect`
+- `POST /api/v1/runners/{id}/checkpoint`
 
----
+## Pause And Resume A Session
 
-## Roll out a host image update
-
-After building a new host image with Packer:
+Pause:
 
 ```bash
-# Start a rolling update (zero downtime: max-surge=1, max-unavailable=0)
-make mig-rolling-update PROJECT_ID=$PROJECT_ID ENV=dev
-
-# Monitor progress
-gcloud compute instance-groups managed list-instances \
-  firecracker-runner-dev-hosts \
-  --region=us-central1
+curl -sS -X POST "${CONTROL_PLANE_BASE}/api/v1/runners/pause" \
+  -H "Content-Type: application/json" \
+  -d "{\"runner_id\":\"${RUNNER_ID}\"}"
 ```
 
-The rolling update replaces hosts one at a time. Running jobs complete on old hosts before they are drained.
-
----
-
-## Automate snapshot freshness checks
-
-Cloud Build can periodically check if snapshots or git-caches are stale and trigger rebuilds.
-
-### Enable in Terraform
+Resume or reconnect:
 
 ```bash
-terraform apply \
-  -var="project_id=$PROJECT_ID" \
-  -var="db_password=$DB_PASSWORD" \
-  -var="enable_snapshot_automation=true" \
-  -var="snapshot_freshness_schedule=0 */4 * * *" \
-  -var="snapshot_max_age_hours=24" \
-  -var="snapshot_max_commit_drift=50"
+curl -sS -X POST "${CONTROL_PLANE_BASE}/api/v1/runners/connect" \
+  -H "Content-Type: application/json" \
+  -d "{\"runner_id\":\"${RUNNER_ID}\"}"
 ```
 
-This creates a Cloud Scheduler job that triggers the freshness check every 4 hours. If the snapshot is older than 24 hours or more than 50 commits behind HEAD, a rebuild is triggered via Cloud Build.
+For auto-resume on first allocation, pass `session_id` during allocate.
 
-The Cloud Build pipelines are in `deploy/cloudbuild/`:
-
-| Pipeline | Purpose |
-|----------|---------|
-| `snapshot-build.yaml` | Build Firecracker snapshot |
-
----
-
-## Scale the cluster
-
-### Change host count
+## Release A Runner
 
 ```bash
-# Update MIG bounds
-terraform apply \
-  -var="project_id=$PROJECT_ID" \
-  -var="db_password=$DB_PASSWORD" \
+curl -sS -X POST "${CONTROL_PLANE_BASE}/api/v1/runners/release" \
+  -H "Content-Type: application/json" \
+  -d "{\"runner_id\":\"${RUNNER_ID}\"}"
+```
+
+## Roll Out A Host Image Update
+
+Build a new image:
+
+```bash
+make release-host-image \
+  PROJECT_ID="${PROJECT_ID}" \
+  REGION="${REGION}" \
+  ZONE="${ZONE}" \
+  ENV="${ENVIRONMENT}"
+```
+
+Then start a MIG rolling update:
+
+```bash
+make mig-rolling-update \
+  PROJECT_ID="${PROJECT_ID}" \
+  REGION="${REGION}" \
+  ENV="${ENVIRONMENT}"
+```
+
+Monitor progress:
+
+```bash
+gcloud compute instance-groups managed list-instances "${HOST_MIG_NAME}" \
+  --region="${REGION}" \
+  --project="${PROJECT_ID}"
+```
+
+## Scale The Fleet
+
+Update Terraform with new bounds:
+
+```bash
+terraform -chdir=deploy/terraform apply \
+  -var="project_id=${PROJECT_ID}" \
+  -var="region=${REGION}" \
+  -var="zone=${ZONE}" \
+  -var="environment=${ENVIRONMENT}" \
+  -var="db_password=${DB_PASSWORD}" \
   -var="min_hosts=4" \
-  -var="max_hosts=40"
+  -var="max_hosts=20"
 ```
 
-### Change microVM density
+## Check Fleet Convergence
 
 ```bash
-# Fewer, larger VMs per host
-terraform apply \
-  -var="project_id=$PROJECT_ID" \
-  -var="db_password=$DB_PASSWORD" \
-  -var="max_runners_per_host=8" \
-  -var="vcpus_per_runner=8" \
-  -var="memory_per_runner_mb=16384"
+curl -sS "${CONTROL_PLANE_BASE}/api/v1/versions/fleet?workload_key=${WORKLOAD_KEY}"
 ```
 
-After changing microVM configuration, rebuild the host image and roll out:
+This reports the desired and current version for each host for the specified workload key.
+
+## Debug Host Health
 
 ```bash
-make release-host-image PROJECT_ID=$PROJECT_ID
-make mig-rolling-update PROJECT_ID=$PROJECT_ID
+gcloud compute ssh "${INSTANCE}" --zone="${ZONE}" --project="${PROJECT_ID}" -- \
+  "sudo journalctl -u firecracker-manager --no-pager -n 100"
 ```
 
----
-
-## Monitor and debug
-
-### Check host health
+Useful host checks:
 
 ```bash
-# List hosts and their status
-gcloud compute instance-groups managed list-instances \
-  firecracker-runner-dev-hosts --region=us-central1
-
-# SSH to a host
-gcloud compute ssh INSTANCE_NAME --zone=us-central1-a
-
-# Check firecracker-manager logs
-sudo journalctl -u firecracker-manager -f
-
-# Check manager health endpoint
-curl http://INSTANCE_IP:8080/health
+curl http://HOST_IP:8080/health
+curl http://HOST_IP:8080/metrics
 ```
 
-### Check control plane
+## Enable GitHub Webhooks Later
 
-```bash
-# Port-forward the control plane
-kubectl port-forward svc/control-plane 8080:8080
+GitHub integration is optional. If you need it later:
 
-# Health check
-curl http://localhost:8080/health
-```
+1. create a GitHub App and store the private key in Secret Manager
+2. update the host metadata inputs in Terraform (`github_app_id`, `github_app_secret`, `github_repo`, `github_org`)
+3. create a real `github-credentials` Kubernetes secret with the webhook secret
+4. configure the GitHub webhook to hit `${CONTROL_PLANE_BASE}/webhook/github`
 
-### Debug a microVM
-
-If you have SSH access to a host:
-
-```bash
-# List running VMs
-ls /var/run/firecracker/
-
-# Check thaw-agent health inside a VM (from the host, via the VM's internal IP)
-curl http://172.16.0.2:8080/health
-curl http://172.16.0.2:8080/debug
-curl http://172.16.0.2:8080/connectivity
-curl http://172.16.0.2:8080/mmds-diag
-```
-
-### View metrics
-
-The `firecracker-manager` exposes Prometheus metrics on its HTTP port:
-
-```bash
-curl http://INSTANCE_IP:8080/metrics
-```
-
----
-
-## Inject credentials into microVMs
-
-Credentials (secrets, certificates) are packaged into an ext4 image and attached as a read-only block device to each microVM.
-
-### From GCP Secret Manager
-
-Add to `onboard.yaml`:
-
-```yaml
-credentials:
-  secrets:
-    - name: "artifactory-netrc"
-      secret_name: "projects/my-proj/secrets/artifactory-netrc/versions/latest"
-      target: "netrc"
-    - name: "gcp-sa-key"
-      secret_name: "projects/my-proj/secrets/ci-sa-key/versions/latest"
-      target: "gcp-service-account.json"
-  env:
-    GOOGLE_APPLICATION_CREDENTIALS: "/mnt/credentials/gcp-service-account.json"
-```
-
-### From host directories
-
-```yaml
-credentials:
-  host_dirs:
-    - name: "buildbarn-certs"
-      host_path: "/etc/glean/ci/certs/buildbarn"
-      target: "certs/buildbarn"
-```
-
-Credentials are mounted at `/mnt/credentials/` inside the microVM by default. The thaw agent sets up any environment variables specified in `credentials.env`.
+The runtime itself remains workload-key based either way.

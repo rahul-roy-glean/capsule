@@ -68,10 +68,18 @@ spec:
               value: {{ .Values.gcp.projectId | quote }}
             - name: GCP_REGION
               value: {{ .Values.gcp.region | quote }}
+            - name: GCP_ZONE
+              value: {{ .Values.gcp.zone | quote }}
             - name: HOST_MIG_NAME
               value: {{ .Values.gcp.hostMigName | quote }}
             - name: HOST_AUTOSCALER_NAME
               value: {{ .Values.gcp.hostAutoscalerName | quote }}
+            - name: BUILDER_NETWORK
+              value: {{ .Values.gcp.builderNetwork | quote }}
+            - name: BUILDER_IMAGE
+              value: {{ .Values.gcp.builderImage | quote }}
+            - name: BUILDER_SERVICE_ACCOUNT
+              value: {{ .Values.gcp.builderServiceAccount | quote }}
             - name: DOWNSCALER_ENABLED
               value: {{ .Values.downscaler.enabled | quote }}
             - name: DOWNSCALER_INTERVAL

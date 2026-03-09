@@ -40,17 +40,18 @@ type SnapshotMetrics struct {
 
 // SnapshotManager manages snapshot lifecycle
 type SnapshotManager struct {
-	db             *sql.DB
-	gcsClient      *storage.Client
-	gcsBucket      string
-	gcsPrefix      string // top-level prefix for all GCS paths (e.g. "v1")
-	gcpProject     string
-	gcpZone        string
-	builderImage   string // GCE image for snapshot builder VM
-	builderNetwork string // VPC network for builder VM
-	logger         *logrus.Entry
-	mu             sync.RWMutex
-	currentVersion string
+	db                    *sql.DB
+	gcsClient             *storage.Client
+	gcsBucket             string
+	gcsPrefix             string // top-level prefix for all GCS paths (e.g. "v1")
+	gcpProject            string
+	gcpZone               string
+	builderImage          string // GCE image for snapshot builder VM
+	builderNetwork        string // VPC network for builder VM
+	builderServiceAccount string // GCE service account email for builder VMs
+	logger                *logrus.Entry
+	mu                    sync.RWMutex
+	currentVersion        string
 }
 
 // NewSnapshotManager creates a new snapshot manager
@@ -84,6 +85,29 @@ func (sm *SnapshotManager) gcsPath(path string) string {
 		return sm.gcsPrefix + "/" + path
 	}
 	return path
+}
+
+// ThawAgentHash returns the MD5 hash of the thaw-agent binary in GCS.
+// Used to include the binary identity in the platform layer hash so that
+// deploying a new thaw-agent invalidates the cached platform layer.
+func (sm *SnapshotManager) ThawAgentHash(ctx context.Context) string {
+	if sm.gcsClient == nil {
+		return ""
+	}
+	obj := sm.gcsClient.Bucket(sm.gcsBucket).Object(sm.gcsPath("build-artifacts/thaw-agent"))
+	attrs, err := obj.Attrs(ctx)
+	if err != nil {
+		sm.logger.WithError(err).Debug("Failed to get thaw-agent GCS attrs (hash will be empty)")
+		return ""
+	}
+	return fmt.Sprintf("%x", attrs.MD5)
+}
+
+func (sm *SnapshotManager) builderServiceAccountEmail() string {
+	if sm.builderServiceAccount != "" {
+		return sm.builderServiceAccount
+	}
+	return "default"
 }
 
 // GetCurrentVersion returns the current active snapshot version
@@ -447,6 +471,7 @@ rm -rf firecracker.tgz "release-v${FC_VERSION}-${ARCH}"
 # Setup KVM
 modprobe kvm_intel || modprobe kvm_amd || true
 chmod 666 /dev/kvm || true
+modprobe tun || true
 
 # Download kernel and rootfs from GCS
 echo "Downloading kernel and rootfs..."
@@ -538,7 +563,7 @@ shutdown -h now
 			},
 			ServiceAccounts: []*computepb.ServiceAccount{
 				{
-					Email:  proto.String("default"),
+					Email:  proto.String(sm.builderServiceAccountEmail()),
 					Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"},
 				},
 			},

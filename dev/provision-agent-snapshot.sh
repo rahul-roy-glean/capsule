@@ -1,5 +1,5 @@
 #!/bin/bash
-# Phase 1: Onboard repos + build golden snapshot for AI agent sandbox testing.
+# Provision an AI agent sandbox snapshot for local development.
 #
 # This builds the agent rootfs (if needed), then uses snapshot-builder to create
 # a golden snapshot with repos cloned and dependencies installed.
@@ -9,8 +9,8 @@
 # Without GCS_BUCKET, falls back to local-only mode (no chunked, no GCS).
 #
 # Usage:
-#   GCS_BUCKET=my-bucket make dev-agent-snapshot    # GCS route
-#   make dev-agent-snapshot                          # local-only fallback
+#   GCS_BUCKET=my-bucket make dev-agent-snapshot
+#   make dev-agent-snapshot
 #
 # Prerequisites:
 #   - make dev-build (builds snapshot-builder binary)
@@ -31,7 +31,7 @@ GCS_PREFIX=${GCS_PREFIX:-v1}
 cd "$REPO_ROOT"
 export PATH="/usr/local/go/bin:$PATH"
 
-echo "=== Phase 1: AI Agent Sandbox Onboarding ==="
+echo "=== Provisioning AI Agent Sandbox Snapshot ==="
 if [ -n "$GCS_BUCKET" ]; then
   echo "  GCS mode: bucket=$GCS_BUCKET prefix=$GCS_PREFIX (chunked + UFFD/FUSE)"
 else
@@ -39,8 +39,6 @@ else
 fi
 
 # --- 1. Build agent rootfs if not present ---
-# We check for a marker that indicates the agent rootfs was built (vs the minimal dev one).
-# If rootfs.img doesn't exist at all, or we haven't built the agent variant, rebuild.
 AGENT_MARKER="$SNAPSHOT_DIR/.agent-rootfs-built"
 if [ ! -f "$SNAPSHOT_DIR/rootfs.img" ] || [ ! -f "$AGENT_MARKER" ]; then
   echo ""
@@ -71,12 +69,6 @@ fi
 echo ""
 echo "--- Building golden snapshot with repos baked in ---"
 
-# Snapshot commands: clone repos + install deps.
-# We use "shell" + git clone instead of "git-clone" because:
-#   1. git-clone uses the repoName/repoName convention (GitHub Actions compat)
-#      which puts repos at /workspace/markupsafe/markupsafe — awkward for agent use
-#   2. git-clone requires a git_token in MMDS for private repos; public repos
-#      work fine with plain git clone + GIT_TERMINAL_PROMPT=0
 SNAPSHOT_COMMANDS='[
   {"type":"shell","args":["bash","-c","rm -rf /workspace/markupsafe && git clone --depth=1 --branch main https://github.com/pallets/markupsafe /workspace/markupsafe"]},
   {"type":"shell","args":["bash","-c","rm -rf /workspace/camelcase && git clone --depth=1 --branch main https://github.com/sindresorhus/camelcase /workspace/camelcase"]},
@@ -90,7 +82,6 @@ echo "Snapshot commands: $SNAPSHOT_COMMANDS"
 echo "Output dir: $OUTPUT_DIR"
 echo ""
 
-# Build snapshot-builder flags based on GCS availability
 BUILDER_FLAGS=(
   --gcs-prefix="$GCS_PREFIX"
   --output-dir="$OUTPUT_DIR"
@@ -151,7 +142,6 @@ for f in "$OUTPUT_DIR"/*.img "$OUTPUT_DIR"/snapshot.mem "$OUTPUT_DIR"/snapshot.s
   fi
 done
 
-# Write metadata.json
 cat > "$SNAPSHOT_DIR/metadata.json" << METADATA
 {
   "version": "agent-sandbox-snapshot",
@@ -164,14 +154,14 @@ cat > "$SNAPSHOT_DIR/metadata.json" << METADATA
 METADATA
 
 echo ""
-echo "=== Phase 1 complete: agent sandbox snapshot built ==="
+echo "=== Agent sandbox snapshot provisioned ==="
 echo ""
 echo "Files in $SNAPSHOT_DIR:"
 ls -lh "$SNAPSHOT_DIR/"
 echo ""
 if [ -n "$GCS_BUCKET" ]; then
   echo "GCS chunked snapshot uploaded to gs://$GCS_BUCKET/$GCS_PREFIX/"
-  echo "Run: SESSION_CHUNK_BUCKET=$GCS_BUCKET make dev-stop dev-stack dev-test-agent-sessions"
+  echo "Run: GCS_BUCKET=$GCS_BUCKET make dev-stop dev-stack dev-test-agent-sessions"
 else
   echo "Run 'make dev-stop && make dev-stack && make dev-test-agent-sessions' to test."
 fi

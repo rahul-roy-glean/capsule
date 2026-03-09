@@ -588,8 +588,34 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 		}
 	}
 
+	// Start auth proxy BEFORE injecting MMDS so proxy config is available to the VM.
+	if req.AuthConfig != nil && useNetNS && nsInfo != nil {
+		proxy, proxyErr := authproxy.NewAuthProxy(
+			runnerID,
+			*req.AuthConfig,
+			nsInfo.GetFirecrackerNetNSPath(),
+			nsInfo.Gateway.String(),
+			nsInfo.HostReachableIP.String(),
+			m.logger,
+		)
+		if proxyErr != nil {
+			m.logger.WithError(proxyErr).Warn("Failed to create auth proxy (non-fatal)")
+		} else if proxyErr := proxy.Start(context.Background()); proxyErr != nil {
+			m.logger.WithError(proxyErr).Warn("Failed to start auth proxy (non-fatal)")
+		} else {
+			m.authProxies[runnerID] = proxy
+			m.logger.WithField("runner_id", runnerID).Info("Auth proxy started")
+		}
+	}
+
 	// Inject MMDS data (VM is already running after Start() or RestoreFromSnapshot())
 	mmdsData := m.buildMMDSData(ctx, runner, tap, req)
+	// Inject auth proxy config into MMDS if proxy was started.
+	if proxy, ok := m.authProxies[runnerID]; ok {
+		mmdsData.Latest.Proxy.Address = proxy.ProxyAddress()
+		mmdsData.Latest.Proxy.CACertPEM = string(proxy.CACertPEM)
+		mmdsData.Latest.Proxy.MetadataHost = proxy.GatewayIP()
+	}
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
 		m.cleanupRunner(runnerID, tap.Name, overlayPath)
@@ -612,26 +638,6 @@ func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Run
 			if err := m.netnsNetwork.ForwardPort(runnerID, req.StartCommand.Port); err != nil {
 				m.logger.WithError(err).WithField("port", req.StartCommand.Port).Warn("Failed to forward service port into namespace")
 			}
-		}
-	}
-
-	// Start auth proxy if configured (requires per-VM namespace).
-	if req.AuthConfig != nil && useNetNS && nsInfo != nil {
-		proxy, proxyErr := authproxy.NewAuthProxy(
-			runnerID,
-			*req.AuthConfig,
-			nsInfo.GetFirecrackerNetNSPath(),
-			nsInfo.Gateway.String(),
-			nsInfo.HostReachableIP.String(),
-			m.logger,
-		)
-		if proxyErr != nil {
-			m.logger.WithError(proxyErr).Warn("Failed to create auth proxy (non-fatal)")
-		} else if proxyErr := proxy.Start(ctx); proxyErr != nil {
-			m.logger.WithError(proxyErr).Warn("Failed to start auth proxy (non-fatal)")
-		} else {
-			m.authProxies[runnerID] = proxy
-			m.logger.WithField("runner_id", runnerID).Info("Auth proxy started")
 		}
 	}
 

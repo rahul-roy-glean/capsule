@@ -99,6 +99,12 @@ variable "vpc_cidr" {
   default     = "10.0.0.0/16"
 }
 
+variable "admin_cidrs" {
+  description = "Additional CIDR blocks allowed to reach the GKE control plane API."
+  type        = list(string)
+  default     = []
+}
+
 variable "gke_pods_cidr" {
   description = "Secondary CIDR for GKE pods"
   type        = string
@@ -184,11 +190,6 @@ variable "use_netns" {
   default     = true
 }
 
-variable "runner_ephemeral" {
-  description = "Whether GitHub runners are ephemeral (one job per VM) or persistent (multiple jobs)"
-  type        = bool
-  default     = false
-}
 
 # Container Registry configuration
 variable "container_registry_location" {

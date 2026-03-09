@@ -25,11 +25,9 @@ trap cleanup EXIT
 
 # Check for Python with websockets
 if ! python3 -c "import websockets" 2>/dev/null; then
-  echo "Installing websockets Python package..."
-  pip3 install --quiet websockets 2>/dev/null || pip install --quiet websockets 2>/dev/null || {
-    echo "SKIP: cannot install Python websockets package"
-    exit 0
-  }
+  echo "FAIL: python3 websockets module is required for PTY testing."
+  echo "Install it with: pip3 install websockets"
+  exit 1
 fi
 
 # ---------------------------------------------------------------------------
@@ -40,11 +38,13 @@ CONFIG_RESP=$(curl -s -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "rootfs-durability-test",
-    "commands": '"$SNAPSHOT_COMMANDS"',
-    "runner_ttl_seconds": 300,
-    "auto_pause": false
+    "layers": [{"name":"base","init_commands":'"$SNAPSHOT_COMMANDS"'}],
+    "config": {
+      "ttl": 300,
+      "auto_pause": false
+    }
   }')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.workload_key')
+WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.leaf_workload_key')
 echo "  workload_key=$WORKLOAD_KEY"
 
 if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then

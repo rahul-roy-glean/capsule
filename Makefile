@@ -1,14 +1,14 @@
-.PHONY: all build test clean proto docker-build docker-push terraform-init terraform-plan terraform-apply
+.PHONY: all build test clean proto docker-build docker-push docker-push-control-plane docker-push-snapshot-builder terraform-init terraform-plan terraform-apply
 .PHONY: packer-init packer-validate packer-build firecracker-manager-linux release-host-image mig-rolling-update
 .PHONY: onboard onboard-validate onboard-plan bin-onboard
 .PHONY: firecracker-manager control-plane snapshot-builder thaw-agent
 .PHONY: test-unit test-race test-cover test-integration test-all check
-.PHONY: sdk-python-lint sdk-python-test sdk-python-typecheck
-.PHONY: dev-build dev-snapshot dev-stack dev-test-exec dev-test-pause-resume dev-test-multi-pause-dedup dev-stop
-.PHONY: dev-test-extension-drives dev-test-gcs-pause-resume
-.PHONY: dev-test-gcs-rootfs-durability dev-test-file-ops dev-test-pty dev-test-checkpoint
+.PHONY: sdk-python-lint sdk-python-test sdk-python-typecheck sdk-python-e2e
+.PHONY: dev-build dev-snapshot dev-stack dev-test-snapshot-builder dev-test-pause-resume dev-test-multi-pause-dedup dev-stop
+.PHONY: dev-test-gcs-pause-resume
+.PHONY: dev-test-file-ops dev-test-pty dev-test-checkpoint
 .PHONY: dev-test-auto-resume dev-test-template-tags dev-test-network-policy dev-test-auth-proxy
-.PHONY: dev-agent-rootfs dev-agent-snapshot dev-test-agent-sessions dev-test-agent-e2e
+.PHONY: dev-agent-rootfs dev-agent-snapshot dev-test-agent-sessions dev-run-agent-e2e
 .PHONY: dev-setup dev-provision
 .PHONY: bench-allocate bench-session dev-bench-allocate dev-bench-session
 
@@ -50,7 +50,7 @@ thaw-agent:
 	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/thaw-agent ./cmd/thaw-agent
 
 bin-onboard:
-	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/onboard ./cmd/onboard
+	$(GO) build $(GOFLAGS) -o bin/onboard ./cmd/onboard
 
 bench-allocate:
 	$(GO) build $(GOFLAGS) -o bin/bench-allocate ./cmd/bench-allocate
@@ -120,9 +120,13 @@ docker-build-snapshot-builder:
 		-t $(REGISTRY)/firecracker-snapshot-builder:latest \
 		-f deploy/docker/Dockerfile.snapshot-builder .
 
-docker-push:
+docker-push: docker-push-control-plane docker-push-snapshot-builder
+
+docker-push-control-plane:
 	docker push $(REGISTRY)/firecracker-control-plane:$(VERSION)
 	docker push $(REGISTRY)/firecracker-control-plane:latest
+
+docker-push-snapshot-builder:
 	docker push $(REGISTRY)/firecracker-snapshot-builder:$(VERSION)
 	docker push $(REGISTRY)/firecracker-snapshot-builder:latest
 
@@ -305,8 +309,8 @@ help:
 	@echo "  dev-provision        - Install prerequisites (run once, needs sudo)"
 	@echo "  dev-build            - Build binaries + minimal rootfs"
 	@echo "  dev-snapshot         - Build full snapshot for restore testing"
+	@echo "  dev-test-snapshot-builder - Run snapshot-builder smoke tests (legacy + base-image)"
 	@echo "  dev-stack            - Start control-plane + firecracker-manager"
-	@echo "  dev-test-exec        - Run E2E exec test"
 	@echo "  dev-test-file-ops    - Run E2E file operations test (WS2)"
 	@echo "  dev-test-pty         - Run E2E PTY terminal test (WS3)"
 	@echo "  dev-test-template-tags - Run E2E template tags test (WS6)"
@@ -314,7 +318,8 @@ help:
 	@echo "  dev-test-auth-proxy  - Run E2E auth proxy test (delegated provider)"
 	@echo "  dev-test-checkpoint  - Run E2E checkpoint test (WS4, needs GCS)"
 	@echo "  dev-test-auto-resume - Run E2E auto-resume test (WS5, needs GCS)"
-	@echo "  dev-test-gcs-rootfs-durability - Run E2E rootfs durability test (WS1, needs GCS)"
+	@echo "  dev-agent-snapshot   - Provision the AI agent snapshot"
+	@echo "  dev-run-agent-e2e    - Convenience wrapper: provision snapshot + run agent tests"
 	@echo "  dev-stop             - Stop the stack"
 	@echo ""
 	@echo "Example workflow (disk snapshots):"
@@ -326,7 +331,7 @@ help:
 
 # === Local Development ===
 # Requires a Linux host with KVM. Run on bare-metal or a GCE VM with nested virt.
-# Workflow: make dev-provision → make dev-build → make dev-snapshot → make dev-stack → make dev-test-exec
+# Workflow: make dev-provision → make dev-build → make dev-test-snapshot-builder → make dev-snapshot → make dev-stack → make dev-test-pause-resume
 # --- Linux dev targets (run directly on a Linux host with KVM) ---
 
 # Install prerequisites on a fresh Linux host (Ubuntu/Debian)
@@ -350,9 +355,9 @@ dev-stack:
 dev-stop:
 	bash dev/stop-stack.sh
 
-# Run E2E exec test
-dev-test-exec:
-	bash dev/test-exec.sh
+# Run snapshot-builder smoke tests
+dev-test-snapshot-builder:
+	bash dev/test-snapshot-builder.sh
 
 # Benchmark: cold allocate → exec → release latency
 # Usage: WORKLOAD_KEY=<key> make dev-bench-allocate
@@ -382,17 +387,9 @@ dev-test-pause-resume:
 dev-test-multi-pause-dedup:
 	bash dev/test-multi-pause-dedup.sh
 
-# Run E2E extension drives test
-dev-test-extension-drives:
-	bash dev/test-extension-drives.sh
-
 # Run E2E GCS pause/resume test
 dev-test-gcs-pause-resume:
 	bash dev/test-gcs-pause-resume.sh
-
-# Run E2E GCS rootfs durability test (WS1)
-dev-test-gcs-rootfs-durability:
-	bash dev/test-gcs-rootfs-durability.sh
 
 # Run E2E file operations test (WS2)
 dev-test-file-ops:
@@ -426,13 +423,13 @@ dev-agent-rootfs:
 	bash dev/build-agent-rootfs.sh
 
 dev-agent-snapshot:
-	bash dev/test-agent-onboard.sh
+	bash dev/provision-agent-snapshot.sh
 
 dev-test-agent-sessions:
 	bash dev/test-agent-sessions.sh
 
-dev-test-agent-e2e:
-	bash dev/test-agent-e2e.sh
+dev-run-agent-e2e:
+	bash dev/run-agent-e2e.sh
 
 # ── Python SDK ──────────────────────────────────────────────────────────────
 sdk-python-lint:
@@ -443,3 +440,6 @@ sdk-python-test:
 
 sdk-python-typecheck:
 	cd sdk/python && python -m pyright src/bf_sdk/
+
+sdk-python-e2e:
+	cd sdk/python && python -m pytest tests/e2e_live.py -v

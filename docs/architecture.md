@@ -1,211 +1,204 @@
 # Architecture
 
-System architecture for bazel-firecracker: self-hosted GitHub Actions runners on Firecracker microVMs with multi-repo support and automated snapshot rollouts.
+`bazel-firecracker` currently implements a generic Firecracker runtime platform:
 
-## Components
+- the control plane stores and builds **layered workload configs**
+- hosts restore microVMs by **workload key**
+- the guest agent runs a user-defined **start command**
+- optional **session pause/resume** preserves dirty state across hosts
+- CI integrations are adapters layered on top, not the core abstraction
 
-```
-                          ┌──────────────────────┐
-                          │     GitHub.com        │
-                          │                       │
-                          │  workflow_job webhook ─┼──────────────┐
-                          │                       │              │
-                          │  Actions job dispatch◄┼──── pull ──┐ │
-                          └──────────────────────┘            │ │
-                                                              │ │
-                                                              │ ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  Control Plane  (GKE pod, cmd/control-plane)                          │
-│                                                                       │
-│  HTTP API:                          Background loops:                  │
-│   /webhook/github                    jobRetryLoop (2s)                │
-│   /api/v1/repos                      snapshotFreshnessLoop (5m)      │
-│   /api/v1/hosts/heartbeat            HealthCheckLoop (30s)            │
-│   /api/v1/versions/desired           startDownscaler (30s)            │
-│   /api/v1/versions/fleet             controlPlaneMetricsLoop (30s)    │
-│   /api/v1/canary/report                                               │
-│                                                                       │
-│  gRPC: ControlPlane service (RegisterHost, Heartbeat, etc.)           │
-│                                                                       │
-│  State: PostgreSQL ──► hosts, runners, jobs, snapshots,               │
-│                        repos, version_assignments                     │
-└──────────┬─────────────────────────────────────┬──────────────────────┘
-           │ gRPC AllocateRunner                 │ HTTP heartbeat (10s)
-           ▼                                     ▼
-┌──────────────────────────┐      ┌──────────────────────────┐
-│  Host VM  (GCE, MIG)     │      │  Host VM  (GCE, MIG)     │
-│  cmd/firecracker-manager │      │  cmd/firecracker-manager │
-│                          │      │                          │
-│  Loops:                  │      │  Loops:                  │
-│   autoscaleLoop (2s)     │      │   autoscaleLoop (2s)     │
-│   heartbeatLoop (10s)    │      │   heartbeatLoop (10s)    │
-│                          │      │                          │
-│  ┌────────┐  ┌────────┐  │      │  ┌────────┐  ┌────────┐  │
-│  │microVM │  │microVM │  │      │  │microVM │  │microVM │  │
-│  │repo-a  │  │idle    │  │      │  │repo-b  │  │repo-a  │  │
-│  │        │  │        │  │      │  │        │  │        │  │
-│  │thaw-   │  │thaw-   │  │      │  │thaw-   │  │thaw-   │  │
-│  │agent + │  │agent + │  │      │  │agent + │  │agent + │  │
-│  │runner  │  │runner  │  │      │  │runner  │  │runner  │  │
-│  └────────┘  └────────┘  │      └────────┘  └────────┘  │
-└──────────────────────────┘      └──────────────────────────┘
+## System Topology
+
+```mermaid
+flowchart TD
+  client[ClientOrCIAdapter]
+  controlPlane[ControlPlane]
+  postgres[PostgreSQL]
+  gcsStore[GCSChunkStore]
+  hostMIG[HostMIG]
+  hostAgent[firecracker-manager]
+  guestAgent[thaw-agent]
+  builderVm[BuilderVM]
+
+  client --> controlPlane
+  controlPlane --> postgres
+  controlPlane --> builderVm
+  builderVm --> gcsStore
+  controlPlane --> hostMIG
+  hostMIG --> hostAgent
+  hostAgent --> gcsStore
+  hostAgent --> guestAgent
 ```
 
-### Control Plane (`cmd/control-plane`)
+## Core Components
 
-Runs in GKE. Manages the fleet of host VMs and the lifecycle of snapshots, repos, and jobs. Stateless except for PostgreSQL. Key responsibilities:
+### Control Plane
 
-- Receive GitHub webhooks and queue jobs
-- Schedule runner allocation across hosts (repo-aware scoring)
-- Manage snapshot builds, validation, and rollouts
-- Track fleet convergence via heartbeat protocol
-- Per-repo fairness enforcement
+`cmd/control-plane` runs in GKE and is the source of truth for:
 
-### Host Agent (`cmd/firecracker-manager`)
+- layered config registration at `/api/v1/layered-configs`
+- build queue management for snapshot layers
+- runner allocation at `/api/v1/runners/allocate`
+- session-aware reconnect/pause/resume APIs
+- workload version convergence via `/api/v1/versions/*`
+- optional GitHub webhook intake at `/webhook/github`
+- optional MCP server exposure for sandbox orchestration
 
-Runs on each GCE VM in a Managed Instance Group (MIG). Manages Firecracker microVMs on that host. Key responsibilities:
+Its durable state lives in PostgreSQL. Important tables are:
 
-- Maintain an idle pool of pre-booted VMs (autoscale loop)
-- Allocate/release runners via gRPC from the control plane
-- Heartbeat to control plane with host status and loaded manifests
-- Sync snapshot manifests on demand (multi-repo)
-- VM pooling (pause/resume for reuse)
-- Disk pressure management and orphan cleanup
+- `layered_configs`
+- `snapshot_layers`
+- `snapshot_builds`
+- `snapshots`
+- `version_assignments`
+- `hosts`
+- `runners`
+- `session_snapshots`
+- `repo_workload_mappings`
 
-### Thaw Agent (`cmd/thaw-agent`)
+### Host Agent
 
-Runs inside each Firecracker microVM after snapshot restore. It is the first process that runs when a VM wakes from a snapshot. Key responsibilities:
+`cmd/firecracker-manager` runs on each GCE host VM in the managed instance group. It:
 
-- Read MMDS metadata (network config, job info, runner token)
-- Configure networking (IP, gateway, DNS)
-- Mount block devices (repo cache, credentials, git cache)
-- Register as a GitHub Actions runner via `runner.sh`
-- Signal readiness to the host agent
+- heartbeats host state to the control plane
+- lazily syncs manifests for desired workload keys
+- restores microVMs from chunked snapshots
+- reuses paused VMs from the local pool when possible
+- pauses and resumes session runners
+- exposes the host-side proxy for exec, PTY, file, and service access
 
-### Snapshot Builder (`cmd/snapshot-builder`)
+### Guest Agent
 
-Runs as a one-off GCE VM to build a new snapshot. Key responsibilities:
+`cmd/thaw-agent` is PID 1-or-near-PID-1 inside the guest and drives lifecycle after boot
+or restore. It:
 
-- Clone the repository
-- Boot a Firecracker VM and warm up Bazel caches (`bazel fetch`)
-- Take a memory + disk snapshot
-- Chunk the snapshot into 4MB content-addressed blocks
-- Upload chunks and metadata to GCS
+- reads MMDS for network, runtime, and session metadata
+- configures networking and clock sync after restore
+- runs warmup commands during snapshot building
+- starts the user `start_command` after restore
+- serves health, warmup status, exec, PTY, and file APIs inside the guest
 
-## Runner Lifecycle
+### Snapshot Builder
 
-The runner lifecycle involves coordination between GitHub, the control plane, host agents, and the thaw agent:
+`cmd/snapshot-builder` runs on a nested-virtualization builder VM. It can:
 
-```
-GitHub webhook           Control Plane              Host Agent              microVM
-"job queued"                  │                          │                     │
-     │                        │                          │                     │
-     ├──► POST /webhook ──►   │                          │                     │
-     │                   INSERT jobs                     │                     │
-     │                   status=queued                   │                     │
-     │                        │                          │                     │
-     │                   jobRetryLoop                    │                     │
-     │                   selects best host               │                     │
-     │                        │                          │                     │
-     │                        ├── gRPC AllocateRunner ──►│                     │
-     │                        │                          │                     │
-     │                        │                    restore from snapshot       │
-     │                        │                    (UFFD mem + FUSE disk)      │
-     │                        │                    inject MMDS data            │
-     │                        │                    resume VM ─────────────────►│
-     │                        │                          │               thaw-agent:
-     │                        │                          │               configure net
-     │                        │                          │               mount drives
-     │                        │                          │               register runner
-     │                        │                          │                     │
-     │                        │                          │               runner.sh ──► GitHub
-     │                        │                          │               "I'm available"
-     │                        │                          │                     │
-GitHub dispatches          (webhook                      │              ◄── job dispatch
-job to runner              "in_progress")                │                (pull-based)
-     │                        │                          │                     │
-     │                   UPDATE jobs                     │               run workflow
-     │                   status=in_progress              │                     │
-     │                        │                          │                     │
-     │                   (webhook                        │                     │
-     │                    "completed")                   │                     │
-     │                        │                          │                     │
-     │                   UPDATE jobs                     │                     │
-     │                   status=completed                │                     │
-     │                        │                          │                     │
-     │                        ├── ReleaseRunner ────────►│                     │
-     │                        │                    try_recycle?                │
-     │                        │                    yes → pause VM (pool)       │
-     │                        │                    no  → destroy VM            │
+- build a rootfs from `base_image`
+- run warmup commands inside a Firecracker guest
+- take a snapshot and chunk memory/disk into GCS-backed content-addressed storage
+- reuse parent layers and incremental session state for faster rebuilds
+
+## Layered Config Lifecycle
+
+The current configuration model is defined in `pkg/snapshot/layer_config.go`.
+
+```mermaid
+flowchart TD
+  layeredConfig[LayeredConfig]
+  platformLayer[_platformLayer]
+  userLayers[UserLayers]
+  layerHashes[LayerHashes]
+  workloadKey[LeafWorkloadKey]
+  buildQueue[SnapshotBuildQueue]
+  gcsPointer[current-pointer.json]
+
+  layeredConfig --> platformLayer
+  layeredConfig --> userLayers
+  platformLayer --> layerHashes
+  userLayers --> layerHashes
+  layerHashes --> workloadKey
+  workloadKey --> buildQueue
+  buildQueue --> gcsPointer
 ```
 
-**Job dispatch is pull-based, not push-based.** The webhook tells the control plane "a job was queued" so it can pre-allocate a runner VM. Inside the VM, `thaw-agent` runs GitHub's `runner.sh` which connects to GitHub over HTTPS and registers as an available runner. GitHub then dispatches the job to that runner directly. The control plane never pushes jobs to runners.
+The important rules are:
 
-## Multi-Repo
+- `base_image` causes an implicit `_platform` layer to be prepended.
+- each layer hash includes its parent hash, commands, and drive specs.
+- the leaf layer hash is converted into a stable `workload_key`.
+- leaf completion creates the workload-key alias in GCS and updates
+  `current-pointer.json`.
 
-Each repository is identified by a deterministic slug derived from its URL (`pkg/repo/slug.go`):
+This is the runtime model the control plane actually understands today.
 
-```
-https://github.com/org/repo  →  org-repo
-git@github.com:co/project.git  →  co-project
-```
+## Allocation Lifecycle
 
-The slug is used as a namespace throughout:
+```mermaid
+sequenceDiagram
+  participant Client
+  participant CP as ControlPlane
+  participant Host as HostAgent
+  participant GCS as GCS
+  participant VM as GuestVM
 
-| Resource | Path |
-|----------|------|
-| GCS snapshots | `gs://bucket/<slug>/<version>/` |
-| GCS pointer | `gs://bucket/<slug>/current-pointer.json` |
-| GCS chunks | `gs://bucket/chunks/<hash>.zst` (shared) |
-| Local kernel | `/mnt/data/snapshots/<slug>/kernel.bin` |
-| DB snapshots | `WHERE repo_slug = '<slug>'` |
-| DB assignments | `version_assignments.repo_slug` |
-
-Chunks are content-addressed and shared across repos. Only manifests and kernels are per-repo.
-
-### UFFD Mode (Required for Multi-Repo)
-
-In traditional mode, each repo's snapshot requires downloading an 8GB memory file per host. With N repos, that's N x 8GB. UFFD (userfaultfd) lazy loading eliminates this:
-
-- Per-repo cost on a host: ~100KB chunk manifest + ~30MB kernel
-- Memory pages are fetched on demand via page faults
-- Disk blocks are fetched on demand via FUSE
-- An LRU chunk cache provides fast access to hot pages
-
-## Database Schema
-
-```
-repos                          snapshots
-┌─────────────────────┐       ┌─────────────────────────┐
-│ slug (PK)           │       │ version (PK)            │
-│ url                 │       │ status                  │
-│ branch              │       │ repo_slug ──────────────┼──► repos.slug
-│ bazel_version       │       │ gcs_path                │
-│ build_schedule      │       │ bazel_version           │
-│ max_concurrent      │       │ repo_commit             │
-│ current_version     │       │ created_at              │
-│ auto_rollout        │       └─────────────────────────┘
-└─────────────────────┘
-
-hosts                          runners
-┌─────────────────────┐       ┌─────────────────────────┐
-│ id (PK)             │       │ id (PK)                 │
-│ instance_name       │◄──┐   │ host_id ────────────────┼──► hosts.id
-│ status              │   │   │ status                  │
-│ total_slots         │   │   │ job_id                  │
-│ used/idle/busy      │   │   │ repo                    │
-│ snapshot_version    │   │   └─────────────────────────┘
-│ last_heartbeat      │   │
-└─────────────────────┘   │   jobs
-                          │   ┌─────────────────────────┐
-version_assignments       │   │ id (PK)                 │
-┌─────────────────────┐   │   │ github_job_id           │
-│ repo_slug           │   │   │ repo                    │
-│ host_id ────────────┼───┘   │ status                  │
-│ version             │       │ runner_id               │
-│ status              │       │ queued_at               │
-│ UNIQUE(slug,host)   │       └─────────────────────────┘
-└─────────────────────┘
+  Client->>CP: POST /api/v1/runners/allocate
+  CP->>CP: load config by workload_key
+  CP->>CP: choose host by capacity and cache affinity
+  CP->>Host: gRPC AllocateRunner
+  Host->>GCS: fetch manifest/chunks if needed
+  Host->>VM: restore or resume microVM
+  Host->>VM: inject MMDS
+  VM->>VM: thaw-agent configures net and runs start_command
+  VM-->>Host: ready signal / health
+  Host-->>CP: runner info
+  CP-->>Client: runner_id, host, internal_ip
 ```
 
-`version_assignments` is the mechanism for rollouts. A row with `host_id=NULL` is a fleet-wide default. A row with a specific `host_id` is a per-host override (used during canary).
+Key details from the current implementation:
+
+- the scheduler resolves `tier`, `start_command`, TTL, auto-pause, and network policy
+  from `layered_configs`
+- session-aware allocation first tries to route back to the original host
+- if no sticky host is available, host choice falls back to workload-key cache affinity
+- the host agent may return an already-running session, resume a suspended one, reuse a
+  paused pool entry, or restore from chunked snapshot data
+
+## Session Lifecycle
+
+Session state is managed by `pkg/runner/session.go` and `session_snapshots`.
+
+```mermaid
+flowchart TD
+  runningRunner[RunningRunner]
+  pauseRequest[PauseOrTTL]
+  localSession[LocalSessionState]
+  gcsSession[GCSSessionChunks]
+  resumeRequest[ResumeRequest]
+  resumedRunner[ResumedRunner]
+
+  runningRunner --> pauseRequest
+  pauseRequest --> localSession
+  pauseRequest --> gcsSession
+  localSession --> resumeRequest
+  gcsSession --> resumeRequest
+  resumeRequest --> resumedRunner
+```
+
+There are two resume modes:
+
+- same-host/local resume from on-disk session state
+- cross-host resume from GCS-backed session manifests plus UFFD/FUSE lazy loading
+
+The control plane tracks session ownership in `session_snapshots`, but the actual pause
+and resume work happens on host agents.
+
+## Optional Adapters
+
+The runtime is generic, but the repository still contains workload-specific adapters:
+
+- GitHub webhook routing populates `jobs` and `repo_workload_mappings`
+- the Python SDK wraps layered config registration and runner lifecycle calls
+- the MCP server exposes sandbox tools on top of the same allocate/pause/resume/exec
+  primitives
+
+These sit on top of the workload-key model; they are not the core architecture.
+
+## Deployment Reality
+
+The current repository has two different eras of deployment/configuration surfaces:
+
+- the **current runtime** is the layered workload system described above
+- the **legacy onboarding surface** still assumes older `snapshot_commands`-style configs
+
+For an actual deployment, follow [docs/setup.md](setup.md). That guide is the canonical
+`onboard.yaml`-driven path for wiring up the current runtime on GCP.

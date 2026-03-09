@@ -6,9 +6,8 @@ namespace:
   name: firecracker-runner
 
 image:
-  # Default uses Artifact Registry. Override with --set or values file.
-  # Format: REGION-docker.pkg.dev/PROJECT_ID/REPO_NAME/IMAGE
-  repository: us-central1-docker.pkg.dev/scio-ci/firecracker/firecracker-control-plane
+  # Required. Format: REGION-docker.pkg.dev/PROJECT_ID/REPO_NAME/IMAGE
+  repository: us-central1-docker.pkg.dev/your-project/firecracker/firecracker-control-plane
   tag: latest
   pullPolicy: Always
 
@@ -17,8 +16,10 @@ replicaCount: 1
 serviceAccount:
   create: true
   name: "control-plane"
-  annotations:
-    iam.gke.io/gcp-service-account: fc-control-plane@scio-ci.iam.gserviceaccount.com
+  annotations: {}
+  # Example:
+  # annotations:
+  #   iam.gke.io/gcp-service-account: fc-runner-dev-control-plane@your-project.iam.gserviceaccount.com
 
 podAnnotations: {}
 
@@ -37,13 +38,13 @@ containerSecurityContext: {}
 
 config:
   # Used by the control plane for snapshot versioning/artifacts.
-  gcsBucket: scio-ci-firecracker-snapshots
+  gcsBucket: your-project-firecracker-snapshots
   
   # GCP project ID for telemetry and GCP API calls
-  gcpProject: scio-ci
+  gcpProject: your-project
   
   # Environment name (dev, staging, prod) for telemetry labels
-  environment: prod
+  environment: dev
 
   # Optional: used for future config expansion; control-plane currently reads env vars.
   configYaml: |
@@ -75,11 +76,21 @@ env:
     webhookSecretKey: webhook_secret
 
 gcp:
-  # Required for safe scale-down (control plane deletes specific MIG instances).
-  projectId: scio-ci
+  # Required for safe scale-down and snapshot builder VMs.
+  projectId: your-project
   region: us-central1
+  zone: us-central1-a
   hostMigName: fc-runner-dev-hosts
   hostAutoscalerName: fc-runner-dev-hosts-autoscaler
+  # Optional. Set when the default network is unavailable or when builder VMs
+  # must run inside the same VPC as the rest of the deployment.
+  builderNetwork: ""
+  # Optional. Override the image used for snapshot-builder/layer-builder VMs.
+  # By default the control plane uses the `firecracker-host` image family.
+  builderImage: ""
+  # Optional. If set, builder VMs use this service account instead of the
+  # project's default compute service account.
+  builderServiceAccount: ""
 
 otelCollector:
   # Deploy OTel Collector as a sidecar alongside the control-plane container

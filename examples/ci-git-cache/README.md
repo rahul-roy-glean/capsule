@@ -59,6 +59,6 @@ already in the config.
 
 ```bash
 cp examples/ci-git-cache/onboard.yaml my-git-cache.yaml
-# Edit: set gcp_project, repository.url, adjust git_cache repos
+# Edit my-git-cache.yaml: set platform.gcp_project and workload values
 make onboard CONFIG=my-git-cache.yaml
 ```

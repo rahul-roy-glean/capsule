@@ -13,6 +13,7 @@ COPY pkg/ ./pkg/
 COPY api/ ./api/
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /snapshot-builder ./cmd/snapshot-builder
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /thaw-agent ./cmd/thaw-agent
 
 # Runtime stage
 FROM --platform=linux/amd64 debian:bookworm-slim
@@ -37,6 +38,7 @@ RUN curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
 WORKDIR /app
 
 COPY --from=builder /snapshot-builder .
+COPY --from=builder /thaw-agent /usr/local/bin/thaw-agent
 
 # Create directories
 RUN mkdir -p /tmp/snapshot /opt/firecracker

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from bf_sdk._snapshot_commands import normalize_snapshot_commands
 from bf_sdk.models.layered_config import (
     BuildResponse,
     CreateConfigResponse,
@@ -26,7 +27,7 @@ class RunnerConfig:
             .with_display_name("My sandbox")
             .with_base_image("ubuntu:22.04")
             .with_commands(["pip install -e .[dev]"])
-            .with_tier("small")
+            .with_tier("m")
             .with_auto_pause(True)
         )
     """
@@ -39,11 +40,14 @@ class RunnerConfig:
     _auto_pause: bool | None = field(default=None, repr=False)
     _ttl: int | None = field(default=None, repr=False)
     _tier: str | None = field(default=None, repr=False)
-    _ci_system: str | None = field(default=None, repr=False)
     _auto_rollout: bool | None = field(default=None, repr=False)
     _session_max_age_seconds: int | None = field(default=None, repr=False)
+    _rootfs_size_gb: int | None = field(default=None, repr=False)
+    _runner_user: str | None = field(default=None, repr=False)
+    _workspace_size_gb: int | None = field(default=None, repr=False)
     _network_policy_preset: str | None = field(default=None, repr=False)
     _network_policy: Any | None = field(default=None, repr=False)
+    _auth: Any | None = field(default=None, repr=False)
 
     # -- Fluent withers (return new immutable copy) ----------------------------
 
@@ -57,7 +61,7 @@ class RunnerConfig:
         return replace(self, _layers=layers)
 
     def with_commands(self, cmds: list[str | dict[str, Any]]) -> RunnerConfig:
-        normalized = [{"command": c} if isinstance(c, str) else c for c in cmds]
+        normalized = normalize_snapshot_commands(cmds) or []
         return replace(self, _commands=normalized)
 
     def with_start_command(self, cmd: dict[str, Any]) -> RunnerConfig:
@@ -72,20 +76,29 @@ class RunnerConfig:
     def with_tier(self, tier: str) -> RunnerConfig:
         return replace(self, _tier=tier)
 
-    def with_ci_system(self, system: str) -> RunnerConfig:
-        return replace(self, _ci_system=system)
-
     def with_auto_rollout(self, enabled: bool = True) -> RunnerConfig:
         return replace(self, _auto_rollout=enabled)
 
     def with_session_max_age(self, seconds: int) -> RunnerConfig:
         return replace(self, _session_max_age_seconds=seconds)
 
+    def with_rootfs_size_gb(self, size_gb: int) -> RunnerConfig:
+        return replace(self, _rootfs_size_gb=size_gb)
+
+    def with_runner_user(self, user: str) -> RunnerConfig:
+        return replace(self, _runner_user=user)
+
+    def with_workspace_size_gb(self, size_gb: int) -> RunnerConfig:
+        return replace(self, _workspace_size_gb=size_gb)
+
     def with_network_policy_preset(self, preset: str) -> RunnerConfig:
         return replace(self, _network_policy_preset=preset)
 
     def with_network_policy(self, policy: Any) -> RunnerConfig:
         return replace(self, _network_policy=policy)
+
+    def with_auth(self, auth: Any) -> RunnerConfig:
+        return replace(self, _auth=auth)
 
     # -- Serialization ---------------------------------------------------------
 
@@ -113,16 +126,22 @@ class RunnerConfig:
             config["ttl"] = self._ttl
         if self._tier is not None:
             config["tier"] = self._tier
-        if self._ci_system is not None:
-            config["ci_system"] = self._ci_system
         if self._auto_rollout is not None:
             config["auto_rollout"] = self._auto_rollout
         if self._session_max_age_seconds is not None:
             config["session_max_age_seconds"] = self._session_max_age_seconds
+        if self._rootfs_size_gb is not None:
+            config["rootfs_size_gb"] = self._rootfs_size_gb
+        if self._runner_user is not None:
+            config["runner_user"] = self._runner_user
+        if self._workspace_size_gb is not None:
+            config["workspace_size_gb"] = self._workspace_size_gb
         if self._network_policy_preset is not None:
             config["network_policy_preset"] = self._network_policy_preset
         if self._network_policy is not None:
             config["network_policy"] = self._network_policy
+        if self._auth is not None:
+            config["auth"] = self._auth
         if config:
             body["config"] = config
 
@@ -146,6 +165,6 @@ class RunnerConfigs:
         """Register a runner config on the control plane."""
         return self._lc.create(cfg.to_create_body())
 
-    def build(self, config_id: str, *, force: bool = False) -> BuildResponse:
+    def build(self, config_id: str, *, force: bool = False, clean: bool = False) -> BuildResponse:
         """Trigger a build for a layered config."""
-        return self._lc.build(config_id, force=force)
+        return self._lc.build(config_id, force=force, clean=clean)

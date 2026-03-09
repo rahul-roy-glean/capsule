@@ -46,8 +46,8 @@ The sandbox's full memory state (loaded weights, interpreter state, variables) i
 
 ```bash
 cp examples/ai-sandbox/onboard.yaml my-sandbox.yaml
-# Edit my-sandbox.yaml: set platform.gcp_project, repository.url
-# Adjust microvm.memory_mb to fit your model weights
+# Edit my-sandbox.yaml: set platform.gcp_project and image/workload values
+# Adjust microvm.memory_mb and workload.config.tier for your model size
 make onboard CONFIG=my-sandbox.yaml
 ```
 

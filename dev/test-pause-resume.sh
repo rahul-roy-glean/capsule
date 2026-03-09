@@ -3,8 +3,8 @@
 # Usage: make dev-test-pause-resume
 #
 # Prerequisites:
-#   - Stack running: make dev-stack (or dev-stack-local)
-#   - Snapshot built: make dev-snapshot (or dev-snapshot-local)
+#   - Stack running: make dev-stack
+#   - Snapshot built: make dev-snapshot
 set -euo pipefail
 
 CP=http://localhost:8080
@@ -26,14 +26,16 @@ CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "pause-resume-test",
-    "commands": [{"type":"shell","command":"echo pause-test"}],
-    "runner_ttl_seconds": 15,
-    "auto_pause": true,
-    "session_max_age_seconds": 3600
+    "layers": [{"name":"base","init_commands":[{"type":"shell","args":["echo","pause-test"]}]}],
+    "config": {
+      "ttl": 15,
+      "auto_pause": true,
+      "session_max_age_seconds": 3600
+    }
   }')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.workload_key')
+WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.leaf_workload_key')
 echo "Registered config: workload_key=$WORKLOAD_KEY"
-echo "  TTL: $(echo "$CONFIG_RESP" | jq '.runner_ttl_seconds')s, auto_pause: $(echo "$CONFIG_RESP" | jq '.auto_pause')"
+echo "  TTL: 15s, auto_pause: true"
 
 if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then
   pass "Snapshot config registered with TTL fields"

@@ -2,6 +2,8 @@ platform:
   gcp_project: "my-project"
   region: "us-central1"
   zone: "us-central1-a"
+  environment: "prod"                 # "dev", "staging", or "prod"
+  # control_plane_domain: "cp.example.com"  # Set to enable Ingress; omit to skip
 
 microvm:
   vcpus: 8
@@ -14,6 +16,8 @@ hosts:
   min_count: 2
   max_count: 20
   data_disk_gb: 500
+  chunk_cache_size_gb: 8              # On-disk LRU cache for FUSE-backed rootfs chunks
+  mem_cache_size_gb: 8                # In-memory LRU cache for UFFD memory page chunks
 
 workload:
   # Docker image with your sandbox runtime, Python, and model dependencies.

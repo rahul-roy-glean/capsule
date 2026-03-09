@@ -5,22 +5,20 @@
 # workloads. Outputs a summary table at the end.
 #
 # Usage:
-#   SESSION_CHUNK_BUCKET=rroy-gc-testing make dev-bench-pause-resume
+#   GCS_BUCKET=rroy-gc-testing make dev-bench-pause-resume
 #
 # Prerequisites:
 #   - Golden chunked snapshot uploaded: GCS_BUCKET=<bucket> ENABLE_CHUNKED=true make dev-snapshot
-#   - Stack running with GCS sessions:  SESSION_CHUNK_BUCKET=<bucket> make dev-stack
+#   - Stack running with GCS sessions:  GCS_BUCKET=<bucket> make dev-stack
 set -uo pipefail
 
 CP=http://localhost:8080
 MGR=http://localhost:9080
-GCS_BUCKET=${SESSION_CHUNK_BUCKET:-}
+GCS_BUCKET=${GCS_BUCKET:-${SESSION_CHUNK_BUCKET:-}}
 SNAPSHOT_COMMANDS=${SNAPSHOT_COMMANDS:-'[{"type":"shell","args":["echo","dev-snapshot-ready"]}]'}
 
-if [ -z "$GCS_BUCKET" ]; then
-  echo "FAIL: SESSION_CHUNK_BUCKET is required."
-  exit 1
-fi
+. "$(dirname "${BASH_SOURCE[0]}")/lib-gcs-mode.sh"
+GCS_BUCKET=$(require_gcs_bucket)
 
 # --- Helpers ---
 
@@ -32,15 +30,17 @@ elapsed_ms() {
 }
 
 register_config() {
-  curl -s -X POST "$CP/api/v1/layered-configs" \
+  curl -sf -X POST "$CP/api/v1/layered-configs" \
     -H 'Content-Type: application/json' \
     -d '{
       "display_name": "bench-pause-resume",
-      "commands": '"$SNAPSHOT_COMMANDS"',
-      "runner_ttl_seconds": 600,
-      "auto_pause": true,
-      "session_max_age_seconds": 3600
-    }' | jq -r '.workload_key'
+      "layers": [{"name":"base","init_commands":'"$SNAPSHOT_COMMANDS"'}],
+      "config": {
+        "ttl": 600,
+        "auto_pause": true,
+        "session_max_age_seconds": 3600
+      }
+    }' | jq -r '.leaf_workload_key'
 }
 
 allocate() {

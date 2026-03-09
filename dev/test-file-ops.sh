@@ -15,11 +15,13 @@ CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
   -H 'Content-Type: application/json' \
   -d '{
     "display_name": "file-ops-test",
-    "commands": [{"type":"shell","command":"echo file-ops-test"}],
-    "runner_ttl_seconds": 60,
-    "auto_pause": false
+    "layers": [{"name":"base","init_commands":[{"type":"shell","args":["echo","file-ops-test"]}]}],
+    "config": {
+      "ttl": 60,
+      "auto_pause": false
+    }
   }')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.workload_key')
+WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.leaf_workload_key')
 echo "Registered config: workload_key=$WORKLOAD_KEY"
 
 if [ -z "$WORKLOAD_KEY" ] || [ "$WORKLOAD_KEY" = "null" ]; then
@@ -86,10 +88,11 @@ READ_RESP=$(curl -sf -X POST "$MGR/api/v1/runners/$RUNNER_ID/files/read" \
 echo "$READ_RESP"
 
 CONTENT=$(echo "$READ_RESP" | jq -r '.content')
-if [ "$CONTENT" != "hello file ops" ]; then
-  echo "OK: content matches (with trailing newline)"
-else
+if [ "$CONTENT" = "hello file ops" ]; then
   echo "OK: content='$CONTENT'"
+else
+  echo "FAIL: expected content 'hello file ops', got '$CONTENT'"
+  exit 1
 fi
 
 # --- 5. Test /files/stat ---

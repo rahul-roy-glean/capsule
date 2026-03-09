@@ -38,18 +38,17 @@ class TestRunnerConfig:
             RunnerConfig("My Sandbox")
             .with_base_image("ubuntu:22.04")
             .with_commands(["pip install -e .", "pytest -q"])
-            .with_tier("small")
-            .with_ci_system("github-actions")
+            .with_tier("m")
             .with_ttl(3600)
             .with_auto_pause(True)
             .with_auto_rollout(True)
-            .with_network_policy_preset("default")
+            .with_network_policy_preset("restricted-egress")
         )
         assert cfg.display_name == "My Sandbox"
         assert cfg._base_image == "ubuntu:22.04"
         assert len(cfg._commands) == 2
-        assert cfg._commands[0] == {"command": "pip install -e ."}
-        assert cfg._tier == "small"
+        assert cfg._commands[0] == {"type": "shell", "args": ["bash", "-lc", "pip install -e ."]}
+        assert cfg._tier == "m"
         assert cfg._auto_pause is True
         assert cfg._auto_rollout is True
 
@@ -65,15 +64,17 @@ class TestRunnerConfig:
             RunnerConfig("Sandbox")
             .with_base_image("ubuntu:22.04")
             .with_commands(["echo hi"])
-            .with_tier("small")
+            .with_tier("s")
             .with_ttl(1800)
             .with_auto_pause(True)
         )
         body = cfg.to_create_body()
         assert body["display_name"] == "Sandbox"
         assert body["base_image"] == "ubuntu:22.04"
-        assert body["layers"] == [{"name": "main", "init_commands": [{"command": "echo hi"}]}]
-        assert body["config"]["tier"] == "small"
+        assert body["layers"] == [
+            {"name": "main", "init_commands": [{"type": "shell", "args": ["bash", "-lc", "echo hi"]}]},
+        ]
+        assert body["config"]["tier"] == "s"
         assert body["config"]["ttl"] == 1800
         assert body["config"]["auto_pause"] is True
 
@@ -81,22 +82,39 @@ class TestRunnerConfig:
         cfg = RunnerConfig("bare").with_commands(["echo hi"])
         body = cfg.to_create_body()
         assert "config" not in body
-        assert body["layers"] == [{"name": "main", "init_commands": [{"command": "echo hi"}]}]
+        assert body["layers"] == [
+            {"name": "main", "init_commands": [{"type": "shell", "args": ["bash", "-lc", "echo hi"]}]},
+        ]
 
     def test_to_create_body_with_explicit_layers(self) -> None:
         layers = [
-            LayerDef(name="deps", init_commands=[{"command": "apt install -y curl"}]),
-            LayerDef(name="app", init_commands=[{"command": "pip install ."}]),
+            LayerDef(name="deps", init_commands=[{"type": "shell", "args": ["bash", "-lc", "apt install -y curl"]}]),
+            LayerDef(name="app", init_commands=[{"type": "shell", "args": ["bash", "-lc", "pip install ."]}]),
         ]
-        cfg = RunnerConfig("multi").with_layers(layers).with_tier("large")
+        cfg = RunnerConfig("multi").with_layers(layers).with_tier("l")
         body = cfg.to_create_body()
         assert len(body["layers"]) == 2
         assert body["layers"][0]["name"] == "deps"
         assert body["layers"][1]["name"] == "app"
 
-    def test_with_dict_commands(self) -> None:
-        cfg = RunnerConfig("wk-1").with_commands([{"command": "echo hi", "timeout": 30}])
-        assert cfg._commands == [{"command": "echo hi", "timeout": 30}]
+    def test_with_legacy_command_dicts(self) -> None:
+        cfg = RunnerConfig("wk-1").with_commands([{"command": "echo hi", "run_as_root": True}])
+        assert cfg._commands == [{"type": "shell", "args": ["bash", "-lc", "echo hi"], "run_as_root": True}]
+
+    def test_with_extended_config_fields(self) -> None:
+        cfg = (
+            RunnerConfig("wk-1")
+            .with_commands(["echo hi"])
+            .with_rootfs_size_gb(16)
+            .with_runner_user("sandbox")
+            .with_workspace_size_gb(100)
+            .with_auth({"type": "delegated"})
+        )
+        body = cfg.to_create_body()
+        assert body["config"]["rootfs_size_gb"] == 16
+        assert body["config"]["runner_user"] == "sandbox"
+        assert body["config"]["workspace_size_gb"] == 100
+        assert body["config"]["auth"] == {"type": "delegated"}
 
     def test_auto_rollout(self) -> None:
         cfg = RunnerConfig("wk-1").with_commands(["echo"]).with_auto_rollout(True)
@@ -129,3 +147,11 @@ class TestRunnerConfigs:
             result = runner_configs.build("c1", force=True)
         assert isinstance(result, BuildResponse)
         assert result.force == "true"
+
+    def test_build_clean(self, runner_configs: RunnerConfigs, http_client: HttpClient) -> None:
+        build_data = {"config_id": "c1", "status": "build_enqueued", "clean": "true"}
+        mock_resp = httpx.Response(202, json=build_data)
+        with patch.object(http_client._client, "request", return_value=mock_resp):
+            result = runner_configs.build("c1", clean=True)
+        assert isinstance(result, BuildResponse)
+        assert result.clean == "true"

@@ -62,6 +62,24 @@ func (s *LayerBuildScheduler) Run(ctx context.Context) {
 	}
 }
 
+// isPlatformLayerStale checks whether the thaw-agent binary in GCS has changed
+// since the platform layer was last built. Returns true if the layer should be
+// rebuilt (hash mismatch or no stored hash).
+func (s *LayerBuildScheduler) isPlatformLayerStale(ctx context.Context, layerHash string) bool {
+	currentHash := s.snapshotManager.ThawAgentHash(ctx)
+	if currentHash == "" {
+		return false // can't check, assume not stale
+	}
+	var storedHash sql.NullString
+	s.db.QueryRowContext(ctx,
+		`SELECT build_artifact_hash FROM snapshot_layers WHERE layer_hash=$1`,
+		layerHash).Scan(&storedHash)
+	if !storedHash.Valid || storedHash.String == "" {
+		return true // no stored hash, assume stale
+	}
+	return storedHash.String != currentHash
+}
+
 // EnqueueChainBuild enqueues builds for a layer chain starting from startDepth.
 // configID is stored on each build row so processQueuedBuilds can resolve
 // tier and credentials with a simple JOIN instead of a recursive CTE.
@@ -105,12 +123,24 @@ func (s *LayerBuildScheduler) EnqueueChainBuild(ctx context.Context, layers []sn
 				`SELECT current_version FROM snapshot_layers WHERE layer_hash=$1`,
 				layer.LayerHash).Scan(&currentVersion)
 			if currentVersion.Valid && currentVersion.String != "" {
-				s.logger.WithFields(logrus.Fields{
-					"layer_hash":      layer.LayerHash[:16],
-					"current_version": currentVersion.String,
-					"depth":           layer.Depth,
-				}).Info("Layer already has active version, skipping")
-				continue
+				// For platform layers (depth 0 with base image), check if the
+				// thaw-agent binary has changed since the last build. If so,
+				// invalidate the cached version so it gets rebuilt with the
+				// new binary.
+				if layer.Depth == 0 && layer.BaseImage != "" && s.isPlatformLayerStale(ctx, layer.LayerHash) {
+					s.logger.WithField("layer_hash", layer.LayerHash[:16]).
+						Info("Thaw-agent binary changed, invalidating platform layer")
+					s.db.ExecContext(ctx,
+						`UPDATE snapshot_layers SET current_version=NULL, build_artifact_hash='' WHERE layer_hash=$1`,
+						layer.LayerHash)
+				} else {
+					s.logger.WithFields(logrus.Fields{
+						"layer_hash":      layer.LayerHash[:16],
+						"current_version": currentVersion.String,
+						"depth":           layer.Depth,
+					}).Info("Layer already has active version, skipping")
+					continue
+				}
 			}
 		}
 
@@ -395,6 +425,21 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 			}
 		}
 
+		// For child layers, inherit base-image and runner-user from the config
+		// so that computeRootfsSourceHash in the snapshot-builder uses the same
+		// Docker-image-based hash mode as the parent platform layer. Without this,
+		// child layers compute a different rootfs hash → reattach fails → cold boot
+		// uses the generic pre-baked rootfs (which may have a stale thaw-agent).
+		if baseImage == "" && b.configJSON.Valid && b.configJSON.String != "" {
+			var lcfg snapshot.LayeredConfig
+			if err := json.Unmarshal([]byte(b.configJSON.String), &lcfg); err == nil {
+				baseImage = lcfg.BaseImage
+				if runnerUser == "" && lcfg.Config.RunnerUser != "" {
+					runnerUser = lcfg.Config.RunnerUser
+				}
+			}
+		}
+
 		// Extract auth config from the layered config JSON (if present)
 		authConfigJSON := ""
 		if b.configJSON.Valid && b.configJSON.String != "" {
@@ -566,8 +611,9 @@ func (s *LayerBuildScheduler) onBuildComplete(ctx context.Context, buildID, laye
 		return
 	}
 
-	// Update layer status
-	s.db.ExecContext(ctx, `UPDATE snapshot_layers SET current_version=$1, status='active', updated_at=NOW() WHERE layer_hash=$2`, version, layerHash)
+	// Update layer status and record the current thaw-agent hash for staleness detection.
+	artifactHash := s.snapshotManager.ThawAgentHash(ctx)
+	s.db.ExecContext(ctx, `UPDATE snapshot_layers SET current_version=$1, build_artifact_hash=$3, status='active', updated_at=NOW() WHERE layer_hash=$2`, version, layerHash, artifactHash)
 
 	// Unblock waiting children (leaf layers have no children, skip the query)
 	if !isLeaf {
@@ -621,6 +667,9 @@ func (s *LayerBuildScheduler) onLeafLayerComplete(ctx context.Context, layerHash
 	if autoRollout {
 		s.logger.WithField("version", version).Info("Auto-rollout: setting active snapshot")
 		s.snapshotManager.SetActiveSnapshotForKey(ctx, workloadKey, version)
+		if err := s.snapshotManager.AssignVersion(ctx, workloadKey, nil, version); err != nil {
+			return fmt.Errorf("failed to assign fleet-wide desired version: %w", err)
+		}
 	}
 
 	return nil
@@ -1047,18 +1096,7 @@ gcloud storage cp "gs://%s/%s/%s/rootfs.img" /opt/firecracker/rootfs.img 2>/dev/
 modprobe kvm_intel || modprobe kvm_amd || true
 chmod 666 /dev/kvm || true
 
-# Setup networking: bridge, IP forwarding, NAT
-HOST_MTU=$(cat /sys/class/net/$(ip route | grep default | awk '{print $5}' | head -1)/mtu)
-ip link add fcbr0 type bridge || true
-ip link set fcbr0 mtu "$HOST_MTU"
-ip addr add 172.16.0.1/24 dev fcbr0 || true
-ip link set fcbr0 up
-echo 1 > /proc/sys/net/ipv4/ip_forward
-PRIMARY_IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
-iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -o "$PRIMARY_IFACE" -j MASQUERADE
-iptables -A FORWARD -i fcbr0 -o "$PRIMARY_IFACE" -j ACCEPT
-iptables -A FORWARD -i "$PRIMARY_IFACE" -o fcbr0 -m state --state RELATED,ESTABLISHED -j ACCEPT
-iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+# Load tun module; snapshot-builder sets up per-build network namespaces itself
 modprobe tun || true
 
 # Download snapshot-builder binary (always download fresh to pick up new deploys)
@@ -1144,7 +1182,7 @@ shutdown -h now
 			},
 			ServiceAccounts: []*computepb.ServiceAccount{
 				{
-					Email:  proto.String("default"),
+					Email:  proto.String(sm.builderServiceAccountEmail()),
 					Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"},
 				},
 			},

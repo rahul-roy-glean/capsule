@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -27,6 +28,8 @@ import (
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/uffd"
 )
+
+var errBaseImageNotPinned = errors.New("base image is not digest-pinned")
 
 var (
 	gcsBucket      = flag.String("gcs-bucket", "", "GCS bucket for snapshots")
@@ -68,12 +71,16 @@ var (
 
 	// Auth proxy: transparent credential injection for the warmup VM
 	authConfigJSON = flag.String("auth-config", "", "JSON auth proxy config (AuthConfig). When set, starts an auth proxy on the host to provide GCP metadata and HTTPS credential injection.")
+
+	// Path to a pre-built thaw-agent binary to inject into the rootfs.
+	// If empty or the file does not exist, snapshot-builder will attempt to
+	// build thaw-agent from source (requires Go toolchain on the host).
+	thawAgentPath = flag.String("thaw-agent-path", "/usr/local/bin/thaw-agent", "Path to thaw-agent binary (if missing, builds from source)")
 )
 
 func main() {
 	flag.Parse()
 
-	// Setup logger
 	logger := logrus.New()
 	logger.SetFormatter(&logrus.JSONFormatter{})
 	level, err := logrus.ParseLevel(*logLevel)
@@ -82,14 +89,23 @@ func main() {
 	}
 	logger.SetLevel(level)
 
+	if err := run(logger); err != nil {
+		logger.WithField("component", "snapshot-builder").WithError(err).Error("Snapshot build failed")
+		os.Exit(1)
+	}
+}
+
+func run(logger *logrus.Logger) error {
+	// Setup logger state for this invocation
+
 	log := logger.WithField("component", "snapshot-builder")
 	log.Info("Starting snapshot builder")
 
 	if *snapshotCommands == "" {
-		log.Fatal("--snapshot-commands is required")
+		return errors.New("--snapshot-commands is required")
 	}
 	if *gcsBucket == "" {
-		log.Fatal("--gcs-bucket is required")
+		return errors.New("--gcs-bucket is required")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *warmupTimeout+30*time.Minute)
@@ -103,7 +119,7 @@ func main() {
 			project = os.Getenv("GCP_PROJECT")
 		}
 		if project == "" {
-			log.Fatal("--gcp-project is required when using GitHub App authentication")
+			return errors.New("--gcp-project is required when using GitHub App authentication")
 		}
 
 		log.WithFields(logrus.Fields{
@@ -114,16 +130,16 @@ func main() {
 
 		tokenClient, err := github.NewTokenClient(ctx, *githubAppID, *githubAppSecret, project)
 		if err != nil {
-			log.WithError(err).Fatal("Failed to create GitHub App token client")
+			return fmt.Errorf("create GitHub App token client: %w", err)
 		}
 
 		installToken, err := tokenClient.GetInstallationToken(ctx)
 		if err != nil {
-			log.WithError(err).Fatal("Failed to get GitHub App installation token")
+			return fmt.Errorf("get GitHub App installation token: %w", err)
 		}
 
 		if installToken == "" {
-			log.Fatal("GitHub App installation token is empty - check App permissions and installation")
+			return errors.New("GitHub App installation token is empty - check App permissions and installation")
 		}
 		gitToken = installToken
 		log.Info("Successfully obtained GitHub App installation token for warmup")
@@ -155,18 +171,17 @@ func main() {
 	// Parse snapshot commands early — needed for workload key and version.
 	var commands []snapshot.SnapshotCommand
 	if err := json.Unmarshal([]byte(*snapshotCommands), &commands); err != nil {
-		log.WithError(err).Fatal("invalid --snapshot-commands")
+		return fmt.Errorf("invalid --snapshot-commands: %w", err)
 	}
 	if len(commands) == 0 {
-		log.Fatal("--snapshot-commands must be non-empty")
+		return errors.New("--snapshot-commands must be non-empty")
 	}
 	workloadKey := snapshot.ComputeWorkloadKey(commands)
 	log.WithField("workload_key", workloadKey).Info("Computed workload key from snapshot commands")
 
 	// Layer mode: use layer_hash as GCS directory key
-	effectiveWorkloadKey := workloadKey
-	if *layerHash != "" {
-		effectiveWorkloadKey = *layerHash
+	effectiveWorkloadKey := resolveSnapshotLookupKey(workloadKey, *layerHash)
+	if effectiveWorkloadKey != workloadKey {
 		log.WithFields(logrus.Fields{
 			"layer_hash":             *layerHash,
 			"effective_workload_key": effectiveWorkloadKey,
@@ -192,6 +207,12 @@ func main() {
 	if incremental {
 		log.WithField("build_type", *buildType).Info("Using incremental restore path")
 	}
+	if err := validateBuildMode(incremental, *enableChunked); err != nil {
+		return err
+	}
+	if err := validateBaseImagePolicy(incremental, *baseImage); err != nil {
+		return err
+	}
 
 	// Generate version string (use override from control plane if provided)
 	version := *versionOverride
@@ -202,32 +223,47 @@ func main() {
 
 	// Create output directory
 	if err := os.MkdirAll(*outputDir, 0755); err != nil {
-		log.WithError(err).Fatal("Failed to create output directory")
+		return fmt.Errorf("create output directory: %w", err)
 	}
 
 	// Network constants shared by both cold boot and incremental paths
 	vmID := "snapshot-builder"
-	tapName := "tap-slot-0"         // Must match manager's slot naming for snapshot compatibility
-	guestIP := "172.16.0.2"         // Slot 0 always gets .2
-	guestMAC := "AA:FC:00:00:00:02" // Deterministic MAC based on slot
-	// hostIP is a package-level constant (172.16.0.1)
-	netmask := "255.255.255.0"
+	socketPath := filepath.Join(*outputDir, vmID+".sock")
+
+	cleanupSocket := func() {
+		if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
+			log.WithError(err).WithField("path", socketPath).Warn("Failed to remove snapshot-builder socket")
+		}
+	}
+	defer cleanupSocket()
 
 	log.Info("Setting up network for warmup VM...")
-	if err := setupWarmupNetwork(tapName, hostIP); err != nil {
-		log.WithError(err).Fatal("Failed to setup warmup network")
+	builderNet, err := setupBuilderNetwork(vmID, logger)
+	if err != nil {
+		return fmt.Errorf("setup builder network: %w", err)
 	}
-	defer cleanupWarmupNetwork(tapName)
+	defer func() {
+		if err := builderNet.cleanup(); err != nil {
+			log.WithError(err).Warn("Failed to cleanup builder network")
+		}
+	}()
+	tapName := builderNet.tapName()     // Must match snapshot contract inside namespace
+	guestIP := builderNet.guestIP()     // Slot 0 guest IP remains 172.16.0.2
+	guestMAC := builderNet.guestMAC()   // Deterministic MAC from tap allocation
+	pollIP := builderNet.pollIP()       // Host-reachable IP for thaw-agent polling
+	gatewayIP := builderNet.gatewayIP() // Guest-visible gateway, typically 172.16.0.1
+	netmask := builderNet.netmask()     // Guest-visible netmask
+	firecrackerNetNSPath := builderNet.firecrackerNetNSPath()
 
 	// Start auth proxy if configured. The proxy provides:
-	// 1. GCP metadata server emulation on hostIP:80 (for keyrings.google-artifactregistry-auth)
-	// 2. HTTPS MITM proxy on hostIP:3128 (injects auth headers for matched hosts)
+	// 1. GCP metadata server emulation on gatewayIP:80 (for keyrings.google-artifactregistry-auth)
+	// 2. HTTPS MITM proxy on gatewayIP:3128 (injects auth headers for matched hosts)
 	var authProxy *authproxy.AuthProxy
 	var authProxyAddr string // e.g. "http://172.16.0.1:3128"
 	if *authConfigJSON != "" {
 		var authCfg authproxy.AuthConfig
 		if err := json.Unmarshal([]byte(*authConfigJSON), &authCfg); err != nil {
-			log.WithError(err).Fatal("Failed to parse --auth-config JSON")
+			return fmt.Errorf("parse --auth-config JSON: %w", err)
 		}
 		log.WithFields(logrus.Fields{
 			"providers": len(authCfg.Providers),
@@ -237,14 +273,14 @@ func main() {
 		if proxyPort == 0 {
 			proxyPort = 3128
 		}
-		authProxyAddr = fmt.Sprintf("http://%s:%d", hostIP, proxyPort)
+		authProxyAddr = fmt.Sprintf("http://%s:%d", gatewayIP, proxyPort)
 		var proxyErr error
-		authProxy, proxyErr = authproxy.NewAuthProxy("snapshot-builder", authCfg, "", hostIP, "", log)
+		authProxy, proxyErr = authproxy.NewAuthProxy("snapshot-builder", authCfg, firecrackerNetNSPath, gatewayIP, "", log)
 		if proxyErr != nil {
-			log.WithError(proxyErr).Fatal("Failed to create auth proxy")
+			return fmt.Errorf("create auth proxy: %w", proxyErr)
 		}
 		if proxyErr = authProxy.Start(ctx); proxyErr != nil {
-			log.WithError(proxyErr).Fatal("Failed to start auth proxy")
+			return fmt.Errorf("start auth proxy: %w", proxyErr)
 		}
 		log.WithField("proxy_addr", authProxyAddr).Info("Auth proxy started")
 		defer authProxy.Stop()
@@ -257,20 +293,66 @@ func main() {
 	}
 
 	bootArgs := fmt.Sprintf("console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off",
-		guestIP, hostIP, netmask)
+		guestIP, gatewayIP, netmask)
 
 	// Track FUSE disks for cleanup and incremental chunking
 	var vm *firecracker.VM
 	var fuseDisk *fuse.ChunkedDisk
 	var fuseExtDisks map[string]*fuse.ChunkedDisk // driveID → FUSE disk for extension drives
 	var incrUffdHandler *uffd.Handler
+	stopVM := func(reason string) {
+		if vm == nil {
+			return
+		}
+		if err := vm.Stop(); err != nil {
+			log.WithError(err).WithField("reason", reason).Warn("Failed to stop VM during cleanup")
+		}
+		vm = nil
+	}
+	defer stopVM("run exit")
+
+	stopUFFD := func(reason string) {
+		if incrUffdHandler == nil {
+			return
+		}
+		log.WithField("reason", reason).Debug("Stopping UFFD handler during cleanup")
+		incrUffdHandler.Stop()
+		incrUffdHandler = nil
+	}
+	defer stopUFFD("run exit")
+
+	unmountRootfsFUSE := func(reason string) {
+		if fuseDisk == nil {
+			return
+		}
+		if err := fuseDisk.Unmount(); err != nil {
+			log.WithError(err).WithField("reason", reason).Warn("Failed to unmount rootfs FUSE disk during cleanup")
+		}
+		fuseDisk = nil
+	}
+	defer unmountRootfsFUSE("run exit")
+
+	unmountExtensionFUSE := func(reason string) {
+		for driveID, d := range fuseExtDisks {
+			if err := d.Unmount(); err != nil {
+				log.WithError(err).WithFields(logrus.Fields{
+					"reason":   reason,
+					"drive_id": driveID,
+				}).Warn("Failed to unmount extension FUSE disk during cleanup")
+			}
+		}
+		fuseExtDisks = nil
+	}
+	defer unmountExtensionFUSE("run exit")
 
 	// Paths used by both paths and for final snapshot creation
 	workingRootfs := filepath.Join(*outputDir, "rootfs.img")
 
-	// rootfsSourceHash is lazily computed and stored in chunked metadata
-	// so future incremental builds can detect rootfs changes.
+	// rootfsSourceHash is lazily computed from the effective rootfs provenance
+	// inputs and stored in chunked metadata so future restores can detect when
+	// they would resume against stale rootfs content.
 	var rootfsSourceHash string
+	var rootfsFlavorForProvenance rootfsFlavor
 
 	// expectedRunnerID is the runner_id we expect to see in warmup status.
 	// For reattach/incremental builds (restoring from parent snapshot), we set
@@ -285,7 +367,7 @@ func main() {
 			// Restore from parent layer: parent's VM state (+ old layer's extension drives if reattach)
 			log.Info("Attempting restore from parent layer...")
 			var reattachErr error
-			vm, fuseDisk, fuseExtDisks, incrUffdHandler, reattachErr = reattachFromParent(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken, commands, newDrives, expectedRunnerID, authProxy, authProxyAddr)
+			vm, fuseDisk, fuseExtDisks, incrUffdHandler, rootfsFlavorForProvenance, reattachErr = reattachFromParent(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, firecrackerNetNSPath, gitToken, gcpAccessToken, commands, newDrives, expectedRunnerID, authProxy, authProxyAddr)
 			if reattachErr != nil {
 				log.WithError(reattachErr).Warn("Reattach failed, falling back to cold boot")
 				vm = nil
@@ -306,7 +388,7 @@ func main() {
 		} else {
 			log.Info("Attempting incremental restore from previous snapshot...")
 			var incrementalErr error
-			vm, fuseDisk, fuseExtDisks, incrUffdHandler, incrementalErr = restoreFromPreviousSnapshot(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, gitToken, gcpAccessToken, commands, newDrives, expectedRunnerID, authProxy, authProxyAddr)
+			vm, fuseDisk, fuseExtDisks, incrUffdHandler, rootfsFlavorForProvenance, incrementalErr = restoreFromPreviousSnapshot(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, firecrackerNetNSPath, effectiveWorkloadKey, gitToken, gcpAccessToken, commands, newDrives, expectedRunnerID, authProxy, authProxyAddr)
 			if incrementalErr != nil {
 				log.WithError(incrementalErr).Warn("Incremental restore failed, falling back to cold boot")
 				vm = nil
@@ -334,26 +416,29 @@ func main() {
 		if *baseImage != "" {
 			// Build rootfs from Docker image: pull → export → inject platform shim → ext4
 			log.WithField("base_image", *baseImage).Info("Building rootfs from Docker image...")
-			if err := buildRootfsFromImage(*baseImage, workingRootfs, *runnerUser, log); err != nil {
-				log.WithError(err).Fatal("Failed to build rootfs from Docker image")
+			var buildFlavor rootfsFlavor
+			buildFlavor, err = buildRootfsFromImage(*baseImage, workingRootfs, *runnerUser, log)
+			if err != nil {
+				return fmt.Errorf("build rootfs from Docker image: %w", err)
 			}
+			rootfsFlavorForProvenance = buildFlavor
 		} else {
 			// Legacy path: copy pre-baked rootfs.img
 			log.Info("Creating working rootfs from pre-baked image...")
 			if err := copyFile(*rootfsPath, workingRootfs); err != nil {
-				log.WithError(err).Fatal("Failed to copy rootfs")
+				return fmt.Errorf("copy rootfs: %w", err)
 			}
 		}
 		if *rootfsSizeGB > 0 {
 			log.WithField("size_gb", *rootfsSizeGB).Info("Expanding rootfs...")
 			if err := exec.Command("truncate", "-s", fmt.Sprintf("%dG", *rootfsSizeGB), workingRootfs).Run(); err != nil {
-				log.WithError(err).Fatal("Failed to expand rootfs")
+				return fmt.Errorf("expand rootfs: %w", err)
 			}
 			if output, err := exec.Command("e2fsck", "-fy", workingRootfs).CombinedOutput(); err != nil {
 				log.WithField("output", string(output)).Warn("e2fsck returned non-zero (may be OK)")
 			}
 			if output, err := exec.Command("resize2fs", workingRootfs).CombinedOutput(); err != nil {
-				log.WithField("output", string(output)).Fatal("Failed to resize2fs rootfs")
+				return fmt.Errorf("resize2fs rootfs: %s", string(output))
 			}
 			log.Info("Rootfs expanded successfully")
 		}
@@ -380,7 +465,7 @@ func main() {
 					label = strings.ToUpper(d.DriveID)
 				}
 				if err := createExt4Image(imgPath, sizeGB, label); err != nil {
-					log.WithError(err).WithField("drive_id", d.DriveID).Fatal("Failed to create drive image")
+					return fmt.Errorf("create drive image %s: %w", d.DriveID, err)
 				}
 				drives = append(drives, firecracker.Drive{
 					DriveID:      d.DriveID,
@@ -405,6 +490,7 @@ func main() {
 			VCPUs:          *vcpus,
 			MemoryMB:       *memoryMB,
 			BootArgs:       bootArgs,
+			LogPath:        filepath.Join(*outputDir, vmID+".log"),
 			NetworkIface: &firecracker.NetworkInterface{
 				IfaceID:     "eth0",
 				HostDevName: tapName,
@@ -414,25 +500,26 @@ func main() {
 				Version:           "V1",
 				NetworkInterfaces: []string{"eth0"},
 			},
-			Drives: drives,
+			Drives:    drives,
+			NetNSPath: firecrackerNetNSPath,
 		}
 
 		var err error
 		vm, err = firecracker.NewVM(vmCfg, logger)
 		if err != nil {
-			log.WithError(err).Fatal("Failed to create VM")
+			return fmt.Errorf("create VM: %w", err)
 		}
 
 		log.Info("Starting warmup VM...")
 		if err := vm.Start(ctx); err != nil {
-			log.WithError(err).Fatal("Failed to start VM")
+			return fmt.Errorf("start VM: %w", err)
 		}
 
 		mmdsData := buildWarmupMMDS(commands, gitToken, newDrives)
 		injectProxyMMDS(mmdsData, authProxy, authProxyAddr, hostIP)
 		if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
-			vm.Stop()
-			log.WithError(err).Fatal("Failed to set MMDS data")
+			stopVM("set MMDS data failure")
+			return fmt.Errorf("set MMDS data: %w", err)
 		}
 	}
 
@@ -441,9 +528,9 @@ func main() {
 	warmupCtx, warmupCancel := context.WithTimeout(ctx, *warmupTimeout)
 	defer warmupCancel()
 
-	if err := waitForWarmup(warmupCtx, vm, guestIP, expectedRunnerID, log); err != nil {
-		vm.Stop()
-		log.WithError(err).Fatal("Warmup failed")
+	if err := waitForWarmup(warmupCtx, vm, pollIP, expectedRunnerID, log); err != nil {
+		stopVM("warmup failure")
+		return fmt.Errorf("warmup failed: %w", err)
 	}
 
 	// Create snapshot
@@ -452,18 +539,15 @@ func main() {
 	memPath := filepath.Join(*outputDir, "snapshot.mem")
 
 	if err := vm.CreateSnapshot(ctx, snapshotPath, memPath); err != nil {
-		vm.Stop()
-		log.WithError(err).Fatal("Failed to create snapshot")
+		stopVM("snapshot creation failure")
+		return fmt.Errorf("create snapshot: %w", err)
 	}
 
 	// Stop VM
-	vm.Stop()
+	stopVM("snapshot created")
 
 	// Stop UFFD handler (if used for incremental restore)
-	if incrUffdHandler != nil {
-		incrUffdHandler.Stop()
-		incrUffdHandler = nil
-	}
+	stopUFFD("snapshot created")
 
 	// If we used FUSE-backed rootfs (incremental), save dirty chunks to the chunk store.
 	// This uploads only the changed chunks. We store the updated chunk refs for use
@@ -477,14 +561,13 @@ func main() {
 		var err error
 		incrementalRootfsChunks, err = fuseDisk.SaveDirtyChunks(ctx)
 		if err != nil {
-			log.WithError(err).Fatal("Failed to save dirty rootfs chunks")
+			return fmt.Errorf("save dirty rootfs chunks: %w", err)
 		}
 		log.WithFields(logrus.Fields{
 			"total_chunks": len(incrementalRootfsChunks),
 			"dirty_chunks": fuseDisk.DirtyChunkCount(),
 		}).Info("Rootfs dirty chunks saved to chunk store")
-		fuseDisk.Unmount()
-		fuseDisk = nil
+		unmountRootfsFUSE("rootfs dirty chunks saved")
 	}
 	for driveID, extDisk := range fuseExtDisks {
 		log.WithFields(logrus.Fields{
@@ -493,11 +576,11 @@ func main() {
 		}).Info("Saving FUSE extension drive dirty chunks to chunk store...")
 		chunks, err := extDisk.SaveDirtyChunks(ctx)
 		if err != nil {
-			log.WithError(err).WithField("drive_id", driveID).Fatal("Failed to save dirty extension drive chunks")
+			return fmt.Errorf("save dirty extension drive chunks for %s: %w", driveID, err)
 		}
 		incrementalExtChunks[driveID] = chunks
-		extDisk.Unmount()
 	}
+	unmountExtensionFUSE("extension drive dirty chunks saved")
 
 	// Copy kernel to output
 	kernelOutput := filepath.Join(*outputDir, "kernel.bin")
@@ -512,15 +595,15 @@ func main() {
 		} else if _, err := os.Stat(reattachKernel); err == nil {
 			kernelSrc = reattachKernel
 		} else {
-			log.Fatal("Failed to find kernel in incremental or reattach dir")
+			return errors.New("failed to find kernel in incremental or reattach dir")
 		}
 		if err := copyFile(kernelSrc, kernelOutput); err != nil {
-			log.WithError(err).Fatal("Failed to copy kernel from restore dir")
+			return fmt.Errorf("copy kernel from restore dir: %w", err)
 		}
 	} else {
 		// Cold boot: copy kernel from flag path
 		if err := copyFile(*kernelPath, kernelOutput); err != nil {
-			log.WithError(err).Fatal("Failed to copy kernel")
+			return fmt.Errorf("copy kernel: %w", err)
 		}
 	}
 
@@ -580,18 +663,20 @@ func main() {
 		Logger:    logger,
 	})
 	if err != nil {
-		log.WithError(err).Fatal("Failed to create uploader")
+		return fmt.Errorf("create uploader: %w", err)
 	}
 	defer uploader.Close()
 
+	uploadedSnapshot := false
 	if *enableChunked {
 		log.Info("Chunked mode: skipping full-file upload")
 	} else if !wasIncremental {
 		// Legacy upload only works with cold boot (needs full files on disk)
 		log.Info("Uploading full snapshot to GCS...")
 		if err := uploader.UploadSnapshot(ctx, *outputDir, metadata); err != nil {
-			log.WithError(err).Fatal("Failed to upload snapshot")
+			return fmt.Errorf("upload snapshot: %w", err)
 		}
+		uploadedSnapshot = true
 	}
 
 	// Build and upload chunked snapshot for lazy loading
@@ -606,7 +691,7 @@ func main() {
 			Logger:         logger,
 		})
 		if err != nil {
-			log.WithError(err).Fatal("Failed to create chunk store")
+			return fmt.Errorf("create chunk store: %w", err)
 		}
 		defer chunkStore.Close()
 
@@ -618,7 +703,7 @@ func main() {
 			Logger:         logger,
 		})
 		if err != nil {
-			log.WithError(err).Fatal("Failed to create mem chunk store")
+			return fmt.Errorf("create mem chunk store: %w", err)
 		}
 		defer memChunkStore.Close()
 
@@ -628,11 +713,17 @@ func main() {
 		// Compute rootfs source hash for storing in metadata (enables incremental change detection).
 		// Only needed at upload time — the incremental path hashes independently for comparison.
 		if rootfsSourceHash == "" {
-			if h, err := hashFile(*rootfsPath); err == nil {
+			provenanceFlavor := rootfsFlavor("")
+			if *baseImage != "" {
+				provenanceFlavor = rootfsFlavorForProvenance
+			}
+			if h, err := computeRootfsSourceHash(*rootfsPath, *baseImage, *runnerUser, *thawAgentPath, *rootfsSizeGB, provenanceFlavor); err == nil {
 				rootfsSourceHash = h
-				log.WithField("hash", rootfsSourceHash[:12]).Info("Base rootfs hash computed for metadata")
+				log.WithField("hash", rootfsSourceHash[:12]).Info("Rootfs provenance hash computed for metadata")
+			} else if errors.Is(err, errBaseImageNotPinned) {
+				log.WithField("base_image", *baseImage).Warn("Base image is not digest-pinned; future incremental restores will fall back to cold boot")
 			} else {
-				log.WithError(err).Warn("Failed to hash base rootfs, future incremental builds won't detect rootfs changes")
+				log.WithError(err).Warn("Failed to compute rootfs provenance hash, future incremental builds won't detect rootfs changes")
 			}
 		}
 
@@ -648,6 +739,7 @@ func main() {
 				CreatedAt:        time.Now(),
 				ChunkSize:        snapshot.DefaultChunkSize,
 				RootfsSourceHash: rootfsSourceHash,
+				RootfsFlavor:     string(rootfsFlavorForProvenance),
 			}
 			// Populate layer fields if in layer mode
 			if *layerHash != "" {
@@ -659,22 +751,22 @@ func main() {
 			// Chunk kernel
 			kernelData, err := os.ReadFile(kernelOutput)
 			if err != nil {
-				log.WithError(err).Fatal("Failed to read kernel for chunking")
+				return fmt.Errorf("read kernel for chunking: %w", err)
 			}
 			kernelHash, _, err := chunkStore.StoreChunk(ctx, kernelData)
 			if err != nil {
-				log.WithError(err).Fatal("Failed to store kernel chunk")
+				return fmt.Errorf("store kernel chunk: %w", err)
 			}
 			chunkedMeta.KernelHash = kernelHash
 
 			// Chunk state
 			stateData, err := os.ReadFile(snapshotPath)
 			if err != nil {
-				log.WithError(err).Fatal("Failed to read state for chunking")
+				return fmt.Errorf("read state for chunking: %w", err)
 			}
 			stateHash, _, err := chunkStore.StoreChunk(ctx, stateData)
 			if err != nil {
-				log.WithError(err).Fatal("Failed to store state chunk")
+				return fmt.Errorf("store state chunk: %w", err)
 			}
 			chunkedMeta.StateHash = stateHash
 
@@ -683,13 +775,13 @@ func main() {
 				memGCSPath := fmt.Sprintf("%s/snapshot_state/%s/snapshot.mem.zst", effectiveWorkloadKey, version)
 				_, _, err = memChunkStore.UploadRawFile(ctx, memPath, memGCSPath)
 				if err != nil {
-					log.WithError(err).Fatal("Failed to upload raw memory file")
+					return fmt.Errorf("upload raw memory file: %w", err)
 				}
 				chunkedMeta.MemFilePath = memGCSPath
 			} else {
 				memChunks, err := memChunkStore.ChunkFile(ctx, memPath, snapshot.DefaultChunkSize)
 				if err != nil {
-					log.WithError(err).Fatal("Failed to chunk memory file")
+					return fmt.Errorf("chunk memory file: %w", err)
 				}
 				chunkedMeta.MemChunks = memChunks
 			}
@@ -742,7 +834,7 @@ func main() {
 				}).Info("Chunking extension drive from disk")
 				chunks, chunkErr := chunkStore.ChunkFile(ctx, imgPath, snapshot.DefaultChunkSize)
 				if chunkErr != nil {
-					log.WithError(chunkErr).WithField("drive_id", d.DriveID).Fatal("Failed to chunk extension drive")
+					return fmt.Errorf("chunk extension drive %s: %w", d.DriveID, chunkErr)
 				}
 				if chunkedMeta.ExtensionDrives == nil {
 					chunkedMeta.ExtensionDrives = make(map[string]snapshot.ExtensionDrive)
@@ -756,8 +848,9 @@ func main() {
 			}
 
 			if err := builder.UploadChunkedMetadata(ctx, chunkedMeta); err != nil {
-				log.WithError(err).Fatal("Failed to upload chunked metadata")
+				return fmt.Errorf("upload incremental chunked metadata: %w", err)
 			}
+			uploadedSnapshot = true
 
 			log.WithFields(logrus.Fields{
 				"mem_file":         chunkedMeta.MemFilePath,
@@ -793,9 +886,10 @@ func main() {
 
 			chunkedMeta, err := builder.BuildChunkedSnapshot(ctx, snapshotPaths, driveSpecs, version, effectiveWorkloadKey)
 			if err != nil {
-				log.WithError(err).Fatal("Failed to build chunked snapshot")
+				return fmt.Errorf("build chunked snapshot: %w", err)
 			}
 			chunkedMeta.RootfsSourceHash = rootfsSourceHash
+			chunkedMeta.RootfsFlavor = string(rootfsFlavorForProvenance)
 			chunkedMeta.Commands = commands
 			// Populate layer fields if in layer mode
 			if *layerHash != "" {
@@ -805,8 +899,9 @@ func main() {
 			}
 
 			if err := builder.UploadChunkedMetadata(ctx, chunkedMeta); err != nil {
-				log.WithError(err).Fatal("Failed to upload chunked metadata")
+				return fmt.Errorf("upload chunked metadata: %w", err)
 			}
+			uploadedSnapshot = true
 
 			log.WithFields(logrus.Fields{
 				"mem_chunks":       len(chunkedMeta.MemChunks),
@@ -818,9 +913,12 @@ func main() {
 
 	// Update current pointer (workload-key-scoped) — done last so the pointer
 	// only moves after all snapshot data has been fully uploaded.
+	if err := shouldPublishCurrentPointer(uploadedSnapshot); err != nil {
+		return err
+	}
 	log.Info("Updating current pointer...")
 	if err := uploader.UpdateCurrentPointerForRepo(ctx, version, effectiveWorkloadKey); err != nil {
-		log.WithError(err).Fatal("Failed to update current pointer")
+		return fmt.Errorf("update current pointer: %w", err)
 	}
 
 	log.WithFields(logrus.Fields{
@@ -829,9 +927,31 @@ func main() {
 		"gcs_path":   fmt.Sprintf("gs://%s/%s/", *gcsBucket, version),
 	}).Info("Snapshot build complete!")
 
-	// Cleanup
-	socketPath := filepath.Join(*outputDir, vmID+".sock")
-	os.Remove(socketPath)
+	return nil
+}
+
+func validateBuildMode(incremental bool, enableChunked bool) error {
+	if incremental && !enableChunked {
+		return errors.New("incremental and reattach builds require --enable-chunked=true")
+	}
+	return nil
+}
+
+func validateBaseImagePolicy(incremental bool, baseImage string) error {
+	if !incremental || baseImage == "" {
+		return nil
+	}
+	if _, err := normalizePinnedBaseImage(baseImage); err != nil {
+		return fmt.Errorf("incremental base-image builds require digest-pinned image references: %w", err)
+	}
+	return nil
+}
+
+func shouldPublishCurrentPointer(uploadedSnapshot bool) error {
+	if !uploadedSnapshot {
+		return errors.New("refusing to update current pointer: snapshot artifacts were not uploaded")
+	}
+	return nil
 }
 
 func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, expectedRunnerID string, log *logrus.Entry) error {
@@ -1026,6 +1146,13 @@ func copyFile(src, dst string) error {
 	return cmd.Run()
 }
 
+func resolveSnapshotLookupKey(workloadKey, layerHash string) string {
+	if layerHash != "" {
+		return layerHash
+	}
+	return workloadKey
+}
+
 // hashFile computes SHA-256 of a file and returns hex string.
 func hashFile(path string) (string, error) {
 	f, err := os.Open(path)
@@ -1038,6 +1165,76 @@ func hashFile(path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func computeRootfsSourceHash(rootfsPath, baseImage, runnerUser, thawAgentPath string, rootfsSizeGB int, flavor rootfsFlavor) (string, error) {
+	var payload any
+	if baseImage != "" {
+		pinnedBaseImage, err := normalizePinnedBaseImage(baseImage)
+		if err != nil {
+			return "", err
+		}
+		if flavor == "" {
+			return "", fmt.Errorf("rootfs flavor is required for base-image provenance")
+		}
+		thawAgentHash, err := hashFile(thawAgentPath)
+		if err != nil {
+			return "", fmt.Errorf("hash thaw-agent binary: %w", err)
+		}
+		platformShimHash, err := computePlatformShimFingerprint(flavor, runnerUser)
+		if err != nil {
+			return "", fmt.Errorf("compute platform shim fingerprint: %w", err)
+		}
+		payload = struct {
+			SchemaVersion string `json:"schema_version"`
+			Mode          string `json:"mode"`
+			BaseImage     string `json:"base_image"`
+			RootfsFlavor  string `json:"rootfs_flavor"`
+			RunnerUser    string `json:"runner_user"`
+			ThawAgentHash string `json:"thaw_agent_hash"`
+			PlatformHash  string `json:"platform_hash"`
+			RootfsSizeGB  int    `json:"rootfs_size_gb"`
+		}{
+			SchemaVersion: "rootfs-source-hash-v2",
+			Mode:          "base-image",
+			BaseImage:     pinnedBaseImage,
+			RootfsFlavor:  string(flavor),
+			RunnerUser:    runnerUser,
+			ThawAgentHash: thawAgentHash,
+			PlatformHash:  platformShimHash,
+			RootfsSizeGB:  rootfsSizeGB,
+		}
+	} else {
+		rootfsHash, err := hashFile(rootfsPath)
+		if err != nil {
+			return "", fmt.Errorf("hash rootfs image: %w", err)
+		}
+		payload = struct {
+			SchemaVersion string `json:"schema_version"`
+			Mode          string `json:"mode"`
+			RootfsHash    string `json:"rootfs_hash"`
+			RootfsSizeGB  int    `json:"rootfs_size_gb"`
+		}{
+			SchemaVersion: "rootfs-source-hash-v2",
+			Mode:          "rootfs-image",
+			RootfsHash:    rootfsHash,
+			RootfsSizeGB:  rootfsSizeGB,
+		}
+	}
+
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal rootfs provenance payload: %w", err)
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func normalizePinnedBaseImage(baseImage string) (string, error) {
+	if !strings.Contains(baseImage, "@sha256:") {
+		return "", fmt.Errorf("%w: %s", errBaseImageNotPinned, baseImage)
+	}
+	return baseImage, nil
 }
 
 func createExt4Image(path string, sizeGB int, label string) error {
@@ -1082,73 +1279,6 @@ func getGitCommit(dir string) string {
 	return commit
 }
 
-// setupWarmupNetwork creates the TAP device and connects it to the existing bridge.
-// The host is expected to have a bridge (fcbr0) with IP 172.16.0.1/24 already configured.
-func setupWarmupNetwork(tapName, hostIP string) error {
-	// Create TAP device
-	if output, err := exec.Command("ip", "tuntap", "add", "dev", tapName, "mode", "tap").CombinedOutput(); err != nil {
-		// Might already exist, try to continue
-		if !strings.Contains(string(output), "exists") {
-			return fmt.Errorf("failed to create tap: %s: %w", string(output), err)
-		}
-	}
-
-	// Try to connect TAP to existing bridge (fcbr0)
-	// This is the preferred setup when the host already has a bridge configured
-	bridgeName := "fcbr0"
-	if output, err := exec.Command("ip", "link", "set", tapName, "master", bridgeName).CombinedOutput(); err != nil {
-		// If bridge doesn't exist, fall back to standalone TAP with its own IP
-		fmt.Printf("Note: Could not add TAP to bridge %s (%s), using standalone network\n", bridgeName, strings.TrimSpace(string(output)))
-		// Configure TAP IP directly
-		if output, err := exec.Command("ip", "addr", "add", hostIP+"/24", "dev", tapName).CombinedOutput(); err != nil {
-			if !strings.Contains(string(output), "exists") {
-				return fmt.Errorf("failed to add ip: %s: %w", string(output), err)
-			}
-		}
-	}
-
-	// Match TAP/bridge MTU to the host's outbound interface (GCP uses 1460, not 1500)
-	hostMTU := "1460" // safe default for GCP
-	if mtuBytes, err := os.ReadFile("/sys/class/net/" + getDefaultIface() + "/mtu"); err == nil {
-		hostMTU = strings.TrimSpace(string(mtuBytes))
-	}
-	exec.Command("ip", "link", "set", tapName, "mtu", hostMTU).Run()
-	if bridgeName == "fcbr0" {
-		exec.Command("ip", "link", "set", bridgeName, "mtu", hostMTU).Run()
-	}
-
-	// Bring TAP up
-	if output, err := exec.Command("ip", "link", "set", tapName, "up").CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to bring tap up: %s: %w", string(output), err)
-	}
-
-	// Enable IP forwarding
-	os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
-
-	// Setup NAT for outbound traffic (guest needs internet for warmup)
-	// These rules may already exist from bridge setup, but adding them again is harmless
-	exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "172.16.0.0/24", "-j", "MASQUERADE").Run()
-	exec.Command("iptables", "-A", "FORWARD", "-i", tapName, "-j", "ACCEPT").Run()
-	exec.Command("iptables", "-A", "FORWARD", "-o", tapName, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT").Run()
-
-	// Clamp TCP MSS to path MTU. The guest may have MTU 1500 (default) while the host
-	// outbound interface uses 1460 (GCP). Without this, large TCP segments from the guest
-	// get dropped after NAT because they exceed the host MTU and DF is set.
-	exec.Command("iptables", "-t", "mangle", "-A", "FORWARD", "-p", "tcp",
-		"--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu").Run()
-
-	return nil
-}
-
-// cleanupWarmupNetwork removes the TAP device and iptables rules
-func cleanupWarmupNetwork(tapName string) {
-	exec.Command("ip", "link", "set", tapName, "down").Run()
-	exec.Command("ip", "tuntap", "del", "dev", tapName, "mode", "tap").Run()
-	exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", "172.16.0.0/24", "-j", "MASQUERADE").Run()
-	exec.Command("iptables", "-D", "FORWARD", "-i", tapName, "-j", "ACCEPT").Run()
-	exec.Command("iptables", "-D", "FORWARD", "-o", tapName, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT").Run()
-}
-
 // snapshotSymlinkDir matches the path used by the manager for snapshot symlinks.
 // Firecracker opens drive backing files at the paths baked into the snapshot state,
 // which are /tmp/snapshot/*.img.
@@ -1164,17 +1294,19 @@ func restoreFromPreviousSnapshot(
 	logger *logrus.Logger,
 	log *logrus.Entry,
 	vmID, tapName, guestMAC, bootArgs string,
+	netnsPath string,
+	restoreWorkloadKey string,
 	gitToken, gcpAccessToken string,
 	commands []snapshot.SnapshotCommand,
 	newDrives []snapshot.DriveSpec,
 	runnerID string,
 	authProxy *authproxy.AuthProxy, authProxyAddr string,
-) (*firecracker.VM, *fuse.ChunkedDisk, map[string]*fuse.ChunkedDisk, *uffd.Handler, error) {
+) (*firecracker.VM, *fuse.ChunkedDisk, map[string]*fuse.ChunkedDisk, *uffd.Handler, rootfsFlavor, error) {
 	// Use a subdirectory for incremental working files to avoid colliding
 	// with the symlinks in /tmp/snapshot/ that Firecracker expects.
 	incrDir := filepath.Join(*outputDir, "incremental")
 	if err := os.MkdirAll(incrDir, 0755); err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("failed to create incremental dir: %w", err)
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to create incremental dir: %w", err)
 	}
 
 	// 1. Create chunk store and load previous chunked metadata
@@ -1186,22 +1318,22 @@ func restoreFromPreviousSnapshot(
 		Logger:         logger,
 	})
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("failed to create chunk store: %w", err)
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to create chunk store: %w", err)
 	}
 
 	// Resolve the current version via pointer file, then load its metadata.
-	wk := snapshot.ComputeWorkloadKey(commands)
-	currentVersion, err := chunkStore.ReadCurrentVersion(ctx, wk)
+	currentVersion, err := chunkStore.ReadCurrentVersion(ctx, restoreWorkloadKey)
 	if err != nil {
 		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("failed to resolve current version for workload key %q: %w", wk, err)
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to resolve current version for workload key %q: %w", restoreWorkloadKey, err)
 	}
-	chunkedMeta, err := chunkStore.LoadChunkedMetadata(ctx, wk, currentVersion)
+	chunkedMeta, err := chunkStore.LoadChunkedMetadata(ctx, restoreWorkloadKey, currentVersion)
 	if err != nil {
 		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("no previous chunked snapshot found for version %s: %w", currentVersion, err)
+		return nil, nil, nil, nil, "", fmt.Errorf("no previous chunked snapshot found for version %s: %w", currentVersion, err)
 	}
 	log.WithFields(logrus.Fields{
+		"workload_key":     restoreWorkloadKey,
 		"version":          chunkedMeta.Version,
 		"rootfs_chunks":    len(chunkedMeta.RootfsChunks),
 		"extension_drives": len(chunkedMeta.ExtensionDrives),
@@ -1211,10 +1343,11 @@ func restoreFromPreviousSnapshot(
 	// If it has (e.g. new thaw-agent binary, new packages), we must cold boot
 	// to pick up the changes — snapshot restore uses the old rootfs.
 	if chunkedMeta.RootfsSourceHash != "" {
-		currentHash, err := hashFile(*rootfsPath)
+		provenanceFlavor := rootfsFlavor(chunkedMeta.RootfsFlavor)
+		currentHash, err := computeRootfsSourceHash(*rootfsPath, *baseImage, *runnerUser, *thawAgentPath, *rootfsSizeGB, provenanceFlavor)
 		if err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to hash current rootfs: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to compute current rootfs provenance hash: %w", err)
 		}
 		if currentHash != chunkedMeta.RootfsSourceHash {
 			chunkStore.Close()
@@ -1222,12 +1355,12 @@ func restoreFromPreviousSnapshot(
 				"previous": chunkedMeta.RootfsSourceHash[:12],
 				"current":  currentHash[:12],
 			}).Warn("Base rootfs has changed, incremental restore would use stale image")
-			return nil, nil, nil, nil, fmt.Errorf("rootfs changed (previous=%s current=%s)", chunkedMeta.RootfsSourceHash[:12], currentHash[:12])
+			return nil, nil, nil, nil, "", fmt.Errorf("rootfs changed (previous=%s current=%s)", chunkedMeta.RootfsSourceHash[:12], currentHash[:12])
 		}
 		log.WithField("hash", currentHash[:12]).Info("Base rootfs unchanged, safe to restore incrementally")
 	} else {
 		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("previous snapshot has no rootfs source hash, cannot verify rootfs unchanged — forcing cold boot")
+		return nil, nil, nil, nil, "", fmt.Errorf("previous snapshot has no rootfs source hash, cannot verify rootfs unchanged — forcing cold boot")
 	}
 
 	// 2. Prepare memory restore: prefer MemFilePath (file-backed), fall back to
@@ -1238,14 +1371,14 @@ func restoreFromPreviousSnapshot(
 		log.Info("Downloading previous snapshot memory file...")
 		if err := chunkStore.DownloadRawFile(ctx, chunkedMeta.MemFilePath, localMemPath); err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to download memory file: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to download memory file: %w", err)
 		}
 	} else if len(chunkedMeta.MemChunks) > 0 {
 		log.Info("No mem_file_path, will use UFFD lazy loading from memory chunks")
 		useUFFD = true
 	} else {
 		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("previous snapshot has no mem_file_path and no mem_chunks")
+		return nil, nil, nil, nil, "", fmt.Errorf("previous snapshot has no mem_file_path and no mem_chunks")
 	}
 
 	// 3. Fetch state chunk and write to local file
@@ -1254,11 +1387,11 @@ func restoreFromPreviousSnapshot(
 		stateData, err := chunkStore.GetChunk(ctx, chunkedMeta.StateHash)
 		if err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to fetch vmstate chunk: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to fetch vmstate chunk: %w", err)
 		}
 		if err := os.WriteFile(localStatePath, stateData, 0644); err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to write vmstate: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to write vmstate: %w", err)
 		}
 		log.WithField("state_size", len(stateData)).Info("Fetched previous vmstate")
 	}
@@ -1269,18 +1402,18 @@ func restoreFromPreviousSnapshot(
 		kernelData, err := chunkStore.GetChunk(ctx, chunkedMeta.KernelHash)
 		if err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to fetch kernel chunk: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to fetch kernel chunk: %w", err)
 		}
 		if err := os.WriteFile(localKernelPath, kernelData, 0644); err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to write kernel: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to write kernel: %w", err)
 		}
 		log.WithField("kernel_size", len(kernelData)).Info("Fetched kernel from chunk store")
 	} else {
 		// Fall back to local kernel
 		if err := copyFile(*kernelPath, localKernelPath); err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to copy kernel: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to copy kernel: %w", err)
 		}
 	}
 
@@ -1296,11 +1429,11 @@ func restoreFromPreviousSnapshot(
 	})
 	if err != nil {
 		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("failed to create FUSE rootfs disk: %w", err)
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to create FUSE rootfs disk: %w", err)
 	}
 	if err := fuseDisk.Mount(); err != nil {
 		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("failed to mount FUSE rootfs: %w", err)
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to mount FUSE rootfs: %w", err)
 	}
 	log.Info("Mounted FUSE-backed rootfs from previous snapshot")
 
@@ -1332,7 +1465,7 @@ func restoreFromPreviousSnapshot(
 				d.Unmount()
 			}
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to create FUSE ext disk %s: %w", driveID, fuseErr)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to create FUSE ext disk %s: %w", driveID, fuseErr)
 		}
 		if err := extFUSE.Mount(); err != nil {
 			fuseDisk.Unmount()
@@ -1340,7 +1473,7 @@ func restoreFromPreviousSnapshot(
 				d.Unmount()
 			}
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to mount FUSE ext disk %s: %w", driveID, err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to mount FUSE ext disk %s: %w", driveID, err)
 		}
 		fuseExtDisks[driveID] = extFUSE
 		extDrivePaths[driveID] = extFUSE.DiskImagePath()
@@ -1354,7 +1487,7 @@ func restoreFromPreviousSnapshot(
 			d.Unmount()
 		}
 		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("failed to create snapshot symlink dir: %w", err)
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to create snapshot symlink dir: %w", err)
 	}
 
 	symlinks := []struct {
@@ -1379,7 +1512,7 @@ func restoreFromPreviousSnapshot(
 				d.Unmount()
 			}
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("symlink %s -> %s: %w", linkPath, s.target, err)
+			return nil, nil, nil, nil, "", fmt.Errorf("symlink %s -> %s: %w", linkPath, s.target, err)
 		}
 		createdSymlinks = append(createdSymlinks, linkPath)
 		log.WithFields(logrus.Fields{
@@ -1407,6 +1540,7 @@ func restoreFromPreviousSnapshot(
 			Version:           "V1",
 			NetworkInterfaces: []string{"eth0"},
 		},
+		NetNSPath: netnsPath,
 	}
 
 	vm, err := firecracker.NewVM(vmCfg, logger)
@@ -1419,7 +1553,7 @@ func restoreFromPreviousSnapshot(
 			d.Unmount()
 		}
 		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("failed to create VM: %w", err)
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to create VM: %w", err)
 	}
 
 	// Restore VM: use UFFD lazy memory if no MemFilePath, otherwise file-backed.
@@ -1443,7 +1577,7 @@ func restoreFromPreviousSnapshot(
 				d.Unmount()
 			}
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to create mem chunk store: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to create mem chunk store: %w", err)
 		}
 
 		uffdSocketPath := filepath.Join(incrDir, "uffd.sock")
@@ -1464,7 +1598,7 @@ func restoreFromPreviousSnapshot(
 				d.Unmount()
 			}
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to create UFFD handler: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to create UFFD handler: %w", err)
 		}
 		if err := uffdHandler.Start(); err != nil {
 			memChunkStore.Close()
@@ -1477,7 +1611,7 @@ func restoreFromPreviousSnapshot(
 				d.Unmount()
 			}
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to start UFFD handler: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to start UFFD handler: %w", err)
 		}
 
 		log.Info("Restoring VM from previous snapshot with UFFD...")
@@ -1493,7 +1627,7 @@ func restoreFromPreviousSnapshot(
 				d.Unmount()
 			}
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to restore from snapshot with UFFD: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to restore from snapshot with UFFD: %w", err)
 		}
 	} else {
 		log.Info("Restoring VM from previous snapshot (file-backed memory)...")
@@ -1507,7 +1641,7 @@ func restoreFromPreviousSnapshot(
 				d.Unmount()
 			}
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to restore from snapshot: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to restore from snapshot: %w", err)
 		}
 	}
 
@@ -1530,7 +1664,7 @@ func restoreFromPreviousSnapshot(
 			d.Unmount()
 		}
 		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("failed to set MMDS data: %w", err)
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to set MMDS data: %w", err)
 	}
 
 	// 12. Resume VM — thaw-agent wakes up, detects runner_id change, re-runs warmup
@@ -1542,11 +1676,11 @@ func restoreFromPreviousSnapshot(
 			d.Unmount()
 		}
 		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("failed to resume VM: %w", err)
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to resume VM: %w", err)
 	}
 
 	log.Info("VM restored and resumed for incremental warmup")
-	return vm, fuseDisk, fuseExtDisks, uffdHandler, nil
+	return vm, fuseDisk, fuseExtDisks, uffdHandler, rootfsFlavor(chunkedMeta.RootfsFlavor), nil
 }
 
 // reattachFromParent implements the reattach build path.
@@ -1558,15 +1692,16 @@ func reattachFromParent(
 	logger *logrus.Logger,
 	log *logrus.Entry,
 	vmID, tapName, guestMAC, bootArgs string,
+	netnsPath string,
 	gitToken, gcpAccessToken string,
 	commands []snapshot.SnapshotCommand,
 	newDrives []snapshot.DriveSpec,
 	runnerID string,
 	authProxy *authproxy.AuthProxy, authProxyAddr string,
-) (*firecracker.VM, *fuse.ChunkedDisk, map[string]*fuse.ChunkedDisk, *uffd.Handler, error) {
+) (*firecracker.VM, *fuse.ChunkedDisk, map[string]*fuse.ChunkedDisk, *uffd.Handler, rootfsFlavor, error) {
 	reattachDir := filepath.Join(*outputDir, "reattach")
 	if err := os.MkdirAll(reattachDir, 0755); err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("failed to create reattach dir: %w", err)
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to create reattach dir: %w", err)
 	}
 
 	// Create chunk store
@@ -1578,14 +1713,14 @@ func reattachFromParent(
 		Logger:         logger,
 	})
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("failed to create chunk store: %w", err)
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to create chunk store: %w", err)
 	}
 
 	// 1. Load parent metadata (for VM state, memory, rootfs)
 	parentMeta, err := chunkStore.LoadChunkedMetadata(ctx, *parentWorkloadKey, *parentVersion)
 	if err != nil {
 		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("failed to load parent metadata: %w", err)
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to load parent metadata: %w", err)
 	}
 	log.WithFields(logrus.Fields{
 		"parent_key":     *parentWorkloadKey,
@@ -1593,13 +1728,37 @@ func reattachFromParent(
 		"rootfs_chunks":  len(parentMeta.RootfsChunks),
 	}).Info("Loaded parent layer metadata for reattach")
 
+	// Check if the current build would produce a different rootfs than the
+	// parent snapshot was built from. If so, restoring the old VM state would
+	// resume against stale rootfs content and must fall back to cold boot.
+	if parentMeta.RootfsSourceHash != "" {
+		provenanceFlavor := rootfsFlavor(parentMeta.RootfsFlavor)
+		currentHash, err := computeRootfsSourceHash(*rootfsPath, *baseImage, *runnerUser, *thawAgentPath, *rootfsSizeGB, provenanceFlavor)
+		if err != nil {
+			chunkStore.Close()
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to compute current rootfs provenance hash: %w", err)
+		}
+		if currentHash != parentMeta.RootfsSourceHash {
+			chunkStore.Close()
+			log.WithFields(logrus.Fields{
+				"previous": parentMeta.RootfsSourceHash[:12],
+				"current":  currentHash[:12],
+			}).Warn("Base rootfs has changed, reattach restore would use stale image")
+			return nil, nil, nil, nil, "", fmt.Errorf("rootfs changed (previous=%s current=%s)", parentMeta.RootfsSourceHash[:12], currentHash[:12])
+		}
+		log.WithField("hash", currentHash[:12]).Info("Base rootfs unchanged, safe to restore parent snapshot")
+	} else {
+		chunkStore.Close()
+		return nil, nil, nil, nil, "", fmt.Errorf("parent snapshot has no rootfs source hash, cannot verify rootfs unchanged — forcing cold boot")
+	}
+
 	// 2. Load old layer metadata (for extension drives) — optional for init builds
 	var oldLayerMeta *snapshot.ChunkedSnapshotMetadata
 	if *previousLayerKey != "" && *previousLayerVersion != "" {
 		oldLayerMeta, err = chunkStore.LoadChunkedMetadata(ctx, *previousLayerKey, *previousLayerVersion)
 		if err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to load old layer metadata: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to load old layer metadata: %w", err)
 		}
 		log.WithFields(logrus.Fields{
 			"old_layer_key":     *previousLayerKey,
@@ -1617,14 +1776,14 @@ func reattachFromParent(
 		log.Info("Downloading parent snapshot memory file...")
 		if err := chunkStore.DownloadRawFile(ctx, parentMeta.MemFilePath, localMemPath); err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to download parent memory: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to download parent memory: %w", err)
 		}
 	} else if len(parentMeta.MemChunks) > 0 {
 		log.Info("Will use UFFD lazy loading from parent memory chunks")
 		useUFFD = true
 	} else {
 		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("parent snapshot has no memory data")
+		return nil, nil, nil, nil, "", fmt.Errorf("parent snapshot has no memory data")
 	}
 
 	// 4. Fetch parent state chunk
@@ -1633,11 +1792,11 @@ func reattachFromParent(
 		stateData, err := chunkStore.GetChunk(ctx, parentMeta.StateHash)
 		if err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to fetch parent vmstate chunk: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to fetch parent vmstate chunk: %w", err)
 		}
 		if err := os.WriteFile(localStatePath, stateData, 0644); err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to write parent vmstate: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to write parent vmstate: %w", err)
 		}
 	}
 
@@ -1647,16 +1806,16 @@ func reattachFromParent(
 		kernelData, err := chunkStore.GetChunk(ctx, parentMeta.KernelHash)
 		if err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to fetch parent kernel chunk: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to fetch parent kernel chunk: %w", err)
 		}
 		if err := os.WriteFile(localKernelPath, kernelData, 0644); err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to write parent kernel: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to write parent kernel: %w", err)
 		}
 	} else {
 		if err := copyFile(*kernelPath, localKernelPath); err != nil {
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to copy kernel: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to copy kernel: %w", err)
 		}
 	}
 
@@ -1672,11 +1831,11 @@ func reattachFromParent(
 	})
 	if err != nil {
 		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("failed to create FUSE rootfs disk: %w", err)
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to create FUSE rootfs disk: %w", err)
 	}
 	if err := fuseDisk.Mount(); err != nil {
 		chunkStore.Close()
-		return nil, nil, nil, nil, fmt.Errorf("failed to mount FUSE rootfs: %w", err)
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to mount FUSE rootfs: %w", err)
 	}
 	log.Info("Mounted FUSE-backed rootfs from parent for reattach")
 
@@ -1765,7 +1924,7 @@ func reattachFromParent(
 		if err := createExt4Image(imgPath, sizeGB, label); err != nil {
 			fuseDisk.Unmount()
 			chunkStore.Close()
-			return nil, nil, nil, nil, fmt.Errorf("failed to create drive %s: %w", d.DriveID, err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to create drive %s: %w", d.DriveID, err)
 		}
 		vmDrives = append(vmDrives, firecracker.Drive{
 			DriveID: d.DriveID, PathOnHost: imgPath, IsRootDevice: false, IsReadOnly: d.ReadOnly,
@@ -1787,13 +1946,13 @@ func reattachFromParent(
 	// Symlinks for snapshot creation (rootfs is always needed)
 	if err := os.MkdirAll(snapshotSymlinkDir, 0755); err != nil {
 		cleanupFuse()
-		return nil, nil, nil, nil, fmt.Errorf("failed to create snapshot symlink dir: %w", err)
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to create snapshot symlink dir: %w", err)
 	}
 	symlinkRootfs := filepath.Join(snapshotSymlinkDir, "rootfs.img")
 	os.Remove(symlinkRootfs)
 	if err := os.Symlink(fuseDisk.DiskImagePath(), symlinkRootfs); err != nil {
 		cleanupFuse()
-		return nil, nil, nil, nil, fmt.Errorf("symlink rootfs: %w", err)
+		return nil, nil, nil, nil, "", fmt.Errorf("symlink rootfs: %w", err)
 	}
 	// Also create symlinks for each drive (used by snapshot upload)
 	// Use driveID+".img" (no underscore-to-hyphen) to match cold boot paths
@@ -1830,7 +1989,8 @@ func reattachFromParent(
 			Version:           "V1",
 			NetworkInterfaces: []string{"eth0"},
 		},
-		Drives: vmDrives,
+		Drives:    vmDrives,
+		NetNSPath: netnsPath,
 	}
 	vm, err := firecracker.NewVM(vmCfg, logger)
 	if err != nil {
@@ -1838,7 +1998,7 @@ func reattachFromParent(
 			os.Remove(c)
 		}
 		cleanupFuse()
-		return nil, nil, nil, nil, fmt.Errorf("failed to create VM: %w", err)
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to create VM: %w", err)
 	}
 
 	cleanupVM := func() {
@@ -1860,7 +2020,7 @@ func reattachFromParent(
 		})
 		if err != nil {
 			cleanupVM()
-			return nil, nil, nil, nil, fmt.Errorf("failed to create mem chunk store: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to create mem chunk store: %w", err)
 		}
 
 		uffdSocketPath := filepath.Join(reattachDir, "uffd.sock")
@@ -1873,12 +2033,12 @@ func reattachFromParent(
 		if err != nil {
 			memChunkStore.Close()
 			cleanupVM()
-			return nil, nil, nil, nil, fmt.Errorf("failed to create UFFD handler: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to create UFFD handler: %w", err)
 		}
 		if err := uffdHandler.Start(); err != nil {
 			memChunkStore.Close()
 			cleanupVM()
-			return nil, nil, nil, nil, fmt.Errorf("failed to start UFFD handler: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to start UFFD handler: %w", err)
 		}
 
 		log.Info("Restoring VM from parent snapshot with UFFD (reattach)...")
@@ -1886,13 +2046,13 @@ func reattachFromParent(
 			uffdHandler.Stop()
 			memChunkStore.Close()
 			cleanupVM()
-			return nil, nil, nil, nil, fmt.Errorf("failed to restore from parent snapshot with UFFD: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to restore from parent snapshot with UFFD: %w", err)
 		}
 	} else {
 		log.Info("Restoring VM from parent snapshot (file-backed memory, reattach)...")
 		if err := vm.RestoreFromSnapshot(ctx, localStatePath, localMemPath, false); err != nil {
 			cleanupVM()
-			return nil, nil, nil, nil, fmt.Errorf("failed to restore from parent snapshot: %w", err)
+			return nil, nil, nil, nil, "", fmt.Errorf("failed to restore from parent snapshot: %w", err)
 		}
 	}
 
@@ -1908,18 +2068,18 @@ func reattachFromParent(
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
 		cleanupFuse()
-		return nil, nil, nil, nil, fmt.Errorf("failed to set MMDS data: %w", err)
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to set MMDS data: %w", err)
 	}
 
 	log.WithField("runner_id", runnerID).Info("Resuming VM for reattach warmup...")
 	if err := vm.Resume(ctx); err != nil {
 		vm.Stop()
 		cleanupFuse()
-		return nil, nil, nil, nil, fmt.Errorf("failed to resume VM: %w", err)
+		return nil, nil, nil, nil, "", fmt.Errorf("failed to resume VM: %w", err)
 	}
 
 	log.Info("VM restored and resumed for reattach warmup")
-	return vm, fuseDisk, fuseExtDisks, uffdHandler, nil
+	return vm, fuseDisk, fuseExtDisks, uffdHandler, rootfsFlavor(parentMeta.RootfsFlavor), nil
 }
 
 // buildWarmupMMDS creates the MMDS data for warmup mode.
@@ -1976,17 +2136,17 @@ func injectProxyMMDS(mmdsData map[string]interface{}, proxy *authproxy.AuthProxy
 //  2. Create a container and export its filesystem
 //  3. Create an ext4 image and populate it from the export
 //  4. Inject the platform shim (systemd init, thaw-agent, networking)
-func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.Entry) error {
+func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.Entry) (rootfsFlavor, error) {
 	log.WithField("image", imageURI).Info("Pulling Docker image...")
 	if output, err := exec.Command("docker", "pull", "--platform=linux/amd64", imageURI).CombinedOutput(); err != nil {
-		return fmt.Errorf("docker pull failed: %s: %w", string(output), err)
+		return "", fmt.Errorf("docker pull failed: %s: %w", string(output), err)
 	}
 
 	// Export container filesystem to tar
 	log.Info("Exporting container filesystem...")
 	containerID, err := exec.Command("docker", "create", "--platform=linux/amd64", imageURI, "/bin/true").Output()
 	if err != nil {
-		return fmt.Errorf("docker create failed: %w", err)
+		return "", fmt.Errorf("docker create failed: %w", err)
 	}
 	cid := strings.TrimSpace(string(containerID))
 	defer exec.Command("docker", "rm", cid).Run()
@@ -1994,14 +2154,14 @@ func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.E
 	tarPath := outputPath + ".tar"
 	tarFile, err := os.Create(tarPath)
 	if err != nil {
-		return fmt.Errorf("failed to create tar file: %w", err)
+		return "", fmt.Errorf("failed to create tar file: %w", err)
 	}
 
 	exportCmd := exec.Command("docker", "export", cid)
 	exportCmd.Stdout = tarFile
 	if err := exportCmd.Run(); err != nil {
 		tarFile.Close()
-		return fmt.Errorf("docker export failed: %w", err)
+		return "", fmt.Errorf("docker export failed: %w", err)
 	}
 	tarFile.Close()
 	defer os.Remove(tarPath)
@@ -2010,28 +2170,28 @@ func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.E
 	rootfsSizeGB := 8
 	log.WithField("size_gb", rootfsSizeGB).Info("Creating ext4 rootfs image...")
 	if err := exec.Command("truncate", "-s", fmt.Sprintf("%dG", rootfsSizeGB), outputPath).Run(); err != nil {
-		return fmt.Errorf("truncate failed: %w", err)
+		return "", fmt.Errorf("truncate failed: %w", err)
 	}
 	if output, err := exec.Command("mkfs.ext4", "-F", outputPath).CombinedOutput(); err != nil {
-		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(output), err)
+		return "", fmt.Errorf("mkfs.ext4 failed: %s: %w", string(output), err)
 	}
 
 	// Mount and populate
 	mountDir := outputPath + ".mnt"
 	if err := os.MkdirAll(mountDir, 0755); err != nil {
-		return fmt.Errorf("failed to create mount dir: %w", err)
+		return "", fmt.Errorf("failed to create mount dir: %w", err)
 	}
 	defer os.RemoveAll(mountDir)
 
 	if output, err := exec.Command("mount", "-o", "loop", outputPath, mountDir).CombinedOutput(); err != nil {
-		return fmt.Errorf("mount failed: %s: %w", string(output), err)
+		return "", fmt.Errorf("mount failed: %s: %w", string(output), err)
 	}
 	defer exec.Command("umount", mountDir).Run()
 
 	// Extract container filesystem
 	log.Info("Extracting container filesystem into rootfs...")
 	if output, err := exec.Command("tar", "xf", tarPath, "-C", mountDir).CombinedOutput(); err != nil {
-		return fmt.Errorf("tar extract failed: %s: %w", string(output), err)
+		return "", fmt.Errorf("tar extract failed: %s: %w", string(output), err)
 	}
 
 	// Extract Docker image ENV variables before injecting platform shim.
@@ -2053,12 +2213,13 @@ func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.E
 
 	// Inject platform shim
 	log.Info("Injecting platform shim (systemd, thaw-agent, networking)...")
-	if err := injectPlatformShim(mountDir, runnerUser, dockerEnv, log); err != nil {
-		return fmt.Errorf("platform shim injection failed: %w", err)
+	flavor, err := injectPlatformShim(mountDir, runnerUser, *thawAgentPath, dockerEnv, log)
+	if err != nil {
+		return "", fmt.Errorf("platform shim injection failed: %w", err)
 	}
 
 	log.Info("Rootfs built from Docker image successfully")
-	return nil
+	return flavor, nil
 }
 
 // injectPlatformShim installs the minimal components needed to run a Firecracker
@@ -2066,167 +2227,44 @@ func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.E
 // dockerEnv contains ENV variables extracted from the Docker image config
 // (e.g., ["PATH=/opt/venv/bin:/usr/bin", "HOME=/home/user"]) that are written
 // to /etc/environment so all processes in the VM inherit them.
-func injectPlatformShim(rootfsDir, runnerUser string, dockerEnv []string, log *logrus.Entry) error {
-	// 1. Ensure systemd is installed (check for /lib/systemd/systemd)
-	systemdPath := filepath.Join(rootfsDir, "lib/systemd/systemd")
-	if _, err := os.Stat(systemdPath); os.IsNotExist(err) {
-		// Install systemd via chroot apt-get (requires the image to be Debian/Ubuntu-based)
-		log.Info("Installing systemd in rootfs...")
-		installCmd := exec.Command("chroot", rootfsDir, "/bin/sh", "-c",
-			"apt-get update -qq && apt-get install -y -qq --no-install-recommends systemd systemd-sysv dbus iproute2 sudo")
-		installCmd.Env = []string{"DEBIAN_FRONTEND=noninteractive", "PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
-		if output, err := installCmd.CombinedOutput(); err != nil {
-			log.WithField("output", string(output)).Warn("systemd install failed (image may not be Debian-based)")
-			return fmt.Errorf("systemd installation failed: %w", err)
-		}
+func injectPlatformShim(rootfsDir, runnerUser, thawAgentBin string, dockerEnv []string, log *logrus.Entry) (rootfsFlavor, error) {
+	cleanupBindMounts := bindRootfsSystemDirs(rootfsDir, log)
+	defer cleanupBindMounts()
+
+	flavor, err := detectRootfsFlavor(rootfsDir)
+	if err != nil {
+		return "", err
+	}
+	log.WithField("flavor", flavor).Info("Detected rootfs flavor for platform shim")
+
+	if err := seedRootfsResolvConf(rootfsDir); err != nil {
+		return "", fmt.Errorf("seed rootfs resolv.conf: %w", err)
+	}
+	if err := ensurePlatformDependencies(rootfsDir, flavor, log); err != nil {
+		return "", err
+	}
+	if err := installThawAgentBinary(rootfsDir, thawAgentBin); err != nil {
+		return "", err
+	}
+	if err := configureFlavorPlatform(rootfsDir, flavor, runnerUser); err != nil {
+		return "", err
+	}
+	if err := writeCommonRootfsFiles(rootfsDir, dockerEnv, log); err != nil {
+		return "", err
+	}
+	if err := createRunnerUser(rootfsDir, flavor, runnerUser); err != nil {
+		return "", err
+	}
+	if err := ensureWorkspaceOwnership(rootfsDir, runnerUser); err != nil {
+		return "", err
+	}
+	if err := validateInjectedRootfs(rootfsDir, flavor, runnerUser); err != nil {
+		return "", fmt.Errorf("platform shim validation failed: %w", err)
 	}
 
-	// 2. Create /init symlink to systemd
-	initLink := filepath.Join(rootfsDir, "init")
-	os.Remove(initLink) // remove if exists
-	if err := os.Symlink("/lib/systemd/systemd", initLink); err != nil {
-		// Try /sbin/init fallback
-		os.Symlink("/lib/systemd/systemd", filepath.Join(rootfsDir, "sbin/init"))
-	}
-
-	// 3. Copy thaw-agent binary (statically linked, available at /usr/local/bin/thaw-agent on the builder VM)
-	thawAgentSrc := "/usr/local/bin/thaw-agent"
-	thawAgentDst := filepath.Join(rootfsDir, "usr/local/bin/thaw-agent")
-	os.MkdirAll(filepath.Dir(thawAgentDst), 0755)
-	if err := copyFile(thawAgentSrc, thawAgentDst); err != nil {
-		return fmt.Errorf("failed to copy thaw-agent: %w", err)
-	}
-	os.Chmod(thawAgentDst, 0755)
-
-	// 4. Write thaw-agent systemd service
-	serviceDir := filepath.Join(rootfsDir, "etc/systemd/system")
-	os.MkdirAll(serviceDir, 0755)
-	serviceContent := fmt.Sprintf(`[Unit]
-Description=Thaw Agent - MicroVM initialization
-After=network.target
-Wants=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/thaw-agent --runner-user=%s
-Restart=on-failure
-RestartSec=5
-StandardOutput=journal+console
-StandardError=journal+console
-Environment=LOG_LEVEL=info
-Environment=HOME=/root
-
-[Install]
-WantedBy=multi-user.target
-`, runnerUser)
-	if err := os.WriteFile(filepath.Join(serviceDir, "thaw-agent.service"), []byte(serviceContent), 0644); err != nil {
-		return fmt.Errorf("failed to write thaw-agent.service: %w", err)
-	}
-	// Enable the service
-	wantsDir := filepath.Join(serviceDir, "multi-user.target.wants")
-	os.MkdirAll(wantsDir, 0755)
-	os.Symlink("/etc/systemd/system/thaw-agent.service", filepath.Join(wantsDir, "thaw-agent.service"))
-
-	// 5. Write network config (static IP, configured at runtime by thaw-agent)
-	networkDir := filepath.Join(rootfsDir, "etc/systemd/network")
-	os.MkdirAll(networkDir, 0755)
-	networkContent := `[Match]
-Name=eth0
-
-[Network]
-DHCP=no
-`
-	os.WriteFile(filepath.Join(networkDir, "10-eth0.network"), []byte(networkContent), 0644)
-
-	// 6. Configure systemd defaults
-	exec.Command("chroot", rootfsDir, "systemctl", "set-default", "multi-user.target").Run()
-	exec.Command("chroot", rootfsDir, "systemctl", "mask",
-		"systemd-resolved.service", "systemd-timesyncd.service").Run()
-
-	// 7. Create required directories
-	for _, dir := range []string{
-		"workspace",
-		"var/run/thaw-agent",
-		"var/log/thaw-agent",
-		"mnt/ephemeral/caches/repository",
-		"mnt/ephemeral/bazel",
-		"mnt/ephemeral/output",
-	} {
-		os.MkdirAll(filepath.Join(rootfsDir, dir), 0755)
-	}
-
-	// 8. Create runner user if it doesn't exist (no sudo access by default).
-	// The runner user runs user-level commands (git clone, builds, etc.).
-	// Only thaw-agent (running as root via systemd) and commands explicitly
-	// marked with run_as_root: true get root privileges.
-	exec.Command("chroot", rootfsDir, "useradd", "-m", "-s", "/bin/bash", runnerUser).Run()
-	// Ensure the runner user owns its workspace
-	exec.Command("chroot", rootfsDir, "chown", "-R", runnerUser+":"+runnerUser, "/workspace").Run()
-
-	// 9. Set hostname, DNS defaults, and /etc/hosts.
-	// Docker bind-mounts /etc/hosts at runtime, so `docker export` produces
-	// an empty file. We must write a proper one or localhost won't resolve,
-	// breaking health checks and any loopback connections.
-	os.WriteFile(filepath.Join(rootfsDir, "etc/hostname"), []byte("runner\n"), 0644)
-	os.WriteFile(filepath.Join(rootfsDir, "etc/hosts"), []byte("127.0.0.1\tlocalhost\n::1\t\tlocalhost ip6-localhost ip6-loopback\n"), 0644)
-	os.WriteFile(filepath.Join(rootfsDir, "etc/resolv.conf.default"), []byte("nameserver 8.8.8.8\n"), 0644)
-
-	// Fix nsswitch.conf to use files+dns instead of systemd-resolve (which is masked).
-	// Many Docker images ship with "hosts: files resolve [!UNAVAIL=return] dns" which
-	// breaks getent/glibc resolution when systemd-resolved is not running.
-	nsswitchPath := filepath.Join(rootfsDir, "etc/nsswitch.conf")
-	if nssData, err := os.ReadFile(nsswitchPath); err == nil {
-		fixed := strings.ReplaceAll(string(nssData), "resolve [!UNAVAIL=return]", "")
-		fixed = strings.ReplaceAll(fixed, "resolve", "")
-		os.WriteFile(nsswitchPath, []byte(fixed), 0644)
-	}
-
-	// 10. Enable serial console for Firecracker
-	exec.Command("chroot", rootfsDir, "systemctl", "enable", "serial-getty@ttyS0.service").Run()
-
-	// 11. Write Docker image ENV variables to /etc/environment so all processes
-	// (including start_command, login shells, etc.) inherit them. Docker ENV
-	// directives are image metadata, not filesystem content, so they're lost
-	// during docker export → ext4 conversion. We restore them here.
-	if len(dockerEnv) > 0 {
-		var envLines []string
-		for _, env := range dockerEnv {
-			// Skip Docker-internal vars that don't make sense in a VM context
-			if strings.HasPrefix(env, "DEBIAN_FRONTEND=") {
-				continue
-			}
-			envLines = append(envLines, env)
-		}
-		if len(envLines) > 0 {
-			envContent := strings.Join(envLines, "\n") + "\n"
-			envPath := filepath.Join(rootfsDir, "etc/environment")
-			if err := os.WriteFile(envPath, []byte(envContent), 0644); err != nil {
-				log.WithError(err).Warn("Failed to write /etc/environment")
-			} else {
-				log.WithField("env_count", len(envLines)).Info("Wrote Docker ENV to /etc/environment")
-			}
-
-			// Also write a profile.d script so interactive shells source them.
-			// /etc/environment is read by PAM but not by non-login shells;
-			// the profile.d script covers bash -c invocations used by thaw-agent.
-			profileDir := filepath.Join(rootfsDir, "etc/profile.d")
-			os.MkdirAll(profileDir, 0755)
-			var profileLines []string
-			for _, env := range envLines {
-				if idx := strings.Index(env, "="); idx > 0 {
-					key := env[:idx]
-					val := env[idx+1:]
-					profileLines = append(profileLines, fmt.Sprintf("export %s=%q", key, val))
-				}
-			}
-			profileContent := "# Docker image environment variables\n" + strings.Join(profileLines, "\n") + "\n"
-			profilePath := filepath.Join(profileDir, "docker-env.sh")
-			if err := os.WriteFile(profilePath, []byte(profileContent), 0755); err != nil {
-				log.WithError(err).Warn("Failed to write /etc/profile.d/docker-env.sh")
-			}
-		}
-	}
-
-	log.WithField("runner_user", runnerUser).Info("Platform shim injected successfully")
-	return nil
+	log.WithFields(logrus.Fields{
+		"runner_user": runnerUser,
+		"flavor":      flavor,
+	}).Info("Platform shim injected successfully")
+	return flavor, nil
 }

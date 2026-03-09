@@ -96,6 +96,6 @@ start_command:
 
 ```bash
 cp examples/ci-bazel-remote-exec/onboard.yaml my-bazel.yaml
-# Edit: set gcp_project, repository.url, certs paths
+# Edit my-bazel.yaml: set platform.gcp_project and workload values
 make onboard CONFIG=my-bazel.yaml
 ```

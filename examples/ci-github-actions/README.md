@@ -44,11 +44,15 @@ base image -- no platform code changes needed.
 
 ```yaml
 workload:
-  snapshot_commands:
-    - type: "shell"
-      args: ["bash", "-c", "git clone --depth=1 -b main https://github.com/myorg/myrepo /workspace"]
-    - type: "shell"
-      args: ["bazel", "fetch", "//..."]
+  base_image: "us-docker.pkg.dev/my-project/images/ci-runner:latest"
+
+  layers:
+    - name: "workspace"
+      init_commands:
+        - type: "shell"
+          args: ["bash", "-c", "git clone --depth=1 -b main https://github.com/myorg/myrepo /workspace"]
+        - type: "shell"
+          args: ["bazel", "fetch", "//..."]
 
   start_command:
     command: ["/home/runner/config.sh", "--url", "https://github.com/myorg/myrepo",
@@ -78,6 +82,6 @@ When a job finishes, if the VM's `WorkloadKey` matches a waiting paused VM in th
 
 ```bash
 cp examples/ci-github-actions/onboard.yaml my-ci.yaml
-# Edit my-ci.yaml: set platform.gcp_project, repository.url, start_command URL
+# Edit my-ci.yaml: set platform.gcp_project and workload/start_command values
 make onboard CONFIG=my-ci.yaml
 ```
