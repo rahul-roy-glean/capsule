@@ -862,11 +862,11 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 	runner, err := s.hostRegistry.GetRunner(req.RunnerID)
 	if err != nil {
 		// Check if suspended in session_snapshots
-		var sessionID, hostID string
+		var sessionID, hostID, workloadKey string
 		var status string
 		scanErr := s.scheduler.db.QueryRowContext(r.Context(),
-			`SELECT session_id, host_id, status FROM session_snapshots WHERE runner_id = $1`,
-			req.RunnerID).Scan(&sessionID, &hostID, &status)
+			`SELECT session_id, host_id, workload_key, status FROM session_snapshots WHERE runner_id = $1`,
+			req.RunnerID).Scan(&sessionID, &hostID, &workloadKey, &status)
 		if scanErr != nil || status != "suspended" {
 			http.Error(w, "runner not found", http.StatusNotFound)
 			return
@@ -881,9 +881,6 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 			resumeHost = origHost
 		} else {
 			// Look up workload_key for affinity scheduling
-			var workloadKey string
-			_ = s.scheduler.db.QueryRowContext(r.Context(),
-				`SELECT workload_key FROM session_snapshots WHERE session_id = $1`, sessionID).Scan(&workloadKey)
 			resumeHost = s.scheduler.selectBestHostForWorkloadKey(s.hostRegistry.GetAvailableHosts(), workloadKey)
 		}
 		if resumeHost == nil {
@@ -914,16 +911,33 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 			return
 		}
 
+		resumedRunnerID := resp.Runner.GetId()
+		if resumedRunnerID == "" {
+			http.Error(w, "resume succeeded but returned empty runner id", http.StatusInternalServerError)
+			return
+		}
+
+		if err := s.hostRegistry.AddRunner(r.Context(), &Runner{
+			ID:          resumedRunnerID,
+			HostID:      resumeHost.ID,
+			Status:      "busy",
+			InternalIP:  resp.Runner.GetInternalIp(),
+			WorkloadKey: workloadKey,
+		}); err != nil {
+			http.Error(w, "failed to register resumed runner", http.StatusInternalServerError)
+			return
+		}
+
 		// Update session status and host assignment
 		_, _ = s.scheduler.db.ExecContext(r.Context(),
-			`UPDATE session_snapshots SET status = 'active', host_id = $1 WHERE session_id = $2`,
-			resumeHost.ID, sessionID)
+			`UPDATE session_snapshots SET runner_id = $1, status = 'active', host_id = $2 WHERE session_id = $3`,
+			resumedRunnerID, resumeHost.ID, sessionID)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(map[string]string{
 			"status":       "resumed",
-			"runner_id":    resp.Runner.GetId(),
+			"runner_id":    resumedRunnerID,
 			"host_address": resumeHost.HTTPAddress,
 		})
 		return
