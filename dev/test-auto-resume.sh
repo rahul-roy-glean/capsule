@@ -5,19 +5,22 @@
 # resumes it without requiring an explicit /connect call.
 #
 # Usage:
-#   SESSION_CHUNK_BUCKET=rroy-gc-testing make dev-test-auto-resume
+#   GCS_BUCKET=rroy-gc-testing make dev-test-auto-resume
 #
 # Prerequisites:
 #   - Golden chunked snapshot uploaded: GCS_BUCKET=<bucket> ENABLE_CHUNKED=true make dev-snapshot
-#   - Stack running with GCS sessions:  SESSION_CHUNK_BUCKET=<bucket> make dev-stack
+#   - Stack running with GCS sessions:  GCS_BUCKET=<bucket> make dev-stack
 set -euo pipefail
 
 CP=http://localhost:8080
 MGR=http://localhost:9080
 SESSION_ID="auto-e2e-$(date +%s)"
-GCS_BUCKET=${SESSION_CHUNK_BUCKET:-}
+GCS_BUCKET=${GCS_BUCKET:-${SESSION_CHUNK_BUCKET:-}}
 PASS=0
 FAIL=0
+
+. "$(dirname "${BASH_SOURCE[0]}")/lib-workload-key.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/lib-gcs-mode.sh"
 
 pass() { echo "  ✓ $1"; PASS=$((PASS + 1)); }
 fail() { echo "  ✗ $1"; FAIL=$((FAIL + 1)); }
@@ -33,37 +36,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ -z "$GCS_BUCKET" ]; then
-  echo "FAIL: SESSION_CHUNK_BUCKET is required."
-  echo "Usage: SESSION_CHUNK_BUCKET=your-bucket make dev-test-auto-resume"
-  exit 1
-fi
+GCS_BUCKET=$(require_gcs_bucket)
+assert_manager_gcs_mode "$GCS_BUCKET"
 
 echo "GCS bucket: $GCS_BUCKET"
 echo "Session ID: $SESSION_ID"
 
 # ---------------------------------------------------------------------------
-header "1. Register snapshot config"
+header "1. Discover workload key from built snapshot"
 # ---------------------------------------------------------------------------
-SNAPSHOT_COMMANDS=${SNAPSHOT_COMMANDS:-'[{"type":"shell","args":["echo","dev-snapshot-ready"]}]'}
-CONFIG_RESP=$(curl -s -X POST "$CP/api/v1/layered-configs" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "display_name": "rootfs-durability-test",
-    "layers": [{"name":"base","init_commands":'"$SNAPSHOT_COMMANDS"'}],
-    "config": {
-      "ttl": 300,
-      "auto_pause": true,
-      "session_max_age_seconds": 3600
-    }
-  }')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.leaf_workload_key')
+WORKLOAD_KEY=$(discover_workload_key || true)
 echo "  workload_key=$WORKLOAD_KEY"
 
 if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then
-  pass "Snapshot config registered"
+  pass "Workload key discovered"
 else
-  fail "Snapshot config registration failed: $CONFIG_RESP"
+  fail "Could not discover workload key from snapshot-builder logs (set WORKLOAD_KEY=... to override)"
   exit 1
 fi
 

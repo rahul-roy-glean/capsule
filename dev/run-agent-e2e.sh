@@ -37,7 +37,7 @@ bash dev/stop-stack.sh 2>/dev/null || true
 sleep 2
 
 if [ -n "$GCS_BUCKET" ]; then
-  SESSION_CHUNK_BUCKET="$GCS_BUCKET" bash dev/run-stack.sh
+  GCS_BUCKET="$GCS_BUCKET" bash dev/run-stack.sh
 else
   bash dev/run-stack.sh
 fi
@@ -47,7 +47,7 @@ echo ""
 echo "Phase 2: Agent session lifecycle tests"
 echo "--------------------------------------"
 if [ -n "$GCS_BUCKET" ]; then
-  SESSION_CHUNK_BUCKET="$GCS_BUCKET" bash dev/test-agent-sessions.sh
+  GCS_BUCKET="$GCS_BUCKET" bash dev/test-agent-sessions.sh
 else
   bash dev/test-agent-sessions.sh
 fi

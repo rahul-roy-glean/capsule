@@ -5,23 +5,29 @@
 # interaction, pause/resume with state preservation, multi-layer chains,
 # and network policy enforcement.
 #
-# When SESSION_CHUNK_BUCKET is set (GCS mode), additionally verifies:
+# When GCS_BUCKET is set (GCS mode), additionally verifies:
 #   - GCS manifest + chunk index uploaded after pause
 #   - Cross-host resume (local layers deleted, resume from GCS only)
 #
 # Usage:
-#   SESSION_CHUNK_BUCKET=my-bucket make dev-test-agent-sessions   # GCS route
+#   GCS_BUCKET=my-bucket make dev-test-agent-sessions             # GCS route
 #   make dev-test-agent-sessions                                   # local-only
 #
 # Prerequisites:
-#   - Stack running: make dev-stack (or SESSION_CHUNK_BUCKET=<bucket> make dev-stack)
+#   - Stack running: make dev-stack (or GCS_BUCKET=<bucket> make dev-stack)
 #   - Agent snapshot built: make dev-agent-snapshot (or GCS_BUCKET=<bucket> make dev-agent-snapshot)
 set -euo pipefail
 
 CP=http://localhost:8080
 MGR=http://localhost:9080
 SESSION_ID="agent-test-$(date +%s)"
-GCS_BUCKET=${SESSION_CHUNK_BUCKET:-}
+GCS_BUCKET=${GCS_BUCKET:-${SESSION_CHUNK_BUCKET:-}}
+if [ -n "$GCS_BUCKET" ]; then
+  . "$(dirname "${BASH_SOURCE[0]}")/lib-gcs-mode.sh"
+  GCS_BUCKET=$(resolve_gcs_bucket)
+  assert_manager_gcs_mode "$GCS_BUCKET"
+fi
+
 PASS=0
 FAIL=0
 SKIP=0
@@ -157,7 +163,7 @@ echo "Session ID: $SESSION_ID"
 if [ -n "$GCS_BUCKET" ]; then
   echo "GCS mode:   bucket=$GCS_BUCKET (chunked snapshots + cross-host resume)"
 else
-  echo "Local-only mode (set SESSION_CHUNK_BUCKET=<bucket> for GCS route)"
+  echo "Local-only mode (set GCS_BUCKET=<bucket> for GCS route)"
 fi
 
 # =========================================================================
