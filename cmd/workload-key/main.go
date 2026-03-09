@@ -35,8 +35,24 @@ func main() {
 	}
 
 	if leaf {
-		layerHash := snapshot.ComputeLayerHash("", commands, nil)
-		fmt.Println(snapshot.ComputeLeafWorkloadKey(layerHash))
+		// Mirror the control plane's layered-config materialization logic so the
+		// computed leaf key matches RegisterLayeredConfig exactly, including the
+		// auto-injected workspace drive defaults for user layers.
+		cfg := &snapshot.LayeredConfig{
+			DisplayName: "workload-key",
+			Layers: []snapshot.LayerDef{
+				{
+					Name:         "base",
+					InitCommands: commands,
+				},
+			},
+		}
+		layers := snapshot.MaterializeLayers(cfg)
+		if len(layers) == 0 {
+			fmt.Fprintln(os.Stderr, "failed to materialize layers")
+			os.Exit(1)
+		}
+		fmt.Println(snapshot.ComputeLeafWorkloadKey(layers[len(layers)-1].LayerHash))
 	} else {
 		fmt.Println(snapshot.ComputeWorkloadKey(commands))
 	}
