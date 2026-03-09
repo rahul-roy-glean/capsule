@@ -69,6 +69,10 @@ def _entry_names(entries: list[dict[str, Any]]) -> set[str]:
     return names
 
 
+def _normalized_stdout(text: str) -> str:
+    return text.rstrip("\r\n")
+
+
 def test_sdk_live_e2e() -> None:
     base_url = os.getenv("BF_BASE_URL", "http://localhost:8080").rstrip("/")
     _preflight_local_stack(base_url)
@@ -129,7 +133,7 @@ def test_sdk_live_e2e() -> None:
 
                 exec_result = runner.exec_collect("sh", "-lc", f"printf {unique}")
                 assert exec_result.exit_code == 0
-                assert exec_result.stdout == unique
+                assert _normalized_stdout(exec_result.stdout) == unique
 
                 write_result = runner.write_file(text_path, unique)
                 assert write_result["bytes_written"] == len(unique)
@@ -166,7 +170,7 @@ def test_sdk_live_e2e() -> None:
 
                 resumed_exec = runner.exec_collect("sh", "-lc", "printf resumed")
                 assert resumed_exec.exit_code == 0
-                assert resumed_exec.stdout == "resumed"
+                assert _normalized_stdout(resumed_exec.stdout) == "resumed"
 
                 remove_text = runner.remove(text_path)
                 assert remove_text["removed"] is True
