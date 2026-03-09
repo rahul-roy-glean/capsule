@@ -73,6 +73,37 @@ def _normalized_stdout(text: str) -> str:
     return text.rstrip("\r\n")
 
 
+def _allocate_with_retry(
+    client: BFClient,
+    workload_key: str,
+    *,
+    session_id: str,
+    network_policy_preset: str,
+    timeout: float = 45.0,
+    poll_interval: float = 2.0,
+) -> Any:
+    deadline = time.monotonic() + timeout
+    last_error: BFServiceUnavailable | None = None
+
+    while time.monotonic() < deadline:
+        try:
+            return client.runners.allocate(
+                workload_key,
+                session_id=session_id,
+                network_policy_preset=network_policy_preset,
+            )
+        except BFServiceUnavailable as exc:
+            last_error = exc
+            time.sleep(poll_interval)
+
+    raise RuntimeError(
+        "The control plane is reachable, but there are no allocatable hosts yet. "
+        "If you just started the stack, wait a few seconds for firecracker-manager "
+        "to heartbeat and retry. Otherwise inspect `/tmp/fc-dev/logs/control-plane.log` "
+        "and `/tmp/fc-dev/logs/firecracker-manager.log`."
+    ) from last_error
+
+
 def test_sdk_live_e2e() -> None:
     base_url = os.getenv("BF_BASE_URL", "http://localhost:8080").rstrip("/")
     _preflight_local_stack(base_url)
@@ -108,17 +139,12 @@ def test_sdk_live_e2e() -> None:
             assert detail.config.config_id == config_id
             assert detail.config.leaf_workload_key == created.leaf_workload_key
 
-            try:
-                allocation = client.runners.allocate(
-                    created.leaf_workload_key,
-                    session_id=session_id,
-                    network_policy_preset="restricted-egress",
-                )
-            except BFServiceUnavailable as exc:
-                raise RuntimeError(
-                    "The control plane is reachable, but runner allocation failed. "
-                    "Spin up the local stack first with `bash dev/run-stack.sh`.",
-                ) from exc
+            allocation = _allocate_with_retry(
+                client,
+                created.leaf_workload_key,
+                session_id=session_id,
+                network_policy_preset="restricted-egress",
+            )
 
             runner = RunnerSession(
                 client.runners,
