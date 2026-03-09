@@ -33,17 +33,11 @@ echo "GCS bucket: $GCS_BUCKET"
 echo "Session ID: $SESSION_ID"
 
 # ---------------------------------------------------------------------------
-header "1. Discover workload key from built snapshot"
+header "1. Discover workload key and register config"
 # ---------------------------------------------------------------------------
-WORKLOAD_KEY=$(discover_workload_key || true)
-echo "  workload_key=$WORKLOAD_KEY"
-
-if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then
-  pass "Workload key discovered"
-else
-  fail "Could not discover workload key from snapshot-builder logs (set WORKLOAD_KEY=... to override)"
-  exit 1
-fi
+require_workload_key
+register_dev_config "gcs-pause-resume-test" '{"ttl": 300, "auto_pause": true, "session_max_age_seconds": 3600}'
+pass "Workload key discovered and config registered"
 
 # ---------------------------------------------------------------------------
 header "2. Allocate runner with session_id"
@@ -97,21 +91,11 @@ header "3b. TTL auto-pause behavioral test"
 # We allocate a SEPARATE short-lived runner for this test so we don't
 # disturb the main test runner.
 TTL_SESSION="ttl-test-$(date +%s)"
-SNAPSHOT_COMMANDS=${SNAPSHOT_COMMANDS:-'[{"type":"shell","args":["echo","dev-snapshot-ready"]}]'}
 
-# Register a snapshot config with a 3-second TTL
-TTL_CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "display_name": "ttl-auto-pause-test",
-    "layers": [{"name":"base","init_commands":'"$SNAPSHOT_COMMANDS"'}],
-    "config": {
-      "ttl": 3,
-      "auto_pause": true,
-      "session_max_age_seconds": 3600
-    }
-  }')
-TTL_WORKLOAD_KEY=$(echo "$TTL_CONFIG_RESP" | jq -r '.leaf_workload_key')
+# Re-register config with a 3-second TTL for the TTL subtest.
+# Uses the same workload key (same snapshot commands), just different TTL config.
+register_dev_config "ttl-auto-pause-test" '{"ttl": 3, "auto_pause": true, "session_max_age_seconds": 3600}'
+TTL_WORKLOAD_KEY="$WORKLOAD_KEY"
 echo "  TTL test workload_key=$TTL_WORKLOAD_KEY"
 
 TTL_ALLOC_RESP=$(curl -s -X POST "$CP/api/v1/runners/allocate" \

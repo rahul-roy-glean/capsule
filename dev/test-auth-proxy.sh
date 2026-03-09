@@ -106,23 +106,10 @@ echo "=== E2E Auth Proxy Tests ==="
 # =========================================================================
 
 header "0. Register snapshot config"
-CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "display_name": "auth-proxy-test",
-    "layers": [{"name":"base","init_commands":[{"type":"shell","args":["echo","auth-proxy-test"]}]}],
-    "config": {
-      "ttl": 120,
-      "auto_pause": false
-    }
-  }')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.leaf_workload_key')
-echo "  workload_key=$WORKLOAD_KEY"
-
-if [ -z "$WORKLOAD_KEY" ] || [ "$WORKLOAD_KEY" = "null" ]; then
-  fail "Could not register snapshot config"
-  exit 1
-fi
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$REPO_ROOT/dev/lib-workload-key.sh"
+require_workload_key
+register_dev_config "auth-proxy-test" '{"ttl": 120, "auto_pause": false}'
 pass "Snapshot config registered"
 
 # =========================================================================

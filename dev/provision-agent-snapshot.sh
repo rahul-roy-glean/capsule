@@ -121,6 +121,52 @@ fi
 echo ""
 echo "--- Snapshot files created successfully ---"
 
+# Save snapshot info for dev tests
+BUILT_WORKLOAD_KEY=$(grep -o '"workload_key":"[^"]*"' "$LOG_DIR/agent-snapshot-builder.log" | tail -1 | cut -d'"' -f4)
+BUILT_VERSION=$(grep -o '"version":"[^"]*"' "$LOG_DIR/agent-snapshot-builder.log" | grep -v '"version":"v1"' | tail -1 | cut -d'"' -f4)
+LEAF_WORKLOAD_KEY=$("$REPO_ROOT/bin/workload-key" --leaf "$SNAPSHOT_COMMANDS" 2>/dev/null || true)
+
+if [ -z "$BUILT_WORKLOAD_KEY" ]; then
+  echo "FAIL: could not extract workload_key from snapshot-builder log"
+  exit 1
+fi
+if [ -z "$BUILT_VERSION" ]; then
+  echo "FAIL: could not extract version from snapshot-builder log"
+  exit 1
+fi
+if [ -z "$LEAF_WORKLOAD_KEY" ]; then
+  echo "FAIL: could not compute leaf workload key (is bin/workload-key built?)"
+  exit 1
+fi
+
+cat > /tmp/fc-dev/snapshot-info.json << SNAPINFO
+{
+  "workload_key": "$BUILT_WORKLOAD_KEY",
+  "leaf_workload_key": "$LEAF_WORKLOAD_KEY",
+  "version": "$BUILT_VERSION",
+  "snapshot_commands": $SNAPSHOT_COMMANDS
+}
+SNAPINFO
+echo "Saved snapshot-info.json (workload_key=$BUILT_WORKLOAD_KEY, leaf=$LEAF_WORKLOAD_KEY)"
+
+# Publish GCS alias under the leaf workload key.
+# Order matters: metadata first, pointer last (matches production layer_builder.go).
+if [ -n "$LEAF_WORKLOAD_KEY" ] && [ -n "$BUILT_VERSION" ]; then
+  SRC_META="gs://$GCS_BUCKET/$GCS_PREFIX/$BUILT_WORKLOAD_KEY/snapshot_state/$BUILT_VERSION/chunked-metadata.json"
+  DST_META="gs://$GCS_BUCKET/$GCS_PREFIX/$LEAF_WORKLOAD_KEY/snapshot_state/$BUILT_VERSION/chunked-metadata.json"
+  if ! gsutil -q cp "$SRC_META" "$DST_META"; then
+    echo "FAIL: could not copy chunked metadata to leaf key path"
+    exit 1
+  fi
+  echo "Copied chunked metadata to leaf key path"
+
+  if ! echo '{"version":"'"$BUILT_VERSION"'"}' | gsutil -q cp - "gs://$GCS_BUCKET/$GCS_PREFIX/$LEAF_WORKLOAD_KEY/current-pointer.json"; then
+    echo "FAIL: could not publish leaf current-pointer.json"
+    exit 1
+  fi
+  echo "Published leaf pointer: $LEAF_WORKLOAD_KEY -> $BUILT_VERSION"
+fi
+
 # --- 5. Copy snapshot files to manager's snapshot cache ---
 echo ""
 echo "--- Copying snapshot files to $SNAPSHOT_DIR ---"

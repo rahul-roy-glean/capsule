@@ -177,14 +177,6 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 			r.SessionID = allocReq.SessionID
 			r.LastExecAt = r.StartedAt
 		}
-		// Set TTL config from request
-		if err == nil && allocReq.TTLSeconds > 0 {
-			r.TTLSeconds = allocReq.TTLSeconds
-			r.AutoPause = allocReq.AutoPause
-			if r.LastExecAt.IsZero() {
-				r.LastExecAt = r.StartedAt
-			}
-		}
 	}
 
 	if err != nil {
@@ -192,6 +184,13 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		return &pb.AllocateRunnerResponse{
 			Error: err.Error(),
 		}, nil
+	}
+
+	// Freeze TTL config on the runner for both fresh allocations and resumes.
+	r.TTLSeconds = allocReq.TTLSeconds
+	r.AutoPause = allocReq.AutoPause
+	if r.SessionID != "" && r.LastExecAt.IsZero() {
+		r.LastExecAt = r.StartedAt
 	}
 
 	// Apply network policy if requested
@@ -385,6 +384,31 @@ func (s *HostAgentServer) ResumeRunner(ctx context.Context, req *pb.ResumeRunner
 		return &pb.ResumeRunnerResponse{
 			Error: err.Error(),
 		}, nil
+	}
+
+	// Reapply the persisted TTL/network policy carried by the control plane.
+	r.TTLSeconds = int(req.TtlSeconds)
+	r.AutoPause = req.AutoPause
+
+	allocReq := runner.AllocateRequest{
+		RequestID:           "resume-" + req.SessionId,
+		WorkloadKey:         req.WorkloadKey,
+		SessionID:           req.SessionId,
+		TTLSeconds:          int(req.TtlSeconds),
+		AutoPause:           req.AutoPause,
+		NetworkPolicyPreset: req.NetworkPolicyPreset,
+	}
+	if req.NetworkPolicyJson != "" {
+		var np network.NetworkPolicy
+		if err := json.Unmarshal([]byte(req.NetworkPolicyJson), &np); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid network_policy_json: %v", err)
+		}
+		allocReq.NetworkPolicy = &np
+	}
+	if allocReq.NetworkPolicyPreset != "" || allocReq.NetworkPolicy != nil {
+		if policyErr := s.manager.ApplyNetworkPolicy(r.ID, allocReq); policyErr != nil {
+			s.logger.WithError(policyErr).WithField("runner_id", r.ID).Warn("Failed to reapply network policy on resume (non-fatal)")
+		}
 	}
 
 	return &pb.ResumeRunnerResponse{

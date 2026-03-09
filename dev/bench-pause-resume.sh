@@ -15,8 +15,8 @@ set -uo pipefail
 CP=http://localhost:8080
 MGR=http://localhost:9080
 GCS_BUCKET=${GCS_BUCKET:-${SESSION_CHUNK_BUCKET:-}}
-SNAPSHOT_COMMANDS=${SNAPSHOT_COMMANDS:-'[{"type":"shell","args":["echo","dev-snapshot-ready"]}]'}
 
+. "$(dirname "${BASH_SOURCE[0]}")/lib-workload-key.sh"
 . "$(dirname "${BASH_SOURCE[0]}")/lib-gcs-mode.sh"
 GCS_BUCKET=$(require_gcs_bucket)
 
@@ -27,20 +27,6 @@ now_ms() { date +%s%3N; }
 elapsed_ms() {
   local start=$1 end=$2
   echo $((end - start))
-}
-
-register_config() {
-  curl -sf -X POST "$CP/api/v1/layered-configs" \
-    -H 'Content-Type: application/json' \
-    -d '{
-      "display_name": "bench-pause-resume",
-      "layers": [{"name":"base","init_commands":'"$SNAPSHOT_COMMANDS"'}],
-      "config": {
-        "ttl": 600,
-        "auto_pause": true,
-        "session_max_age_seconds": 3600
-      }
-    }' | jq -r '.leaf_workload_key'
 }
 
 allocate() {
@@ -102,7 +88,8 @@ echo ""
 echo "GCS bucket: $GCS_BUCKET"
 echo ""
 
-WORKLOAD_KEY=$(register_config)
+require_workload_key
+register_dev_config "bench-pause-resume" '{"ttl": 600, "auto_pause": true, "session_max_age_seconds": 3600}'
 echo "Workload key: $WORKLOAD_KEY"
 echo ""
 

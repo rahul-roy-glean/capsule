@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -12,9 +13,9 @@ import (
 )
 
 // startTTLEnforcement runs a background loop that auto-pauses idle runners
-// whose workload_key has auto_pause enabled and whose idle duration exceeds
-// the configured runner_ttl_seconds. This centralises TTL enforcement in the
-// control plane instead of each host agent acting independently.
+// whose persisted runner config has auto_pause enabled and whose idle duration
+// exceeds the stored runner_ttl_seconds. This centralises TTL enforcement in
+// the control plane instead of each host agent acting independently.
 func (s *ControlPlaneServer) startTTLEnforcement(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -30,27 +31,42 @@ func (s *ControlPlaneServer) startTTLEnforcement(ctx context.Context) {
 }
 
 func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
-	// Build a lookup of workload_key → (ttl, auto_pause) from layered_configs.
-	type ttlConfig struct {
-		ttlSeconds int
-		autoPause  bool
+	// Build a lookup of runner_id → persisted TTL/network policy config from the
+	// runners table. This freezes TTL behavior at allocate time instead of
+	// re-reading mutable layered-config defaults by workload key.
+	type runnerConfig struct {
+		ttlSeconds          int
+		autoPause           bool
+		workloadKey         string
+		networkPolicyPreset string
+		networkPolicyJSON   string
 	}
-	configs := make(map[string]ttlConfig)
+	configs := make(map[string]runnerConfig)
 	if s.snapshotManager != nil && s.snapshotManager.db != nil {
 		rows, err := s.snapshotManager.db.QueryContext(ctx,
-			`SELECT leaf_workload_key, runner_ttl_seconds, auto_pause FROM layered_configs WHERE auto_pause = true AND runner_ttl_seconds > 0`)
+			`SELECT id, workload_key, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
+			 FROM runners
+			 WHERE auto_pause = true AND runner_ttl_seconds > 0`)
 		if err != nil {
-			s.logger.WithError(err).Warn("TTL enforcement: failed to query layered_configs")
+			s.logger.WithError(err).Warn("TTL enforcement: failed to query runners")
 			return
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var wk string
-			var cfg ttlConfig
-			if err := rows.Scan(&wk, &cfg.ttlSeconds, &cfg.autoPause); err != nil {
+			var runnerID string
+			var cfg runnerConfig
+			var npPreset sql.NullString
+			var npJSON sql.NullString
+			if err := rows.Scan(&runnerID, &cfg.workloadKey, &cfg.ttlSeconds, &cfg.autoPause, &npPreset, &npJSON); err != nil {
 				continue
 			}
-			configs[wk] = cfg
+			if npPreset.Valid {
+				cfg.networkPolicyPreset = npPreset.String
+			}
+			if npJSON.Valid {
+				cfg.networkPolicyJSON = npJSON.String
+			}
+			configs[runnerID] = cfg
 		}
 	}
 	if len(configs) == 0 {
@@ -62,7 +78,7 @@ func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
 		runnerID    string
 		hostID      string
 		grpcAddress string
-		workloadKey string
+		config      runnerConfig
 	}
 	var candidates []pauseCandidate
 
@@ -76,7 +92,7 @@ func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
 			if ri.State != "idle" {
 				continue
 			}
-			cfg, ok := configs[ri.WorkloadKey]
+			cfg, ok := configs[ri.RunnerID]
 			if !ok {
 				continue
 			}
@@ -88,7 +104,7 @@ func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
 					runnerID:    ri.RunnerID,
 					hostID:      h.ID,
 					grpcAddress: h.GRPCAddress,
-					workloadKey: ri.WorkloadKey,
+					config:      cfg,
 				})
 			}
 		}
@@ -125,14 +141,26 @@ func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
 
 		// Update session_snapshots (same as HandlePauseRunner).
 		if resp.SessionId != "" && s.scheduler.db != nil {
+			var networkPolicy any
+			if c.config.networkPolicyJSON != "" {
+				networkPolicy = c.config.networkPolicyJSON
+			}
 			_, _ = s.scheduler.db.ExecContext(ctx, `
-				INSERT INTO session_snapshots (session_id, runner_id, workload_key, host_id, status, layer_count, paused_at)
-				VALUES ($1, $2, $3, $4, 'suspended', $5, NOW())
+				INSERT INTO session_snapshots (
+					session_id, runner_id, workload_key, host_id, status, layer_count, paused_at,
+					runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
+				)
+				VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9)
 				ON CONFLICT (session_id) DO UPDATE SET
 					status = 'suspended',
 					layer_count = EXCLUDED.layer_count,
-					paused_at = NOW()
-			`, resp.SessionId, c.runnerID, c.workloadKey, c.hostID, resp.Layer+1)
+					paused_at = NOW(),
+					runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
+					auto_pause = EXCLUDED.auto_pause,
+					network_policy_preset = EXCLUDED.network_policy_preset,
+					network_policy = EXCLUDED.network_policy
+			`, resp.SessionId, c.runnerID, c.config.workloadKey, c.hostID, resp.Layer+1,
+				c.config.ttlSeconds, c.config.autoPause, c.config.networkPolicyPreset, networkPolicy)
 		}
 
 		// Roll back optimistic resource reservation.

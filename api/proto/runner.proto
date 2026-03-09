@@ -323,6 +323,10 @@ message PauseRunnerResponse {
 message ResumeRunnerRequest {
   string session_id = 1;
   string workload_key = 2;
+  int32 ttl_seconds = 3;
+  bool auto_pause = 4;
+  string network_policy_preset = 5;
+  string network_policy_json = 6;
 }
 
 message ResumeRunnerResponse {

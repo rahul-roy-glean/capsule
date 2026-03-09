@@ -126,17 +126,11 @@ echo "  GCS bucket:  $GCS_BUCKET"
 echo "  Session ID:  $SESSION_ID"
 
 # =====================================================================
-header "1. Discover workload key from built snapshot"
+header "1. Discover workload key and register config"
 # =====================================================================
-WORKLOAD_KEY=$(discover_workload_key || true)
-info "workload_key=$WORKLOAD_KEY"
-
-if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then
-  pass "Workload key discovered"
-else
-  fail "Could not discover workload key from snapshot-builder logs (set WORKLOAD_KEY=... to override)"
-  exit 1
-fi
+require_workload_key
+register_dev_config "multi-pause-dedup-test" '{"ttl": 300, "auto_pause": true, "session_max_age_seconds": 3600}'
+pass "Workload key discovered and config registered"
 
 # =====================================================================
 header "2. Allocate runner with session_id"

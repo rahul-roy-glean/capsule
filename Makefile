@@ -29,7 +29,7 @@ GOARCH_TARGET ?= amd64
 export PATH := /usr/local/go/bin:$(PATH)
 
 # Binaries
-BINARIES := firecracker-manager control-plane snapshot-builder thaw-agent bin-onboard
+BINARIES := firecracker-manager control-plane snapshot-builder thaw-agent bin-onboard workload-key
 
 all: build
 
@@ -52,6 +52,9 @@ thaw-agent:
 
 bin-onboard:
 	$(CROSS_BUILD) $(GO) build $(GOFLAGS) -o bin/onboard ./cmd/onboard
+
+workload-key:
+	$(GO) build $(GOFLAGS) -o bin/workload-key ./cmd/workload-key
 
 bench-allocate:
 	$(GO) build $(GOFLAGS) -o bin/bench-allocate ./cmd/bench-allocate

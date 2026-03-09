@@ -21,6 +21,9 @@
 #   - ipset installed: sudo apt-get install -y ipset
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$REPO_ROOT/dev/lib-workload-key.sh"
+
 CP=http://localhost:8080
 MGR=http://localhost:9080
 PASS=0
@@ -141,11 +144,11 @@ cleanup() {
 trap cleanup EXIT
 
 # Pre-cleanup: delete any leftover configs from previous runs by listing all
-# configs and deleting any whose display_name starts with "netpol-test".
+# configs and deleting any whose display_name starts with "netpol-".
 pre_cleanup() {
   local list
   list=$(curl -sf "$CP/api/v1/layered-configs" 2>/dev/null) || return 0
-  echo "$list" | jq -r '.configs[]? | select(.display_name | startswith("netpol-test")) | .config_id' | while read -r cid; do
+  echo "$list" | jq -r '.configs[]? | select(.display_name | startswith("netpol-")) | .config_id' | while read -r cid; do
     curl -s -X DELETE "$CP/api/v1/layered-configs/$cid" > /dev/null 2>&1 || true
     echo "  pre-cleanup: deleted stale config $cid"
   done
@@ -170,23 +173,12 @@ echo "=== E2E Network Policy Tests ==="
 # ---------------------------------------------------------------------------
 header "1. Register layered config (no policy — backwards compat)"
 # ---------------------------------------------------------------------------
-CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "display_name": "netpol-test",
-    "layers": [{"name": "base", "init_commands": [{"type":"shell","args":["echo","netpol-test-nopolicy"]}]}],
-    "config": {"ttl": 120, "auto_pause": false}
-  }')
+require_workload_key
+register_dev_config "netpol-test" '{"ttl": 120, "auto_pause": false}'
 CONFIG_ID=$(echo "$CONFIG_RESP" | jq -r '.config_id')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.leaf_workload_key')
 CONFIG_IDS+=("$CONFIG_ID")
 echo "  config_id=$CONFIG_ID  workload_key=$WORKLOAD_KEY"
-
-if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then
-  pass "Layered config registered (no policy)"
-else
-  fail "Layered config registration failed"; exit 1
-fi
+pass "Layered config registered (no policy)"
 
 GET_RESP=$(curl -sf "$CP/api/v1/layered-configs/$CONFIG_ID")
 NP=$(echo "$GET_RESP" | jq -r '.config.network_policy // "null"')
@@ -198,32 +190,10 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-header "2. Register layered config with policy preset"
+header "2. Allocate runner without policy (unrestricted)"
 # ---------------------------------------------------------------------------
-CONFIG_PRESET_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "display_name": "netpol-ci-test",
-    "layers": [{"name": "base", "init_commands": [{"type":"shell","args":["echo","netpol-ci"]}]}],
-    "config": {"ttl": 120, "auto_pause": false, "network_policy_preset": "restricted-egress"}
-  }')
-CONFIG_PRESET_ID=$(echo "$CONFIG_PRESET_RESP" | jq -r '.config_id')
-CONFIG_IDS+=("$CONFIG_PRESET_ID")
-GET_PRESET_RESP=$(curl -sf "$CP/api/v1/layered-configs/$CONFIG_PRESET_ID")
-NP_PRESET2=$(echo "$GET_PRESET_RESP" | jq -r '.config.network_policy_preset // ""')
-echo "  preset=$NP_PRESET2"
-
-if [ "$NP_PRESET2" = "restricted-egress" ]; then
-  pass "Config stored network_policy_preset=restricted-egress"
-else
-  fail "Expected preset restricted-egress, got '$NP_PRESET2'"
-fi
-
-# ---------------------------------------------------------------------------
-header "3. Allocate runner without policy (unrestricted)"
-# ---------------------------------------------------------------------------
-# Use the no-policy config's workload key. pre_cleanup() cleared stale DB
-# rows so the cache will only see this config with no preset set.
+# Allocate before registering any alternate config for the same workload key.
+# This validates the backwards-compatible default path.
 RUNNER_ID=$(allocate_and_wait "{\"ci_system\":\"none\",\"workload_key\":\"$WORKLOAD_KEY\"}")
 if [ "$RUNNER_ID" != "ALLOC_FAILED" ]; then
   pass "Runner allocated (no policy)"
@@ -232,7 +202,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-header "4. Get policy for unrestricted runner"
+header "3. Get policy for unrestricted runner"
 # ---------------------------------------------------------------------------
 sleep 1
 POLICY_RESP=$(curl -s "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID")
@@ -247,7 +217,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-header "5. Verify unrestricted runner has network access"
+header "4. Verify unrestricted runner has network access"
 # ---------------------------------------------------------------------------
 EXEC_OUT=$(vm_tcp_check "$RUNNER_ID" "8.8.8.8" "53")
 if echo "$EXEC_OUT" | grep -q "NET_OK"; then
@@ -256,18 +226,24 @@ else
   fail "Unrestricted runner has no network access"
 fi
 
-# Release unrestricted runner — we're done with it for connectivity tests.
-# Keep RUNNER_ID for validation tests in step 15 (runner must still exist).
-# Actually release it now and allocate fresh for validation later.
-curl -sf -X POST "$CP/api/v1/runners/release" \
-  -H 'Content-Type: application/json' \
-  -d "{\"runner_id\":\"$RUNNER_ID\"}" > /dev/null 2>&1 || true
-echo "  (released unrestricted runner to free capacity)"
-# Remove from cleanup list
-RUNNER_IDS=("${RUNNER_IDS[@]/$RUNNER_ID/}")
+# ---------------------------------------------------------------------------
+header "5. Register layered config with policy preset"
+# ---------------------------------------------------------------------------
+register_dev_config "netpol-ci-test" '{"ttl": 120, "auto_pause": false, "network_policy_preset": "restricted-egress"}'
+CONFIG_PRESET_ID=$(echo "$CONFIG_RESP" | jq -r '.config_id')
+CONFIG_IDS+=("$CONFIG_PRESET_ID")
+GET_PRESET_RESP=$(curl -sf "$CP/api/v1/layered-configs/$CONFIG_PRESET_ID")
+NP_PRESET2=$(echo "$GET_PRESET_RESP" | jq -r '.config.network_policy_preset // ""')
+echo "  preset=$NP_PRESET2"
+
+if [ "$NP_PRESET2" = "restricted-egress" ]; then
+  pass "Config stored network_policy_preset=restricted-egress"
+else
+  fail "Expected preset restricted-egress, got '$NP_PRESET2'"
+fi
 
 # =========================================================================
-# PART 2: restricted-egress preset enforcement
+# PART 2: concurrent restricted/unrestricted runners on same snapshot
 # =========================================================================
 
 # ---------------------------------------------------------------------------
@@ -285,9 +261,20 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-header "7. Verify restricted-egress policy is applied"
+header "7. Verify concurrent restricted and unrestricted policies"
 # ---------------------------------------------------------------------------
 sleep 1
+UNRESTRICTED_RESP=$(curl -s "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID")
+UNRESTRICTED_VER=$(echo "$UNRESTRICTED_RESP" | jq -r '.version // 0')
+UNRESTRICTED_POLICY=$(echo "$UNRESTRICTED_RESP" | jq -r '.policy')
+echo "  unrestricted version=$UNRESTRICTED_VER policy=$UNRESTRICTED_POLICY"
+
+if [ "$UNRESTRICTED_VER" = "0" ] && [ "$UNRESTRICTED_POLICY" = "null" ]; then
+  pass "Unrestricted runner kept its null policy after restricted runner allocation"
+else
+  fail "Unrestricted runner policy changed unexpectedly: $UNRESTRICTED_RESP"
+fi
+
 CI_RESP=$(curl -s "$MGR/api/v1/runners/network-policy?runner_id=$RUNNER_ID_CI")
 CI_VER=$(echo "$CI_RESP" | jq -r '.version // 0')
 CI_NAME=$(echo "$CI_RESP" | jq -r '.policy.name // ""')
@@ -297,6 +284,13 @@ echo "  version=$CI_VER name=$CI_NAME action=$CI_ACTION"
 [ "$CI_VER" = "1" ] && pass "Policy version 1" || fail "Expected version 1, got $CI_VER"
 [ "$CI_NAME" = "restricted-egress" ] && pass "Policy name is restricted-egress" || fail "Expected restricted-egress, got '$CI_NAME'"
 [ "$CI_ACTION" = "allow" ] && pass "default_egress_action=allow" || fail "Expected allow, got '$CI_ACTION'"
+
+# Release the unrestricted runner once we've proven both variants can coexist.
+curl -sf -X POST "$CP/api/v1/runners/release" \
+  -H 'Content-Type: application/json' \
+  -d "{\"runner_id\":\"$RUNNER_ID\"}" > /dev/null 2>&1 || true
+echo "  (released unrestricted runner after coexistence check)"
+RUNNER_IDS=("${RUNNER_IDS[@]/$RUNNER_ID/}")
 
 # ---------------------------------------------------------------------------
 header "8. restricted-egress: external egress works"

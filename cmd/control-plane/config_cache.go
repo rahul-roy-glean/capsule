@@ -66,7 +66,7 @@ func (cc *ConfigCache) loadFromDB() {
 	}
 
 	// Load layered_configs
-	lcRows, err := cc.db.Query(`SELECT leaf_workload_key, tier, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy FROM layered_configs`)
+	lcRows, err := cc.db.Query(`SELECT DISTINCT ON (leaf_workload_key) leaf_workload_key, tier, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy FROM layered_configs ORDER BY leaf_workload_key, created_at DESC`)
 	if err == nil {
 		defer lcRows.Close()
 		for lcRows.Next() {
@@ -148,7 +148,7 @@ func (cc *ConfigCache) loadWorkloadConfigFromDB(ctx context.Context, workloadKey
 	// Try layered_configs first
 	err := cc.db.QueryRowContext(ctx,
 		`SELECT tier, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy
-		 FROM layered_configs WHERE leaf_workload_key = $1`, workloadKey).Scan(
+		 FROM layered_configs WHERE leaf_workload_key = $1 ORDER BY created_at DESC LIMIT 1`, workloadKey).Scan(
 		&wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON)
 	if err != nil {
 		return nil
