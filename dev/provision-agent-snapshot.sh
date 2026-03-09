@@ -161,7 +161,7 @@ ls -lh "$SNAPSHOT_DIR/"
 echo ""
 if [ -n "$GCS_BUCKET" ]; then
   echo "GCS chunked snapshot uploaded to gs://$GCS_BUCKET/$GCS_PREFIX/"
-  echo "Run: SESSION_CHUNK_BUCKET=$GCS_BUCKET make dev-stop dev-stack dev-test-agent-sessions"
+  echo "Run: GCS_BUCKET=$GCS_BUCKET make dev-stop dev-stack dev-test-agent-sessions"
 else
   echo "Run 'make dev-stop && make dev-stack && make dev-test-agent-sessions' to test."
 fi
