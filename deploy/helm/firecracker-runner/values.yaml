@@ -75,6 +75,14 @@ env:
     secretName: github-credentials
     webhookSecretKey: webhook_secret
 
+auth:
+  apiToken:
+    secretName: ""
+    key: token
+  hostBootstrapToken:
+    secretName: ""
+    key: token
+
 gcp:
   # Required for safe scale-down and snapshot builder VMs.
   projectId: your-project

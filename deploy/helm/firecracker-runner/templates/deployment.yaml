@@ -64,6 +64,20 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.env.github.secretName }}
                   key: {{ .Values.env.github.webhookSecretKey }}
+{{- if .Values.auth.apiToken.secretName }}
+            - name: API_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.apiToken.secretName }}
+                  key: {{ .Values.auth.apiToken.key }}
+{{- end }}
+{{- if .Values.auth.hostBootstrapToken.secretName }}
+            - name: HOST_BOOTSTRAP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.hostBootstrapToken.secretName }}
+                  key: {{ .Values.auth.hostBootstrapToken.key }}
+{{- end }}
             - name: GCP_PROJECT_ID
               value: {{ .Values.gcp.projectId | quote }}
             - name: GCP_REGION

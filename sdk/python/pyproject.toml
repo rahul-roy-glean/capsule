@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bf-sdk"
-version = "1.0.0"
+dynamic = ["version"]
 description = "Python SDK for bazel-firecracker"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
+license = "Apache-2.0"
 dependencies = [
     "httpx>=0.27,<1.0",
     "pydantic>=2.0,<3.0",
@@ -27,6 +27,9 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/bf_sdk"]
 
+[tool.hatch.version]
+path = "src/bf_sdk/_version.py"
+
 [tool.ruff]
 target-version = "py310"
 line-length = 120
@@ -38,3 +41,8 @@ ignore = ["N818", "SIM117"]
 [tool.pyright]
 pythonVersion = "3.10"
 typeCheckingMode = "strict"
+
+[tool.pytest.ini_options]
+markers = [
+    "contract: tests that run against a live control-plane instance",
+]

@@ -35,8 +35,8 @@ class HttpClient:
             "User-Agent": config.user_agent,
             "Accept": "application/json",
         }
-        if config.api_key:
-            headers["X-API-Key"] = config.api_key
+        if config.token:
+            headers["Authorization"] = f"Bearer {config.token}"
 
         self._client = httpx.Client(
             base_url=config.base_url,

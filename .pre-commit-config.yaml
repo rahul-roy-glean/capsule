@@ -1,4 +1,10 @@
 repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.12.10
+    hooks:
+      - id: ruff
+        args: [--fix]
+
   - repo: local
     hooks:
       - id: gofmt
@@ -35,6 +41,12 @@ repos:
         types: [go]
         pass_filenames: false
         stages: [pre-push]
+
+      - id: migration-guard
+        name: migration guard
+        entry: bash .github/scripts/check-migrations.sh --staged
+        language: system
+        pass_filenames: false
 
   - repo: https://github.com/golangci/golangci-lint
     rev: v1.64.8

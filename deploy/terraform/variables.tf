@@ -93,6 +93,13 @@ variable "control_plane_addr" {
   default     = ""
 }
 
+variable "host_bootstrap_token" {
+  description = "Shared bearer token used by host VMs when sending authenticated heartbeats to the control plane"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
 variable "vpc_cidr" {
   description = "CIDR range for the VPC"
   type        = string
@@ -271,27 +278,3 @@ variable "github_org" {
   default     = ""
 }
 
-# Snapshot automation configuration
-variable "enable_snapshot_automation" {
-  description = "Enable Cloud Scheduler for automated snapshot freshness checks and rebuild triggers"
-  type        = bool
-  default     = false
-}
-
-variable "snapshot_freshness_schedule" {
-  description = "Cron schedule for snapshot freshness checks (Cloud Scheduler format)"
-  type        = string
-  default     = "0 */4 * * *"
-}
-
-variable "snapshot_max_age_hours" {
-  description = "Maximum snapshot age in hours before triggering rebuild"
-  type        = number
-  default     = 24
-}
-
-variable "snapshot_max_commit_drift" {
-  description = "Maximum number of commits behind HEAD before triggering rebuild"
-  type        = number
-  default     = 50
-}

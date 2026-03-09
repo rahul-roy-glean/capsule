@@ -136,6 +136,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 
 	// Derive repo slug for multi-repo support
 	workloadKey := req.WorkloadKey
+	var taggedSnapshotVersion string
 
 	// Look up config for fairness checks, start_command, tier, and TTL/auto_pause.
 	// Uses in-memory cache first, falls back to DB on miss.
@@ -211,6 +212,25 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 				}
 			}
 		}
+	}
+
+	if req.SnapshotTag != "" {
+		if workloadKey == "" {
+			return nil, fmt.Errorf("snapshot tag %q requires a workload_key", req.SnapshotTag)
+		}
+		if s.tagRegistry == nil {
+			return nil, fmt.Errorf("snapshot tag %q not found for workload %q", req.SnapshotTag, workloadKey)
+		}
+		v, err := s.tagRegistry.ResolveTagVersion(ctx, workloadKey, req.SnapshotTag)
+		if err != nil {
+			return nil, fmt.Errorf("snapshot tag %q not found for workload %q", req.SnapshotTag, workloadKey)
+		}
+		taggedSnapshotVersion = v
+		s.logger.WithFields(logrus.Fields{
+			"workload_key": workloadKey,
+			"snapshot_tag": req.SnapshotTag,
+			"version":      v,
+		}).Info("Resolved snapshot_tag to version")
 	}
 
 	// Resolve tier (default to "m")
@@ -313,21 +333,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// Resolve the desired snapshot version for this workload_key + host
 	var snapshotVersion string
 
-	// If a snapshot_tag was specified, resolve it to a version first
-	if req.SnapshotTag != "" && workloadKey != "" && s.tagRegistry != nil {
-		if v, err := s.tagRegistry.ResolveTagVersion(ctx, workloadKey, req.SnapshotTag); err == nil {
-			snapshotVersion = v
-			s.logger.WithFields(logrus.Fields{
-				"workload_key": workloadKey,
-				"snapshot_tag": req.SnapshotTag,
-				"version":      v,
-			}).Info("Resolved snapshot_tag to version")
-		} else {
-			s.logger.WithError(err).WithFields(logrus.Fields{
-				"workload_key": workloadKey,
-				"snapshot_tag": req.SnapshotTag,
-			}).Warn("Failed to resolve snapshot_tag, falling back to default version")
-		}
+	if taggedSnapshotVersion != "" {
+		snapshotVersion = taggedSnapshotVersion
 	}
 
 	if snapshotVersion == "" && workloadKey != "" && s.snapshotManager != nil && s.snapshotManager.db != nil {

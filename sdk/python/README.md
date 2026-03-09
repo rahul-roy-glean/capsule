@@ -53,7 +53,7 @@ cfg = (
     .with_auto_rollout(True)
 )
 
-with BFClient(base_url="http://localhost:8080", api_key="my-key") as bf:
+with BFClient(base_url="http://localhost:8080", token="my-token") as bf:
     # 2. Register the config and build
     result = bf.runner_configs.apply(cfg)
     bf.runner_configs.build(result.config_id)
@@ -86,7 +86,7 @@ For full control, use the resource APIs directly:
 ```python
 from bf_sdk import BFClient
 
-with BFClient(base_url="http://localhost:8080", api_key="my-key") as client:
+with BFClient(base_url="http://localhost:8080", token="my-token") as client:
     # Allocate a runner
     runner = client.runners.allocate("my-workload-key")
     client.runners.wait_ready(runner.runner_id)
@@ -149,7 +149,7 @@ with BFClient() as client:
 | Parameter | Env var | Default |
 |---|---|---|
 | `base_url` | `BF_BASE_URL` | `http://localhost:8080` |
-| `api_key` | `BF_API_KEY` | `None` |
+| `token` | `BF_TOKEN` | `None` |
 | `timeout` | - | `30.0` |
 
 ## Key Concepts

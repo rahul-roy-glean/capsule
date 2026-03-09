@@ -11,7 +11,7 @@ class ConnectionConfig:
     """Resolved connection configuration."""
 
     base_url: str
-    api_key: str | None
+    token: str | None
     timeout: float
     user_agent: str
 
@@ -20,7 +20,7 @@ class ConnectionConfig:
         cls,
         *,
         base_url: str | None = None,
-        api_key: str | None = None,
+        token: str | None = None,
         timeout: float = 30.0,
     ) -> ConnectionConfig:
         resolved_base_url = (
@@ -29,11 +29,11 @@ class ConnectionConfig:
             or "http://localhost:8080"
         ).rstrip("/")
 
-        resolved_api_key = api_key or os.environ.get("BF_API_KEY")
+        resolved_token = token or os.environ.get("BF_TOKEN")
 
         return cls(
             base_url=resolved_base_url,
-            api_key=resolved_api_key,
+            token=resolved_token,
             timeout=timeout,
             user_agent=f"bf-sdk-python/{__version__}",
         )

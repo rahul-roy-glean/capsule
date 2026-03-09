@@ -40,23 +40,24 @@ import (
 )
 
 var (
-	grpcPort       = flag.Int("grpc-port", 50051, "gRPC server port")
-	httpPort       = flag.Int("http-port", 8080, "HTTP server port (health/metrics)")
-	maxRunners     = flag.Int("max-runners", 16, "Maximum runners per host")
-	idleTarget     = flag.Int("idle-target", 2, "Target number of idle runners")
-	firecrackerBin = flag.String("firecracker-bin", "/usr/local/bin/firecracker", "Path to firecracker binary")
-	socketDir      = flag.String("socket-dir", "/var/run/firecracker", "Directory for VM sockets")
-	workspaceDir   = flag.String("workspace-dir", "/mnt/data/workspaces", "Directory for workspaces")
-	logDir         = flag.String("log-dir", "/var/log/firecracker", "Directory for VM logs")
-	snapshotBucket = flag.String("snapshot-bucket", "", "GCS bucket for snapshots")
-	snapshotCache  = flag.String("snapshot-cache", "/mnt/data/snapshots", "Local snapshot cache path")
-	quarantineDir  = flag.String("quarantine-dir", "/mnt/data/quarantine", "Directory to store quarantined runner manifests and debug metadata")
-	microVMSubnet  = flag.String("microvm-subnet", "172.16.0.0/24", "Subnet for microVMs")
-	extInterface   = flag.String("ext-interface", "eth0", "External network interface")
-	bridgeName     = flag.String("bridge-name", "fcbr0", "Bridge name for microVMs")
-	environment    = flag.String("environment", "dev", "Environment name")
-	controlPlane   = flag.String("control-plane", "", "Control plane address")
-	logLevel       = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+	grpcPort           = flag.Int("grpc-port", 50051, "gRPC server port")
+	httpPort           = flag.Int("http-port", 8080, "HTTP server port (health/metrics)")
+	maxRunners         = flag.Int("max-runners", 16, "Maximum runners per host")
+	idleTarget         = flag.Int("idle-target", 2, "Target number of idle runners")
+	firecrackerBin     = flag.String("firecracker-bin", "/usr/local/bin/firecracker", "Path to firecracker binary")
+	socketDir          = flag.String("socket-dir", "/var/run/firecracker", "Directory for VM sockets")
+	workspaceDir       = flag.String("workspace-dir", "/mnt/data/workspaces", "Directory for workspaces")
+	logDir             = flag.String("log-dir", "/var/log/firecracker", "Directory for VM logs")
+	snapshotBucket     = flag.String("snapshot-bucket", "", "GCS bucket for snapshots")
+	snapshotCache      = flag.String("snapshot-cache", "/mnt/data/snapshots", "Local snapshot cache path")
+	quarantineDir      = flag.String("quarantine-dir", "/mnt/data/quarantine", "Directory to store quarantined runner manifests and debug metadata")
+	microVMSubnet      = flag.String("microvm-subnet", "172.16.0.0/24", "Subnet for microVMs")
+	extInterface       = flag.String("ext-interface", "eth0", "External network interface")
+	bridgeName         = flag.String("bridge-name", "fcbr0", "Bridge name for microVMs")
+	environment        = flag.String("environment", "dev", "Environment name")
+	controlPlane       = flag.String("control-plane", "", "Control plane address")
+	hostBootstrapToken = flag.String("host-bootstrap-token", "", "Bearer token for authenticated host heartbeats")
+	logLevel           = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 
 	gcpProject = flag.String("gcp-project", "", "GCP project")
 
@@ -124,6 +125,13 @@ func main() {
 	// Get control plane address from instance metadata if not provided.
 	if *controlPlane == "" {
 		*controlPlane = getMetadataAttribute("control-plane")
+	}
+	if *hostBootstrapToken == "" {
+		if v := os.Getenv("HOST_BOOTSTRAP_TOKEN"); v != "" {
+			*hostBootstrapToken = v
+		} else {
+			*hostBootstrapToken = getMetadataAttribute("host-bootstrap-token")
+		}
 	}
 
 	// Get GCP project
@@ -414,7 +422,7 @@ func main() {
 
 	// Start heartbeat loop if control plane is configured
 	if *controlPlane != "" {
-		go heartbeatLoop(ctx, mgr, chunkedMgr, *controlPlane, instanceName, zone, *grpcPort, *httpPort, logger, hbLatencyHist)
+		go heartbeatLoop(ctx, mgr, chunkedMgr, *controlPlane, *hostBootstrapToken, instanceName, zone, *grpcPort, *httpPort, logger, hbLatencyHist)
 	}
 
 	// Wait for shutdown signal
@@ -429,7 +437,7 @@ func main() {
 
 	// Send a drain heartbeat to the control plane so it stops allocating to this host.
 	if *controlPlane != "" {
-		sendDrainHeartbeat(mgr, chunkedMgr, *controlPlane, instanceName, zone, *grpcPort, *httpPort, logger)
+		sendDrainHeartbeat(mgr, chunkedMgr, *controlPlane, *hostBootstrapToken, instanceName, zone, *grpcPort, *httpPort, logger)
 	}
 
 	// Pause all session-bound runners so their state is saved to GCS and they
@@ -692,7 +700,7 @@ type hostHeartbeatResponse struct {
 	Error              string            `json:"error,omitempty"`
 }
 
-func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, controlPlane, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger, hbLatencyHist metric.Float64Histogram) {
+func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, controlPlane, hostBootstrapToken, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger, hbLatencyHist metric.Float64Histogram) {
 	log := logger.WithField("component", "heartbeat")
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -745,6 +753,9 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				continue
 			}
 			req.Header.Set("Content-Type", "application/json")
+			if hostBootstrapToken != "" {
+				req.Header.Set("Authorization", "Bearer "+hostBootstrapToken)
+			}
 			resp, err := client.Do(req)
 			if err != nil {
 				log.WithError(err).Warn("Heartbeat request failed")
@@ -839,7 +850,7 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 
 // sendDrainHeartbeat sends a single heartbeat with Draining=true so the control
 // plane marks this host as draining before the process exits.
-func sendDrainHeartbeat(mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, controlPlane, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger) {
+func sendDrainHeartbeat(mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, controlPlane, hostBootstrapToken, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger) {
 	log := logger.WithField("component", "drain-heartbeat")
 
 	cp := strings.TrimSpace(controlPlane)
@@ -884,6 +895,9 @@ func sendDrainHeartbeat(mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, 
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if hostBootstrapToken != "" {
+		req.Header.Set("Authorization", "Bearer "+hostBootstrapToken)
+	}
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)

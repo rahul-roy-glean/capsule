@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -32,17 +32,20 @@ import (
 )
 
 var (
-	grpcPort   = flag.Int("grpc-port", 50051, "gRPC server port")
-	httpPort   = flag.Int("http-port", 8080, "HTTP server port")
-	dbHost     = flag.String("db-host", "localhost", "Database host")
-	dbPort     = flag.Int("db-port", 5432, "Database port")
-	dbUser     = flag.String("db-user", "postgres", "Database user")
-	dbPassword = flag.String("db-password", "", "Database password")
-	dbName     = flag.String("db-name", "firecracker_runner", "Database name")
-	dbSSLMode  = flag.String("db-ssl-mode", "disable", "Database SSL mode")
-	gcsBucket  = flag.String("gcs-bucket", "", "GCS bucket for snapshots")
-	gcsPrefix  = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
-	logLevel   = flag.String("log-level", "info", "Log level")
+	grpcPort           = flag.Int("grpc-port", 50051, "gRPC server port")
+	httpPort           = flag.Int("http-port", 8080, "HTTP server port")
+	dbHost             = flag.String("db-host", "localhost", "Database host")
+	dbPort             = flag.Int("db-port", 5432, "Database port")
+	dbUser             = flag.String("db-user", "postgres", "Database user")
+	dbPassword         = flag.String("db-password", "", "Database password")
+	dbName             = flag.String("db-name", "firecracker_runner", "Database name")
+	dbSSLMode          = flag.String("db-ssl-mode", "disable", "Database SSL mode")
+	gcsBucket          = flag.String("gcs-bucket", "", "GCS bucket for snapshots")
+	gcsPrefix          = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
+	logLevel           = flag.String("log-level", "info", "Log level")
+	apiAuthToken       = flag.String("api-auth-token", "", "Bearer token required for control-plane API requests (or API_AUTH_TOKEN env var)")
+	hostBootstrapToken = flag.String("host-bootstrap-token", "", "Bearer token required for host heartbeat requests (or HOST_BOOTSTRAP_TOKEN env var)")
+	skipMigrations     = flag.Bool("skip-migrations", false, "Skip database migrations at startup")
 
 	// Telemetry
 	gcpProject  = flag.String("gcp-project", "", "GCP project for telemetry and snapshot builder VMs")
@@ -53,9 +56,6 @@ var (
 	mcpPort      = flag.Int("mcp-port", 0, "MCP server port (0 = disabled)")
 	mcpAuthToken = flag.String("mcp-auth-token", "", "Bearer token for MCP authentication (or MCP_AUTH_TOKEN env var)")
 )
-
-//go:embed schema.sql
-var schemaSQL string
 
 func main() {
 	flag.Parse()
@@ -90,6 +90,17 @@ func main() {
 	if v := os.Getenv("MCP_AUTH_TOKEN"); v != "" && *mcpAuthToken == "" {
 		*mcpAuthToken = v
 	}
+	if v := os.Getenv("API_AUTH_TOKEN"); v != "" && *apiAuthToken == "" {
+		*apiAuthToken = v
+	}
+	if v := os.Getenv("HOST_BOOTSTRAP_TOKEN"); v != "" && *hostBootstrapToken == "" {
+		*hostBootstrapToken = v
+	}
+	if v := os.Getenv("SKIP_MIGRATIONS"); v != "" && !*skipMigrations {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			*skipMigrations = parsed
+		}
+	}
 
 	// Setup logger
 	logger := logrus.New()
@@ -120,7 +131,7 @@ func main() {
 	log.Info("Connected to database")
 
 	// Initialize database schema
-	if err := initSchema(db); err != nil {
+	if err := initSchema(db, *skipMigrations); err != nil {
 		log.WithError(err).Fatal("Failed to initialize schema")
 	}
 
@@ -284,9 +295,10 @@ func main() {
 		}
 	}
 
+	httpHandler := apiLoggingMiddleware(logger, authMiddleware(*apiAuthToken, *hostBootstrapToken, httpMux))
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *httpPort),
-		Handler: apiLoggingMiddleware(logger, httpMux),
+		Handler: httpHandler,
 	}
 
 	go func() {
@@ -410,9 +422,55 @@ func apiLoggingMiddleware(logger *logrus.Logger, next http.Handler) http.Handler
 	})
 }
 
-func initSchema(db *sql.DB) error {
-	if _, err := db.Exec(schemaSQL); err != nil {
-		return fmt.Errorf("schema exec: %w", err)
+func authMiddleware(apiToken, hostToken string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" || r.URL.Path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		var required string
+		switch {
+		case r.URL.Path == "/api/v1/hosts/heartbeat":
+			required = hostToken
+		case strings.HasPrefix(r.URL.Path, "/api/v1/"):
+			required = apiToken
+		default:
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if required == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if hasAuthToken(r, required) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	})
+}
+
+func hasAuthToken(r *http.Request, expected string) bool {
+	if expected == "" {
+		return true
+	}
+
+	authz := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authz, "Bearer ") {
+		return false
+	}
+	return strings.TrimSpace(strings.TrimPrefix(authz, "Bearer ")) == expected
+}
+
+func initSchema(db *sql.DB, skip bool) error {
+	if !skip {
+		if err := runMigrations(db); err != nil {
+			return fmt.Errorf("run migrations: %w", err)
+		}
 	}
 
 	logger := logrus.WithField("component", "schema")

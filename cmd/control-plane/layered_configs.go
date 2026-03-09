@@ -461,7 +461,7 @@ func (r *LayeredConfigRegistry) HandleLayeredConfigs(w http.ResponseWriter, req 
 		case http.MethodPost:
 			r.handleCreateLayeredConfig(w, req)
 		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 		}
 		return
 	}
@@ -503,23 +503,23 @@ func (r *LayeredConfigRegistry) HandleLayeredConfigs(w http.ResponseWriter, req 
 	case http.MethodDelete:
 		r.handleDeleteLayeredConfig(w, req)
 	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
 }
 
 func (r *LayeredConfigRegistry) handleCreateLayeredConfig(w http.ResponseWriter, req *http.Request) {
 	var cfg snapshot.LayeredConfig
 	if err := json.NewDecoder(req.Body).Decode(&cfg); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	configID, leafWorkloadKey, err := r.RegisterLayeredConfig(req.Context(), &cfg)
 	if err != nil {
 		if strings.Contains(err.Error(), "invalid") {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, err.Error())
 		} else {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeAPIError(w, http.StatusInternalServerError, err.Error())
 		}
 		return
 	}
@@ -548,7 +548,7 @@ func (r *LayeredConfigRegistry) handleCreateLayeredConfig(w http.ResponseWriter,
 func (r *LayeredConfigRegistry) handleListLayeredConfigs(w http.ResponseWriter, req *http.Request) {
 	configs, err := r.ListLayeredConfigs(req.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -558,16 +558,16 @@ func (r *LayeredConfigRegistry) handleListLayeredConfigs(w http.ResponseWriter, 
 func (r *LayeredConfigRegistry) handleGetLayeredConfig(w http.ResponseWriter, req *http.Request) {
 	configID := strings.TrimPrefix(req.URL.Path, "/api/v1/layered-configs/")
 	if configID == "" {
-		http.Error(w, "config_id is required", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "config_id is required")
 		return
 	}
 
 	sc, err := r.GetLayeredConfig(req.Context(), configID)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
-			http.Error(w, err.Error(), http.StatusNotFound)
+			writeAPIError(w, http.StatusNotFound, err.Error())
 		} else {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeAPIError(w, http.StatusInternalServerError, err.Error())
 		}
 		return
 	}
@@ -592,15 +592,15 @@ func (r *LayeredConfigRegistry) handleGetLayeredConfig(w http.ResponseWriter, re
 func (r *LayeredConfigRegistry) handleDeleteLayeredConfig(w http.ResponseWriter, req *http.Request) {
 	configID := strings.TrimPrefix(req.URL.Path, "/api/v1/layered-configs/")
 	if configID == "" {
-		http.Error(w, "config_id is required", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "config_id is required")
 		return
 	}
 
 	if err := r.DeleteLayeredConfig(req.Context(), configID); err != nil {
 		if strings.Contains(err.Error(), "not found") {
-			http.Error(w, err.Error(), http.StatusNotFound)
+			writeAPIError(w, http.StatusNotFound, err.Error())
 		} else {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeAPIError(w, http.StatusInternalServerError, err.Error())
 		}
 		return
 	}
@@ -610,14 +610,14 @@ func (r *LayeredConfigRegistry) handleDeleteLayeredConfig(w http.ResponseWriter,
 
 func (r *LayeredConfigRegistry) handleTriggerBuild(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
 	path := strings.TrimPrefix(req.URL.Path, "/api/v1/layered-configs/")
 	configID := strings.TrimSuffix(path, "/build")
 	if configID == "" {
-		http.Error(w, "config_id is required", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "config_id is required")
 		return
 	}
 
@@ -625,13 +625,13 @@ func (r *LayeredConfigRegistry) handleTriggerBuild(w http.ResponseWriter, req *h
 	var cfgJSON string
 	err := r.db.QueryRowContext(req.Context(), `SELECT config_json FROM layered_configs WHERE config_id = $1`, configID).Scan(&cfgJSON)
 	if err != nil {
-		http.Error(w, "config not found", http.StatusNotFound)
+		writeAPIError(w, http.StatusNotFound, "config not found")
 		return
 	}
 
 	var cfg snapshot.LayeredConfig
 	if err := json.Unmarshal([]byte(cfgJSON), &cfg); err != nil {
-		http.Error(w, "failed to parse stored config", http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, "failed to parse stored config")
 		return
 	}
 
@@ -646,7 +646,7 @@ func (r *LayeredConfigRegistry) handleTriggerBuild(w http.ResponseWriter, req *h
 				`UPDATE snapshot_layers SET current_version=NULL WHERE layer_hash=$1`,
 				layer.LayerHash); err != nil {
 				logrus.WithError(err).WithField("layer_hash", layer.LayerHash[:16]).Error("Failed to clear layer version during clean build")
-				http.Error(w, "failed to clear layer versions", http.StatusInternalServerError)
+				writeAPIError(w, http.StatusInternalServerError, "failed to clear layer versions")
 				return
 			}
 		}
@@ -654,7 +654,7 @@ func (r *LayeredConfigRegistry) handleTriggerBuild(w http.ResponseWriter, req *h
 
 	if r.layerBuilder != nil {
 		if err := r.layerBuilder.EnqueueChainBuild(req.Context(), layers, 0, "init", configID, forceRebuild, cleanBuild); err != nil {
-			http.Error(w, fmt.Sprintf("failed to enqueue build: %s", err), http.StatusInternalServerError)
+			writeAPIError(w, http.StatusInternalServerError, fmt.Sprintf("failed to enqueue build: %s", err))
 			return
 		}
 	}
@@ -671,7 +671,7 @@ func (r *LayeredConfigRegistry) handleTriggerBuild(w http.ResponseWriter, req *h
 
 func (r *LayeredConfigRegistry) handleRefreshLayer(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
@@ -679,7 +679,7 @@ func (r *LayeredConfigRegistry) handleRefreshLayer(w http.ResponseWriter, req *h
 	path := strings.TrimPrefix(req.URL.Path, "/api/v1/layered-configs/")
 	parts := strings.SplitN(path, "/layers/", 2)
 	if len(parts) != 2 {
-		http.Error(w, "Invalid path", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "invalid path")
 		return
 	}
 	configID := parts[0]
@@ -689,13 +689,13 @@ func (r *LayeredConfigRegistry) handleRefreshLayer(w http.ResponseWriter, req *h
 	var cfgJSON string
 	err := r.db.QueryRowContext(req.Context(), `SELECT config_json FROM layered_configs WHERE config_id = $1`, configID).Scan(&cfgJSON)
 	if err != nil {
-		http.Error(w, "config not found", http.StatusNotFound)
+		writeAPIError(w, http.StatusNotFound, "config not found")
 		return
 	}
 
 	var cfg snapshot.LayeredConfig
 	if err := json.Unmarshal([]byte(cfgJSON), &cfg); err != nil {
-		http.Error(w, "failed to parse stored config", http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, "failed to parse stored config")
 		return
 	}
 
@@ -708,13 +708,13 @@ func (r *LayeredConfigRegistry) handleRefreshLayer(w http.ResponseWriter, req *h
 		}
 	}
 	if startDepth < 0 {
-		http.Error(w, fmt.Sprintf("layer %q not found in config", layerName), http.StatusNotFound)
+		writeAPIError(w, http.StatusNotFound, fmt.Sprintf("layer %q not found in config", layerName))
 		return
 	}
 
 	if r.layerBuilder != nil {
 		if err := r.layerBuilder.EnqueueChainBuild(req.Context(), layers, startDepth, "refresh", configID); err != nil {
-			http.Error(w, fmt.Sprintf("failed to enqueue refresh: %s", err), http.StatusInternalServerError)
+			writeAPIError(w, http.StatusInternalServerError, fmt.Sprintf("failed to enqueue refresh: %s", err))
 			return
 		}
 	}

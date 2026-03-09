@@ -14,7 +14,7 @@ from bf_sdk.runner_config import RunnerConfig, RunnerConfigs
 
 @pytest.fixture
 def http_client() -> HttpClient:
-    config = ConnectionConfig.resolve(base_url="http://testserver:8080", api_key="test")
+    config = ConnectionConfig.resolve(base_url="http://testserver:8080", token="test-token")
     return HttpClient(config)
 
 

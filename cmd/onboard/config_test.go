@@ -306,3 +306,35 @@ func TestValidate_CredentialsWrapperRejected(t *testing.T) {
 		t.Fatal("Validate() expected credentials wrapper rejection")
 	}
 }
+
+func TestExampleConfigs(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join("..", "..", "examples", "*", "onboard.yaml"))
+	if err != nil {
+		t.Fatalf("glob example configs: %v", err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("expected at least one example onboard config")
+	}
+
+	origLookPath := lookPath
+	lookPath = func(name string) (string, error) { return "/usr/bin/" + name, nil }
+	t.Cleanup(func() { lookPath = origLookPath })
+
+	for _, path := range paths {
+		t.Run(filepath.Base(filepath.Dir(path)), func(t *testing.T) {
+			cfg, err := LoadConfig(path)
+			if err != nil {
+				t.Fatalf("LoadConfig(%q) error = %v", path, err)
+			}
+			if cfg.Platform.GCPProject == "" {
+				t.Fatalf("example %q missing platform.gcp_project", path)
+			}
+			if len(cfg.Workload.Layers) == 0 && len(cfg.Workload.SnapshotCommands) == 0 {
+				t.Fatalf("example %q must define workload.layers or workload.snapshot_commands", path)
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate(%q) error = %v", path, err)
+			}
+		})
+	}
+}

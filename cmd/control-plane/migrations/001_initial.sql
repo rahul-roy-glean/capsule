@@ -1,7 +1,6 @@
--- Firecracker Runner Database Schema (reference only)
+-- Firecracker Runner Database Schema
 -- Run this against a PostgreSQL 15+ database
--- Canonical startup schema now lives in cmd/control-plane/migrations/.
--- Keep this file in sync for operator reference and manual inspection.
+-- Initial baseline migration for fresh installs.
 
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";

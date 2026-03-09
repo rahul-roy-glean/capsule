@@ -65,21 +65,22 @@ resource "google_compute_instance_template" "firecracker_host" {
   }
 
   metadata = {
-    snapshot-bucket       = google_storage_bucket.snapshots.name
-    microvm-subnet        = var.microvm_subnet
-    environment           = var.environment
-    control-plane         = var.control_plane_addr
-    github-app-id         = var.github_app_id
-    github-app-secret     = var.github_app_secret
-    github-repo           = var.github_repo
+    snapshot-bucket         = google_storage_bucket.snapshots.name
+    microvm-subnet          = var.microvm_subnet
+    environment             = var.environment
+    control-plane           = var.control_plane_addr
+    host-bootstrap-token    = var.host_bootstrap_token
+    github-app-id           = var.github_app_id
+    github-app-secret       = var.github_app_secret
+    github-repo             = var.github_repo
     max-runners             = var.max_runners_per_host
-    idle-target           = var.idle_runners_target
-    runner-ephemeral      = var.runner_ephemeral ? "true" : "false"
-    use-chunked-snapshots  = var.use_chunked_snapshots ? "true" : "false"
-    enable-session-chunks  = var.enable_session_chunks ? "true" : "false"
-    chunk-cache-size-gb    = var.chunk_cache_size_gb
-    mem-cache-size-gb      = var.mem_cache_size_gb
-    use-netns              = var.use_netns ? "true" : "false"
+    idle-target             = var.idle_runners_target
+    runner-ephemeral        = var.runner_ephemeral ? "true" : "false"
+    use-chunked-snapshots   = var.use_chunked_snapshots ? "true" : "false"
+    enable-session-chunks   = var.enable_session_chunks ? "true" : "false"
+    chunk-cache-size-gb     = var.chunk_cache_size_gb
+    mem-cache-size-gb       = var.mem_cache_size_gb
+    use-netns               = var.use_netns ? "true" : "false"
     otel-collector-endpoint = var.otel_collector_addr
   }
 
@@ -231,6 +232,8 @@ LOGROTATE
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/github-repo || echo "")
     CONTROL_PLANE=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/control-plane || echo "")
+    HOST_BOOTSTRAP_TOKEN=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/host-bootstrap-token || echo "")
 
     USE_CHUNKED_SNAPSHOTS=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/use-chunked-snapshots || echo "false")
@@ -260,6 +263,9 @@ LOGROTATE
     # Add control plane if configured
     if [ -n "$CONTROL_PLANE" ]; then
       EXEC_START="$EXEC_START --control-plane=$CONTROL_PLANE"
+    fi
+    if [ -n "$HOST_BOOTSTRAP_TOKEN" ]; then
+      EXEC_START="$EXEC_START --host-bootstrap-token=$HOST_BOOTSTRAP_TOKEN"
     fi
 
     # Add chunked snapshot flag if enabled

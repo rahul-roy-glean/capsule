@@ -20,7 +20,7 @@ from bf_sdk._http import HttpClient
 
 @pytest.fixture
 def config() -> ConnectionConfig:
-    return ConnectionConfig.resolve(base_url="http://testserver:8080", api_key="test-key")
+    return ConnectionConfig.resolve(base_url="http://testserver:8080", token="test-token")
 
 
 @pytest.fixture

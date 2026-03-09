@@ -24,6 +24,7 @@ VERSION ?= $(shell git describe --tags --always --dirty)
 # Go build settings
 GO := go
 GOFLAGS := -trimpath -ldflags "-X main.version=$(VERSION)"
+GOOS_TARGET ?= linux
 GOARCH_TARGET ?= amd64
 export PATH := /usr/local/go/bin:$(PATH)
 
@@ -35,22 +36,22 @@ all: build
 # Build all binaries
 build: $(BINARIES)
 
-LINUX_BUILD = CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH_TARGET)
+CROSS_BUILD = CGO_ENABLED=0 GOOS=$(GOOS_TARGET) GOARCH=$(GOARCH_TARGET)
 
 firecracker-manager:
-	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/firecracker-manager ./cmd/firecracker-manager
+	$(CROSS_BUILD) $(GO) build $(GOFLAGS) -o bin/firecracker-manager ./cmd/firecracker-manager
 
 control-plane:
-	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/control-plane ./cmd/control-plane
+	$(CROSS_BUILD) $(GO) build $(GOFLAGS) -o bin/control-plane ./cmd/control-plane
 
 snapshot-builder:
-	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/snapshot-builder ./cmd/snapshot-builder
+	$(CROSS_BUILD) $(GO) build $(GOFLAGS) -o bin/snapshot-builder ./cmd/snapshot-builder
 
 thaw-agent:
-	$(LINUX_BUILD) $(GO) build $(GOFLAGS) -o bin/thaw-agent ./cmd/thaw-agent
+	$(CROSS_BUILD) $(GO) build $(GOFLAGS) -o bin/thaw-agent ./cmd/thaw-agent
 
 bin-onboard:
-	$(GO) build $(GOFLAGS) -o bin/onboard ./cmd/onboard
+	$(CROSS_BUILD) $(GO) build $(GOFLAGS) -o bin/onboard ./cmd/onboard
 
 bench-allocate:
 	$(GO) build $(GOFLAGS) -o bin/bench-allocate ./cmd/bench-allocate
