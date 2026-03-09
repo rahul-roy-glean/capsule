@@ -190,11 +190,6 @@ variable "use_netns" {
   default     = true
 }
 
-variable "runner_ephemeral" {
-  description = "Whether GitHub runners are ephemeral (one job per VM) or persistent (multiple jobs)"
-  type        = bool
-  default     = false
-}
 
 # Container Registry configuration
 variable "container_registry_location" {

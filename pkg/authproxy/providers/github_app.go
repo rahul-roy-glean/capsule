@@ -197,6 +197,7 @@ func (p *githubAppProvider) refreshToken() error {
 	return nil
 }
 
+
 func (p *githubAppProvider) refreshLoop() {
 	for {
 		// Refresh at 45 minutes (installation tokens expire in 60 min).

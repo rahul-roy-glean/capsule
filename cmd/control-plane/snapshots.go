@@ -87,6 +87,22 @@ func (sm *SnapshotManager) gcsPath(path string) string {
 	return path
 }
 
+// ThawAgentHash returns the MD5 hash of the thaw-agent binary in GCS.
+// Used to include the binary identity in the platform layer hash so that
+// deploying a new thaw-agent invalidates the cached platform layer.
+func (sm *SnapshotManager) ThawAgentHash(ctx context.Context) string {
+	if sm.gcsClient == nil {
+		return ""
+	}
+	obj := sm.gcsClient.Bucket(sm.gcsBucket).Object(sm.gcsPath("build-artifacts/thaw-agent"))
+	attrs, err := obj.Attrs(ctx)
+	if err != nil {
+		sm.logger.WithError(err).Debug("Failed to get thaw-agent GCS attrs (hash will be empty)")
+		return ""
+	}
+	return fmt.Sprintf("%x", attrs.MD5)
+}
+
 func (sm *SnapshotManager) builderServiceAccountEmail() string {
 	if sm.builderServiceAccount != "" {
 		return sm.builderServiceAccount

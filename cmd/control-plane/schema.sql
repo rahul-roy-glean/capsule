@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS snapshot_layers (
     all_chain_drives     JSONB DEFAULT '[]',
     refresh_interval     VARCHAR(64) DEFAULT '',
     current_version      VARCHAR(255),
+    build_artifact_hash  VARCHAR(64) DEFAULT '',  -- MD5 hash of thaw-agent binary used for current_version; stale value triggers rebuild
     status               VARCHAR(32) DEFAULT 'pending',
     created_at           TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at           TIMESTAMP WITH TIME ZONE DEFAULT NOW()
@@ -264,3 +265,6 @@ COMMENT ON TABLE snapshot_builds IS 'Build queue for layered snapshot pipeline';
 COMMENT ON TABLE layered_configs IS 'Top-level workload configurations';
 COMMENT ON TABLE repo_workload_mappings IS 'Maps CI repo names to workload keys for webhook routing';
 COMMENT ON TABLE snapshot_tags IS 'Named aliases for snapshot versions (e.g., stable, canary)';
+
+-- Migrations (idempotent)
+ALTER TABLE snapshot_layers ADD COLUMN IF NOT EXISTS build_artifact_hash VARCHAR(64) DEFAULT '';

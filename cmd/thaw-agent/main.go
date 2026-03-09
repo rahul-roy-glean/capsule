@@ -521,6 +521,21 @@ func main() {
 					}
 				}
 
+				// Re-configure auth proxy after restore. During warmup the
+				// metadata forwarder was stopped before MMDS polling, so
+				// 169.254.169.254 is no longer on lo. Re-run the full setup
+				// (CA cert install is idempotent, forwarder will be started fresh).
+				if tempData.Latest.Proxy.Address != "" {
+					log.WithField("proxy_address", tempData.Latest.Proxy.Address).Info("Configuring auth proxy after restore")
+					stopFwd, proxyErr := configureAuthProxy(tempData)
+					if proxyErr != nil {
+						log.WithError(proxyErr).Warn("Failed to configure auth proxy after restore (non-fatal)")
+					}
+					if stopFwd != nil {
+						globalMetadataForwarderStop = stopFwd
+					}
+				}
+
 				// Reset boot timer so phase durations reflect post-restore time,
 				// not accumulated warmup time from before the snapshot.
 				bootTimer = telemetry.NewTimer()
@@ -741,6 +756,13 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 			if err := json.Unmarshal(body, &inner); err != nil {
 				return nil, fmt.Errorf("failed to parse MMDS data: %w", err)
 			}
+			log.WithFields(logrus.Fields{
+				"inner_runner_id":    inner.Meta.RunnerID,
+				"inner_mode":        inner.Meta.Mode,
+				"inner_proxy_addr":  inner.Proxy.Address,
+				"inner_proxy_meta":  inner.Proxy.MetadataHost,
+				"inner_warmup_cmds": len(inner.Warmup.Commands),
+			}).Info("DEBUG: Parsed MMDS inner struct")
 			data.Latest = inner
 		}
 
@@ -1343,6 +1365,11 @@ func runWarmupMode(data *MMDSData) error {
 	// This replaces the old runGCPAuthCommand auto-setup: the proxy provides both
 	// GCP metadata emulation (for keyrings.google-artifactregistry-auth) and HTTPS
 	// credential injection transparently.
+	log.WithFields(logrus.Fields{
+		"proxy_address":       data.Latest.Proxy.Address,
+		"proxy_metadata_host": data.Latest.Proxy.MetadataHost,
+		"proxy_has_ca_cert":   data.Latest.Proxy.CACertPEM != "",
+	}).Info("DEBUG: Proxy data from parsed MMDS")
 	if data.Latest.Proxy.Address != "" {
 		log.WithField("proxy_address", data.Latest.Proxy.Address).Info("Configuring auth proxy from MMDS")
 		stopFwd, proxyErr := configureAuthProxy(data)
@@ -1508,11 +1535,16 @@ func configureAuthProxy(data *MMDSData) (stopForwarder func(), err error) {
 	}
 	if metadataHost != "" {
 		proxyEnv = append(proxyEnv, "GCE_METADATA_HOST="+metadataHost)
+		// Firecracker VMs lack GCE DMI data (/sys/class/dmi/id/product_name).
+		// Node.js gcp-metadata library skips the metadata probe when DMI
+		// doesn't match "Google", causing "Could not load default credentials".
+		// Force the library to assume the metadata server is present.
+		proxyEnv = append(proxyEnv, "METADATA_SERVER_DETECTION=assume-present")
 		log.WithField("metadata_host", metadataHost).Info("Set GCE_METADATA_HOST for google-auth")
 	}
 	globalProxyEnv = proxyEnv
 
-	// 4. Intercept GCE metadata requests at the network level.
+	// 3. Intercept GCE metadata requests at the network level.
 	// Firecracker's MMDS V1 intercepts all traffic to 169.254.169.254 on the
 	// TAP device. By assigning 169.254.169.254 to the loopback interface, we
 	// keep metadata traffic local (kernel delivers to lo, never reaches TAP).
@@ -1578,17 +1610,14 @@ func startMetadataForwarder(metadataHost string) (stop func(), err error) {
 
 		body, _ := io.ReadAll(resp.Body)
 
-		// Copy upstream headers using direct map access with lowercase keys.
-		// Go's w.Header().Set() canonicalizes to Title-Case ("Content-Type"),
-		// but older google-auth versions look up "content-type" (lowercase) in
-		// a plain dict, causing KeyError. Direct map assignment bypasses
-		// canonicalization: w.Header()["content-type"] stores the lowercase key.
-		// We also keep the canonical key so Go's auto Content-Type detection
-		// sees it and doesn't add a duplicate.
+		// Copy upstream headers using canonical (Title-Case) keys only.
+		// Do NOT add lowercase duplicates — Node.js's HTTP parser rejects
+		// responses with duplicate Content-Length headers ("Parse Error:
+		// Duplicate Content-Length"). Both Python (CaseInsensitiveDict) and
+		// Node.js (lowercases automatically) handle canonical keys correctly.
 		h := w.Header()
 		for k, vals := range resp.Header {
-			h[k] = vals                  // canonical key (suppresses Go auto-detection)
-			h[strings.ToLower(k)] = vals // lowercase key (for old google-auth)
+			h[k] = vals
 		}
 		w.WriteHeader(resp.StatusCode)
 		w.Write(body)
