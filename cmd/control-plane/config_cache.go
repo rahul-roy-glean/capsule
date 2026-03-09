@@ -23,6 +23,7 @@ type WorkloadConfig struct {
 	MaxConcurrentRunners int
 	NetworkPolicyPreset  string
 	NetworkPolicyJSON    string
+	AuthConfigJSON       string // JSON-encoded authproxy.AuthConfig for injection into host agent
 }
 
 // ConfigCache provides in-memory lookup for repo→workload_key mappings and
@@ -66,7 +67,7 @@ func (cc *ConfigCache) loadFromDB() {
 	}
 
 	// Load layered_configs
-	lcRows, err := cc.db.Query(`SELECT leaf_workload_key, tier, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy FROM layered_configs`)
+	lcRows, err := cc.db.Query(`SELECT leaf_workload_key, tier, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy, config_json FROM layered_configs`)
 	if err == nil {
 		defer lcRows.Close()
 		for lcRows.Next() {
@@ -74,7 +75,8 @@ func (cc *ConfigCache) loadFromDB() {
 			var startCmdJSON sql.NullString
 			var npPreset sql.NullString
 			var npJSON sql.NullString
-			if err := lcRows.Scan(&wc.WorkloadKey, &wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON); err != nil {
+			var configJSON sql.NullString
+			if err := lcRows.Scan(&wc.WorkloadKey, &wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON, &configJSON); err != nil {
 				continue
 			}
 			if startCmdJSON.Valid && startCmdJSON.String != "" {
@@ -86,6 +88,9 @@ func (cc *ConfigCache) loadFromDB() {
 			}
 			if npJSON.Valid {
 				wc.NetworkPolicyJSON = npJSON.String
+			}
+			if configJSON.Valid {
+				wc.AuthConfigJSON = extractAuthConfigJSON(configJSON.String)
 			}
 			cc.workloadConfig[wc.WorkloadKey] = &wc
 		}
@@ -146,10 +151,11 @@ func (cc *ConfigCache) loadWorkloadConfigFromDB(ctx context.Context, workloadKey
 	wc.WorkloadKey = workloadKey
 
 	// Try layered_configs first
+	var configJSON sql.NullString
 	err := cc.db.QueryRowContext(ctx,
-		`SELECT tier, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy
+		`SELECT tier, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy, config_json
 		 FROM layered_configs WHERE leaf_workload_key = $1`, workloadKey).Scan(
-		&wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON)
+		&wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON, &configJSON)
 	if err != nil {
 		return nil
 	}
@@ -162,6 +168,9 @@ func (cc *ConfigCache) loadWorkloadConfigFromDB(ctx context.Context, workloadKey
 	}
 	if npJSON.Valid {
 		wc.NetworkPolicyJSON = npJSON.String
+	}
+	if configJSON.Valid {
+		wc.AuthConfigJSON = extractAuthConfigJSON(configJSON.String)
 	}
 	return &wc
 }
@@ -178,6 +187,19 @@ func (cc *ConfigCache) PutWorkloadConfig(wc *WorkloadConfig) {
 	cc.mu.Lock()
 	cc.workloadConfig[wc.WorkloadKey] = wc
 	cc.mu.Unlock()
+}
+
+// extractAuthConfigJSON extracts the "config.auth" field from a LayeredConfig JSON blob.
+func extractAuthConfigJSON(configJSON string) string {
+	var raw struct {
+		Config struct {
+			Auth json.RawMessage `json:"auth"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal([]byte(configJSON), &raw); err != nil || len(raw.Config.Auth) == 0 || string(raw.Config.Auth) == "null" {
+		return ""
+	}
+	return string(raw.Config.Auth)
 }
 
 // InvalidateWorkloadConfig removes a workload config from the cache.

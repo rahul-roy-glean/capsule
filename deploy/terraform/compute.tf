@@ -75,7 +75,6 @@ resource "google_compute_instance_template" "firecracker_host" {
     github-repo             = var.github_repo
     max-runners             = var.max_runners_per_host
     idle-target             = var.idle_runners_target
-    runner-ephemeral        = var.runner_ephemeral ? "true" : "false"
     use-chunked-snapshots   = var.use_chunked_snapshots ? "true" : "false"
     enable-session-chunks   = var.enable_session_chunks ? "true" : "false"
     chunk-cache-size-gb     = var.chunk_cache_size_gb
@@ -226,10 +225,6 @@ LOGROTATE
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/max-runners || echo "16")
     IDLE_TARGET=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/idle-target || echo "2")
-    RUNNER_EPHEMERAL=$(curl -sf -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/runner-ephemeral || echo "true")
-    GITHUB_REPO=$(curl -sf -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/github-repo || echo "")
     CONTROL_PLANE=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/control-plane || echo "")
     HOST_BOOTSTRAP_TOKEN=$(curl -sf -H "Metadata-Flavor: Google" \
@@ -251,14 +246,8 @@ LOGROTATE
     EXEC_START="/usr/local/bin/firecracker-manager"
     EXEC_START="$EXEC_START --max-runners=$MAX_RUNNERS"
     EXEC_START="$EXEC_START --idle-target=$IDLE_TARGET"
-    EXEC_START="$EXEC_START --runner-ephemeral=$RUNNER_EPHEMERAL"
     EXEC_START="$EXEC_START --snapshot-cache=/mnt/data/snapshots"
     EXEC_START="$EXEC_START --workspace-dir=/mnt/data/workspaces"
-
-    # Add GitHub repo if configured
-    if [ -n "$GITHUB_REPO" ]; then
-      EXEC_START="$EXEC_START --github-repo=$GITHUB_REPO"
-    fi
 
     # Add control plane if configured
     if [ -n "$CONTROL_PLANE" ]; then
