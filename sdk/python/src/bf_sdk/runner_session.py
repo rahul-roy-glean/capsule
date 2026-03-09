@@ -72,7 +72,11 @@ class RunnerSession:
 
     def resume(self) -> ConnectResult:
         """Reconnect to the runner (extends TTL or resumes from suspend)."""
-        return self._runners.connect(self._runner_id)
+        previous_runner_id = self._runner_id
+        result = self._runners.connect(previous_runner_id)
+        if result.runner_id != previous_runner_id:
+            self._runner_id = result.runner_id
+        return result
 
     def release(self) -> bool:
         """Release (destroy) the runner."""

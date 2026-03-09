@@ -161,11 +161,15 @@ def test_sdk_live_e2e() -> None:
                 assert pause.success is True
                 assert runner.session_id
 
+                previous_runner_id = runner.runner_id
                 resumed = runner.resume()
-                assert resumed.runner_id == allocation.runner_id
                 assert resumed.status in {"connected", "resumed"}
+                assert runner.runner_id == resumed.runner_id
+                assert runner.runner_id
+                if resumed.status == "resumed":
+                    assert runner.runner_id != previous_runner_id
 
-                resumed_status = client.runners.wait_ready(allocation.runner_id, timeout=120.0, poll_interval=2.0)
+                resumed_status = client.runners.wait_ready(runner.runner_id, timeout=120.0, poll_interval=2.0)
                 assert resumed_status.status == "ready"
 
                 resumed_exec = runner.exec_collect("sh", "-lc", "printf resumed")
