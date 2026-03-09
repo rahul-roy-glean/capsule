@@ -572,30 +572,6 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		runner.ServicePort = req.StartCommand.Port
 	}
 
-	// Start auth proxy if requested. Must happen after namespace creation
-	// (proxy binds inside the netns) but before VM resume (guest needs the
-	// proxy available on first network access).
-	if req.AuthConfig != nil {
-		hostVethIP := net.IPv4(10, 200, byte(netns.Slot), 1).String()
-		proxy, proxyErr := authproxy.NewAuthProxy(
-			runnerID,
-			*req.AuthConfig,
-			netns.Path,
-			netns.Gateway.String(),
-			hostVethIP,
-			cm.logger,
-		)
-		if proxyErr != nil {
-			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
-			return nil, fmt.Errorf("failed to create auth proxy: %w", proxyErr)
-		}
-		if startErr := proxy.Start(ctx); startErr != nil {
-			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
-			return nil, fmt.Errorf("failed to start auth proxy: %w", startErr)
-		}
-		cm.authProxies[runnerID] = proxy
-	}
-
 	// Build kernel boot args
 	netCfg := tap.GetNetworkConfig()
 	guestIP := tap.IP.String()
@@ -694,23 +670,29 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	}
 
 	// Start auth proxy BEFORE injecting MMDS so proxy config is available to the VM.
+	// The proxy binds inside the netns on the gateway IP and on the host-side
+	// veth for the token update endpoint.
 	if req.AuthConfig != nil && netns != nil {
+		hostVethIP := net.IPv4(10, 200, byte(netns.Slot), 1).String()
 		proxy, proxyErr := authproxy.NewAuthProxy(
 			runnerID,
 			*req.AuthConfig,
-			netns.GetFirecrackerNetNSPath(),
+			netns.Path,
 			netns.Gateway.String(),
-			netns.HostReachableIP.String(),
+			hostVethIP,
 			cm.chunkedLogger,
 		)
 		if proxyErr != nil {
-			cm.chunkedLogger.WithError(proxyErr).Warn("Failed to create auth proxy (non-fatal)")
-		} else if proxyErr := proxy.Start(context.Background()); proxyErr != nil {
-			cm.chunkedLogger.WithError(proxyErr).Warn("Failed to start auth proxy (non-fatal)")
-		} else {
-			cm.authProxies[runnerID] = proxy
-			cm.chunkedLogger.WithField("runner_id", runnerID).Info("Auth proxy started")
+			vm.Stop()
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+			return nil, fmt.Errorf("failed to create auth proxy: %w", proxyErr)
 		}
+		if startErr := proxy.Start(ctx); startErr != nil {
+			vm.Stop()
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+			return nil, fmt.Errorf("failed to start auth proxy: %w", startErr)
+		}
+		cm.authProxies[runnerID] = proxy
 	}
 
 	// Inject MMDS data BEFORE resuming so the thaw-agent sees fresh config
