@@ -38,7 +38,7 @@ class TestLayeredConfigs:
         mock_resp = httpx.Response(201, json=resp_data)
         body = {
             "display_name": "My Config",
-            "layers": [{"name": "main", "init_commands": [{"command": "echo hi"}]}],
+            "layers": [{"name": "main", "init_commands": [{"type": "shell", "args": ["bash", "-lc", "echo hi"]}]}],
         }
         with patch.object(http_client._client, "request", return_value=mock_resp):
             result = lc.create(body)
@@ -86,6 +86,14 @@ class TestLayeredConfigs:
             result = lc.build("c1")
         assert isinstance(result, BuildResponse)
         assert result.status == "build_enqueued"
+
+    def test_build_clean(self, lc: LayeredConfigs, http_client: HttpClient) -> None:
+        resp_data = {"config_id": "c1", "status": "build_enqueued", "clean": "true"}
+        mock_resp = httpx.Response(202, json=resp_data)
+        with patch.object(http_client._client, "request", return_value=mock_resp):
+            result = lc.build("c1", clean=True)
+        assert isinstance(result, BuildResponse)
+        assert result.clean == "true"
 
     def test_refresh_layer(self, lc: LayeredConfigs, http_client: HttpClient) -> None:
         resp_data = {"config_id": "c1", "layer_name": "deps", "status": "refresh_enqueued"}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
@@ -100,17 +101,26 @@ class TestRunners:
 
     def test_shell_with_command(self, runners: Runners) -> None:
         runners._host_cache["r-1"] = "10.0.0.1:8080"
-        session = runners.shell("r-1", command="/bin/zsh")
-        assert "command=/bin/zsh" in session._url
+        session = runners.shell("r-1", command="/bin/zsh -lc 'echo hi'")
+        parsed = urlparse(session._url)
+        assert parse_qs(parsed.query)["command"] == ["/bin/zsh -lc 'echo hi'"]
 
     def test_quarantine(self, runners: Runners, http_client: HttpClient) -> None:
         mock_resp = httpx.Response(200, json={"success": True, "quarantine_dir": "/tmp/q"})
-        with patch.object(http_client._client, "request", return_value=mock_resp):
+        with patch.object(http_client._client, "request", return_value=mock_resp) as request:
             result = runners.quarantine("r-1", reason="test")
         assert result["success"] is True
+        request_url = request.call_args.args[1]
+        parsed = urlparse(request_url)
+        assert parsed.path == "/api/v1/runners/quarantine"
+        assert parse_qs(parsed.query)["reason"] == ["test"]
 
     def test_unquarantine(self, runners: Runners, http_client: HttpClient) -> None:
         mock_resp = httpx.Response(200, json={"success": True})
-        with patch.object(http_client._client, "request", return_value=mock_resp):
+        with patch.object(http_client._client, "request", return_value=mock_resp) as request:
             result = runners.unquarantine("r-1")
         assert result["success"] is True
+        request_url = request.call_args.args[1]
+        parsed = urlparse(request_url)
+        assert parsed.path == "/api/v1/runners/unquarantine"
+        assert parse_qs(parsed.query)["runner_id"] == ["r-1"]

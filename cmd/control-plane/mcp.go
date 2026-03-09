@@ -269,13 +269,13 @@ func (m *mcpDeps) handleResume(ctx context.Context, _ *mcp.CallToolRequest, in R
 	}
 
 	// Look up suspended session
-	var sessionID, hostID, status string
+	var sessionID, hostID, workloadKey, status string
 	if m.db == nil {
 		return nil, ResumeSandboxOutput{}, fmt.Errorf("no database configured")
 	}
 	err := m.db.QueryRowContext(ctx,
-		`SELECT session_id, host_id, status FROM session_snapshots WHERE runner_id = $1`,
-		in.SandboxID).Scan(&sessionID, &hostID, &status)
+		`SELECT session_id, host_id, workload_key, status FROM session_snapshots WHERE runner_id = $1`,
+		in.SandboxID).Scan(&sessionID, &hostID, &workloadKey, &status)
 	if err != nil || status != "suspended" {
 		return nil, ResumeSandboxOutput{}, fmt.Errorf("no suspended session found for sandbox %s", in.SandboxID)
 	}
@@ -286,9 +286,6 @@ func (m *mcpDeps) handleResume(ctx context.Context, _ *mcp.CallToolRequest, in R
 	if origErr == nil && origHost.Status != "draining" && origHost.Status != "terminating" {
 		resumeHost = origHost
 	} else {
-		var workloadKey string
-		_ = m.db.QueryRowContext(ctx,
-			`SELECT workload_key FROM session_snapshots WHERE session_id = $1`, sessionID).Scan(&workloadKey)
 		resumeHost = m.scheduler.selectBestHostForWorkloadKey(m.hostRegistry.GetAvailableHosts(), workloadKey)
 	}
 	if resumeHost == nil {
@@ -310,14 +307,29 @@ func (m *mcpDeps) handleResume(ctx context.Context, _ *mcp.CallToolRequest, in R
 		return nil, ResumeSandboxOutput{}, fmt.Errorf("resume error: %s", resp.Error)
 	}
 
+	resumedRunnerID := resp.Runner.GetId()
+	if resumedRunnerID == "" {
+		return nil, ResumeSandboxOutput{}, fmt.Errorf("resume succeeded but returned empty runner id")
+	}
+
+	if err := m.hostRegistry.AddRunner(ctx, &Runner{
+		ID:          resumedRunnerID,
+		HostID:      resumeHost.ID,
+		Status:      "busy",
+		InternalIP:  resp.Runner.GetInternalIp(),
+		WorkloadKey: workloadKey,
+	}); err != nil {
+		return nil, ResumeSandboxOutput{}, fmt.Errorf("register resumed runner: %w", err)
+	}
+
 	// Update session status
 	_, _ = m.db.ExecContext(ctx,
-		`UPDATE session_snapshots SET status = 'active', host_id = $1 WHERE session_id = $2`,
-		resumeHost.ID, sessionID)
+		`UPDATE session_snapshots SET runner_id = $1, status = 'active', host_id = $2 WHERE session_id = $3`,
+		resumedRunnerID, resumeHost.ID, sessionID)
 
 	return nil, ResumeSandboxOutput{
 		Status:      "resumed",
-		SandboxID:   resp.Runner.GetId(),
+		SandboxID:   resumedRunnerID,
 		HostAddress: resumeHost.HTTPAddress,
 	}, nil
 }

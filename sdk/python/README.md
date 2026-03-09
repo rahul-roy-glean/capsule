@@ -13,6 +13,28 @@ cd sdk/python
 pip install -e ".[dev]"
 ```
 
+## Live E2E
+
+There is an explicit live SDK E2E at `sdk/python/tests/e2e_live.py`.
+It talks to a real control plane, defaults to `http://localhost:8080`, and
+exercises config registration, build enqueue, allocation, exec, file ops, PTY,
+pause/resume, release, and config cleanup.
+
+Run it with:
+
+```bash
+make sdk-python-e2e
+```
+
+If you are not using the default address:
+
+```bash
+BF_BASE_URL="http://localhost:8080" make sdk-python-e2e
+```
+
+If the control plane or local stack is not up, the test raises a clear error
+telling you to spin it up first with `bash dev/run-stack.sh`.
+
 ## Quickstart
 
 The fastest way to get started is the declarative **RunnerConfig** API — declare your runner shape once, build it, then spawn runners:
@@ -25,7 +47,7 @@ cfg = (
     RunnerConfig("My dev sandbox")
     .with_base_image("ubuntu:22.04")
     .with_commands(["apt-get install -y python3", "pip install -e .[dev]"])
-    .with_tier("small")
+    .with_tier("m")
     .with_ttl(3600)
     .with_auto_pause(True)
     .with_auto_rollout(True)
@@ -104,10 +126,10 @@ with BFClient() as client:
         "display_name": "My Workload",
         "base_image": "ubuntu:22.04",
         "layers": [
-            {"name": "deps", "init_commands": [{"command": "apt-get install -y python3"}]},
-            {"name": "app", "init_commands": [{"command": "pip install ."}]},
+            {"name": "deps", "init_commands": [{"type": "shell", "args": ["bash", "-lc", "apt-get install -y python3"]}]},
+            {"name": "app", "init_commands": [{"type": "shell", "args": ["bash", "-lc", "pip install ."]}]},
         ],
-        "config": {"tier": "small", "auto_rollout": True},
+        "config": {"tier": "m", "auto_rollout": True},
     })
 
     # Trigger a build
@@ -143,3 +165,7 @@ with BFClient() as client:
 ## Host Reconnection
 
 The SDK caches host addresses from `allocate()` and `connect()` responses. If a host agent returns 503 during `exec()`, the SDK automatically calls `connect()` to get a new host and retries (only if no output has been received yet).
+
+Layer commands use the control-plane `SnapshotCommand` shape under the hood:
+`{"type": "shell", "args": ["bash", "-lc", "echo hi"]}`. The shorthand
+`RunnerConfig.with_commands(["echo hi"])` is normalized to that wire format for you.
