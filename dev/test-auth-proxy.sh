@@ -151,12 +151,38 @@ ALLOC_BODY=$(cat <<EOF
 EOF
 )
 
-RUNNER_ID=$(allocate_and_wait "$ALLOC_BODY")
-if [ "$RUNNER_ID" = "ALLOC_FAILED" ]; then
+# Use allocate_and_wait but also capture internal_ip from the control-plane
+# allocate response (needed for token update endpoint discovery).
+ALLOC_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
+  -H 'Content-Type: application/json' \
+  -d "$ALLOC_BODY")
+RUNNER_ID=$(echo "$ALLOC_RESP" | jq -r '.runner_id')
+RUNNER_IP=$(echo "$ALLOC_RESP" | jq -r '.internal_ip // empty')
+
+if [ -z "$RUNNER_ID" ] || [ "$RUNNER_ID" = "null" ]; then
   fail "Failed to allocate runner with auth config"
   exit 1
 fi
+RUNNER_IDS+=("$RUNNER_ID")
+
+echo -n "  runner_id=$RUNNER_ID  waiting..."
+for i in $(seq 1 60); do
+  code=$(curl -s -o /dev/null -w "%{http_code}" \
+    "$CP/api/v1/runners/status?runner_id=$RUNNER_ID")
+  if [ "$code" = "200" ]; then
+    echo " ready (${i}s)"
+    break
+  fi
+  if [ "$i" = "60" ]; then
+    echo " TIMEOUT"
+    fail "Runner did not become ready in 60s"
+    exit 1
+  fi
+  echo -n "."
+  sleep 1
+done
 pass "Runner allocated with auth proxy config"
+echo "  internal_ip=$RUNNER_IP"
 
 # =========================================================================
 # PART 2: Verify proxy port is reachable inside VM netns
@@ -186,9 +212,7 @@ fi
 header "3. Discover token update endpoint"
 
 # The auth proxy's token update endpoint runs on the host veth IP (10.200.{slot}.1:9443).
-# We can find the runner's host-reachable IP from the manager status.
-RUNNER_INFO=$(curl -sf "$MGR/api/v1/runners/$RUNNER_ID" 2>/dev/null || echo '{}')
-RUNNER_IP=$(echo "$RUNNER_INFO" | jq -r '.internal_ip // empty')
+# RUNNER_IP was captured from the allocate response above.
 echo "  runner internal IP: ${RUNNER_IP:-"(unknown)"}"
 
 # Derive host veth IP: if runner IP is 10.200.X.2, host is 10.200.X.1

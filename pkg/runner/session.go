@@ -434,6 +434,12 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 		handler.Stop()
 		delete(m.uffdHandlers, runnerID)
 	}
+
+	// Stop auth proxy — it binds inside the netns which is about to be released.
+	if proxy, ok := m.authProxies[runnerID]; ok {
+		proxy.Stop()
+		delete(m.authProxies, runnerID)
+	}
 	m.mu.Unlock()
 
 	// Unmount FUSE disks after VM stop (Firecracker no longer holds fds open).

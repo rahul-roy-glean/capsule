@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/fuse"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
@@ -571,6 +572,30 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		runner.ServicePort = req.StartCommand.Port
 	}
 
+	// Start auth proxy if requested. Must happen after namespace creation
+	// (proxy binds inside the netns) but before VM resume (guest needs the
+	// proxy available on first network access).
+	if req.AuthConfig != nil {
+		hostVethIP := net.IPv4(10, 200, byte(netns.Slot), 1).String()
+		proxy, proxyErr := authproxy.NewAuthProxy(
+			runnerID,
+			*req.AuthConfig,
+			netns.Path,
+			netns.Gateway.String(),
+			hostVethIP,
+			cm.logger,
+		)
+		if proxyErr != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+			return nil, fmt.Errorf("failed to create auth proxy: %w", proxyErr)
+		}
+		if startErr := proxy.Start(ctx); startErr != nil {
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+			return nil, fmt.Errorf("failed to start auth proxy: %w", startErr)
+		}
+		cm.authProxies[runnerID] = proxy
+	}
+
 	// Build kernel boot args
 	netCfg := tap.GetNetworkConfig()
 	guestIP := tap.IP.String()
@@ -783,6 +808,12 @@ func (cm *ChunkedManager) ReleaseRunnerChunked(ctx context.Context, runnerID str
 		delete(cm.uffdHandlers, runnerID)
 	}
 
+	// Stop auth proxy if one exists
+	if proxy, ok := cm.authProxies[runnerID]; ok {
+		proxy.Stop()
+		delete(cm.authProxies, runnerID)
+	}
+
 	// Cleanup rootfs FUSE disk
 	if disk, exists := cm.fuseDisks[runnerID]; exists {
 		disk.Unmount()
@@ -826,6 +857,11 @@ func (cm *ChunkedManager) cleanupChunkedRunner(
 ) {
 	if uffdHandler != nil {
 		uffdHandler.Stop()
+	}
+	// Stop auth proxy on allocation failure
+	if proxy, ok := cm.authProxies[runnerID]; ok {
+		proxy.Stop()
+		delete(cm.authProxies, runnerID)
 	}
 	if fuseDisk != nil {
 		fuseDisk.Unmount()
