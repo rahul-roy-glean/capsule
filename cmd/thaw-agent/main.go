@@ -757,7 +757,7 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 				return nil, fmt.Errorf("failed to parse MMDS data: %w", err)
 			}
 			log.WithFields(logrus.Fields{
-				"inner_runner_id":    inner.Meta.RunnerID,
+				"inner_runner_id":   inner.Meta.RunnerID,
 				"inner_mode":        inner.Meta.Mode,
 				"inner_proxy_addr":  inner.Proxy.Address,
 				"inner_proxy_meta":  inner.Proxy.MetadataHost,

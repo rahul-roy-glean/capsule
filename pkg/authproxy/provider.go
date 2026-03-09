@@ -26,4 +26,3 @@ type TokenReceiver interface {
 type MetadataHandler interface {
 	ServeMetadata(w http.ResponseWriter, r *http.Request)
 }
-

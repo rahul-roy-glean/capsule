@@ -380,9 +380,9 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	}
 	// Pass auth config via labels so the host agent can start the auth proxy.
 	s.logger.WithFields(logrus.Fields{
-		"workload_key":     workloadKey,
-		"auth_config_len":  len(authConfigJSON),
-		"has_auth_config":  authConfigJSON != "",
+		"workload_key":    workloadKey,
+		"auth_config_len": len(authConfigJSON),
+		"has_auth_config": authConfigJSON != "",
 	}).Info("DEBUG: auth config for allocation")
 	if authConfigJSON != "" {
 		if protoReq.Labels == nil {
