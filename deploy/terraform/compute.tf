@@ -181,8 +181,7 @@ LOGROTATE
       EXEC_START="$EXEC_START --host-bootstrap-token=$HOST_BOOTSTRAP_TOKEN"
     fi
 
-    # Add chunked snapshot flags
-    EXEC_START="$EXEC_START --use-chunked-snapshots"
+    # Add snapshot flags
     EXEC_START="$EXEC_START --snapshot-bucket=$SNAPSHOT_BUCKET"
     CHUNK_CACHE_SIZE_GB=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/chunk-cache-size-gb || echo "2")
@@ -190,9 +189,6 @@ LOGROTATE
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/mem-cache-size-gb || echo "2")
     EXEC_START="$EXEC_START --chunk-cache-size-gb=$CHUNK_CACHE_SIZE_GB"
     EXEC_START="$EXEC_START --mem-cache-size-gb=$MEM_CACHE_SIZE_GB"
-
-    # Add network namespace flag
-    EXEC_START="$EXEC_START --use-netns"
 
     # Read OTel collector endpoint from metadata (empty = OTel disabled)
     OTEL_ENDPOINT=$(curl -sf -H "Metadata-Flavor: Google" \
