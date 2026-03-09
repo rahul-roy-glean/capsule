@@ -5,12 +5,11 @@
 #
 # Once a snapshot exists, the manager uses snapshot restore (fast) instead of cold boot.
 #
-# Usage: make dev-snapshot
+# Usage: GCS_BUCKET=<bucket> make dev-snapshot
 #
 # Environment variables:
-#   GCS_BUCKET         - GCS bucket for chunked snapshot upload (default: none, local-only)
+#   GCS_BUCKET         - GCS bucket for chunked snapshot upload (required)
 #   GCS_PREFIX         - GCS path prefix (default: v1)
-#   ENABLE_CHUNKED     - Upload chunked snapshot to GCS (default: false; true requires GCS_BUCKET)
 #   SNAPSHOT_COMMANDS  - JSON array of warmup commands (default: echo dev-snapshot-ready)
 #
 # Prerequisites:
@@ -61,15 +60,17 @@ mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
 # Snapshot commands: for dev, a minimal warmup. Override with SNAPSHOT_COMMANDS env var.
 SNAPSHOT_COMMANDS=${SNAPSHOT_COMMANDS:-'[{"type":"shell","args":["echo","dev-snapshot-ready"]}]'}
 
-# GCS config: when GCS_BUCKET is set, enable chunked upload so the golden snapshot
-# is available in GCS for cross-host session resume testing.
-GCS_BUCKET=${GCS_BUCKET:-local-dev-unused}
+# GCS config
+GCS_BUCKET=${GCS_BUCKET:-}
 GCS_PREFIX=${GCS_PREFIX:-v1}
-ENABLE_CHUNKED=${ENABLE_CHUNKED:-false}
+
+if [ -z "$GCS_BUCKET" ]; then
+  echo "FAIL: GCS_BUCKET is required. Set GCS_BUCKET=<bucket> to upload chunked snapshots."
+  exit 1
+fi
 
 echo "Snapshot commands: $SNAPSHOT_COMMANDS"
 echo "GCS bucket: $GCS_BUCKET"
-echo "Enable chunked: $ENABLE_CHUNKED"
 if [ -n "$BASE_IMAGE" ]; then
   echo "Base image: $BASE_IMAGE"
 else
@@ -89,7 +90,6 @@ BUILDER_FLAGS=(
   --vcpus=2
   --memory-mb=2048
   --warmup-timeout=5m
-  --enable-chunked="$ENABLE_CHUNKED"
   --snapshot-commands="$SNAPSHOT_COMMANDS"
   --log-level=info
 )
@@ -123,7 +123,7 @@ set -e
 if [ $BUILD_EXIT -ne 0 ]; then
   echo ""
   echo "--- Snapshot builder exited with code $BUILD_EXIT ---"
-  echo "    (Expected: GCS upload fails without credentials, but local files should exist)"
+  echo "    Check GCS credentials and bucket configuration."
 fi
 
 # Check if snapshot files were created (they're produced before the GCS upload step)

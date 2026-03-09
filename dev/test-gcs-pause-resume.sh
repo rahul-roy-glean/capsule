@@ -8,7 +8,7 @@
 #   GCS_BUCKET=rroy-gc-testing make dev-test-gcs-pause-resume
 #
 # Prerequisites:
-#   - Golden chunked snapshot uploaded: GCS_BUCKET=<bucket> ENABLE_CHUNKED=true make dev-snapshot
+#   - Golden chunked snapshot uploaded: GCS_BUCKET=<bucket> make dev-snapshot
 #   - Stack running with GCS sessions:  GCS_BUCKET=<bucket> make dev-stack
 set -euo pipefail
 

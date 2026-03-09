@@ -20,9 +20,6 @@ service HostAgent {
   // Heartbeat sends a heartbeat to the control plane
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   
-  // SyncSnapshot triggers a snapshot sync from GCS
-  rpc SyncSnapshot(SyncSnapshotRequest) returns (SyncSnapshotResponse);
-  
   // ListRunners lists all runners on this host
   rpc ListRunners(ListRunnersRequest) returns (ListRunnersResponse);
   
@@ -172,12 +169,8 @@ message StartCommand {
 // AllocateRunnerRequest
 message AllocateRunnerRequest {
   string request_id = 1;
-  // Optional: Only used when the workload requires a git repository.
-  string repo = 2;
-  // Optional: Only used when the workload requires a git repository.
-  string branch = 3;
-  // Optional: Only used when the workload requires a git repository.
-  string commit = 4;
+  reserved 2, 3, 4;
+  reserved "repo", "branch", "commit";
   Resources resources = 5;
   map<string, string> labels = 6;
   reserved 7, 8;
@@ -233,21 +226,9 @@ message HeartbeatRequest {
 // HeartbeatResponse
 message HeartbeatResponse {
   bool acknowledged = 1;
-  string snapshot_version = 2;
-  bool should_sync_snapshot = 3;
+  reserved 2, 3;
+  reserved "snapshot_version", "should_sync_snapshot";
   bool should_drain = 4;
-}
-
-// SyncSnapshotRequest
-message SyncSnapshotRequest {
-  string version = 1;
-}
-
-// SyncSnapshotResponse
-message SyncSnapshotResponse {
-  bool success = 1;
-  string error = 2;
-  string synced_version = 3;
 }
 
 // ListRunnersRequest

@@ -11,7 +11,6 @@ func TestMMDSData_JobID(t *testing.T) {
 	data.Latest.Meta.HostID = "host-1"
 	data.Latest.Meta.JobID = "gh-12345"
 	data.Latest.Meta.Environment = "test"
-	data.Latest.Job.Repo = "org/repo"
 	data.Latest.Snapshot.Version = "v1"
 
 	b, err := json.Marshal(data)
@@ -31,7 +30,7 @@ func TestMMDSData_JobID(t *testing.T) {
 
 func TestMMDSData_BackwardsCompatible(t *testing.T) {
 	// Old MMDS data without JobID should still unmarshal
-	oldJSON := `{"latest":{"meta":{"runner_id":"r1","host_id":"h1","environment":"prod"},"network":{"ip":"10.0.0.1","gateway":"10.0.0.254","netmask":"255.255.255.0","dns":"8.8.8.8","interface":"eth0","mac":"aa:bb:cc:dd:ee:ff"},"job":{"repo":"org/repo","branch":"main","commit":"abc123"},"snapshot":{"version":"v1"}}}`
+	oldJSON := `{"latest":{"meta":{"runner_id":"r1","host_id":"h1","environment":"prod"},"network":{"ip":"10.0.0.1","gateway":"10.0.0.254","netmask":"255.255.255.0","dns":"8.8.8.8","interface":"eth0","mac":"aa:bb:cc:dd:ee:ff"},"snapshot":{"version":"v1"}}}`
 
 	var data MMDSData
 	if err := json.Unmarshal([]byte(oldJSON), &data); err != nil {
@@ -49,75 +48,11 @@ func TestMMDSData_BackwardsCompatible(t *testing.T) {
 func TestAllocateRequest_WorkloadKey(t *testing.T) {
 	req := AllocateRequest{
 		RequestID:   "req-1",
-		Repo:        "https://github.com/org/repo",
 		WorkloadKey: "abc1234567890abc",
-		Branch:      "main",
 	}
 
 	if req.WorkloadKey != "abc1234567890abc" {
 		t.Errorf("WorkloadKey = %q, want %q", req.WorkloadKey, "abc1234567890abc")
-	}
-}
-
-func TestRunnerKey_Match(t *testing.T) {
-	tests := []struct {
-		name string
-		a    *RunnerKey
-		b    *RunnerKey
-		want bool
-	}{
-		{
-			"same version matches",
-			&RunnerKey{SnapshotVersion: "v1", Platform: "linux/amd64"},
-			&RunnerKey{SnapshotVersion: "v1", Platform: "linux/amd64"},
-			true,
-		},
-		{
-			"different version no match",
-			&RunnerKey{SnapshotVersion: "v1"},
-			&RunnerKey{SnapshotVersion: "v2"},
-			false,
-		},
-		{
-			"same repo matches",
-			&RunnerKey{SnapshotVersion: "v1", AffinityKey: "org/repo"},
-			&RunnerKey{SnapshotVersion: "v1", AffinityKey: "org/repo"},
-			true,
-		},
-		{
-			"different repo no match",
-			&RunnerKey{SnapshotVersion: "v1", AffinityKey: "org/repo-a"},
-			&RunnerKey{SnapshotVersion: "v1", AffinityKey: "org/repo-b"},
-			false,
-		},
-		{
-			"empty repo matches anything",
-			&RunnerKey{SnapshotVersion: "v1", AffinityKey: ""},
-			&RunnerKey{SnapshotVersion: "v1", AffinityKey: "org/repo"},
-			true,
-		},
-		{
-			"nil keys match",
-			nil,
-			nil,
-			true,
-		},
-		{
-			"nil vs non-nil no match",
-			nil,
-			&RunnerKey{SnapshotVersion: "v1"},
-			false,
-		},
-	}
-
-	pool := &Pool{}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := pool.keysMatch(tt.a, tt.b)
-			if got != tt.want {
-				t.Errorf("keysMatch() = %v, want %v", got, tt.want)
-			}
-		})
 	}
 }
 

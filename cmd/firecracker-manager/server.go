@@ -23,7 +23,7 @@ import (
 type HostAgentServer struct {
 	pb.UnimplementedHostAgentServer
 	manager              *runner.Manager
-	chunkedMgr           *runner.ChunkedManager // Optional, for chunked snapshot support
+	chunkedMgr           *runner.ChunkedManager
 	sessionPauseHist     metric.Float64Histogram
 	sessionPauseCounter  metric.Int64Counter
 	sessionResumeHist    metric.Float64Histogram
@@ -31,16 +31,8 @@ type HostAgentServer struct {
 	logger               *logrus.Entry
 }
 
-// NewHostAgentServer creates a new HostAgentServer
-func NewHostAgentServer(mgr *runner.Manager, logger *logrus.Logger) *HostAgentServer {
-	return &HostAgentServer{
-		manager: mgr,
-		logger:  logger.WithField("service", "host-agent"),
-	}
-}
-
-// NewHostAgentServerWithChunked creates a HostAgentServer with chunked snapshot support
-func NewHostAgentServerWithChunked(mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, logger *logrus.Logger) *HostAgentServer {
+// NewHostAgentServer creates a HostAgentServer with chunked snapshot support
+func NewHostAgentServer(mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, logger *logrus.Logger) *HostAgentServer {
 	return &HostAgentServer{
 		manager:    mgr,
 		chunkedMgr: chunkedMgr,
@@ -59,10 +51,7 @@ func (s *HostAgentServer) SetOTelInstruments(pauseHist metric.Float64Histogram, 
 // AllocateRunner allocates a new runner
 func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRunnerRequest) (*pb.AllocateRunnerResponse, error) {
 	s.logger.WithFields(logrus.Fields{
-		"request_id":   req.RequestId,
-		"repo":         req.Repo,
-		"branch":       req.Branch,
-		"chunked_mode": s.chunkedMgr != nil,
+		"request_id": req.RequestId,
 	}).Info("AllocateRunner request")
 
 	if req.WorkloadKey == "" {
@@ -71,9 +60,6 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 
 	allocReq := runner.AllocateRequest{
 		RequestID:           req.RequestId,
-		Repo:                req.Repo,
-		Branch:              req.Branch,
-		Commit:              req.Commit,
 		Labels:              req.Labels,
 		WorkloadKey:         req.WorkloadKey,
 		SnapshotVersion:     req.SnapshotVersion,
@@ -184,11 +170,7 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 
 	// Fresh allocation if not resumed from session
 	if r == nil {
-		if s.chunkedMgr != nil {
-			r, err = s.chunkedMgr.AllocateRunnerChunked(ctx, allocReq)
-		} else {
-			r, err = s.manager.AllocateRunner(ctx, allocReq)
-		}
+		r, err = s.chunkedMgr.AllocateRunnerChunked(ctx, allocReq)
 
 		// Bind session_id to the new runner
 		if err == nil && allocReq.SessionID != "" {
@@ -231,27 +213,11 @@ func (s *HostAgentServer) ReleaseRunner(ctx context.Context, req *pb.ReleaseRunn
 	s.logger.WithFields(logrus.Fields{
 		"runner_id":        req.RunnerId,
 		"destroy":          req.Destroy,
-		"try_recycle":      req.TryRecycle,
 		"finished_cleanly": req.FinishedCleanly,
-		"chunked_mode":     s.chunkedMgr != nil,
 	}).Info("ReleaseRunner request")
 
-	var err error
-
-	// Use chunked release if available (with optional incremental snapshot save)
-	if s.chunkedMgr != nil {
-		// Don't save incremental for normal destroy - only for explicit snapshot saves
-		err = s.chunkedMgr.ReleaseRunnerChunked(ctx, req.RunnerId, false)
-	} else if req.TryRecycle && !req.Destroy {
-		// Try to recycle to pool if requested
-		err = s.manager.ReleaseRunnerWithOptions(ctx, req.RunnerId, runner.ReleaseOptions{
-			Destroy:         req.Destroy,
-			TryRecycle:      req.TryRecycle,
-			FinishedCleanly: req.FinishedCleanly,
-		})
-	} else {
-		err = s.manager.ReleaseRunner(req.RunnerId, req.Destroy)
-	}
+	// Don't save incremental for normal destroy - only for explicit snapshot saves
+	err := s.chunkedMgr.ReleaseRunnerChunked(ctx, req.RunnerId, false)
 
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to release runner")
@@ -271,46 +237,11 @@ func (s *HostAgentServer) GetHostStatus(ctx context.Context, req *pb.GetHostStat
 	st := s.manager.GetStatus()
 
 	resp := &pb.HostStatus{
-		IdleRunners:     int32(st.IdleRunners),
-		BusyRunners:     int32(st.BusyRunners),
-		SnapshotVersion: st.SnapshotVersion,
-	}
-
-	// Include pool stats if pool is enabled
-	if pool := s.manager.GetPool(); pool != nil {
-		poolStats := pool.Stats()
-		resp.PoolStats = &pb.PoolStats{
-			PooledRunners:    int32(poolStats.PooledRunners),
-			MaxRunners:       int32(poolStats.MaxRunners),
-			MemoryUsageBytes: poolStats.MemoryUsageBytes,
-			MaxMemoryBytes:   poolStats.MaxMemoryBytes,
-			PoolHits:         poolStats.PoolHits,
-			PoolMisses:       poolStats.PoolMisses,
-			Evictions:        poolStats.Evictions,
-			RecycleFailures:  poolStats.RecycleFailures,
-		}
+		IdleRunners: int32(st.IdleRunners),
+		BusyRunners: int32(st.BusyRunners),
 	}
 
 	return resp, nil
-}
-
-// SyncSnapshot triggers a snapshot sync
-func (s *HostAgentServer) SyncSnapshot(ctx context.Context, req *pb.SyncSnapshotRequest) (*pb.SyncSnapshotResponse, error) {
-	s.logger.WithField("version", req.Version).Info("SyncSnapshot request")
-
-	err := s.manager.SyncSnapshot(ctx, req.Version)
-	if err != nil {
-		s.logger.WithError(err).Error("Failed to sync snapshot")
-		return &pb.SyncSnapshotResponse{
-			Success: false,
-			Error:   err.Error(),
-		}, nil
-	}
-
-	return &pb.SyncSnapshotResponse{
-		Success:       true,
-		SyncedVersion: req.Version,
-	}, nil
 }
 
 // ListRunners lists all runners

@@ -57,23 +57,3 @@ func TestGCHandler_WrongMethod(t *testing.T) {
 		t.Errorf("gcHandler GET status = %d, want %d", w.Code, http.StatusMethodNotAllowed)
 	}
 }
-
-func TestPoolStatsHandler_NilManager(t *testing.T) {
-	// poolStatsHandler calls mgr.GetPool() immediately, so it cannot
-	// be tested with a nil manager without panicking.
-	t.Skip("poolStatsHandler requires non-nil manager")
-}
-
-func TestPoolFlushHandler_WrongMethod(t *testing.T) {
-	// poolFlushHandler checks method before accessing mgr
-	logger := logrus.New()
-	handler := poolFlushHandler(nil, logger)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/pool/flush", nil)
-	w := httptest.NewRecorder()
-
-	handler(w, req)
-
-	if w.Code != http.StatusMethodNotAllowed {
-		t.Errorf("poolFlushHandler GET status = %d, want %d", w.Code, http.StatusMethodNotAllowed)
-	}
-}

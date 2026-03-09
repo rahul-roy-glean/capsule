@@ -4,19 +4,17 @@
 # This builds the agent rootfs (if needed), then uses snapshot-builder to create
 # a golden snapshot with repos cloned and dependencies installed.
 #
-# When GCS_BUCKET is set, uploads a chunked golden snapshot to GCS so the manager
-# can lazy-load via UFFD+FUSE, and session pause/resume uses GCS-backed chunks.
-# Without GCS_BUCKET, falls back to local-only mode (no chunked, no GCS).
+# Uploads a chunked golden snapshot to GCS so the manager can lazy-load via
+# UFFD+FUSE, and session pause/resume uses GCS-backed chunks.
 #
 # Usage:
 #   GCS_BUCKET=my-bucket make dev-agent-snapshot
-#   make dev-agent-snapshot
 #
 # Prerequisites:
 #   - make dev-build (builds snapshot-builder binary)
 #   - Docker available (for rootfs build)
 #   - /dev/kvm available
-#   - gcloud auth (if using GCS)
+#   - gcloud auth
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,19 +22,20 @@ SNAPSHOT_DIR="/tmp/fc-dev/snapshots"
 OUTPUT_DIR="/tmp/fc-dev/snapshot-build"
 LOG_DIR="/tmp/fc-dev/logs"
 
-# GCS config: set GCS_BUCKET to enable chunked upload + GCS session resume
+# GCS config (required)
 GCS_BUCKET=${GCS_BUCKET:-}
 GCS_PREFIX=${GCS_PREFIX:-v1}
+
+if [ -z "$GCS_BUCKET" ]; then
+  echo "FAIL: GCS_BUCKET is required. Set GCS_BUCKET=<bucket> to upload chunked snapshots."
+  exit 1
+fi
 
 cd "$REPO_ROOT"
 export PATH="/usr/local/go/bin:$PATH"
 
 echo "=== Provisioning AI Agent Sandbox Snapshot ==="
-if [ -n "$GCS_BUCKET" ]; then
-  echo "  GCS mode: bucket=$GCS_BUCKET prefix=$GCS_PREFIX (chunked + UFFD/FUSE)"
-else
-  echo "  Local-only mode (set GCS_BUCKET=<bucket> for GCS route)"
-fi
+echo "  GCS mode: bucket=$GCS_BUCKET prefix=$GCS_PREFIX (chunked + UFFD/FUSE)"
 
 # --- 1. Build agent rootfs if not present ---
 AGENT_MARKER="$SNAPSHOT_DIR/.agent-rootfs-built"
@@ -95,12 +94,7 @@ BUILDER_FLAGS=(
   --log-level=info
 )
 
-if [ -n "$GCS_BUCKET" ]; then
-  BUILDER_FLAGS+=(--gcs-bucket="$GCS_BUCKET" --enable-chunked=true)
-  echo "--- Snapshot will be uploaded to GCS (chunked) ---"
-else
-  BUILDER_FLAGS+=(--gcs-bucket=local-dev-unused --enable-chunked=false)
-fi
+BUILDER_FLAGS+=(--gcs-bucket="$GCS_BUCKET")
 
 set +e
 sudo "$REPO_ROOT/bin/snapshot-builder" \
@@ -112,11 +106,7 @@ set -e
 if [ $BUILD_EXIT -ne 0 ]; then
   echo ""
   echo "--- Snapshot builder exited with code $BUILD_EXIT ---"
-  if [ -n "$GCS_BUCKET" ]; then
-    echo "    Check GCS credentials if upload failed."
-  else
-    echo "    (Expected: GCS upload fails without credentials, but local files should exist)"
-  fi
+  echo "    Check GCS credentials and bucket configuration."
 fi
 
 # --- 4. Verify snapshot files ---
@@ -159,9 +149,5 @@ echo ""
 echo "Files in $SNAPSHOT_DIR:"
 ls -lh "$SNAPSHOT_DIR/"
 echo ""
-if [ -n "$GCS_BUCKET" ]; then
-  echo "GCS chunked snapshot uploaded to gs://$GCS_BUCKET/$GCS_PREFIX/"
-  echo "Run: GCS_BUCKET=$GCS_BUCKET make dev-stop dev-stack dev-test-agent-sessions"
-else
-  echo "Run 'make dev-stop && make dev-stack && make dev-test-agent-sessions' to test."
-fi
+echo "GCS chunked snapshot uploaded to gs://$GCS_BUCKET/$GCS_PREFIX/"
+echo "Run: GCS_BUCKET=$GCS_BUCKET make dev-stop dev-stack dev-test-agent-sessions"

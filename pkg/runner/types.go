@@ -36,7 +36,6 @@ type Runner struct {
 	TapDevice               string
 	MAC                     string
 	SnapshotVersion         string
-	PoolAffinityKey         string // Opaque key for pool reuse matching (e.g. repo name)
 	WorkloadKey             string // Workload key for snapshot routing in multi-snapshot support
 	JobID                   string
 	Resources               Resources
@@ -64,12 +63,7 @@ type Runner struct {
 	DynamicCIDRsAdded      int                    `json:"dynamic_cidrs_added,omitempty"`
 	EmergencyEgressBlocked bool                   `json:"emergency_egress_blocked,omitempty"`
 
-	// Pool-related fields
-	PoolKey          *RunnerKey `json:"pool_key,omitempty"`
 	PausedAt         time.Time  `json:"paused_at,omitempty"`
-	TaskCount        int        `json:"task_count"`
-	MemoryUsageBytes int64      `json:"memory_usage_bytes,omitempty"`
-	DiskUsageBytes   int64      `json:"disk_usage_bytes,omitempty"`
 
 	// Session pause/resume fields
 	SessionID     string    `json:"session_id,omitempty"`
@@ -100,9 +94,6 @@ type Resources struct {
 // AllocateRequest represents a request to allocate a runner
 type AllocateRequest struct {
 	RequestID           string
-	Repo                string
-	Branch              string
-	Commit              string
 	WorkloadKey         string // Workload key identifying which snapshot to use for this runner
 	SnapshotVersion     string // Explicit snapshot version; skips current-pointer.json lookup when set
 	Resources           Resources
@@ -127,7 +118,8 @@ type MMDSData struct {
 			Environment  string `json:"environment"`
 			JobID        string `json:"job_id,omitempty"`
 			Mode         string `json:"mode,omitempty"`         // "warmup", "exec", or empty for normal runner
-			CurrentTime  string `json:"current_time,omitempty"` // RFC3339 timestamp from host for clock sync
+			CurrentTime  string            `json:"current_time,omitempty"` // RFC3339 timestamp from host for clock sync
+			Labels       map[string]string `json:"labels,omitempty"`
 		} `json:"meta"`
 		Network struct {
 			IP        string `json:"ip"`
@@ -137,12 +129,6 @@ type MMDSData struct {
 			Interface string `json:"interface"`
 			MAC       string `json:"mac"`
 		} `json:"network"`
-		Job struct {
-			Repo   string            `json:"repo"`
-			Branch string            `json:"branch"`
-			Commit string            `json:"commit"`
-			Labels map[string]string `json:"labels"`
-		} `json:"job"`
 		Snapshot struct {
 			Version string `json:"version"`
 		} `json:"snapshot"`
@@ -188,9 +174,6 @@ type HostConfig struct {
 	// SessionDir is the base directory for session snapshot storage (pause/resume).
 	// Defaults to {SnapshotCachePath}/../sessions (e.g. /mnt/data/sessions).
 	SessionDir        string
-	MicroVMSubnet     string
-	ExternalInterface string
-	BridgeName        string
 	// WorkloadKey identifies which snapshot this host should use (hash of snapshot commands).
 	WorkloadKey      string
 	Environment      string
@@ -200,14 +183,6 @@ type HostConfig struct {
 	// Host resource capacity for bin-packing scheduler
 	TotalCPUMillicores int
 	TotalMemoryMB      int
-
-	// Runner Pool Configuration
-	PoolEnabled            bool `json:"pool_enabled"`
-	PoolMaxRunners         int  `json:"pool_max_runners"`
-	PoolMaxTotalMemoryGB   int  `json:"pool_max_total_memory_gb"`
-	PoolMaxRunnerMemoryGB  int  `json:"pool_max_runner_memory_gb"`
-	PoolMaxRunnerDiskGB    int  `json:"pool_max_runner_disk_gb"`
-	PoolRecycleTimeoutSecs int  `json:"pool_recycle_timeout_secs"`
 
 	// SessionChunkBucket enables cloud-backed session pause/resume.
 	SessionChunkBucket string

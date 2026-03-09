@@ -171,9 +171,6 @@ type MMDSData struct {
 			MAC       string `json:"mac"`
 		} `json:"network"`
 		Job struct {
-			Repo     string            `json:"repo"`
-			Branch   string            `json:"branch"`
-			Commit   string            `json:"commit"`
 			GitToken string            `json:"git_token"`
 			Labels   map[string]string `json:"labels"`
 		} `json:"job"`
@@ -323,8 +320,6 @@ func main() {
 		"runner_id": mmdsData.Latest.Meta.RunnerID,
 		"host_id":   mmdsData.Latest.Meta.HostID,
 		"job_id":    mmdsData.Latest.Meta.JobID,
-		"repo":      mmdsData.Latest.Job.Repo,
-		"branch":    mmdsData.Latest.Job.Branch,
 	}).Info("MMDS data received")
 
 	// Initialize structured metrics logger for GCP log-based metrics
@@ -704,9 +699,6 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					MAC       string `json:"mac"`
 				} `json:"network"`
 				Job struct {
-					Repo     string            `json:"repo"`
-					Branch   string            `json:"branch"`
-					Commit   string            `json:"commit"`
 					GitToken string            `json:"git_token"`
 					Labels   map[string]string `json:"labels"`
 				} `json:"job"`
@@ -806,7 +798,6 @@ func waitForMMDSOnce(ctx context.Context) (*MMDSData, error) {
 	log.WithFields(logrus.Fields{
 		"runner_id":       data.Latest.Meta.RunnerID,
 		"mode":            data.Latest.Meta.Mode,
-		"job_repo":        data.Latest.Job.Repo,
 		"has_git_token":   data.Latest.Job.GitToken != "",
 		"git_token_len":   len(data.Latest.Job.GitToken),
 		"warmup_commands": len(data.Latest.Warmup.Commands),
@@ -819,7 +810,6 @@ func waitForMMDSOnce(ctx context.Context) (*MMDSData, error) {
 			log.WithFields(logrus.Fields{
 				"runner_id":       data.Latest.Meta.RunnerID,
 				"mode":            data.Latest.Meta.Mode,
-				"job_repo":        data.Latest.Job.Repo,
 				"has_git_token":   data.Latest.Job.GitToken != "",
 				"git_token_len":   len(data.Latest.Job.GitToken),
 				"warmup_commands": len(data.Latest.Warmup.Commands),

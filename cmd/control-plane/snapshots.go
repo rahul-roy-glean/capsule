@@ -406,7 +406,7 @@ func (sm *SnapshotManager) cleanupBuilderVM(ctx context.Context, instanceName st
 // launchSnapshotBuilderVMForKey creates a GCE instance to build a snapshot from commands JSON.
 //
 //nolint:unused // will be wired up when per-key snapshot builds are enabled
-func (sm *SnapshotManager) launchSnapshotBuilderVMForKey(ctx context.Context, instanceName, workloadKey, commandsJSON, version, githubAppID, githubAppSecret string, buildType string, snapshotVCPUs, snapshotMemoryMB int) error {
+func (sm *SnapshotManager) launchSnapshotBuilderVMForKey(ctx context.Context, instanceName, workloadKey, commandsJSON, version string, buildType string, snapshotVCPUs, snapshotMemoryMB int) error {
 	if sm.gcpProject == "" {
 		sm.logger.Warn("GCP project not configured, skipping VM launch")
 		return nil
@@ -425,11 +425,6 @@ func (sm *SnapshotManager) launchSnapshotBuilderVMForKey(ctx context.Context, in
 	defer instancesClient.Close()
 
 	// Build optional flags
-	githubFlags := ""
-	if githubAppID != "" && githubAppSecret != "" {
-		githubFlags = fmt.Sprintf(`--github-app-id="%s" --github-app-secret="%s" --gcp-project="%s"`,
-			githubAppID, githubAppSecret, sm.gcpProject)
-	}
 	gcsBase := sm.gcsPath("build-artifacts")
 	buildTypeFlag := ""
 	if buildType != "" && buildType != "init" {
@@ -482,10 +477,10 @@ fi
 	--vcpus=%d \
 	--memory-mb=%d \
     --version="%s" \
-    %s %s
+    %s
 echo "Snapshot build complete, shutting down..."
 shutdown -h now
-`, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, workloadKey, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, commandsJSON, sm.gcsBucket, sm.gcsPrefix, snapshotVCPUs, snapshotMemoryMB, version, githubFlags, buildTypeFlag)
+`, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, workloadKey, sm.gcsBucket, gcsBase, sm.gcsBucket, gcsBase, commandsJSON, sm.gcsBucket, sm.gcsPrefix, snapshotVCPUs, snapshotMemoryMB, version, buildTypeFlag)
 
 	// Size the builder VM to fit the snapshot build: give it at least 8 vCPUs
 	// or the snapshot's vCPUs + 2 headroom, whichever is larger.

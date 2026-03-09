@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,7 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
@@ -43,7 +41,6 @@ type Manager struct {
 	vms            map[string]*firecracker.VM
 	uffdHandlers   map[string]uffdStopper // layered UFFD handlers per runner (session resume)
 	snapshotCache  *snapshot.Cache
-	network        *network.NATNetwork
 	// netnsNetwork manages per-VM network namespaces (nil if using legacy bridge mode).
 	// When set, each VM gets its own namespace with point-to-point veth routing
 	// instead of sharing the fcbr0 bridge.
@@ -56,9 +53,6 @@ type Manager struct {
 	draining     bool
 	mu           sync.RWMutex
 	logger       *logrus.Entry
-
-	// Runner pool for VM reuse (nil if pooling disabled)
-	pool *Pool
 
 	// sessionMemStore and sessionDiskStore are chunk stores for GCS-backed
 	// session pause/resume (nil when SessionChunkBucket is not configured).
@@ -130,22 +124,6 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 		return nil, fmt.Errorf("failed to create snapshot cache: %w", err)
 	}
 
-	// Create NAT network
-	natNet, err := network.NewNATNetwork(network.NATConfig{
-		BridgeName:    cfg.BridgeName,
-		Subnet:        cfg.MicroVMSubnet,
-		ExternalIface: cfg.ExternalInterface,
-		Logger:        logger,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create NAT network: %w", err)
-	}
-
-	// Setup network
-	if err := natNet.Setup(); err != nil {
-		return nil, fmt.Errorf("failed to setup NAT network: %w", err)
-	}
-
 	// Ensure directories exist
 	for _, dir := range []string{cfg.SocketDir, cfg.WorkspaceDir, cfg.LogDir} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -160,44 +138,11 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 		vms:             make(map[string]*firecracker.VM),
 		uffdHandlers:    make(map[string]uffdStopper),
 		snapshotCache:   cache,
-		network:         natNet,
 		slotToRunner:    make(map[int]string),
 		runnerToSlot:    make(map[string]int),
 		policyEnforcers: make(map[string]*network.PolicyEnforcer),
 		authProxies:     make(map[string]*authproxy.AuthProxy),
 		logger:          logger.WithField("component", "runner-manager"),
-	}
-
-	// Initialize runner pool if enabled
-	if cfg.PoolEnabled {
-		poolCfg := PoolConfig{
-			Enabled:          true,
-			MaxPooledRunners: cfg.PoolMaxRunners,
-		}
-		if cfg.PoolMaxTotalMemoryGB > 0 {
-			poolCfg.MaxTotalMemoryBytes = int64(cfg.PoolMaxTotalMemoryGB) * 1024 * 1024 * 1024
-		}
-		if cfg.PoolMaxRunnerMemoryGB > 0 {
-			poolCfg.MaxRunnerMemoryBytes = int64(cfg.PoolMaxRunnerMemoryGB) * 1024 * 1024 * 1024
-		}
-		if cfg.PoolMaxRunnerDiskGB > 0 {
-			poolCfg.MaxRunnerDiskBytes = int64(cfg.PoolMaxRunnerDiskGB) * 1024 * 1024 * 1024
-		}
-		if cfg.PoolRecycleTimeoutSecs > 0 {
-			poolCfg.RecycleTimeout = time.Duration(cfg.PoolRecycleTimeoutSecs) * time.Second
-		}
-
-		m.pool = NewPool(poolCfg, logger)
-		m.pool.SetCallbacks(
-			m.pauseRunnerVM,
-			m.resumeRunnerVM,
-			m.getRunnerVMStats,
-			m.removeRunnerVM,
-		)
-		logger.WithFields(logrus.Fields{
-			"max_runners":   poolCfg.MaxPooledRunners,
-			"max_memory_gb": cfg.PoolMaxTotalMemoryGB,
-		}).Info("Runner pooling enabled")
 	}
 
 	// Start idempotency cleanup loop
@@ -242,17 +187,11 @@ func (m *Manager) cleanupRecentRequests() {
 	}
 }
 
-// SetNetNSNetwork configures the manager to use per-VM network namespaces
-// instead of the shared bridge. When set, AllocateRunner creates a namespace
-// per VM with point-to-point veth routing, and Firecracker is launched inside
-// the namespace.
+// SetNetNSNetwork configures the manager to use per-VM network namespaces.
+// Each VM gets a namespace with point-to-point veth routing, and Firecracker
+// is launched inside the namespace.
 func (m *Manager) SetNetNSNetwork(netnsNet *network.NetNSNetwork) {
 	m.netnsNetwork = netnsNet
-}
-
-// GetNetNSNetwork returns the netns network manager (may be nil).
-func (m *Manager) GetNetNSNetwork() *network.NetNSNetwork {
-	return m.netnsNetwork
 }
 
 func (m *Manager) IsDraining() bool {
@@ -271,425 +210,6 @@ func (m *Manager) SetDraining(draining bool) (changed bool) {
 	return true
 }
 
-// AllocateRunner allocates a new runner
-func (m *Manager) AllocateRunner(ctx context.Context, req AllocateRequest) (*Runner, error) {
-	// Idempotency check: if we've already allocated for this RequestID, return existing runner
-	if req.RequestID != "" {
-		m.mu.RLock()
-		if recent, ok := m.recentRequests[req.RequestID]; ok {
-			if time.Since(recent.allocTime) < 5*time.Minute {
-				if existingRunner, exists := m.runners[recent.runner.ID]; exists {
-					m.mu.RUnlock()
-					m.logger.WithFields(logrus.Fields{
-						"runner_id":  existingRunner.ID,
-						"request_id": req.RequestID,
-					}).Info("Returning existing runner for duplicate request")
-					return existingRunner, nil
-				}
-			}
-		}
-		m.mu.RUnlock()
-	}
-
-	// Build pool key from request (before locking, as pool.Get needs the key)
-	var poolKey *RunnerKey
-	if m.pool != nil {
-		// Get snapshot version for pool key
-		snapshotPaths, err := m.snapshotCache.GetSnapshotPaths()
-		if err == nil {
-			poolKey = &RunnerKey{
-				SnapshotVersion: snapshotPaths.Version,
-				Platform:        "linux/amd64",
-				AffinityKey:     req.Repo,
-				Labels:          req.Labels,
-			}
-		}
-	}
-
-	// Try to get from pool first (before acquiring main lock)
-	if m.pool != nil && poolKey != nil {
-		if pooled := m.pool.Get(ctx, poolKey); pooled != nil {
-			m.mu.Lock()
-			defer m.mu.Unlock()
-
-			m.logger.WithField("runner_id", pooled.Runner.ID).Info("Reusing pooled runner")
-
-			// Update runner state
-			pooled.Runner.State = StateBusy
-			pooled.Runner.TaskCount++
-			pooled.Runner.JobID = req.RequestID
-
-			// Update MMDS with new task data
-			if vm, ok := m.vms[pooled.Runner.ID]; ok {
-				var tap *network.TapDevice
-				if slot, hasSlot := m.runnerToSlot[pooled.Runner.ID]; hasSlot {
-					tap, _ = m.network.GetOrCreateTapSlot(slot, pooled.Runner.ID)
-				}
-				if tap != nil {
-					mmdsData := m.buildMMDSData(ctx, pooled.Runner, tap, req)
-					if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
-						m.logger.WithError(err).Warn("Failed to update MMDS for pooled runner")
-					}
-				}
-			}
-
-			return pooled.Runner, nil
-		}
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.draining {
-		return nil, fmt.Errorf("host is draining")
-	}
-
-	// Check capacity
-	if len(m.runners) >= m.config.MaxRunners {
-		return nil, fmt.Errorf("host at capacity: %d/%d runners", len(m.runners), m.config.MaxRunners)
-	}
-
-	runnerID := uuid.New().String()
-	allocStart := time.Now()
-	m.logger.WithField("runner_id", runnerID).Info("Allocating new runner")
-
-	// Get snapshot paths first to determine if we should use slot-based TAP allocation
-	snapshotPaths, err := m.snapshotCache.GetSnapshotPaths()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get snapshot paths: %w", err)
-	}
-
-	// Determine if snapshot restore is available
-	useSnapshotRestore := snapshotPaths.Mem != "" && snapshotPaths.State != ""
-
-	// Allocate network resources.
-	// When using per-VM namespaces, each VM gets its own namespace with
-	// tap-slot-0 inside it — no TAP rename needed, no shared bridge.
-	// Otherwise, use the legacy slot-based TAP allocation on the shared bridge.
-	var tap *network.TapDevice
-	var nsInfo *network.VMNamespace
-	var slot int
-	useNetNS := m.netnsNetwork != nil
-
-	if useNetNS {
-		// Per-VM namespace mode: create isolated namespace with inner bridge + TAP
-		slot = m.findAvailableSlot()
-		if slot < 0 {
-			return nil, fmt.Errorf("no slots available (all %d slots in use)", m.config.MaxRunners)
-		}
-		nsInfo, err = m.netnsNetwork.CreateNamespaceForVM(runnerID, slot)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create network namespace: %w", err)
-		}
-		tap = nsInfo.GetTapDevice(m.netnsNetwork.GetSubnet())
-		m.slotToRunner[slot] = runnerID
-		m.runnerToSlot[runnerID] = slot
-		m.logger.WithFields(logrus.Fields{
-			"runner_id": runnerID,
-			"slot":      slot,
-			"namespace": nsInfo.Name,
-			"tap":       tap.Name,
-		}).Debug("Using per-VM namespace with inner bridge")
-	} else if useSnapshotRestore {
-		// Legacy: slot-based TAP on shared bridge for snapshot restore
-		slot = m.findAvailableSlot()
-		if slot < 0 {
-			return nil, fmt.Errorf("no TAP slots available (all %d slots in use)", m.config.MaxRunners)
-		}
-		tap, err = m.network.GetOrCreateTapSlot(slot, runnerID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get TAP slot %d: %w", slot, err)
-		}
-		m.slotToRunner[slot] = runnerID
-		m.runnerToSlot[runnerID] = slot
-		m.logger.WithFields(logrus.Fields{
-			"runner_id": runnerID,
-			"slot":      slot,
-			"tap":       tap.Name,
-		}).Debug("Using slot-based TAP for snapshot restore")
-	} else {
-		// Legacy: dynamic TAP allocation for cold boot
-		tap, err = m.network.CreateTapForVM(runnerID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create TAP device: %w", err)
-		}
-		m.logger.WithFields(logrus.Fields{
-			"runner_id": runnerID,
-			"tap":       tap.Name,
-		}).Debug("Using dynamic TAP for cold boot")
-	}
-
-	// Create rootfs overlay
-	overlayStart := time.Now()
-	overlayPath, err := m.snapshotCache.CreateOverlay(runnerID)
-	if err != nil {
-		m.network.ReleaseTap(runnerID)
-		return nil, fmt.Errorf("failed to create rootfs overlay: %w", err)
-	}
-	overlayDur := time.Since(overlayStart)
-
-	// Create runner record.
-	// When using per-VM namespaces, InternalIP is set to the host-reachable
-	// veth IP (10.0.{slot}.2) so the host proxy can reach the VM's services.
-	// The guest still uses 172.16.0.2 internally (configured via boot args).
-	internalIP := tap.IP
-	if useNetNS && nsInfo != nil {
-		internalIP = nsInfo.HostReachableIP
-	}
-	runner := &Runner{
-		ID:              runnerID,
-		HostID:          m.config.HostID,
-		State:           StateBooting,
-		InternalIP:      internalIP,
-		TapDevice:       tap.Name,
-		MAC:             tap.MAC,
-		SnapshotVersion: snapshotPaths.Version,
-		WorkloadKey:     req.WorkloadKey,
-		PoolAffinityKey: req.Repo, // For pool key matching
-		Resources:       req.Resources,
-		CreatedAt:       time.Now(),
-		SocketPath:      filepath.Join(m.config.SocketDir, runnerID+".sock"),
-		LogPath:         filepath.Join(m.config.LogDir, runnerID+".log"),
-		MetricsPath:     filepath.Join(m.config.LogDir, runnerID+".metrics"),
-		RootfsOverlay:   overlayPath,
-	}
-	if req.StartCommand != nil {
-		runner.ServicePort = req.StartCommand.Port
-	}
-
-	// Build kernel boot args with network configuration
-	// Format: ip=<client-ip>::<gateway-ip>:<netmask>::<interface>:off
-	// This configures networking at kernel boot time, before userspace starts
-	// See: https://github.com/firecracker-microvm/firecracker/blob/main/docs/network-setup.md
-	netCfg := tap.GetNetworkConfig()
-	// Extract IP without CIDR suffix (netCfg.IP is "172.16.0.2/24", we need "172.16.0.2")
-	guestIP := strings.Split(netCfg.IP, "/")[0]
-	gateway := netCfg.Gateway // e.g., "172.16.0.1"
-	netmask := netCfg.Netmask // e.g., "255.255.255.0"
-	bootArgs := fmt.Sprintf("console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off", guestIP, gateway, netmask)
-
-	m.logger.WithFields(logrus.Fields{
-		"guest_ip": guestIP,
-		"gateway":  gateway,
-		"netmask":  netmask,
-	}).Debug("Configuring kernel network boot args")
-
-	// Create VM configuration — resolve extension drives dynamically from snapshot
-	extensionPaths := make(map[string]string)
-	for driveID, path := range snapshotPaths.ExtensionDriveImages {
-		extensionPaths[driveID] = path
-	}
-	vmCfg := firecracker.VMConfig{
-		VMID:           runnerID,
-		SocketDir:      m.config.SocketDir,
-		FirecrackerBin: m.config.FirecrackerBin,
-		KernelPath:     snapshotPaths.Kernel,
-		RootfsPath:     overlayPath,
-		BootArgs:       bootArgs,
-		VCPUs:          runner.Resources.VCPUs,
-		MemoryMB:       runner.Resources.MemoryMB,
-		NetworkIface: &firecracker.NetworkInterface{
-			IfaceID:     "eth0",
-			HostDevName: tap.Name,
-			GuestMAC:    tap.MAC,
-		},
-		MMDSConfig: &firecracker.MMDSConfig{
-			Version:           "V1", // V1 for simple GET requests (thaw-agent uses V1 protocol)
-			NetworkInterfaces: []string{"eth0"},
-		},
-		Drives:      m.buildDrives(extensionPaths),
-		LogPath:     runner.LogPath,
-		MetricsPath: runner.MetricsPath,
-	}
-
-	// When using per-VM namespaces, Firecracker must be launched inside the
-	// namespace so it can open tap-slot-0 (which exists only in that namespace).
-	if useNetNS && nsInfo != nil {
-		vmCfg.NetNSPath = nsInfo.GetFirecrackerNetNSPath()
-	}
-
-	// Create VM instance
-	vm, err := firecracker.NewVM(vmCfg, m.logger.Logger)
-	if err != nil {
-		m.cleanupRunner(runnerID, tap.Name, overlayPath)
-		return nil, fmt.Errorf("failed to create VM: %w", err)
-	}
-
-	// Try snapshot restore first (fast path), fall back to cold boot if needed
-	if snapshotPaths.Mem != "" && snapshotPaths.State != "" {
-		m.logger.WithFields(logrus.Fields{
-			"runner_id": runnerID,
-			"snapshot":  snapshotPaths.Version,
-			"mem":       snapshotPaths.Mem,
-			"state":     snapshotPaths.State,
-		}).Info("Restoring runner from snapshot (fast path)")
-
-		// Setup symlinks and TAP rename for snapshot restore.
-		// AllocateRunner holds m.mu, which serializes these shared-resource operations.
-		//
-		// Drives: The snapshot bakes in drive paths at /tmp/snapshot/*.img.
-		// Symlinks redirect these to actual host paths.
-		//
-		// TAP: The snapshot bakes in host_dev_name="tap-slot-0". If this runner
-		// uses a different slot, we temporarily rename its TAP to tap-slot-0
-		// for LoadSnapshot, then rename it back. Running VMs are unaffected
-		// because they hold TAP FDs (kernel tracks by ifindex, not name).
-		restoreOK := false
-		cleanup, symlinkErr := m.setupSnapshotSymlinks(overlayPath, extensionPaths)
-		if symlinkErr != nil {
-			m.logger.WithError(symlinkErr).Warn("Failed to setup snapshot symlinks, falling back to cold boot")
-		} else if useNetNS {
-			// With per-VM namespaces, tap-slot-0 already exists in the namespace
-			// with the right name — no TAP rename dance needed.
-			restoreErr := vm.RestoreFromSnapshot(ctx, snapshotPaths.State, snapshotPaths.Mem, true)
-			cleanup()
-			if restoreErr != nil {
-				m.logger.WithError(restoreErr).Warn("Snapshot restore failed, falling back to cold boot")
-			} else {
-				restoreOK = true
-			}
-		} else {
-			tapRestore, tapErr := m.setupSnapshotTAPRename(tap.Name)
-			if tapErr != nil {
-				cleanup()
-				m.logger.WithError(tapErr).Warn("Failed to setup TAP rename for snapshot, falling back to cold boot")
-			} else {
-				restoreErr := vm.RestoreFromSnapshot(ctx, snapshotPaths.State, snapshotPaths.Mem, true)
-				tapRestore()
-				cleanup()
-				if restoreErr != nil {
-					m.logger.WithError(restoreErr).Warn("Snapshot restore failed, falling back to cold boot")
-				} else {
-					restoreOK = true
-				}
-			}
-		}
-
-		if !restoreOK {
-			// Stop the failed Firecracker process before retry
-			vm.Stop()
-			// Recreate VM for cold boot
-			vm, err = firecracker.NewVM(vmCfg, m.logger.Logger)
-			if err != nil {
-				m.cleanupRunner(runnerID, tap.Name, overlayPath)
-				return nil, fmt.Errorf("failed to recreate VM for cold boot: %w", err)
-			}
-			if err := vm.Start(ctx); err != nil {
-				m.cleanupRunner(runnerID, tap.Name, overlayPath)
-				return nil, fmt.Errorf("failed to start VM (cold boot fallback): %w", err)
-			}
-		}
-	} else {
-		// No snapshot available, cold boot
-		m.logger.WithField("runner_id", runnerID).Info("Starting runner (cold boot - no snapshot available)")
-		if err := vm.Start(ctx); err != nil {
-			m.cleanupRunner(runnerID, tap.Name, overlayPath)
-			return nil, fmt.Errorf("failed to start VM: %w", err)
-		}
-	}
-
-	// Inject MMDS data (VM is already running after Start() or RestoreFromSnapshot())
-	mmdsData := m.buildMMDSData(ctx, runner, tap, req)
-	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
-		vm.Stop()
-		m.cleanupRunner(runnerID, tap.Name, overlayPath)
-		return nil, fmt.Errorf("failed to set MMDS data: %w", err)
-	}
-
-	// When using per-VM namespaces, set up port forwarding (DNAT) so the host
-	// can reach services inside the VM via the host-reachable veth IP.
-	// Port 10500 is the thaw-agent health/warmup server.
-	// Port 10501 is the thaw-agent debug server (health checks, /exec endpoint).
-	if useNetNS && m.netnsNetwork != nil {
-		if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentHealthPort); err != nil {
-			m.logger.WithError(err).WithField("port", snapshot.ThawAgentHealthPort).Warn("Failed to forward port into namespace")
-		}
-		if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentDebugPort); err != nil {
-			m.logger.WithError(err).WithField("port", snapshot.ThawAgentDebugPort).Warn("Failed to forward port into namespace")
-		}
-		// Forward user service port if start_command is configured
-		if req.StartCommand != nil && req.StartCommand.Port > 0 {
-			if err := m.netnsNetwork.ForwardPort(runnerID, req.StartCommand.Port); err != nil {
-				m.logger.WithError(err).WithField("port", req.StartCommand.Port).Warn("Failed to forward service port into namespace")
-			}
-		}
-	}
-
-	// Start auth proxy if configured (requires per-VM namespace).
-	if req.AuthConfig != nil && useNetNS && nsInfo != nil {
-		proxy, proxyErr := authproxy.NewAuthProxy(
-			runnerID,
-			*req.AuthConfig,
-			nsInfo.GetFirecrackerNetNSPath(),
-			nsInfo.Gateway.String(),
-			nsInfo.HostReachableIP.String(),
-			m.logger,
-		)
-		if proxyErr != nil {
-			m.logger.WithError(proxyErr).Warn("Failed to create auth proxy (non-fatal)")
-		} else if proxyErr := proxy.Start(ctx); proxyErr != nil {
-			m.logger.WithError(proxyErr).Warn("Failed to start auth proxy (non-fatal)")
-		} else {
-			m.authProxies[runnerID] = proxy
-			m.logger.WithField("runner_id", runnerID).Info("Auth proxy started")
-		}
-	}
-
-	// Wait for thaw-agent to be ready before returning. After snapshot restore,
-	// the VM's HTTP listener needs a moment to accept connections. Without this
-	// gate, the first exec request races the thaw-agent and gets connection reset.
-	if err := m.waitForThawAgent(ctx, runner.InternalIP.String(), 10*time.Second); err != nil {
-		m.logger.WithError(err).WithField("runner_id", runnerID).Warn("Thaw-agent readiness check failed (non-fatal)")
-	}
-
-	runner.State = StateInitializing
-	runner.StartedAt = time.Now()
-
-	m.runners[runnerID] = runner
-	m.vms[runnerID] = vm
-
-	// Track for idempotency
-	if req.RequestID != "" {
-		m.recentRequests[req.RequestID] = &recentAllocation{
-			runner:    runner,
-			allocTime: time.Now(),
-		}
-	}
-
-	m.logger.WithFields(logrus.Fields{
-		"runner_id":  runnerID,
-		"ip":         runner.InternalIP.String(),
-		"snapshot":   runner.SnapshotVersion,
-		"alloc_ms":   time.Since(allocStart).Milliseconds(),
-		"overlay_ms": overlayDur.Milliseconds(),
-	}).Info("Runner allocated successfully")
-
-	return runner, nil
-}
-
-// waitForThawAgent polls the thaw-agent /alive endpoint until it returns
-// HTTP 200 or the timeout expires. This ensures the VM is functional after
-// snapshot restore before we expose it to callers.
-func (m *Manager) waitForThawAgent(ctx context.Context, ip string, timeout time.Duration) error {
-	aliveURL := fmt.Sprintf("http://%s:%d/alive", ip, snapshot.ThawAgentDebugPort)
-	deadline := time.Now().Add(timeout)
-	client := &http.Client{Timeout: 2 * time.Second}
-
-	for time.Now().Before(deadline) {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		resp, err := client.Get(aliveURL)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return nil
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return fmt.Errorf("thaw-agent at %s not ready after %v", aliveURL, timeout)
-}
 
 // buildMMDSData builds the MMDS data structure for a runner
 func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *network.TapDevice, req AllocateRequest) MMDSData {
@@ -708,10 +228,7 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 	data.Latest.Network.DNS = netCfg.DNS
 	data.Latest.Network.Interface = netCfg.Interface
 	data.Latest.Network.MAC = netCfg.MAC
-	data.Latest.Job.Repo = req.Repo
-	data.Latest.Job.Branch = req.Branch
-	data.Latest.Job.Commit = req.Commit
-	data.Latest.Job.Labels = req.Labels
+	data.Latest.Meta.Labels = req.Labels
 	data.Latest.Snapshot.Version = runner.SnapshotVersion
 
 	// Populate start_command for user service startup
@@ -868,9 +385,6 @@ func (m *Manager) QuarantineRunner(ctx context.Context, runnerID string, opts Qu
 		if m.netnsNetwork != nil {
 			// Per-VM namespace mode: block by veth interface name
 			blockErr = m.netnsNetwork.EmergencyBlockEgress(runnerID)
-		} else {
-			// Legacy bridge mode: block by VM IP
-			blockErr = m.network.BlockEgress(net.IP(ip))
 		}
 		if blockErr != nil {
 			errs = append(errs, fmt.Errorf("block egress: %w", blockErr))
@@ -944,7 +458,6 @@ func (m *Manager) UnquarantineRunner(ctx context.Context, runnerID string, opts 
 		return fmt.Errorf("runner %s is not quarantined", runnerID)
 	}
 	vm := m.vms[runnerID]
-	ip := append([]byte(nil), r.InternalIP...)
 	prevState := r.PreQuarantineState
 	egressWasBlocked := r.QuarantineEgressBlocked
 	wasPaused := r.QuarantinePaused
@@ -957,8 +470,6 @@ func (m *Manager) UnquarantineRunner(ctx context.Context, runnerID string, opts 
 		var unblockErr error
 		if m.netnsNetwork != nil {
 			unblockErr = m.netnsNetwork.EmergencyUnblockEgress(runnerID)
-		} else {
-			unblockErr = m.network.UnblockEgress(net.IP(ip))
 		}
 		if unblockErr != nil {
 			errs = append(errs, fmt.Errorf("unblock egress: %w", unblockErr))
@@ -1028,16 +539,6 @@ func (m *Manager) ApplyNetworkPolicy(runnerID string, req AllocateRequest) error
 	m.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("runner not found: %s", runnerID)
-	}
-
-	if m.netnsNetwork == nil {
-		m.logger.WithField("runner_id", runnerID).Warn("Network policy requested but netns mode not enabled; skipping enforcement")
-		// Store policy on runner for observability even without enforcement
-		m.mu.Lock()
-		r.NetworkPolicy = policy
-		r.NetworkPolicyVersion = 1
-		m.mu.Unlock()
-		return nil
 	}
 
 	ns, err := m.netnsNetwork.GetNamespace(runnerID)
@@ -1142,9 +643,6 @@ func (m *Manager) GetNetworkPolicy(runnerID string) (*network.NetworkPolicy, int
 
 // EmergencyBlockEgress blocks all egress for a VM at the host level (independent of namespace policy).
 func (m *Manager) EmergencyBlockEgress(runnerID string) error {
-	if m.netnsNetwork == nil {
-		return fmt.Errorf("netns mode not enabled")
-	}
 	if err := m.netnsNetwork.EmergencyBlockEgress(runnerID); err != nil {
 		return err
 	}
@@ -1158,9 +656,6 @@ func (m *Manager) EmergencyBlockEgress(runnerID string) error {
 
 // EmergencyUnblockEgress removes the host-level egress block.
 func (m *Manager) EmergencyUnblockEgress(runnerID string) error {
-	if m.netnsNetwork == nil {
-		return fmt.Errorf("netns mode not enabled")
-	}
 	if err := m.netnsNetwork.EmergencyUnblockEgress(runnerID); err != nil {
 		return err
 	}
@@ -1207,18 +702,10 @@ func (m *Manager) cleanupRunner(runnerID, tapDevice, overlayPath string) {
 	if m.netnsNetwork != nil {
 		// Per-VM namespace mode: release the entire namespace
 		m.netnsNetwork.ReleaseNamespace(runnerID)
-		if slot, ok := m.runnerToSlot[runnerID]; ok {
-			delete(m.slotToRunner, slot)
-			delete(m.runnerToSlot, runnerID)
-		}
-	} else if slot, ok := m.runnerToSlot[runnerID]; ok {
-		// Legacy: release TAP slot
-		m.network.ReleaseTapSlot(slot, runnerID)
+	}
+	if slot, ok := m.runnerToSlot[runnerID]; ok {
 		delete(m.slotToRunner, slot)
 		delete(m.runnerToSlot, runnerID)
-	} else {
-		// Legacy: release dynamic TAP device (cold boot path)
-		m.network.ReleaseTap(runnerID)
 	}
 
 	// Remove overlay
@@ -1271,17 +758,12 @@ func (m *Manager) buildDrives(extensionDrivePaths map[string]string) []firecrack
 // Must match snapshot-builder's --output-dir flag (default: /tmp/snapshot).
 const snapshotSymlinkDir = "/tmp/snapshot"
 
-// snapshotTAPName is the TAP device name baked into the snapshot state file.
-// Must match the TAP name used by the snapshot-builder (always "tap-slot-0").
-const snapshotTAPName = "tap-slot-0"
-
-// setupSnapshotSymlinks creates symlinks from the snapshot's baked-in drive paths
 // to the actual host paths. Firecracker validates (opens) drive backing files during
 // LoadSnapshot at the paths recorded in the snapshot state. Since the snapshot was
 // built with drives at /tmp/snapshot/*.img but the host has them at different locations,
 // symlinks bridge the gap.
 //
-// This function must be called while m.mu is held (AllocateRunner holds it),
+// This function must be called while m.mu is held (the caller holds it),
 // which serializes access to the shared /tmp/snapshot/ directory.
 //
 // Returns a cleanup function that removes the symlinks. The cleanup should be
@@ -1335,71 +817,6 @@ func (m *Manager) setupSnapshotSymlinks(overlayPath string, extensionDrivePaths 
 		}
 	}
 	return cleanup, nil
-}
-
-// setupSnapshotTAPRename temporarily renames TAP devices so that this runner's
-// TAP has the name baked into the snapshot (tap-slot-0). Firecracker opens the
-// TAP device by name during LoadSnapshot via TUNSETIFF, so the name must match.
-//
-// If tap-slot-0 is already held by another runner's Firecracker process, we
-// rename it to a temporary name first, then restore it after. Firecracker holds
-// TAP devices by file descriptor, so renames are transparent to running VMs.
-// Bridge membership (fcbr0) is also preserved since the kernel tracks ports
-// by ifindex, not by name.
-//
-// This function must be called while m.mu is held.
-// Returns a restore function that undoes the renames (call after LoadSnapshot).
-func (m *Manager) setupSnapshotTAPRename(currentTAP string) (func(), error) {
-	if currentTAP == snapshotTAPName {
-		// Already has the right name (slot 0), no rename needed
-		return func() {}, nil
-	}
-
-	// Check if tap-slot-0 already exists (held by another runner)
-	_, err := net.InterfaceByName(snapshotTAPName)
-	existingTAPInUse := err == nil
-
-	tempName := snapshotTAPName + "-tmp"
-
-	if existingTAPInUse {
-		// Rename existing tap-slot-0 → tap-slot-0-tmp
-		m.logger.WithFields(logrus.Fields{
-			"from": snapshotTAPName,
-			"to":   tempName,
-		}).Debug("Temporarily renaming existing TAP for snapshot restore")
-		if output, err := exec.Command("ip", "link", "set", snapshotTAPName, "name", tempName).CombinedOutput(); err != nil {
-			return nil, fmt.Errorf("rename %s → %s: %s: %w", snapshotTAPName, tempName, strings.TrimSpace(string(output)), err)
-		}
-	}
-
-	// Rename our TAP → tap-slot-0
-	m.logger.WithFields(logrus.Fields{
-		"from": currentTAP,
-		"to":   snapshotTAPName,
-	}).Debug("Renaming TAP for snapshot restore")
-	if output, err := exec.Command("ip", "link", "set", currentTAP, "name", snapshotTAPName).CombinedOutput(); err != nil {
-		// Undo the temp rename if we did it
-		if existingTAPInUse {
-			exec.Command("ip", "link", "set", tempName, "name", snapshotTAPName).Run()
-		}
-		return nil, fmt.Errorf("rename %s → %s: %s: %w", currentTAP, snapshotTAPName, strings.TrimSpace(string(output)), err)
-	}
-
-	restore := func() {
-		// Rename tap-slot-0 back to our real name
-		if output, err := exec.Command("ip", "link", "set", snapshotTAPName, "name", currentTAP).CombinedOutput(); err != nil {
-			m.logger.WithError(err).WithField("output", strings.TrimSpace(string(output))).Warn("Failed to restore TAP name after snapshot")
-		}
-
-		// Restore original tap-slot-0 if we moved it
-		if existingTAPInUse {
-			if output, err := exec.Command("ip", "link", "set", tempName, "name", snapshotTAPName).CombinedOutput(); err != nil {
-				m.logger.WithError(err).WithField("output", strings.TrimSpace(string(output))).Warn("Failed to restore original tap-slot-0 name")
-			}
-		}
-	}
-
-	return restore, nil
 }
 
 // GetRunner returns a runner by ID
@@ -1466,7 +883,6 @@ func (m *Manager) GetStatus() ManagerStatus {
 		ActiveRunners:      len(m.runners),
 		IdleRunners:        idle,
 		BusyRunners:        busy,
-		SnapshotVersion:    m.snapshotCache.CurrentVersion(),
 		Draining:           m.draining,
 		TotalCPUMillicores: m.config.TotalCPUMillicores,
 		UsedCPUMillicores:  usedCPU,
@@ -1500,18 +916,11 @@ type ManagerStatus struct {
 	ActiveRunners      int
 	IdleRunners        int
 	BusyRunners        int
-	SnapshotVersion    string
 	Draining           bool
 	TotalCPUMillicores int
 	UsedCPUMillicores  int
 	TotalMemoryMB      int
 	UsedMemoryMB       int
-}
-
-// SyncSnapshot syncs a new snapshot version from GCS
-func (m *Manager) SyncSnapshot(ctx context.Context, version string) error {
-	m.logger.WithField("version", version).Info("Syncing snapshot")
-	return m.snapshotCache.SyncFromGCS(ctx, version)
 }
 
 // CanAddRunner checks if a new runner with the given resources can be added.
@@ -1616,23 +1025,11 @@ func (m *Manager) Close() error {
 
 	m.logger.Info("Shutting down runner manager")
 
-	// Shutdown runner pool first
-	if m.pool != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		if err := m.pool.Shutdown(ctx); err != nil {
-			m.logger.WithError(err).Warn("Failed to shutdown runner pool")
-		}
-	}
-
 	// Stop all VMs
 	for id, vm := range m.vms {
 		m.logger.WithField("runner_id", id).Debug("Stopping VM")
 		vm.Stop()
 	}
-
-	// Cleanup network
-	m.network.Cleanup()
 
 	// Close snapshot cache
 	m.snapshotCache.Close()
@@ -1696,57 +1093,6 @@ func (m *Manager) CleanupOrphanedWorkspaces() {
 	if cleaned > 0 {
 		m.logger.WithField("cleaned", cleaned).Info("Cleaned up orphaned workspaces")
 	}
-}
-
-// pauseRunnerVM pauses a runner's VM (pool callback)
-func (m *Manager) pauseRunnerVM(ctx context.Context, runnerID string) error {
-	m.mu.RLock()
-	vm := m.vms[runnerID]
-	m.mu.RUnlock()
-
-	if vm == nil {
-		return fmt.Errorf("VM not found for runner %s", runnerID)
-	}
-	return vm.Pause(ctx)
-}
-
-// resumeRunnerVM resumes a runner's VM (pool callback)
-func (m *Manager) resumeRunnerVM(ctx context.Context, runnerID string) error {
-	m.mu.RLock()
-	vm := m.vms[runnerID]
-	m.mu.RUnlock()
-
-	if vm == nil {
-		return fmt.Errorf("VM not found for runner %s", runnerID)
-	}
-	return vm.Resume(ctx)
-}
-
-// getRunnerVMStats gets VM resource statistics (pool callback)
-func (m *Manager) getRunnerVMStats(ctx context.Context, runnerID string) (*VMStats, error) {
-	m.mu.RLock()
-	runner := m.runners[runnerID]
-	m.mu.RUnlock()
-
-	if runner == nil {
-		return nil, fmt.Errorf("runner not found: %s", runnerID)
-	}
-
-	// Estimate memory usage from config
-	memoryUsage := int64(runner.Resources.MemoryMB) * 1024 * 1024
-
-	// Disk usage: estimate from runner disk allocation
-	diskUsage := int64(runner.Resources.DiskGB) * 1024 * 1024 * 1024
-
-	return &VMStats{
-		MemoryUsageBytes: memoryUsage,
-		DiskUsageBytes:   diskUsage,
-	}, nil
-}
-
-// removeRunnerVM removes a runner completely (pool callback)
-func (m *Manager) removeRunnerVM(ctx context.Context, runnerID string) error {
-	return m.ReleaseRunner(runnerID, true)
 }
 
 // ReconcileOrphans cleans up resources left behind by a previous manager incarnation.
@@ -1818,49 +1164,3 @@ func (m *Manager) ReconcileOrphans(ctx context.Context) {
 	}
 }
 
-// GetPool returns the runner pool (may be nil if pooling disabled)
-func (m *Manager) GetPool() *Pool {
-	return m.pool
-}
-
-// ReleaseRunnerWithOptions releases a runner with more control over behavior
-func (m *Manager) ReleaseRunnerWithOptions(ctx context.Context, runnerID string, opts ReleaseOptions) error {
-	m.mu.Lock()
-	runner, exists := m.runners[runnerID]
-	if !exists {
-		m.mu.Unlock()
-		return fmt.Errorf("runner not found: %s", runnerID)
-	}
-
-	// Don't pool quarantined runners
-	if runner.State == StateQuarantined {
-		m.mu.Unlock()
-		if opts.Destroy {
-			return fmt.Errorf("runner %s is quarantined; unquarantine before destroying", runnerID)
-		}
-		return nil
-	}
-	m.mu.Unlock()
-
-	// Try to recycle if pooling enabled and requested
-	if m.pool != nil && opts.TryRecycle && !opts.Destroy {
-		pooled := &pooledRunner{
-			Runner: runner,
-			key: &RunnerKey{
-				SnapshotVersion: runner.SnapshotVersion,
-				Platform:        "linux/amd64",
-				AffinityKey:     runner.PoolAffinityKey,
-			},
-		}
-
-		if err := m.pool.TryRecycle(ctx, pooled, opts.FinishedCleanly); err == nil {
-			m.logger.WithField("runner_id", runnerID).Info("Runner recycled to pool")
-			return nil
-		} else {
-			m.logger.WithError(err).WithField("runner_id", runnerID).Debug("Failed to recycle runner, destroying")
-		}
-	}
-
-	// Fall back to destroy
-	return m.ReleaseRunner(runnerID, true)
-}

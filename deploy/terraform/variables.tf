@@ -130,24 +130,6 @@ variable "use_custom_host_image" {
   default     = false
 }
 
-variable "github_app_id" {
-  description = "GitHub App ID for generating installation tokens (for private repos)"
-  type        = string
-  default     = ""
-}
-
-variable "github_app_secret" {
-  description = "Secret Manager secret name containing GitHub App private key (for private repos)"
-  type        = string
-  default     = ""
-}
-
-variable "github_repo" {
-  description = "GitHub repository for runner registration (e.g., 'askscio/scio')"
-  type        = string
-  default     = ""
-}
-
 # MicroVM configuration per host
 variable "max_runners_per_host" {
   description = "Maximum number of microVMs (runners) per host"
@@ -159,18 +141,6 @@ variable "idle_runners_target" {
   description = "Target number of idle runners to maintain per host"
   type        = number
   default     = 2
-}
-
-variable "use_chunked_snapshots" {
-  description = "Enable chunked snapshot restore with UFFD (lazy memory) and FUSE (lazy disk). Requires chunked metadata in the snapshot bucket."
-  type        = bool
-  default     = true
-}
-
-variable "enable_session_chunks" {
-  description = "Enable cloud-backed session pause/resume. Uses snapshot bucket for chunk storage. When enabled, PauseRunner uploads chunks to GCS and ResumeFromSession fetches lazily via UFFD+FUSE."
-  type        = bool
-  default     = true
 }
 
 variable "otel_collector_addr" {
@@ -189,18 +159,6 @@ variable "mem_cache_size_gb" {
   description = "Size in GB of the in-memory LRU chunk cache for UFFD page fault handling. Larger values reduce GCS fetches for memory pages."
   type        = number
   default     = 2
-}
-
-variable "use_netns" {
-  description = "Use per-VM network namespaces instead of a shared bridge. Provides VM-to-VM isolation by construction — each VM gets its own namespace with point-to-point veth routing."
-  type        = bool
-  default     = true
-}
-
-variable "runner_ephemeral" {
-  description = "Whether GitHub runners are ephemeral (one job per VM) or persistent (multiple jobs)"
-  type        = bool
-  default     = false
 }
 
 # Container Registry configuration

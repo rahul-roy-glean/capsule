@@ -25,7 +25,6 @@ func TestWaitForMMDS_WrappedJSON(t *testing.T) {
 	data.Latest.Meta.RunnerID = "runner-abc"
 	data.Latest.Meta.HostID = "host-123"
 	data.Latest.Network.IP = "172.16.0.2/24"
-	data.Latest.Job.Repo = "org/repo"
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -50,9 +49,6 @@ func TestWaitForMMDS_WrappedJSON(t *testing.T) {
 	if got.Latest.Meta.HostID != "host-123" {
 		t.Errorf("HostID = %q, want %q", got.Latest.Meta.HostID, "host-123")
 	}
-	if got.Latest.Job.Repo != "org/repo" {
-		t.Errorf("Repo = %q, want %q", got.Latest.Job.Repo, "org/repo")
-	}
 }
 
 func TestWaitForMMDS_UnwrappedJSON(t *testing.T) {
@@ -66,9 +62,6 @@ func TestWaitForMMDS_UnwrappedJSON(t *testing.T) {
 		Network struct {
 			IP string `json:"ip"`
 		} `json:"network"`
-		Job struct {
-			Repo string `json:"repo"`
-		} `json:"job"`
 	}{}
 	inner.Meta.RunnerID = "runner-unwrapped"
 	inner.Meta.HostID = "host-456"
