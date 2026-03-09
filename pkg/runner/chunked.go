@@ -693,8 +693,34 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		}
 	}
 
+	// Start auth proxy BEFORE injecting MMDS so proxy config is available to the VM.
+	if req.AuthConfig != nil && netns != nil {
+		proxy, proxyErr := authproxy.NewAuthProxy(
+			runnerID,
+			*req.AuthConfig,
+			netns.GetFirecrackerNetNSPath(),
+			netns.Gateway.String(),
+			netns.HostReachableIP.String(),
+			cm.chunkedLogger,
+		)
+		if proxyErr != nil {
+			cm.chunkedLogger.WithError(proxyErr).Warn("Failed to create auth proxy (non-fatal)")
+		} else if proxyErr := proxy.Start(context.Background()); proxyErr != nil {
+			cm.chunkedLogger.WithError(proxyErr).Warn("Failed to start auth proxy (non-fatal)")
+		} else {
+			cm.authProxies[runnerID] = proxy
+			cm.chunkedLogger.WithField("runner_id", runnerID).Info("Auth proxy started")
+		}
+	}
+
 	// Inject MMDS data BEFORE resuming so the thaw-agent sees fresh config
 	mmdsData := cm.buildMMDSData(ctx, runner, tap, req)
+	// Inject auth proxy config into MMDS if proxy was started.
+	if proxy, ok := cm.authProxies[runnerID]; ok {
+		mmdsData.Latest.Proxy.Address = proxy.ProxyAddress()
+		mmdsData.Latest.Proxy.CACertPEM = string(proxy.CACertPEM)
+		mmdsData.Latest.Proxy.MetadataHost = proxy.GatewayIP()
+	}
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
 		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
@@ -796,6 +822,12 @@ func (cm *ChunkedManager) ReleaseRunnerChunked(ctx context.Context, runnerID str
 		}
 	}
 
+	// Stop auth proxy
+	if proxy, exists := cm.authProxies[runnerID]; exists {
+		proxy.Stop()
+		delete(cm.authProxies, runnerID)
+	}
+
 	// Stop VM
 	if vm, exists := cm.vms[runnerID]; exists {
 		vm.Stop()
@@ -855,6 +887,11 @@ func (cm *ChunkedManager) cleanupChunkedRunner(
 	fuseDisk *fuse.ChunkedDisk,
 	uffdHandler *uffd.Handler,
 ) {
+	// Stop auth proxy if started
+	if proxy, ok := cm.authProxies[runnerID]; ok {
+		proxy.Stop()
+		delete(cm.authProxies, runnerID)
+	}
 	if uffdHandler != nil {
 		uffdHandler.Stop()
 	}

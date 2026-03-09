@@ -424,6 +424,16 @@ func (p *AuthProxy) handleHTTP(clientConn net.Conn, req *http.Request) {
 	resp.Write(clientConn)
 }
 
+// ProxyAddress returns the proxy listen address (e.g., "172.16.0.1:3128").
+func (p *AuthProxy) ProxyAddress() string {
+	return fmt.Sprintf("%s:%d", p.gatewayIP, p.proxyConf.ListenPort)
+}
+
+// GatewayIP returns the gateway IP used by this proxy.
+func (p *AuthProxy) GatewayIP() string {
+	return p.gatewayIP
+}
+
 // tunnel copies bytes bidirectionally without decryption (no SSL bump).
 func (p *AuthProxy) tunnel(clientConn net.Conn, targetHost string) {
 	upstream, err := net.DialTimeout("tcp", targetHost, 10*time.Second)
