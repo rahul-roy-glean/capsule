@@ -33,10 +33,15 @@ class LayeredConfigs:
     def delete(self, config_id: str) -> None:
         self._http.delete(f"/api/v1/layered-configs/{config_id}")
 
-    def build(self, config_id: str, *, force: bool = False) -> BuildResponse:
+    def build(self, config_id: str, *, force: bool = False, clean: bool = False) -> BuildResponse:
         url = f"/api/v1/layered-configs/{config_id}/build"
+        params: list[str] = []
         if force:
-            url += "?force=true"
+            params.append("force=true")
+        if clean:
+            params.append("clean=true")
+        if params:
+            url += "?" + "&".join(params)
         data = self._http.post(url)
         return BuildResponse.model_validate(data)
 

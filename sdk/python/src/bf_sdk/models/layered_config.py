@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
+from pydantic import field_validator
+
+from bf_sdk._snapshot_commands import normalize_snapshot_commands
 from bf_sdk.models.common import BFModel
 
 
@@ -23,6 +26,16 @@ class LayerDef(BFModel):
     drives: list[DriveSpec] | None = None
     refresh_interval: str | None = None
 
+    @field_validator("init_commands", "refresh_commands", mode="before")
+    @classmethod
+    def _normalize_commands(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            return value
+        commands = cast(list[str | dict[str, Any]], value)
+        return normalize_snapshot_commands(commands)
+
 
 class LayeredConfigConfig(BFModel):
     """Runtime configuration nested inside a LayeredConfig."""
@@ -30,7 +43,6 @@ class LayeredConfigConfig(BFModel):
     auto_pause: bool | None = None
     ttl: int | None = None
     tier: str | None = None
-    ci_system: str | None = None
     auto_rollout: bool | None = None
     session_max_age_seconds: int | None = None
     rootfs_size_gb: int | None = None
@@ -38,6 +50,7 @@ class LayeredConfigConfig(BFModel):
     workspace_size_gb: int | None = None
     network_policy_preset: str | None = None
     network_policy: Any | None = None
+    auth: Any | None = None
 
 
 class StoredLayeredConfig(BFModel):
@@ -48,7 +61,6 @@ class StoredLayeredConfig(BFModel):
     leaf_layer_hash: str | None = None
     leaf_workload_key: str | None = None
     tier: str | None = None
-    ci_system: str | None = None
     start_command: dict[str, Any] | None = None
     runner_ttl_seconds: int | None = None
     session_max_age_seconds: int | None = None
@@ -70,6 +82,8 @@ class LayerStatus(BFModel):
     status: str | None = None
     current_version: str | None = None
     depth: int | None = None
+    build_status: str | None = None
+    build_version: str | None = None
 
 
 class LayeredConfigDetail(BFModel):
@@ -94,6 +108,7 @@ class BuildResponse(BFModel):
     config_id: str
     status: str | None = None
     force: str | None = None
+    clean: str | None = None
 
 
 class RefreshResponse(BFModel):

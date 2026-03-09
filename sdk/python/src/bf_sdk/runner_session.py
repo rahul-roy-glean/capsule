@@ -153,33 +153,40 @@ class RunnerSession:
         """Download a file from the runner as raw bytes."""
         return self._runners.file_download(self._runner_id, path)
 
-    def upload(self, path: str, data: bytes | str, *, mode: str = "overwrite", perm: str | None = None) -> dict:
+    def upload(
+        self,
+        path: str,
+        data: bytes | str,
+        *,
+        mode: str = "overwrite",
+        perm: str | None = None,
+    ) -> dict[str, Any]:
         """Upload data to a file in the runner. Strings are encoded to UTF-8."""
         if isinstance(data, str):
             data = data.encode("utf-8")
         return self._runners.file_upload(self._runner_id, path, data, mode=mode, perm=perm)
 
-    def read_file(self, path: str, *, offset: int = 0, limit: int | None = None) -> dict:
+    def read_file(self, path: str, *, offset: int = 0, limit: int | None = None) -> dict[str, Any]:
         """Read a file's content (JSON-based, supports offset/limit)."""
         return self._runners.file_read(self._runner_id, path, offset=offset, limit=limit)
 
-    def write_file(self, path: str, content: str, *, mode: str = "overwrite") -> dict:
+    def write_file(self, path: str, content: str, *, mode: str = "overwrite") -> dict[str, Any]:
         """Write string content to a file in the runner."""
         return self._runners.file_write(self._runner_id, path, content, mode=mode)
 
-    def list_files(self, path: str, *, recursive: bool = False) -> dict:
+    def list_files(self, path: str, *, recursive: bool = False) -> dict[str, Any]:
         """List files in a directory in the runner."""
         return self._runners.file_list(self._runner_id, path, recursive=recursive)
 
-    def stat_file(self, path: str) -> dict:
+    def stat_file(self, path: str) -> dict[str, Any]:
         """Stat a file in the runner."""
         return self._runners.file_stat(self._runner_id, path)
 
-    def remove(self, path: str, *, recursive: bool = False) -> dict:
+    def remove(self, path: str, *, recursive: bool = False) -> dict[str, Any]:
         """Remove a file or directory in the runner."""
         return self._runners.file_remove(self._runner_id, path, recursive=recursive)
 
-    def mkdir(self, path: str) -> dict:
+    def mkdir(self, path: str) -> dict[str, Any]:
         """Create a directory in the runner."""
         return self._runners.file_mkdir(self._runner_id, path)
 

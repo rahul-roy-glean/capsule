@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from typing import Any
+from urllib.parse import urlencode
 
 from bf_sdk._errors import BFServiceUnavailable
 from bf_sdk._http import HttpClient
@@ -100,9 +101,7 @@ class Runners:
             params["reason"] = reason
         params["block_egress"] = str(block_egress).lower()
         params["pause_vm"] = str(pause_vm).lower()
-        return self._http.post(
-            "/api/v1/runners/quarantine?" + "&".join(f"{k}={v}" for k, v in params.items()),
-        )
+        return self._http.post("/api/v1/runners/quarantine?" + urlencode(params))
 
     def unquarantine(
         self,
@@ -116,9 +115,7 @@ class Runners:
             "unblock_egress": str(unblock_egress).lower(),
             "resume_vm": str(resume_vm).lower(),
         }
-        return self._http.post(
-            "/api/v1/runners/unquarantine?" + "&".join(f"{k}={v}" for k, v in params.items()),
-        )
+        return self._http.post("/api/v1/runners/unquarantine?" + urlencode(params))
 
     def wait_ready(self, runner_id: str, *, timeout: float = 120.0, poll_interval: float = 2.0) -> RunnerStatus:
         """Poll status until runner is ready or timeout."""
@@ -263,10 +260,10 @@ class Runners:
     ) -> ShellSession:
         """Open a PTY shell session. Returns an unconnected ShellSession; use as context manager."""
         host = self._resolve_host(runner_id)
-        qs_parts = [f"cols={cols}", f"rows={rows}"]
+        query: dict[str, int | str] = {"cols": cols, "rows": rows}
         if command:
-            qs_parts.append(f"command={command}")
-        qs = "&".join(qs_parts)
+            query["command"] = command
+        qs = urlencode(query)
 
         scheme = "wss" if host.startswith("https://") else "ws"
         host_addr = host.replace("https://", "").replace("http://", "")
