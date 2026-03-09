@@ -161,6 +161,7 @@ variable "mem_cache_size_gb" {
   default     = 2
 }
 
+
 # Container Registry configuration
 variable "container_registry_location" {
   description = "Location for Artifact Registry (e.g., us-central1, us, eu)"

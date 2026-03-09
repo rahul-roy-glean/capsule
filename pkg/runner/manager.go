@@ -210,7 +210,6 @@ func (m *Manager) SetDraining(draining bool) (changed bool) {
 	return true
 }
 
-
 // buildMMDSData builds the MMDS data structure for a runner
 func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *network.TapDevice, req AllocateRequest) MMDSData {
 	netCfg := tap.GetNetworkConfig()
@@ -1163,4 +1162,3 @@ func (m *Manager) ReconcileOrphans(ctx context.Context) {
 		m.logger.Info("No orphaned resources found")
 	}
 }
-

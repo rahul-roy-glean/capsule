@@ -152,6 +152,11 @@ type MMDSData struct {
 		Warmup struct {
 			Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
 		} `json:"warmup,omitempty"`
+		Proxy struct {
+			CACertPEM    string `json:"ca_cert_pem,omitempty"`
+			Address      string `json:"address,omitempty"`
+			MetadataHost string `json:"metadata_host,omitempty"`
+		} `json:"proxy,omitempty"`
 	} `json:"latest"`
 }
 

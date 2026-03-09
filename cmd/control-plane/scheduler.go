@@ -147,6 +147,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	var configNetworkPolicyPreset string
 	var configNetworkPolicyJSON string
 	var resumeFromSessionConfig bool
+	var authConfigJSON string
 	if workloadKey != "" {
 		var wc *WorkloadConfig
 		if s.configCache != nil {
@@ -159,6 +160,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			autoPause = wc.AutoPause
 			configNetworkPolicyPreset = wc.NetworkPolicyPreset
 			configNetworkPolicyJSON = wc.NetworkPolicyJSON
+			authConfigJSON = wc.AuthConfigJSON
 			if wc.MaxConcurrentRunners > 0 && s.db != nil {
 				var currentCount int
 				_ = s.db.QueryRowContext(ctx, `
@@ -177,8 +179,9 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			var autoPauseCol sql.NullBool
 			var npPreset sql.NullString
 			var npJSON sql.NullString
+			var configJSON sql.NullString
 
-			err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, start_command, tier, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy FROM layered_configs WHERE leaf_workload_key = $1 ORDER BY created_at DESC LIMIT 1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON)
+			err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, start_command, tier, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, config_json FROM layered_configs WHERE leaf_workload_key = $1 ORDER BY created_at DESC LIMIT 1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON, &configJSON)
 			if err == nil {
 				if tierCol.Valid && tierCol.String != "" {
 					tierName = tierCol.String
@@ -210,6 +213,9 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 				}
 				if npJSON.Valid {
 					configNetworkPolicyJSON = npJSON.String
+				}
+				if configJSON.Valid {
+					authConfigJSON = extractAuthConfigJSON(configJSON.String)
 				}
 			}
 		}
@@ -405,6 +411,18 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		if effectiveNPJSON != "" {
 			protoReq.Labels["_network_policy_json"] = effectiveNPJSON
 		}
+	}
+	// Pass auth config via labels so the host agent can start the auth proxy.
+	s.logger.WithFields(logrus.Fields{
+		"workload_key":    workloadKey,
+		"auth_config_len": len(authConfigJSON),
+		"has_auth_config": authConfigJSON != "",
+	}).Info("DEBUG: auth config for allocation")
+	if authConfigJSON != "" {
+		if protoReq.Labels == nil {
+			protoReq.Labels = make(map[string]string)
+		}
+		protoReq.Labels["_auth_config_json"] = authConfigJSON
 	}
 	// Populate resources from tier (overrides request-level values)
 	protoReq.Resources = &pb.Resources{
