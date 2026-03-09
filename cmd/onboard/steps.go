@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -286,63 +285,6 @@ func applySecret(name string, data map[string]string) error {
 	if err := runCommandStreaming(applyCmd); err != nil {
 		return fmt.Errorf("failed to apply secret %s: %w", name, err)
 	}
-	return nil
-}
-
-// templateAndApplyK8sManifests reads the K8s manifest templates from deploy/kubernetes/,
-// substitutes config placeholders, optionally strips the Ingress resource, writes the
-// result to a temp dir, and applies via kubectl.
-func templateAndApplyK8sManifests(cfg *Config, log *logrus.Entry) error {
-	srcDir := "deploy/kubernetes"
-	files, err := filepath.Glob(filepath.Join(srcDir, "*.yaml"))
-	if err != nil {
-		return fmt.Errorf("failed to glob K8s manifests: %w", err)
-	}
-	if len(files) == 0 {
-		return fmt.Errorf("no YAML files found in %s", srcDir)
-	}
-
-	replacer := strings.NewReplacer(
-		"${PROJECT_ID}", cfg.Platform.GCPProject,
-		"${GCP_PROJECT_ID}", cfg.Platform.GCPProject,
-		"${REGION}", cfg.Platform.Region,
-		"${ZONE}", cfg.Platform.Zone,
-		"${CONTROL_PLANE_DOMAIN}", cfg.Platform.ControlPlaneDomain,
-	)
-
-	tmpDir, err := os.MkdirTemp("", "k8s-manifests-*")
-	if err != nil {
-		return fmt.Errorf("failed to create temp dir: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	for _, f := range files {
-		data, err := os.ReadFile(f)
-		if err != nil {
-			return fmt.Errorf("failed to read %s: %w", f, err)
-		}
-
-		content := replacer.Replace(string(data))
-
-		// If no domain configured, strip Ingress documents.
-		if cfg.Platform.ControlPlaneDomain == "" {
-			content = stripIngressDocuments(content)
-		}
-
-		outPath := filepath.Join(tmpDir, filepath.Base(f))
-		if err := os.WriteFile(outPath, []byte(content), 0644); err != nil {
-			return fmt.Errorf("failed to write templated manifest %s: %w", outPath, err)
-		}
-	}
-
-	log.WithField("dir", tmpDir).Info("Applying templated manifests...")
-	applyCmd := exec.Command("kubectl", "apply", "-f", tmpDir)
-	applyCmd.Stdout = os.Stdout
-	applyCmd.Stderr = os.Stderr
-	if err := applyCmd.Run(); err != nil {
-		return fmt.Errorf("kubectl apply failed: %w", err)
-	}
-
 	return nil
 }
 

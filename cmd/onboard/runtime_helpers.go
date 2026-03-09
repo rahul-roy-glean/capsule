@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	onboardNamespace    = "firecracker-runner"
+	onboardNamespace     = "firecracker-runner"
 	portForwardLocalPort = 18080
 )
 
@@ -54,22 +54,6 @@ func generateSecretString(n int) (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(buf), nil
-}
-
-func waitForHTTP(url string, timeout time.Duration) error {
-	client := &http.Client{Timeout: 2 * time.Second}
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		resp, err := client.Get(url)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode >= 200 && resp.StatusCode < 500 {
-				return nil
-			}
-		}
-		time.Sleep(2 * time.Second)
-	}
-	return fmt.Errorf("timed out waiting for %s", url)
 }
 
 func waitForTCP(addr string, timeout time.Duration) error {

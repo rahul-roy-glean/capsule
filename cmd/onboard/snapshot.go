@@ -95,8 +95,8 @@ func stepSnapshotBuild(cfg *Config, logger *logrus.Logger, planOnly bool) error 
 		cfg.ResolvedConfigID = createResult.ConfigID
 		cfg.ResolvedWorkloadKey = createResult.LeafWorkloadKey
 		log.WithFields(logrus.Fields{
-			"config_id":     cfg.ResolvedConfigID,
-			"workload_key":  cfg.ResolvedWorkloadKey,
+			"config_id":    cfg.ResolvedConfigID,
+			"workload_key": cfg.ResolvedWorkloadKey,
 		}).Info("Registered layered config")
 
 		buildReq, err := http.NewRequest(http.MethodPost, baseURL+"/api/v1/layered-configs/"+cfg.ResolvedConfigID+"/build", nil)
@@ -152,9 +152,9 @@ func waitForLayeredBuild(baseURL, configID string, log *logrus.Entry) error {
 		}
 		leaf := detail.Layers[len(detail.Layers)-1]
 		log.WithFields(logrus.Fields{
-			"layer":          leaf.Name,
-			"status":         leaf.Status,
-			"build_status":   leaf.BuildStatus,
+			"layer":           leaf.Name,
+			"status":          leaf.Status,
+			"build_status":    leaf.BuildStatus,
 			"current_version": leaf.CurrentVersion,
 		}).Info("Waiting for layered build")
 		if leaf.Status == "active" && leaf.CurrentVersion != "" {

@@ -31,27 +31,27 @@ type Config struct {
 	Session     SessionConfig     `yaml:"session"`
 	Credentials CredentialsConfig `yaml:"credentials"`
 
-	ResolvedDBPassword     string `yaml:"-"`
-	ResolvedStateBucket    string `yaml:"-"`
-	ResolvedControlPlaneIP string `yaml:"-"`
+	ResolvedDBPassword      string `yaml:"-"`
+	ResolvedStateBucket     string `yaml:"-"`
+	ResolvedControlPlaneIP  string `yaml:"-"`
 	ResolvedControlPlaneURL string `yaml:"-"`
-	ResolvedConfigID       string `yaml:"-"`
-	ResolvedWorkloadKey    string `yaml:"-"`
+	ResolvedConfigID        string `yaml:"-"`
+	ResolvedWorkloadKey     string `yaml:"-"`
 }
 
 // --- Core fields ---
 
 type PlatformConfig struct {
-	GCPProject         string `yaml:"gcp_project"`
-	Region             string `yaml:"region"`
-	Zone               string `yaml:"zone"`
-	Environment        string `yaml:"environment"`
-	ControlPlaneDomain string `yaml:"control_plane_domain"`
-	TerraformStateBucket string `yaml:"terraform_state_bucket"`
-	TerraformStatePrefix string `yaml:"terraform_state_prefix"`
-	DBPassword          string `yaml:"db_password"`
-	GitHubWebhookSecret string `yaml:"github_webhook_secret"`
-	AdminCIDRs          []string `yaml:"admin_cidrs"`
+	GCPProject           string   `yaml:"gcp_project"`
+	Region               string   `yaml:"region"`
+	Zone                 string   `yaml:"zone"`
+	Environment          string   `yaml:"environment"`
+	ControlPlaneDomain   string   `yaml:"control_plane_domain"`
+	TerraformStateBucket string   `yaml:"terraform_state_bucket"`
+	TerraformStatePrefix string   `yaml:"terraform_state_prefix"`
+	DBPassword           string   `yaml:"db_password"`
+	GitHubWebhookSecret  string   `yaml:"github_webhook_secret"`
+	AdminCIDRs           []string `yaml:"admin_cidrs"`
 }
 
 type MicroVMConfig struct {
@@ -62,12 +62,12 @@ type MicroVMConfig struct {
 }
 
 type HostsConfig struct {
-	MachineType     string `yaml:"machine_type"`
-	MinCount        int    `yaml:"min_count"`
-	MaxCount        int    `yaml:"max_count"`
-	DataDiskGB      int    `yaml:"data_disk_gb"`
-	ChunkCacheSizeGB int   `yaml:"chunk_cache_size_gb"`
-	MemCacheSizeGB   int   `yaml:"mem_cache_size_gb"`
+	MachineType      string `yaml:"machine_type"`
+	MinCount         int    `yaml:"min_count"`
+	MaxCount         int    `yaml:"max_count"`
+	DataDiskGB       int    `yaml:"data_disk_gb"`
+	ChunkCacheSizeGB int    `yaml:"chunk_cache_size_gb"`
+	MemCacheSizeGB   int    `yaml:"mem_cache_size_gb"`
 }
 
 // --- Workload: what runs inside the VM ---
@@ -80,8 +80,8 @@ type WorkloadConfig struct {
 	SnapshotCommands []SnapshotCommandConfig `yaml:"snapshot_commands"`
 
 	// Layered workload schema used by the examples and control-plane API.
-	BaseImage string             `yaml:"base_image"`
-	Layers    []snapshot.LayerDef `yaml:"layers"`
+	BaseImage string                `yaml:"base_image"`
+	Layers    []snapshot.LayerDef   `yaml:"layers"`
 	Config    WorkloadRuntimeConfig `yaml:"config"`
 
 	// StartCommand describes the service to launch inside the VM after restore.
@@ -91,16 +91,16 @@ type WorkloadConfig struct {
 }
 
 type WorkloadRuntimeConfig struct {
-	AutoPause            *bool                `yaml:"auto_pause"`
-	TTL                  int                  `yaml:"ttl"`
-	Tier                 string               `yaml:"tier"`
-	AutoRollout          *bool                `yaml:"auto_rollout"`
-	SessionMaxAgeSeconds int                  `yaml:"session_max_age_seconds"`
-	RootfsSizeGB         int                  `yaml:"rootfs_size_gb"`
-	RunnerUser           string               `yaml:"runner_user"`
-	WorkspaceSizeGB      int                  `yaml:"workspace_size_gb"`
-	NetworkPolicyPreset  string               `yaml:"network_policy_preset"`
-	NetworkPolicy        json.RawMessage      `yaml:"network_policy"`
+	AutoPause            *bool                 `yaml:"auto_pause"`
+	TTL                  int                   `yaml:"ttl"`
+	Tier                 string                `yaml:"tier"`
+	AutoRollout          *bool                 `yaml:"auto_rollout"`
+	SessionMaxAgeSeconds int                   `yaml:"session_max_age_seconds"`
+	RootfsSizeGB         int                   `yaml:"rootfs_size_gb"`
+	RunnerUser           string                `yaml:"runner_user"`
+	WorkspaceSizeGB      int                   `yaml:"workspace_size_gb"`
+	NetworkPolicyPreset  string                `yaml:"network_policy_preset"`
+	NetworkPolicy        json.RawMessage       `yaml:"network_policy"`
 	Auth                 *authproxy.AuthConfig `yaml:"auth"`
 }
 
@@ -114,9 +114,9 @@ type SnapshotCommandConfig struct {
 
 // StartCommandConfig describes the persistent service the VM runs after restore.
 type StartCommandConfig struct {
-	Command    []string `yaml:"command"`
-	Port       int      `yaml:"port"`
-	HealthPath string   `yaml:"health_path"`
+	Command    []string          `yaml:"command"`
+	Port       int               `yaml:"port"`
+	HealthPath string            `yaml:"health_path"`
 	Env        map[string]string `yaml:"env"`
 	RunAs      string            `yaml:"run_as"`
 }
