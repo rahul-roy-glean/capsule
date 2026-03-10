@@ -262,7 +262,6 @@ func (m *Manager) finishIdempotentAllocation(reqID string, alloc *recentAllocati
 	}
 	alloc.inFlight = false
 	waitCh := alloc.waitCh
-	alloc.waitCh = nil
 	m.mu.Unlock()
 
 	if waitCh != nil {

@@ -579,12 +579,6 @@ func (s *Scheduler) scoreHostForWorkloadKeyWithUsage(h *Host, workloadKey string
 	return score
 }
 
-// canFitWorkload checks whether a host has enough resources to run a workload
-// of the given tier.
-func canFitWorkload(h *Host, t tiers.Tier) bool {
-	return canFitWorkloadWithUsage(h, h.UsedCPUMillicores, h.UsedMemoryMB, t)
-}
-
 func canFitWorkloadWithUsage(h *Host, usedCPU, usedMem int, t tiers.Tier) bool {
 	if h.TotalCPUMillicores == 0 {
 		return false
