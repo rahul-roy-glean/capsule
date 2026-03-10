@@ -21,6 +21,16 @@ import (
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/tiers"
 )
 
+const schedulerRequestTTL = 5 * time.Minute
+
+type recentSchedulerAllocation struct {
+	resp      *AllocateRunnerResponse
+	allocTime time.Time
+	err       error
+	waitCh    chan struct{}
+	inFlight  bool
+}
+
 // Scheduler handles runner allocation across hosts
 type Scheduler struct {
 	hostRegistry    *HostRegistry
@@ -37,6 +47,9 @@ type Scheduler struct {
 	// gRPC connections are multiplexed and designed to be long-lived, so
 	// reusing them avoids TCP+TLS handshake latency on every RPC.
 	connPool sync.Map // map[string]*grpc.ClientConn
+
+	requestMu      sync.Mutex
+	recentRequests map[string]*recentSchedulerAllocation
 }
 
 // NewScheduler creates a new scheduler
@@ -47,7 +60,91 @@ func NewScheduler(hr *HostRegistry, db *sql.DB, sm *SnapshotManager, tr *Snapsho
 		snapshotManager: sm,
 		tagRegistry:     tr,
 		logger:          logger.WithField("component", "scheduler"),
+		recentRequests:  make(map[string]*recentSchedulerAllocation),
 	}
+}
+
+func (s *Scheduler) beginIdempotentAllocation(reqID string) (*AllocateRunnerResponse, *recentSchedulerAllocation, bool) {
+	if reqID == "" {
+		return nil, nil, true
+	}
+
+	s.requestMu.Lock()
+	defer s.requestMu.Unlock()
+
+	if alloc, ok := s.recentRequests[reqID]; ok {
+		if alloc.inFlight {
+			return nil, alloc, false
+		}
+		if time.Since(alloc.allocTime) <= schedulerRequestTTL && s.cachedAllocationStillValid(alloc) {
+			return alloc.resp, nil, false
+		}
+		delete(s.recentRequests, reqID)
+	}
+
+	alloc := &recentSchedulerAllocation{
+		allocTime: time.Now(),
+		waitCh:    make(chan struct{}),
+		inFlight:  true,
+	}
+	s.recentRequests[reqID] = alloc
+	return nil, alloc, true
+}
+
+func (s *Scheduler) waitForIdempotentAllocation(ctx context.Context, reqID string, alloc *recentSchedulerAllocation) (*AllocateRunnerResponse, error) {
+	if reqID == "" || alloc == nil {
+		return nil, nil
+	}
+
+	select {
+	case <-alloc.waitCh:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	s.requestMu.Lock()
+	defer s.requestMu.Unlock()
+
+	if alloc.resp != nil && s.cachedAllocationStillValid(alloc) {
+		return alloc.resp, nil
+	}
+	if alloc.err != nil {
+		return nil, alloc.err
+	}
+	return nil, fmt.Errorf("allocation for request %q completed without a runner", reqID)
+}
+
+func (s *Scheduler) finishIdempotentAllocation(reqID string, alloc *recentSchedulerAllocation, resp *AllocateRunnerResponse, err error) {
+	if reqID == "" || alloc == nil {
+		return
+	}
+
+	s.requestMu.Lock()
+	if err == nil && resp != nil {
+		alloc.resp = resp
+		alloc.allocTime = time.Now()
+	} else {
+		alloc.err = err
+		delete(s.recentRequests, reqID)
+	}
+	alloc.inFlight = false
+	waitCh := alloc.waitCh
+	s.requestMu.Unlock()
+
+	if waitCh != nil {
+		close(waitCh)
+	}
+}
+
+func (s *Scheduler) cachedAllocationStillValid(alloc *recentSchedulerAllocation) bool {
+	if alloc == nil || alloc.resp == nil || alloc.resp.RunnerID == "" {
+		return false
+	}
+	if s.hostRegistry == nil {
+		return true
+	}
+	_, err := s.hostRegistry.GetRunner(alloc.resp.RunnerID)
+	return err == nil
 }
 
 // SetOTel attaches OTel instruments for distributed tracing and metrics.
@@ -128,7 +225,21 @@ type AllocateRunnerResponse struct {
 }
 
 // AllocateRunner allocates a runner on the best available host
-func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerRequest) (*AllocateRunnerResponse, error) {
+func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerRequest) (_ *AllocateRunnerResponse, retErr error) {
+	var idempotentAlloc *recentSchedulerAllocation
+	var allocatedResp *AllocateRunnerResponse
+
+	if existing, alloc, leader := s.beginIdempotentAllocation(req.RequestID); existing != nil {
+		return existing, nil
+	} else if !leader {
+		return s.waitForIdempotentAllocation(ctx, req.RequestID, alloc)
+	} else {
+		idempotentAlloc = alloc
+		defer func() {
+			s.finishIdempotentAllocation(req.RequestID, idempotentAlloc, allocatedResp, retErr)
+		}()
+	}
+
 	s.logger.WithFields(logrus.Fields{
 		"request_id":   req.RequestID,
 		"workload_key": req.WorkloadKey,
@@ -305,7 +416,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	}
 	if len(available) == 0 {
 		s.hostRegistry.mu.Unlock()
-		return nil, fmt.Errorf("no available hosts")
+		retErr = fmt.Errorf("no available hosts")
+		return nil, retErr
 	}
 
 	candidateHosts := available
@@ -344,7 +456,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	}
 	if host == nil {
 		s.hostRegistry.mu.Unlock()
-		return nil, fmt.Errorf("no suitable host found")
+		retErr = fmt.Errorf("no suitable host found")
+		return nil, retErr
 	}
 
 	host.PendingCPUMillicores += effectiveCPU
@@ -384,7 +497,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	conn, err := s.getHostConn(host.GRPCAddress)
 	if err != nil {
 		s.hostRegistry.releasePendingReservation(host.ID, effectiveCPU, effectiveMemoryMB)
-		return nil, err
+		retErr = err
+		return nil, retErr
 	}
 
 	// Create host agent client
@@ -481,16 +595,18 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	if err != nil {
 		s.hostRegistry.releasePendingReservation(host.ID, effectiveCPU, effectiveMemoryMB)
 		s.logger.WithError(err).WithField("host", host.InstanceName).Error("gRPC AllocateRunner failed")
-		return nil, fmt.Errorf("host agent AllocateRunner failed: %w", err)
+		retErr = fmt.Errorf("host agent AllocateRunner failed: %w", err)
+		return nil, retErr
 	}
 
 	if resp.Error != "" {
 		s.hostRegistry.releasePendingReservation(host.ID, effectiveCPU, effectiveMemoryMB)
+		retErr = fmt.Errorf("host agent returned error: %s", resp.Error)
 		return &AllocateRunnerResponse{
 			HostID:      host.ID,
 			HostAddress: host.HTTPAddress,
 			Error:       resp.Error,
-		}, fmt.Errorf("host agent returned error: %s", resp.Error)
+		}, retErr
 	}
 
 	// Register runner in our registry
@@ -513,14 +629,15 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	}
 	s.hostRegistry.releasePendingReservation(host.ID, effectiveCPU, effectiveMemoryMB)
 
-	return &AllocateRunnerResponse{
+	allocatedResp = &AllocateRunnerResponse{
 		RunnerID:    resp.Runner.GetId(),
 		HostID:      host.ID,
 		HostAddress: host.HTTPAddress,
 		InternalIP:  resp.Runner.GetInternalIp(),
 		SessionID:   resp.GetSessionId(),
 		Resumed:     resp.GetResumed(),
-	}, nil
+	}
+	return allocatedResp, nil
 }
 
 // selectBestHostForWorkloadKey selects the best host with workload-key cache affinity.

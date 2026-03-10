@@ -80,7 +80,15 @@ const (
 	HostMemTotal          GaugeName = "host.memory_mb.total"
 	HostMemUsed           GaugeName = "host.memory_mb.used"
 	CPHostsTotal          GaugeName = "control_plane.hosts"
+	CPHostsReady          GaugeName = "control_plane.hosts.ready"
+	CPHostsDraining       GaugeName = "control_plane.hosts.draining"
+	CPHostsTerminating    GaugeName = "control_plane.hosts.terminating"
+	CPHostsUnhealthy      GaugeName = "control_plane.hosts.unhealthy"
+	CPHostsTerminated     GaugeName = "control_plane.hosts.terminated"
 	CPRunnersTotal        GaugeName = "control_plane.runners"
+	CPRunnersTotalCurrent GaugeName = "control_plane.runners.total"
+	CPRunnersIdleCurrent  GaugeName = "control_plane.runners.idle"
+	CPRunnersBusyCurrent  GaugeName = "control_plane.runners.busy"
 	CPQueueDepth          GaugeName = "control_plane.queue.depth"
 	CPFleetCPUTotal       GaugeName = "control_plane.fleet.cpu_millicores.total"
 	CPFleetCPUUsed        GaugeName = "control_plane.fleet.cpu_millicores.used"
@@ -219,7 +227,15 @@ var gaugeDescriptions = map[GaugeName]string{
 	HostMemTotal:          "Total memory in MB on the host",
 	HostMemUsed:           "Used memory in MB on the host",
 	CPHostsTotal:          "Total number of hosts in the control plane",
+	CPHostsReady:          "Number of ready hosts in the control plane",
+	CPHostsDraining:       "Number of draining hosts in the control plane",
+	CPHostsTerminating:    "Number of terminating hosts in the control plane",
+	CPHostsUnhealthy:      "Number of unhealthy hosts in the control plane",
+	CPHostsTerminated:     "Number of terminated hosts tracked by the control plane",
 	CPRunnersTotal:        "Total number of runners in the control plane",
+	CPRunnersTotalCurrent: "Current total number of runners in the control plane",
+	CPRunnersIdleCurrent:  "Current number of idle runners in the control plane",
+	CPRunnersBusyCurrent:  "Current number of busy runners in the control plane",
 	CPQueueDepth:          "Current control plane queue depth",
 	CPFleetCPUTotal:       "Total fleet CPU millicores",
 	CPFleetCPUUsed:        "Used fleet CPU millicores",

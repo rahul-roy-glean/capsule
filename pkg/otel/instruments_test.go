@@ -52,7 +52,8 @@ func TestAllCountersHaveDescriptions(t *testing.T) {
 func TestAllGaugesHaveDescriptions(t *testing.T) {
 	gauges := []GaugeName{
 		HostCPUTotal, HostCPUUsed, HostMemTotal, HostMemUsed,
-		CPHostsTotal, CPRunnersTotal, CPQueueDepth,
+		CPHostsTotal, CPHostsReady, CPHostsDraining, CPHostsTerminating, CPHostsUnhealthy, CPHostsTerminated,
+		CPRunnersTotal, CPRunnersTotalCurrent, CPRunnersIdleCurrent, CPRunnersBusyCurrent, CPQueueDepth,
 		CPFleetCPUTotal, CPFleetCPUUsed, CPFleetCPUFree,
 		CPFleetMemTotal, CPFleetMemUsed, CPFleetMemFree,
 		ChunkedDiskCacheSize, ChunkedDiskCacheMax, ChunkedDiskCacheItems,

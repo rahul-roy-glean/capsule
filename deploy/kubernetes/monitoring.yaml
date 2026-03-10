@@ -20,6 +20,21 @@ data:
   control-plane-endpoint-health.json: |
     {
       "displayName": "Firecracker Control Plane Endpoint Health",
+      "dashboardFilters": [
+        {
+          "filterType": "VALUE_ONLY",
+          "templateVariable": "latency_percentile",
+          "valueType": "STRING",
+          "stringValue": "95",
+          "stringArray": {
+            "values": [
+              "50",
+              "95",
+              "99"
+            ]
+          }
+        }
+      ],
       "mosaicLayout": {
         "columns": 12,
         "tiles": [
@@ -71,7 +86,80 @@ data:
             "width": 2,
             "height": 2,
             "widget": {
+              "title": "Allocate P50",
+              "visibilityCondition": {
+                "templateVariableCondition": {
+                  "templateVariable": "latency_percentile",
+                  "templateVariableValue": "50",
+                  "comparator": "REGEX_FULL_MATCH"
+                }
+              },
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/allocate\"",
+                    "aggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_DELTA",
+                      "crossSeriesReducer": "REDUCE_SUM"
+                    },
+                    "secondaryAggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_PERCENTILE_50",
+                      "crossSeriesReducer": "REDUCE_MEAN"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "xPos": 4,
+            "yPos": 0,
+            "width": 2,
+            "height": 2,
+            "widget": {
+              "title": "Allocate P99",
+              "visibilityCondition": {
+                "templateVariableCondition": {
+                  "templateVariable": "latency_percentile",
+                  "templateVariableValue": "99",
+                  "comparator": "REGEX_FULL_MATCH"
+                }
+              },
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/allocate\"",
+                    "aggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_DELTA",
+                      "crossSeriesReducer": "REDUCE_SUM"
+                    },
+                    "secondaryAggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_PERCENTILE_99",
+                      "crossSeriesReducer": "REDUCE_MEAN"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "xPos": 4,
+            "yPos": 0,
+            "width": 2,
+            "height": 2,
+            "widget": {
               "title": "Allocate P95",
+              "visibilityCondition": {
+                "templateVariableCondition": {
+                  "templateVariable": "latency_percentile",
+                  "templateVariableValue": "95",
+                  "comparator": "REGEX_FULL_MATCH"
+                }
+              },
               "scorecard": {
                 "timeSeriesQuery": {
                   "timeSeriesFilter": {
@@ -97,7 +185,80 @@ data:
             "width": 2,
             "height": 2,
             "widget": {
+              "title": "Pause P50",
+              "visibilityCondition": {
+                "templateVariableCondition": {
+                  "templateVariable": "latency_percentile",
+                  "templateVariableValue": "50",
+                  "comparator": "REGEX_FULL_MATCH"
+                }
+              },
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/pause\"",
+                    "aggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_DELTA",
+                      "crossSeriesReducer": "REDUCE_SUM"
+                    },
+                    "secondaryAggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_PERCENTILE_50",
+                      "crossSeriesReducer": "REDUCE_MEAN"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "xPos": 6,
+            "yPos": 0,
+            "width": 2,
+            "height": 2,
+            "widget": {
+              "title": "Pause P99",
+              "visibilityCondition": {
+                "templateVariableCondition": {
+                  "templateVariable": "latency_percentile",
+                  "templateVariableValue": "99",
+                  "comparator": "REGEX_FULL_MATCH"
+                }
+              },
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/pause\"",
+                    "aggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_DELTA",
+                      "crossSeriesReducer": "REDUCE_SUM"
+                    },
+                    "secondaryAggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_PERCENTILE_99",
+                      "crossSeriesReducer": "REDUCE_MEAN"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "xPos": 6,
+            "yPos": 0,
+            "width": 2,
+            "height": 2,
+            "widget": {
               "title": "Pause P95",
+              "visibilityCondition": {
+                "templateVariableCondition": {
+                  "templateVariable": "latency_percentile",
+                  "templateVariableValue": "95",
+                  "comparator": "REGEX_FULL_MATCH"
+                }
+              },
               "scorecard": {
                 "timeSeriesQuery": {
                   "timeSeriesFilter": {
@@ -123,7 +284,80 @@ data:
             "width": 2,
             "height": 2,
             "widget": {
+              "title": "Connect/Resume P50",
+              "visibilityCondition": {
+                "templateVariableCondition": {
+                  "templateVariable": "latency_percentile",
+                  "templateVariableValue": "50",
+                  "comparator": "REGEX_FULL_MATCH"
+                }
+              },
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/connect\"",
+                    "aggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_DELTA",
+                      "crossSeriesReducer": "REDUCE_SUM"
+                    },
+                    "secondaryAggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_PERCENTILE_50",
+                      "crossSeriesReducer": "REDUCE_MEAN"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "xPos": 8,
+            "yPos": 0,
+            "width": 2,
+            "height": 2,
+            "widget": {
+              "title": "Connect/Resume P99",
+              "visibilityCondition": {
+                "templateVariableCondition": {
+                  "templateVariable": "latency_percentile",
+                  "templateVariableValue": "99",
+                  "comparator": "REGEX_FULL_MATCH"
+                }
+              },
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/connect\"",
+                    "aggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_DELTA",
+                      "crossSeriesReducer": "REDUCE_SUM"
+                    },
+                    "secondaryAggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_PERCENTILE_99",
+                      "crossSeriesReducer": "REDUCE_MEAN"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "xPos": 8,
+            "yPos": 0,
+            "width": 2,
+            "height": 2,
+            "widget": {
               "title": "Connect/Resume P95",
+              "visibilityCondition": {
+                "templateVariableCondition": {
+                  "templateVariable": "latency_percentile",
+                  "templateVariableValue": "95",
+                  "comparator": "REGEX_FULL_MATCH"
+                }
+              },
               "scorecard": {
                 "timeSeriesQuery": {
                   "timeSeriesFilter": {
@@ -256,7 +490,250 @@ data:
             "width": 12,
             "height": 4,
             "widget": {
+              "title": "Key Endpoint P50 Latency",
+              "visibilityCondition": {
+                "templateVariableCondition": {
+                  "templateVariable": "latency_percentile",
+                  "templateVariableValue": "50",
+                  "comparator": "REGEX_FULL_MATCH"
+                }
+              },
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/allocate\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        },
+                        "secondaryAggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_PERCENTILE_50",
+                          "crossSeriesReducer": "REDUCE_MEAN"
+                        }
+                      }
+                    },
+                    "legendTemplate": "allocate",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/pause\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        },
+                        "secondaryAggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_PERCENTILE_50",
+                          "crossSeriesReducer": "REDUCE_MEAN"
+                        }
+                      }
+                    },
+                    "legendTemplate": "pause",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/connect\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        },
+                        "secondaryAggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_PERCENTILE_50",
+                          "crossSeriesReducer": "REDUCE_MEAN"
+                        }
+                      }
+                    },
+                    "legendTemplate": "connect/resume",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/release\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        },
+                        "secondaryAggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_PERCENTILE_50",
+                          "crossSeriesReducer": "REDUCE_MEAN"
+                        }
+                      }
+                    },
+                    "legendTemplate": "release",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/status\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        },
+                        "secondaryAggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_PERCENTILE_50",
+                          "crossSeriesReducer": "REDUCE_MEAN"
+                        }
+                      }
+                    },
+                    "legendTemplate": "status",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "seconds"
+                }
+              }
+            }
+          },
+          {
+            "xPos": 0,
+            "yPos": 6,
+            "width": 12,
+            "height": 4,
+            "widget": {
+              "title": "Key Endpoint P99 Latency",
+              "visibilityCondition": {
+                "templateVariableCondition": {
+                  "templateVariable": "latency_percentile",
+                  "templateVariableValue": "99",
+                  "comparator": "REGEX_FULL_MATCH"
+                }
+              },
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/allocate\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        },
+                        "secondaryAggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_PERCENTILE_99",
+                          "crossSeriesReducer": "REDUCE_MEAN"
+                        }
+                      }
+                    },
+                    "legendTemplate": "allocate",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/pause\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        },
+                        "secondaryAggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_PERCENTILE_99",
+                          "crossSeriesReducer": "REDUCE_MEAN"
+                        }
+                      }
+                    },
+                    "legendTemplate": "pause",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/connect\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        },
+                        "secondaryAggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_PERCENTILE_99",
+                          "crossSeriesReducer": "REDUCE_MEAN"
+                        }
+                      }
+                    },
+                    "legendTemplate": "connect/resume",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/release\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        },
+                        "secondaryAggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_PERCENTILE_99",
+                          "crossSeriesReducer": "REDUCE_MEAN"
+                        }
+                      }
+                    },
+                    "legendTemplate": "release",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/status\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        },
+                        "secondaryAggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_PERCENTILE_99",
+                          "crossSeriesReducer": "REDUCE_MEAN"
+                        }
+                      }
+                    },
+                    "legendTemplate": "status",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "seconds"
+                }
+              }
+            }
+          },
+          {
+            "xPos": 0,
+            "yPos": 6,
+            "width": 12,
+            "height": 4,
+            "widget": {
               "title": "Key Endpoint P95 Latency",
+              "visibilityCondition": {
+                "templateVariableCondition": {
+                  "templateVariable": "latency_percentile",
+                  "templateVariableValue": "95",
+                  "comparator": "REGEX_FULL_MATCH"
+                }
+              },
               "xyChart": {
                 "dataSets": [
                   {
@@ -497,11 +974,11 @@ data:
             "width": 3,
             "height": 2,
             "widget": {
-              "title": "Queue Depth",
+              "title": "Total Runners",
               "scorecard": {
                 "timeSeriesQuery": {
                   "timeSeriesFilter": {
-                    "filter": "metric.type=\"workload.googleapis.com/control_plane.queue.depth\" AND metric.label.service_name=\"control-plane\"",
+                    "filter": "metric.type=\"workload.googleapis.com/control_plane.runners.total\" AND metric.label.service_name=\"control-plane\"",
                     "aggregation": {
                       "alignmentPeriod": "60s",
                       "perSeriesAligner": "ALIGN_MAX",
@@ -518,15 +995,15 @@ data:
             "width": 3,
             "height": 2,
             "widget": {
-              "title": "Fleet Utilization",
+              "title": "Idle Runners",
               "scorecard": {
                 "timeSeriesQuery": {
                   "timeSeriesFilter": {
-                    "filter": "metric.type=\"workload.googleapis.com/control_plane.fleet.utilization\" AND metric.label.service_name=\"control-plane\"",
+                    "filter": "metric.type=\"workload.googleapis.com/control_plane.runners.idle\" AND metric.label.service_name=\"control-plane\"",
                     "aggregation": {
                       "alignmentPeriod": "60s",
-                      "perSeriesAligner": "ALIGN_MEAN",
-                      "crossSeriesReducer": "REDUCE_MEAN"
+                      "perSeriesAligner": "ALIGN_MAX",
+                      "crossSeriesReducer": "REDUCE_SUM"
                     }
                   }
                 }
@@ -539,14 +1016,14 @@ data:
             "width": 3,
             "height": 2,
             "widget": {
-              "title": "Canary Failures / Hour",
+              "title": "Queue Depth",
               "scorecard": {
                 "timeSeriesQuery": {
                   "timeSeriesFilter": {
-                    "filter": "metric.type=\"workload.googleapis.com/e2e.canary.failure\" AND metric.label.service_name=\"control-plane\"",
+                    "filter": "metric.type=\"workload.googleapis.com/control_plane.queue.depth\" AND metric.label.service_name=\"control-plane\"",
                     "aggregation": {
-                      "alignmentPeriod": "3600s",
-                      "perSeriesAligner": "ALIGN_DELTA",
+                      "alignmentPeriod": "60s",
+                      "perSeriesAligner": "ALIGN_MAX",
                       "crossSeriesReducer": "REDUCE_SUM"
                     }
                   }
@@ -560,13 +1037,13 @@ data:
             "width": 6,
             "height": 4,
             "widget": {
-              "title": "Ready Hosts Over Time",
+              "title": "Hosts By Status",
               "xyChart": {
                 "dataSets": [
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/control_plane.hosts\" AND metric.label.service_name=\"control-plane\" AND metric.label.status=\"ready\"",
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.hosts.ready\" AND metric.label.service_name=\"control-plane\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -575,7 +1052,49 @@ data:
                       }
                     },
                     "legendTemplate": "ready",
-                    "plotType": "LINE"
+                    "plotType": "STACKED_AREA"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.hosts.draining\" AND metric.label.service_name=\"control-plane\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "draining",
+                    "plotType": "STACKED_AREA"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.hosts.terminating\" AND metric.label.service_name=\"control-plane\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "terminating",
+                    "plotType": "STACKED_AREA"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.hosts.unhealthy\" AND metric.label.service_name=\"control-plane\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "unhealthy",
+                    "plotType": "STACKED_AREA"
                   }
                 ],
                 "yAxis": {
@@ -590,13 +1109,13 @@ data:
             "width": 6,
             "height": 4,
             "widget": {
-              "title": "Queue Depth Over Time",
+              "title": "Runners By State",
               "xyChart": {
                 "dataSets": [
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/control_plane.queue.depth\" AND metric.label.service_name=\"control-plane\"",
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.runners.idle\" AND metric.label.service_name=\"control-plane\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -604,12 +1123,26 @@ data:
                         }
                       }
                     },
-                    "legendTemplate": "queue depth",
-                    "plotType": "LINE"
+                    "legendTemplate": "idle",
+                    "plotType": "STACKED_AREA"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.runners.busy\" AND metric.label.service_name=\"control-plane\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "busy",
+                    "plotType": "STACKED_AREA"
                   }
                 ],
                 "yAxis": {
-                  "label": "queued requests"
+                  "label": "runners"
                 }
               }
             }

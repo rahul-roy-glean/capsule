@@ -253,7 +253,15 @@ func main() {
 	// Create OTel instruments
 	meter := otelClient.Meter("control-plane")
 	cpHostsGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPHostsTotal)
+	cpHostsReadyGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPHostsReady)
+	cpHostsDrainingGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPHostsDraining)
+	cpHostsTerminatingGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPHostsTerminating)
+	cpHostsUnhealthyGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPHostsUnhealthy)
+	cpHostsTerminatedGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPHostsTerminated)
 	cpRunnersGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPRunnersTotal)
+	cpRunnersTotalCurrentGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPRunnersTotalCurrent)
+	cpRunnersIdleCurrentGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPRunnersIdleCurrent)
+	cpRunnersBusyCurrentGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPRunnersBusyCurrent)
 	cpQueueDepthGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPQueueDepth)
 	cpFleetCPUTotalGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetCPUTotal)
 	cpFleetCPUUsedGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetCPUUsed)
@@ -437,7 +445,8 @@ func main() {
 	go controlPlaneServer.startTTLEnforcement(ctx)
 	go layerBuildScheduler.Run(ctx)
 	go controlPlaneMetricsLoop(ctx, hostRegistry, scheduler, snapshotManager,
-		cpHostsGauge, cpRunnersGauge, cpQueueDepthGauge,
+		cpHostsGauge, cpHostsReadyGauge, cpHostsDrainingGauge, cpHostsTerminatingGauge, cpHostsUnhealthyGauge, cpHostsTerminatedGauge,
+		cpRunnersGauge, cpRunnersTotalCurrentGauge, cpRunnersIdleCurrentGauge, cpRunnersBusyCurrentGauge, cpQueueDepthGauge,
 		cpFleetCPUTotalGauge, cpFleetCPUUsedGauge, cpFleetCPUFreeGauge,
 		cpFleetMemTotalGauge, cpFleetMemUsedGauge, cpFleetMemFreeGauge,
 		cpFleetUtilGauge, snapshotAgeGauge, logger)
@@ -1296,7 +1305,8 @@ func (s *ControlPlaneServer) HandleCanaryReport(w http.ResponseWriter, r *http.R
 
 // controlPlaneMetricsLoop periodically records control plane metrics via OpenTelemetry
 func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Scheduler, sm *SnapshotManager,
-	cpHostsGauge, cpRunnersGauge, cpQueueDepthGauge metric.Int64Gauge,
+	cpHostsGauge, cpHostsReadyGauge, cpHostsDrainingGauge, cpHostsTerminatingGauge, cpHostsUnhealthyGauge, cpHostsTerminatedGauge metric.Int64Gauge,
+	cpRunnersGauge, cpRunnersTotalCurrentGauge, cpRunnersIdleCurrentGauge, cpRunnersBusyCurrentGauge, cpQueueDepthGauge metric.Int64Gauge,
 	cpFleetCPUTotalGauge, cpFleetCPUUsedGauge, cpFleetCPUFreeGauge metric.Int64Gauge,
 	cpFleetMemTotalGauge, cpFleetMemUsedGauge, cpFleetMemFreeGauge metric.Int64Gauge,
 	cpFleetUtilGauge metric.Float64Gauge, snapshotAgeGauge metric.Int64Gauge,
@@ -1314,7 +1324,13 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 			hosts := hr.GetAllHosts()
 
 			// Aggregate host counts by status
-			statusCounts := map[string]int64{}
+			statusCounts := map[string]int64{
+				"ready":       0,
+				"draining":    0,
+				"terminating": 0,
+				"unhealthy":   0,
+				"terminated":  0,
+			}
 			totalRunners := int64(0)
 			totalIdle := int64(0)
 			totalBusy := int64(0)
@@ -1344,6 +1360,11 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 					fcrotel.AttrStatus.String(status),
 				))
 			}
+			cpHostsReadyGauge.Record(ctx, statusCounts["ready"])
+			cpHostsDrainingGauge.Record(ctx, statusCounts["draining"])
+			cpHostsTerminatingGauge.Record(ctx, statusCounts["terminating"])
+			cpHostsUnhealthyGauge.Record(ctx, statusCounts["unhealthy"])
+			cpHostsTerminatedGauge.Record(ctx, statusCounts["terminated"])
 
 			// Record runner totals
 			cpRunnersGauge.Record(ctx, totalRunners, metric.WithAttributes(
@@ -1355,6 +1376,9 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 			cpRunnersGauge.Record(ctx, totalBusy, metric.WithAttributes(
 				fcrotel.AttrStatus.String("busy"),
 			))
+			cpRunnersTotalCurrentGauge.Record(ctx, totalRunners)
+			cpRunnersIdleCurrentGauge.Record(ctx, totalIdle)
+			cpRunnersBusyCurrentGauge.Record(ctx, totalBusy)
 
 			// Record fleet resource metrics
 			cpFleetCPUTotalGauge.Record(ctx, fleetCPUTotal)
