@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
+	"github.com/sirupsen/logrus"
 )
 
 // TestSchedulerAllocateRequest_TTLFieldsExist verifies that the
@@ -94,4 +97,33 @@ func TestReleaseDoesNotCleanSessionSnapshots(t *testing.T) {
 	// Fix needed: After successful release, execute:
 	//   DELETE FROM session_snapshots WHERE runner_id = $1
 	t.Log("BUG DOCUMENTED: scheduler.ReleaseRunner does not clean session_snapshots DB rows")
+}
+
+func TestAllocateRunner_MissingSnapshotTagFailsFast(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+	hr := NewHostRegistry(nil, logger)
+	hr.hosts["host-1"] = &Host{
+		ID:                 "host-1",
+		InstanceName:       "host-1",
+		Status:             "ready",
+		LastHeartbeat:      time.Now(),
+		GRPCAddress:        "127.0.0.1:65535",
+		TotalCPUMillicores: 16000,
+		TotalMemoryMB:      65536,
+	}
+
+	s := NewScheduler(hr, nil, nil, nil, logger)
+
+	_, err := s.AllocateRunner(context.Background(), AllocateRunnerRequest{
+		RequestID:   "req-1",
+		WorkloadKey: "wk-missing",
+		SnapshotTag: "stable",
+	})
+	if err == nil {
+		t.Fatal("expected missing snapshot tag to fail")
+	}
+	if got := err.Error(); got != `snapshot tag "stable" not found for workload "wk-missing"` {
+		t.Fatalf("unexpected error: %s", got)
+	}
 }

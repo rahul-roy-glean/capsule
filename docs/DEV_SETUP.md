@@ -1,6 +1,6 @@
 # Development Setup
 
-Local development guide for bazel-firecracker. You can build and test all components on macOS (Apple Silicon or Intel). Integration tests and actually running microVMs require Linux with KVM.
+Local development guide for the Firecracker-based sandbox platform in this repository. You can build and test most components on macOS (Apple Silicon or Intel). Integration tests and actually running microVMs require Linux with KVM.
 
 ## Prerequisites
 
@@ -37,6 +37,28 @@ This runs `go mod download` and installs:
 - `protoc-gen-go` (protobuf Go codegen)
 - `protoc-gen-go-grpc` (gRPC Go codegen)
 - `buf` (protobuf linting/generation)
+
+## Python SDK
+
+The Python SDK is a tier-1 surface and has its own local workflow:
+
+```bash
+cd sdk/python
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+
+python -m ruff check src/bf_sdk/ tests/
+python -m pyright src/bf_sdk/
+python -m pytest tests/ -v --ignore=tests/e2e_live.py
+```
+
+For the live control-plane-backed contract tests, export `BF_BASE_URL` and `BF_TOKEN`:
+
+```bash
+BF_BASE_URL=http://localhost:8080 BF_TOKEN=test-token \
+  python -m pytest tests/test_contract.py -v -m contract
+```
 
 ## Building
 
@@ -168,7 +190,6 @@ deploy/
   helm/                  Helm charts (alternative)
   packer/                GCE host VM image
   docker/                Dockerfiles
-  cloudbuild/            Cloud Build automation pipelines
 images/microvm/          MicroVM rootfs build scripts
 docs/                    Documentation
 ```
@@ -177,13 +198,13 @@ docs/                    Documentation
 
 ### Snapshot Lifecycle
 
-1. `snapshot-builder` boots a Firecracker VM with a base rootfs
-2. The `thaw-agent` inside it runs in "warmup mode": clones the repo, runs `bazel fetch //...` and `bazel build --nobuild //...`
+1. `snapshot-builder` boots a Firecracker VM from a Docker `base_image`
+2. The `thaw-agent` runs the layered warmup commands inside the guest
 3. The VM is paused and its memory + disk state are saved as a snapshot
-4. The snapshot is uploaded to GCS with version metadata
-5. `firecracker-manager` on each host syncs snapshots from GCS to local NVMe
-6. When a job arrives, the manager restores a microVM from the snapshot in ~100-500ms
-7. The `thaw-agent` wakes up in "restore mode": configures networking, syncs to the requested git commit, registers the GitHub runner
+4. The snapshot is uploaded to GCS with workload-keyed metadata
+5. `firecracker-manager` on each host syncs the manifests or chunks it needs
+6. On allocation, the manager restores or resumes a microVM in ~100-500ms
+7. The `thaw-agent` wakes up in restore mode, configures networking, and launches the configured `start_command`
 
 ### MMDS
 

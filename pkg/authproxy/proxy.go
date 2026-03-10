@@ -119,6 +119,22 @@ func (p *AuthProxy) Start(ctx context.Context) error {
 		}
 	}
 
+	// Bind the token update endpoint BEFORE any listenInNamespace calls.
+	// listenInNamespace switches the OS thread's network namespace; any net.Listen
+	// called after that (even on a different goroutine) may land on a thread whose
+	// netns was not fully restored. Binding here, before any namespace switching,
+	// guarantees the socket is created in the host namespace.
+	if p.hasDelegatedProviders() && p.hostVethIP != "" {
+		updateAddr := fmt.Sprintf("%s:%d", p.hostVethIP, tokenUpdatePort)
+		uln, err := listenInHostNamespace(updateAddr)
+		if err != nil {
+			return fmt.Errorf("binding token update listener on %s: %w", updateAddr, err)
+		}
+		p.updateLn = uln
+		p.wg.Add(1)
+		go p.serveTokenUpdate()
+	}
+
 	// Start metadata server if any provider implements MetadataHandler.
 	if handler := p.findMetadataHandler(); handler != nil {
 		ln, err := p.listenInNamespace(fmt.Sprintf("%s:%d", p.gatewayIP, metadataPort))
@@ -139,18 +155,6 @@ func (p *AuthProxy) Start(ctx context.Context) error {
 	p.proxyLn = ln
 	p.wg.Add(1)
 	go p.serveProxy()
-
-	// Start token update endpoint on host veth (if any delegated providers exist).
-	if p.hasDelegatedProviders() && p.hostVethIP != "" {
-		updateAddr := fmt.Sprintf("%s:%d", p.hostVethIP, tokenUpdatePort)
-		uln, err := net.Listen("tcp", updateAddr)
-		if err != nil {
-			return fmt.Errorf("binding token update listener on %s: %w", updateAddr, err)
-		}
-		p.updateLn = uln
-		p.wg.Add(1)
-		go p.serveTokenUpdate()
-	}
 
 	p.logger.WithFields(logrus.Fields{
 		"runner_id":    p.runnerID,
@@ -196,7 +200,31 @@ func (p *AuthProxy) TokenUpdateAddr() string {
 	return ""
 }
 
-// listenInNamespace creates a TCP listener inside the VM's network namespace.
+// listenInHostNamespace creates a TCP listener in the host network namespace.
+// It explicitly pins the OS thread and sets the host netns to counteract any
+// thread that was previously used for a namespace switch and may not have been
+// fully restored to the host namespace by the Go scheduler.
+func listenInHostNamespace(addr string) (net.Listener, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// Open the init process's network namespace — this is always the true host
+	// namespace. We cannot use netns.Get() because the current thread may have
+	// been left in a VM namespace by a previous listenInNamespace call (Go
+	// reuses OS threads across goroutines).
+	hostNS, err := netns.GetFromPath("/proc/1/ns/net")
+	if err != nil {
+		return nil, fmt.Errorf("opening host namespace /proc/1/ns/net: %w", err)
+	}
+	defer hostNS.Close()
+
+	if err := netns.Set(hostNS); err != nil {
+		return nil, fmt.Errorf("setting host namespace: %w", err)
+	}
+
+	return net.Listen("tcp", addr)
+}
+
 func (p *AuthProxy) listenInNamespace(addr string) (net.Listener, error) {
 	if p.nsPath == "" {
 		return net.Listen("tcp", addr)

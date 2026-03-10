@@ -1,7 +1,7 @@
--- Firecracker Runner Database Schema
+-- Firecracker Runner Database Schema (reference only)
 -- Run this against a PostgreSQL 15+ database
--- This is the canonical DDL. cmd/control-plane/main.go initSchema creates
--- the base tables, and migrations bring them up to date.
+-- Canonical startup schema now lives in cmd/control-plane/migrations/.
+-- Keep this file in sync for operator reference and manual inspection.
 
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
@@ -34,6 +34,10 @@ CREATE TABLE IF NOT EXISTS runners (
     internal_ip VARCHAR(45),
     job_id VARCHAR(255),
     workload_key VARCHAR(16),
+    runner_ttl_seconds INT DEFAULT 0,
+    auto_pause BOOLEAN DEFAULT false,
+    network_policy_preset VARCHAR(64),
+    network_policy JSONB,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     started_at TIMESTAMP WITH TIME ZONE,
     completed_at TIMESTAMP WITH TIME ZONE
@@ -87,6 +91,10 @@ CREATE TABLE IF NOT EXISTS session_snapshots (
     runner_id VARCHAR(255) NOT NULL,
     layer_count INT DEFAULT 0,
     status VARCHAR(32) DEFAULT 'active',
+    runner_ttl_seconds INT DEFAULT 0,
+    auto_pause BOOLEAN DEFAULT false,
+    network_policy_preset VARCHAR(64),
+    network_policy JSONB,
     paused_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );

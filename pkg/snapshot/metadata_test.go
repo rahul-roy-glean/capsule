@@ -3,36 +3,7 @@ package snapshot
 import (
 	"encoding/json"
 	"testing"
-	"time"
 )
-
-func TestAllocateRequest_WorkloadKey(t *testing.T) {
-	meta := SnapshotMetadata{
-		Version:     "v20260221-120000-main",
-		Repo:        "https://github.com/org/repo",
-		WorkloadKey: "abc1234567890abc",
-		CreatedAt:   time.Now(),
-		KernelPath:  "kernel.bin",
-		RootfsPath:  "rootfs.img",
-	}
-
-	data, err := json.Marshal(meta)
-	if err != nil {
-		t.Fatalf("Failed to marshal: %v", err)
-	}
-
-	var decoded SnapshotMetadata
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		t.Fatalf("Failed to unmarshal: %v", err)
-	}
-
-	if decoded.Repo != meta.Repo {
-		t.Errorf("Repo = %q, want %q", decoded.Repo, meta.Repo)
-	}
-	if decoded.WorkloadKey != meta.WorkloadKey {
-		t.Errorf("WorkloadKey = %q, want %q", decoded.WorkloadKey, meta.WorkloadKey)
-	}
-}
 
 func TestChunkedSnapshotMetadata_WorkloadKeyFields(t *testing.T) {
 	meta := ChunkedSnapshotMetadata{

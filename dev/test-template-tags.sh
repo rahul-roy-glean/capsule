@@ -3,6 +3,9 @@
 # Usage: make dev-test-template-tags (or run directly)
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$REPO_ROOT/dev/lib-workload-key.sh"
+
 CP=http://localhost:8080
 
 echo "=== E2E Template Tags Test ==="
@@ -10,23 +13,8 @@ echo ""
 
 # --- 0. Register snapshot config ---
 echo "=== 0. Register snapshot config ==="
-CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "display_name": "tag-test",
-    "layers": [{"name":"base","init_commands":[{"type":"shell","args":["echo","tag-test"]}]}],
-    "config": {
-      "ttl": 60,
-      "auto_pause": false
-    }
-  }')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.leaf_workload_key')
-echo "Registered config: workload_key=$WORKLOAD_KEY"
-
-if [ -z "$WORKLOAD_KEY" ] || [ "$WORKLOAD_KEY" = "null" ]; then
-  echo "FAIL: could not register snapshot config"
-  exit 1
-fi
+require_workload_key
+register_dev_config "tag-test" '{"ttl": 60, "auto_pause": false}'
 
 # --- 1. Create tags ---
 echo ""

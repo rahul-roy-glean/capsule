@@ -42,6 +42,16 @@ jobs:
             exit 1
           fi
 
+  migration-guard:
+    name: Migration Guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Check migration changes
+        run: bash .github/scripts/check-migrations.sh --ci
+
   vet:
     name: Vet
     runs-on: ubuntu-latest
@@ -111,3 +121,91 @@ jobs:
           for bin in bin/*; do
             file "$bin"
           done
+
+  sdk-python:
+    name: Python SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/python
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install SDK dev dependencies
+        run: pip install -e ".[dev]"
+      - name: Ruff
+        run: python -m ruff check src/bf_sdk/ tests/
+      - name: Pyright
+        run: python -m pyright src/bf_sdk/
+      - name: Pytest
+        run: python -m pytest tests/ -v --ignore=tests/e2e_live.py -m "not contract"
+
+  workflow-lint:
+    name: Workflow Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: reviewdog/action-actionlint@v1
+
+  helm-lint:
+    name: Helm Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: azure/setup-helm@v4
+      - run: helm lint deploy/helm/firecracker-runner
+
+  example-validation:
+    name: Validate Examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: go test -v -run TestExampleConfigs ./cmd/onboard/...
+
+  contract-tests:
+    name: SDK Contract Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: firecracker_runner
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build and start control plane
+        run: |
+          go build -o /tmp/control-plane ./cmd/control-plane
+          /tmp/control-plane \
+            --db-host=localhost --db-port=5432 \
+            --db-user=postgres --db-password=postgres \
+            --db-name=firecracker_runner \
+            --api-auth-token=test-token > /tmp/control-plane.log 2>&1 &
+          for _i in $(seq 1 30); do
+            curl -sf http://localhost:8080/health && break || sleep 1
+          done
+          curl -sf http://localhost:8080/health || { echo "Control plane failed to start"; cat /tmp/control-plane.log; exit 1; }
+      - name: Run contract tests
+        run: |
+          cd sdk/python
+          pip install -e ".[dev]"
+          BF_BASE_URL=http://localhost:8080 BF_TOKEN=test-token \
+            python -m pytest tests/test_contract.py -v -m contract

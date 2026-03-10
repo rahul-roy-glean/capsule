@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   GO_VERSION: '1.24'
@@ -22,10 +22,44 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
       - run: go test -race -count=1 ./pkg/... ./cmd/...
 
-  release:
-    name: Release
-    needs: test
+  sdk-test:
+    name: Python SDK
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/python
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: python -m ruff check src/bf_sdk/ tests/
+      - run: python -m pyright src/bf_sdk/
+      - run: python -m pytest tests/ -v --ignore=tests/e2e_live.py
+
+  helm-lint:
+    name: Helm Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: azure/setup-helm@v4
+      - run: helm lint deploy/helm/firecracker-runner
+
+  build-candidates:
+    name: Build Release Candidates
+    needs: [test, sdk-test, helm-lint]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    outputs:
+      release_version: ${{ steps.version.outputs.release_version }}
+      helm_version: ${{ steps.version.outputs.helm_version }}
+      pypi_version: ${{ steps.version.outputs.pypi_version }}
+      control_plane_image: ${{ steps.images.outputs.control_plane_image }}
+      snapshot_builder_image: ${{ steps.images.outputs.snapshot_builder_image }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -35,13 +69,49 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      - name: Get version
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: azure/setup-helm@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Resolve release versions
         id: version
-        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        run: |
+          eval "$(bash .github/scripts/release-version.sh "$GITHUB_REF_NAME")"
+          prerelease=false
+          if [[ "$GITHUB_REF_NAME" == *"-alpha."* || "$GITHUB_REF_NAME" == *"-beta."* || "$GITHUB_REF_NAME" == *"-rc."* ]]; then
+            prerelease=true
+          fi
+          {
+            echo "release_version=${RELEASE_VERSION}"
+            echo "helm_version=${HELM_VERSION}"
+            echo "pypi_version=${PYPI_VERSION}"
+            echo "prerelease=${prerelease}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Derive image names
+        id: images
+        run: |
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          repo="$(echo "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
+          echo "control_plane_image=ghcr.io/${owner}/${repo}-control-plane" >> "$GITHUB_OUTPUT"
+          echo "snapshot_builder_image=ghcr.io/${owner}/${repo}-snapshot-builder" >> "$GITHUB_OUTPUT"
 
       - name: Build linux/amd64
         run: |
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 make build
+          make build GOOS_TARGET=linux GOARCH_TARGET=amd64
+          for bin in bin/*; do
+            file "$bin"
+          done
           mkdir -p dist
           for bin in bin/*; do
             name=$(basename "$bin")
@@ -51,7 +121,10 @@ jobs:
       - name: Build linux/arm64
         run: |
           rm -rf bin/
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 make build
+          make build GOOS_TARGET=linux GOARCH_TARGET=arm64
+          for bin in bin/*; do
+            file "$bin"
+          done
           for bin in bin/*; do
             name=$(basename "$bin")
             mv "$bin" "dist/${name}-linux-arm64"
@@ -60,35 +133,164 @@ jobs:
       - name: Build darwin/arm64
         run: |
           rm -rf bin/
-          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 make build
+          make build GOOS_TARGET=darwin GOARCH_TARGET=arm64
+          for bin in bin/*; do
+            file "$bin"
+          done
           for bin in bin/*; do
             name=$(basename "$bin")
             mv "$bin" "dist/${name}-darwin-arm64"
           done
 
+      - name: Verify release artifacts
+        run: |
+          for bin in dist/*; do
+            file "$bin"
+          done
+
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum * > checksums.txt
+        run: sha256sum ./* > checksums.txt
+
+      - name: Build candidate container images
+        run: |
+          docker buildx build --platform linux/amd64 --push \
+            -t "${{ steps.images.outputs.control_plane_image }}:${{ steps.version.outputs.release_version }}-rc" \
+            -f deploy/docker/Dockerfile.control-plane .
+          docker buildx build --platform linux/amd64 --push \
+            -t "${{ steps.images.outputs.snapshot_builder_image }}:${{ steps.version.outputs.release_version }}-rc" \
+            -f deploy/docker/Dockerfile.snapshot-builder .
+
+      - name: Package Helm chart
+        run: |
+          mkdir -p helm-dist
+          helm package deploy/helm/firecracker-runner \
+            --destination helm-dist \
+            --version "${{ steps.version.outputs.helm_version }}" \
+            --app-version "${{ steps.version.outputs.helm_version }}"
+
+      - name: Build and publish SDK candidate
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        run: |
+          python -m pip install --upgrade pip build twine
+          bash .github/scripts/release-version.sh "$GITHUB_REF_NAME" --write-python >/tmp/release-version.env
+          cd sdk/python
+          python -m build
+          twine upload --repository-url https://test.pypi.org/legacy/ dist/*
 
       - name: Generate changelog
         id: changelog
         run: |
+          cat <<EOF >/tmp/release-notes.md
+          ## Summary
+          EOF
           # Get previous tag
           prev_tag=$(git tag --sort=-v:refname | head -2 | tail -1)
-          if [ -z "$prev_tag" ] || [ "$prev_tag" = "${{ steps.version.outputs.version }}" ]; then
-            echo "Initial release" > /tmp/changelog.md
+          if [ -z "$prev_tag" ] || [ "$prev_tag" = "${GITHUB_REF_NAME}" ]; then
+            echo "- Initial release" >> /tmp/release-notes.md
           else
-            changelog=$(git log --pretty=format:"- %s (%h)" "$prev_tag".."${{ steps.version.outputs.version }}" -- . ':!docs' ':!*.md')
-            # Write to file to handle multiline
-            echo "$changelog" > /tmp/changelog.md
+            changelog=$(git log --pretty=format:"- %s (%h)" "$prev_tag".."${GITHUB_REF_NAME}" -- . ':!docs' ':!*.md')
+            echo "$changelog" >> /tmp/release-notes.md
           fi
+          cat <<EOF >>/tmp/release-notes.md
 
-      - name: Create release
+          ## Candidate Artifacts
+          - Go binaries attached to this draft release
+          - Control plane image candidate: `${{ steps.images.outputs.control_plane_image }}:${{ steps.version.outputs.release_version }}-rc`
+          - Snapshot builder image candidate: `${{ steps.images.outputs.snapshot_builder_image }}:${{ steps.version.outputs.release_version }}-rc`
+          - Python SDK candidate: `pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ bf-sdk==${{ steps.version.outputs.pypi_version }}`
+          - Helm chart: attached `.tgz` package
+          - Host images are built separately via `.github/workflows/build-host-image.yaml`
+          - Final GHCR and PyPI coordinates are published only after the KVM E2E gate passes
+          EOF
+
+      - name: Create draft release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ steps.version.outputs.version }}
-          body_path: /tmp/changelog.md
-          files: dist/*
-          draft: false
-          prerelease: ${{ contains(steps.version.outputs.version, '-rc') || contains(steps.version.outputs.version, '-beta') || contains(steps.version.outputs.version, '-alpha') }}
+          name: ${{ github.ref_name }}
+          body_path: /tmp/release-notes.md
+          files: |
+            dist/*
+            helm-dist/*.tgz
+            sdk/python/dist/*
+          draft: true
+          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
           fail_on_unmatched_files: true
+
+  e2e-gate:
+    name: KVM E2E Gate
+    needs: build-candidates
+    runs-on: [self-hosted, firecracker]
+    env:
+      BF_BASE_URL: ${{ vars.BF_BASE_URL }}
+      BF_TOKEN: ${{ secrets.BF_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install SDK candidate
+        run: |
+          version="${{ needs.build-candidates.outputs.pypi_version }}"
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          for _ in $(seq 1 10); do
+            if python -m pip install \
+              --index-url https://test.pypi.org/simple/ \
+              --extra-index-url https://pypi.org/simple/ \
+              "bf-sdk==${version}"; then
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "failed to install bf-sdk candidate ${version} from TestPyPI"
+          exit 1
+      - name: Run live SDK E2E
+        run: python -m pytest sdk/python/tests/e2e_live.py -v
+
+  promote:
+    name: Promote Release
+    needs: [build-candidates, e2e-gate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Promote container images
+        run: |
+          docker buildx imagetools create \
+            -t "${{ needs.build-candidates.outputs.control_plane_image }}:${{ needs.build-candidates.outputs.release_version }}" \
+            -t "${{ needs.build-candidates.outputs.control_plane_image }}:latest" \
+            "${{ needs.build-candidates.outputs.control_plane_image }}:${{ needs.build-candidates.outputs.release_version }}-rc"
+          docker buildx imagetools create \
+            -t "${{ needs.build-candidates.outputs.snapshot_builder_image }}:${{ needs.build-candidates.outputs.release_version }}" \
+            -t "${{ needs.build-candidates.outputs.snapshot_builder_image }}:latest" \
+            "${{ needs.build-candidates.outputs.snapshot_builder_image }}:${{ needs.build-candidates.outputs.release_version }}-rc"
+      - name: Publish SDK to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          python -m pip install --upgrade pip build twine
+          bash .github/scripts/release-version.sh "$GITHUB_REF_NAME" --write-python >/tmp/release-version.env
+          cd sdk/python
+          python -m build
+          twine upload dist/*
+      - name: Publish GitHub release
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false

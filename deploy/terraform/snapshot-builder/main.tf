@@ -94,8 +94,6 @@ resource "google_compute_instance" "snapshot_builder" {
     repo-url            = var.repo_url
     repo-branch         = var.repo_branch
     fetch-targets       = var.fetch_targets
-    github-app-id       = var.github_app_id
-    github-app-secret   = var.github_app_secret
     gcp-project         = var.project_id
     debug-mode          = var.debug_mode ? "true" : "false"
     firecracker-version = var.firecracker_version

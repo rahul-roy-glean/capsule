@@ -106,23 +106,10 @@ echo "=== E2E Auth Proxy Tests ==="
 # =========================================================================
 
 header "0. Register snapshot config"
-CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "display_name": "auth-proxy-test",
-    "layers": [{"name":"base","init_commands":[{"type":"shell","args":["echo","auth-proxy-test"]}]}],
-    "config": {
-      "ttl": 120,
-      "auto_pause": false
-    }
-  }')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.leaf_workload_key')
-echo "  workload_key=$WORKLOAD_KEY"
-
-if [ -z "$WORKLOAD_KEY" ] || [ "$WORKLOAD_KEY" = "null" ]; then
-  fail "Could not register snapshot config"
-  exit 1
-fi
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$REPO_ROOT/dev/lib-workload-key.sh"
+require_workload_key
+register_dev_config "auth-proxy-test" '{"ttl": 120, "auto_pause": false}'
 pass "Snapshot config registered"
 
 # =========================================================================
@@ -164,12 +151,38 @@ ALLOC_BODY=$(cat <<EOF
 EOF
 )
 
-RUNNER_ID=$(allocate_and_wait "$ALLOC_BODY")
-if [ "$RUNNER_ID" = "ALLOC_FAILED" ]; then
+# Use allocate_and_wait but also capture internal_ip from the control-plane
+# allocate response (needed for token update endpoint discovery).
+ALLOC_RESP=$(curl -sf -X POST "$CP/api/v1/runners/allocate" \
+  -H 'Content-Type: application/json' \
+  -d "$ALLOC_BODY")
+RUNNER_ID=$(echo "$ALLOC_RESP" | jq -r '.runner_id')
+RUNNER_IP=$(echo "$ALLOC_RESP" | jq -r '.internal_ip // empty')
+
+if [ -z "$RUNNER_ID" ] || [ "$RUNNER_ID" = "null" ]; then
   fail "Failed to allocate runner with auth config"
   exit 1
 fi
+RUNNER_IDS+=("$RUNNER_ID")
+
+echo -n "  runner_id=$RUNNER_ID  waiting..."
+for i in $(seq 1 60); do
+  code=$(curl -s -o /dev/null -w "%{http_code}" \
+    "$CP/api/v1/runners/status?runner_id=$RUNNER_ID")
+  if [ "$code" = "200" ]; then
+    echo " ready (${i}s)"
+    break
+  fi
+  if [ "$i" = "60" ]; then
+    echo " TIMEOUT"
+    fail "Runner did not become ready in 60s"
+    exit 1
+  fi
+  echo -n "."
+  sleep 1
+done
 pass "Runner allocated with auth proxy config"
+echo "  internal_ip=$RUNNER_IP"
 
 # =========================================================================
 # PART 2: Verify proxy port is reachable inside VM netns
@@ -199,9 +212,7 @@ fi
 header "3. Discover token update endpoint"
 
 # The auth proxy's token update endpoint runs on the host veth IP (10.200.{slot}.1:9443).
-# We can find the runner's host-reachable IP from the manager status.
-RUNNER_INFO=$(curl -sf "$MGR/api/v1/runners/$RUNNER_ID" 2>/dev/null || echo '{}')
-RUNNER_IP=$(echo "$RUNNER_INFO" | jq -r '.internal_ip // empty')
+# RUNNER_IP was captured from the allocate response above.
 echo "  runner internal IP: ${RUNNER_IP:-"(unknown)"}"
 
 # Derive host veth IP: if runner IP is 10.200.X.2, host is 10.200.X.1
@@ -272,7 +283,7 @@ header "6. Verify proxy responds to HTTP CONNECT"
 # Send a raw CONNECT request to the proxy and check it responds.
 # We use /dev/tcp to make a TCP connection and send raw HTTP.
 # The proxy should respond with 200 (for allowed host) or 403 (for blocked host).
-CONNECT_TEST=$(vm_exec "$RUNNER_ID" "[\"bash\",\"-c\",\"echo -e 'CONNECT github.com:443 HTTP/1.1\\\\r\\\\nHost: github.com:443\\\\r\\\\n\\\\r\\\\n' | timeout 3 nc 172.16.0.1 3128 2>/dev/null | head -1 || echo CONNECT_FAIL\"]")
+CONNECT_TEST=$(vm_exec "$RUNNER_ID" "[\"bash\",\"-c\",\"exec 3<>/dev/tcp/172.16.0.1/3128; echo -e 'CONNECT github.com:443 HTTP/1.1\\\\r\\\\nHost: github.com:443\\\\r\\\\n\\\\r\\\\n' >&3; read -t 3 resp <&3; echo \\\"\$resp\\\"; exec 3>&- || echo CONNECT_FAIL\"]")
 if echo "$CONNECT_TEST" | grep -q "200"; then
   pass "Proxy responds 200 to CONNECT github.com:443"
 elif echo "$CONNECT_TEST" | grep -q "CONNECT_FAIL\|EXEC_PROXY_FAILED"; then

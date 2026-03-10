@@ -4,19 +4,17 @@
 # This builds the agent rootfs (if needed), then uses snapshot-builder to create
 # a golden snapshot with repos cloned and dependencies installed.
 #
-# When GCS_BUCKET is set, uploads a chunked golden snapshot to GCS so the manager
-# can lazy-load via UFFD+FUSE, and session pause/resume uses GCS-backed chunks.
-# Without GCS_BUCKET, falls back to local-only mode (no chunked, no GCS).
+# Uploads a chunked golden snapshot to GCS so the manager can lazy-load via
+# UFFD+FUSE, and session pause/resume uses GCS-backed chunks.
 #
 # Usage:
 #   GCS_BUCKET=my-bucket make dev-agent-snapshot
-#   make dev-agent-snapshot
 #
 # Prerequisites:
 #   - make dev-build (builds snapshot-builder binary)
 #   - Docker available (for rootfs build)
 #   - /dev/kvm available
-#   - gcloud auth (if using GCS)
+#   - gcloud auth
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,19 +22,20 @@ SNAPSHOT_DIR="/tmp/fc-dev/snapshots"
 OUTPUT_DIR="/tmp/fc-dev/snapshot-build"
 LOG_DIR="/tmp/fc-dev/logs"
 
-# GCS config: set GCS_BUCKET to enable chunked upload + GCS session resume
+# GCS config (required)
 GCS_BUCKET=${GCS_BUCKET:-}
 GCS_PREFIX=${GCS_PREFIX:-v1}
+
+if [ -z "$GCS_BUCKET" ]; then
+  echo "FAIL: GCS_BUCKET is required. Set GCS_BUCKET=<bucket> to upload chunked snapshots."
+  exit 1
+fi
 
 cd "$REPO_ROOT"
 export PATH="/usr/local/go/bin:$PATH"
 
 echo "=== Provisioning AI Agent Sandbox Snapshot ==="
-if [ -n "$GCS_BUCKET" ]; then
-  echo "  GCS mode: bucket=$GCS_BUCKET prefix=$GCS_PREFIX (chunked + UFFD/FUSE)"
-else
-  echo "  Local-only mode (set GCS_BUCKET=<bucket> for GCS route)"
-fi
+echo "  GCS mode: bucket=$GCS_BUCKET prefix=$GCS_PREFIX (chunked + UFFD/FUSE)"
 
 # --- 1. Build agent rootfs if not present ---
 AGENT_MARKER="$SNAPSHOT_DIR/.agent-rootfs-built"
@@ -95,12 +94,7 @@ BUILDER_FLAGS=(
   --log-level=info
 )
 
-if [ -n "$GCS_BUCKET" ]; then
-  BUILDER_FLAGS+=(--gcs-bucket="$GCS_BUCKET" --enable-chunked=true)
-  echo "--- Snapshot will be uploaded to GCS (chunked) ---"
-else
-  BUILDER_FLAGS+=(--gcs-bucket=local-dev-unused --enable-chunked=false)
-fi
+BUILDER_FLAGS+=(--gcs-bucket="$GCS_BUCKET")
 
 set +e
 sudo "$REPO_ROOT/bin/snapshot-builder" \
@@ -112,11 +106,7 @@ set -e
 if [ $BUILD_EXIT -ne 0 ]; then
   echo ""
   echo "--- Snapshot builder exited with code $BUILD_EXIT ---"
-  if [ -n "$GCS_BUCKET" ]; then
-    echo "    Check GCS credentials if upload failed."
-  else
-    echo "    (Expected: GCS upload fails without credentials, but local files should exist)"
-  fi
+  echo "    Check GCS credentials and bucket configuration."
 fi
 
 # --- 4. Verify snapshot files ---
@@ -130,6 +120,52 @@ fi
 
 echo ""
 echo "--- Snapshot files created successfully ---"
+
+# Save snapshot info for dev tests
+BUILT_WORKLOAD_KEY=$(grep -o '"workload_key":"[^"]*"' "$LOG_DIR/agent-snapshot-builder.log" | tail -1 | cut -d'"' -f4)
+BUILT_VERSION=$(grep -o '"version":"[^"]*"' "$LOG_DIR/agent-snapshot-builder.log" | grep -v '"version":"v1"' | tail -1 | cut -d'"' -f4)
+LEAF_WORKLOAD_KEY=$("$REPO_ROOT/bin/workload-key" --leaf "$SNAPSHOT_COMMANDS" 2>/dev/null || true)
+
+if [ -z "$BUILT_WORKLOAD_KEY" ]; then
+  echo "FAIL: could not extract workload_key from snapshot-builder log"
+  exit 1
+fi
+if [ -z "$BUILT_VERSION" ]; then
+  echo "FAIL: could not extract version from snapshot-builder log"
+  exit 1
+fi
+if [ -z "$LEAF_WORKLOAD_KEY" ]; then
+  echo "FAIL: could not compute leaf workload key (is bin/workload-key built?)"
+  exit 1
+fi
+
+cat > /tmp/fc-dev/snapshot-info.json << SNAPINFO
+{
+  "workload_key": "$BUILT_WORKLOAD_KEY",
+  "leaf_workload_key": "$LEAF_WORKLOAD_KEY",
+  "version": "$BUILT_VERSION",
+  "snapshot_commands": $SNAPSHOT_COMMANDS
+}
+SNAPINFO
+echo "Saved snapshot-info.json (workload_key=$BUILT_WORKLOAD_KEY, leaf=$LEAF_WORKLOAD_KEY)"
+
+# Publish GCS alias under the leaf workload key.
+# Order matters: metadata first, pointer last (matches production layer_builder.go).
+if [ -n "$LEAF_WORKLOAD_KEY" ] && [ -n "$BUILT_VERSION" ]; then
+  SRC_META="gs://$GCS_BUCKET/$GCS_PREFIX/$BUILT_WORKLOAD_KEY/snapshot_state/$BUILT_VERSION/chunked-metadata.json"
+  DST_META="gs://$GCS_BUCKET/$GCS_PREFIX/$LEAF_WORKLOAD_KEY/snapshot_state/$BUILT_VERSION/chunked-metadata.json"
+  if ! gsutil -q cp "$SRC_META" "$DST_META"; then
+    echo "FAIL: could not copy chunked metadata to leaf key path"
+    exit 1
+  fi
+  echo "Copied chunked metadata to leaf key path"
+
+  if ! echo '{"version":"'"$BUILT_VERSION"'"}' | gsutil -q cp - "gs://$GCS_BUCKET/$GCS_PREFIX/$LEAF_WORKLOAD_KEY/current-pointer.json"; then
+    echo "FAIL: could not publish leaf current-pointer.json"
+    exit 1
+  fi
+  echo "Published leaf pointer: $LEAF_WORKLOAD_KEY -> $BUILT_VERSION"
+fi
 
 # --- 5. Copy snapshot files to manager's snapshot cache ---
 echo ""
@@ -159,9 +195,5 @@ echo ""
 echo "Files in $SNAPSHOT_DIR:"
 ls -lh "$SNAPSHOT_DIR/"
 echo ""
-if [ -n "$GCS_BUCKET" ]; then
-  echo "GCS chunked snapshot uploaded to gs://$GCS_BUCKET/$GCS_PREFIX/"
-  echo "Run: GCS_BUCKET=$GCS_BUCKET make dev-stop dev-stack dev-test-agent-sessions"
-else
-  echo "Run 'make dev-stop && make dev-stack && make dev-test-agent-sessions' to test."
-fi
+echo "GCS chunked snapshot uploaded to gs://$GCS_BUCKET/$GCS_PREFIX/"
+echo "Run: GCS_BUCKET=$GCS_BUCKET make dev-stop dev-stack dev-test-agent-sessions"

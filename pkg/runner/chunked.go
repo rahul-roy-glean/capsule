@@ -38,9 +38,8 @@ type ChunkedManager struct {
 	fuseDisks          map[string]*fuse.ChunkedDisk            // rootfs FUSE disks per runner
 	fuseExtensionDisks map[string]map[string]*fuse.ChunkedDisk // extension drive FUSE disks: runnerID → driveID → disk
 
-	// Network namespace manager (alternative to slot-based TAPs)
+	// Network namespace manager
 	netnsNetwork *network.NetNSNetwork
-	useNetNS     bool
 
 	// memBackend overrides metadata-based backend detection:
 	// "chunked" forces UFFD, "file" forces file-backed, "" uses metadata.
@@ -59,8 +58,10 @@ type ChunkedManagerConfig struct {
 	// UseChunkedSnapshots enables chunked snapshot restore
 	UseChunkedSnapshots bool
 
-	// UseNetNS uses network namespaces instead of slot-based TAPs
-	UseNetNS bool
+	// Network namespace configuration
+	MicroVMSubnet     string
+	ExternalInterface string
+	BridgeName        string
 
 	// ChunkCacheSizeBytes is the max size of the disk chunk LRU cache (FUSE)
 	ChunkCacheSizeBytes int64
@@ -102,7 +103,6 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 		uffdHandlers:       make(map[string]*uffd.Handler),
 		fuseDisks:          make(map[string]*fuse.ChunkedDisk),
 		fuseExtensionDisks: make(map[string]map[string]*fuse.ChunkedDisk),
-		useNetNS:           cfg.UseNetNS,
 		memBackend:         cfg.MemBackend,
 		readyTimeout:       cfg.ReadyTimeout,
 		chunkedLogger:      logger.WithField("component", "chunked-manager"),
@@ -177,28 +177,26 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 		// and SyncManifest (heartbeat-driven sync). No startup preload needed.
 	}
 
-	// Setup network namespace manager if enabled
-	if cfg.UseNetNS {
-		netnsNet, err := network.NewNetNSNetwork(network.NetNSConfig{
-			BridgeName:    cfg.BridgeName,
-			Subnet:        cfg.MicroVMSubnet,
-			ExternalIface: cfg.ExternalInterface,
-			Logger:        logger,
-		})
-		if err != nil {
-			cm.Close()
-			return nil, fmt.Errorf("failed to create netns network: %w", err)
-		}
-
-		if err := netnsNet.Setup(); err != nil {
-			cm.Close()
-			return nil, fmt.Errorf("failed to setup netns network: %w", err)
-		}
-
-		cm.netnsNetwork = netnsNet
-		cm.Manager.SetNetNSNetwork(netnsNet)
-		cm.chunkedLogger.Info("Network namespace mode enabled")
+	// Setup network namespace manager
+	netnsNet, err := network.NewNetNSNetwork(network.NetNSConfig{
+		BridgeName:    cfg.BridgeName,
+		Subnet:        cfg.MicroVMSubnet,
+		ExternalIface: cfg.ExternalInterface,
+		Logger:        logger,
+	})
+	if err != nil {
+		cm.Close()
+		return nil, fmt.Errorf("failed to create netns network: %w", err)
 	}
+
+	if err := netnsNet.Setup(); err != nil {
+		cm.Close()
+		return nil, fmt.Errorf("failed to setup netns network: %w", err)
+	}
+
+	cm.netnsNetwork = netnsNet
+	cm.Manager.SetNetNSNetwork(netnsNet)
+	cm.chunkedLogger.Info("Network namespace mode enabled")
 
 	return cm, nil
 }
@@ -276,11 +274,8 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 
 	// Check if we can use chunked restore
 	if meta == nil || cm.chunkStore == nil {
-		cm.chunkedLogger.Warn("Chunked snapshots not available, falling back to traditional restore")
 		cm.mu.Unlock()
-		runner, err := cm.Manager.AllocateRunner(ctx, req)
-		cm.mu.Lock()
-		return runner, err
+		return nil, fmt.Errorf("chunked snapshots not available: meta=%v, chunkStore=%v", meta != nil, cm.chunkStore != nil)
 	}
 
 	runnerID := uuid.New().String()
@@ -288,36 +283,22 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 
 	startTime := time.Now()
 
-	// Setup network (namespace or slot-based)
+	// Setup network namespace
 	var tap *network.TapDevice
 	var netns *network.VMNamespace
 	var err error
 
-	if cm.useNetNS && cm.netnsNetwork != nil {
-		slot := cm.findAvailableSlot()
-		if slot < 0 {
-			return nil, fmt.Errorf("no slots available")
-		}
-		netns, err = cm.netnsNetwork.CreateNamespaceForVM(runnerID, slot)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create network namespace: %w", err)
-		}
-		tap = netns.GetTapDevice(cm.netnsNetwork.GetSubnet())
-		cm.slotToRunner[slot] = runnerID
-		cm.runnerToSlot[runnerID] = slot
-	} else {
-		// Use slot-based allocation from base manager
-		slot := cm.findAvailableSlot()
-		if slot < 0 {
-			return nil, fmt.Errorf("no TAP slots available")
-		}
-		tap, err = cm.network.GetOrCreateTapSlot(slot, runnerID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get TAP slot: %w", err)
-		}
-		cm.slotToRunner[slot] = runnerID
-		cm.runnerToSlot[runnerID] = slot
+	slot := cm.findAvailableSlot()
+	if slot < 0 {
+		return nil, fmt.Errorf("no slots available")
 	}
+	netns, err = cm.netnsNetwork.CreateNamespaceForVM(runnerID, slot)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create network namespace: %w", err)
+	}
+	tap = netns.GetTapDevice(cm.netnsNetwork.GetSubnet())
+	cm.slotToRunner[slot] = runnerID
+	cm.runnerToSlot[runnerID] = slot
 
 	// Setup FUSE disk for lazy rootfs loading with CoW
 	fuseMountDir := filepath.Join(cm.config.WorkspaceDir, runnerID, "fuse")
@@ -567,13 +548,9 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		return nil, fmt.Errorf("kernel not found at %s and no KernelHash in metadata to fetch it: %w", kernelPath, err)
 	}
 
-	// Create runner record.
 	// When using per-VM namespaces, InternalIP is set to the host-reachable
 	// veth IP (10.0.{slot}.2) so the host proxy can reach the VM's services.
-	internalIP := tap.IP
-	if netns != nil {
-		internalIP = netns.HostReachableIP
-	}
+	internalIP := netns.HostReachableIP
 	runner := &Runner{
 		ID:              runnerID,
 		HostID:          cm.config.HostID,
@@ -627,10 +604,8 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		MetricsPath: runner.MetricsPath,
 	}
 
-	// When using per-VM namespaces, Firecracker runs inside the namespace
-	if netns != nil {
-		vmCfg.NetNSPath = netns.GetFirecrackerNetNSPath()
-	}
+	// Firecracker runs inside the network namespace
+	vmCfg.NetNSPath = netns.GetFirecrackerNetNSPath()
 
 	// Create VM instance
 	vm, err := firecracker.NewVM(vmCfg, cm.logger.Logger)
@@ -654,18 +629,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		return nil, fmt.Errorf("failed to setup snapshot symlinks: %w", err)
 	}
 
-	// Setup TAP rename: the snapshot bakes in host_dev_name="tap-slot-0".
 	// With per-VM namespaces, tap-slot-0 already exists in the namespace — no rename needed.
-	var tapRestore func()
-	if netns == nil {
-		var tapErr error
-		tapRestore, tapErr = cm.setupSnapshotTAPRename(tap.Name)
-		if tapErr != nil {
-			symlinkCleanup()
-			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
-			return nil, fmt.Errorf("failed to setup TAP rename: %w", tapErr)
-		}
-	}
 
 	// Restore from snapshot.
 	// Load WITHOUT resuming so we can inject MMDS data before the guest
@@ -687,9 +651,6 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		}).Info("Restoring VM with UFFD memory backend")
 		restoreErr = vm.RestoreFromSnapshotWithUFFD(ctx, restoreStatePath, uffdSocketPath, false)
 	}
-	if tapRestore != nil {
-		tapRestore()
-	}
 	symlinkCleanup()
 
 	if restoreErr != nil {
@@ -709,23 +670,29 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	}
 
 	// Start auth proxy BEFORE injecting MMDS so proxy config is available to the VM.
+	// The proxy binds inside the netns on the gateway IP and on the host-side
+	// veth for the token update endpoint.
 	if req.AuthConfig != nil && netns != nil {
+		hostVethIP := net.IPv4(10, 200, byte(netns.Slot), 1).String()
 		proxy, proxyErr := authproxy.NewAuthProxy(
 			runnerID,
 			*req.AuthConfig,
-			netns.GetFirecrackerNetNSPath(),
+			netns.Path,
 			netns.Gateway.String(),
-			netns.HostReachableIP.String(),
+			hostVethIP,
 			cm.chunkedLogger,
 		)
 		if proxyErr != nil {
-			cm.chunkedLogger.WithError(proxyErr).Warn("Failed to create auth proxy (non-fatal)")
-		} else if proxyErr := proxy.Start(context.Background()); proxyErr != nil {
-			cm.chunkedLogger.WithError(proxyErr).Warn("Failed to start auth proxy (non-fatal)")
-		} else {
-			cm.authProxies[runnerID] = proxy
-			cm.chunkedLogger.WithField("runner_id", runnerID).Info("Auth proxy started")
+			vm.Stop()
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+			return nil, fmt.Errorf("failed to create auth proxy: %w", proxyErr)
 		}
+		if startErr := proxy.Start(context.Background()); startErr != nil {
+			vm.Stop()
+			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
+			return nil, fmt.Errorf("failed to start auth proxy: %w", startErr)
+		}
+		cm.authProxies[runnerID] = proxy
 	}
 
 	// Inject MMDS data BEFORE resuming so the thaw-agent sees fresh config
@@ -753,17 +720,15 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 
 	// When using per-VM namespaces, set up port forwarding (DNAT) so the host
 	// can reach services inside the VM via the host-reachable veth IP.
-	if netns != nil && cm.netnsNetwork != nil {
-		for _, port := range []int{snapshot.ThawAgentHealthPort, snapshot.ThawAgentDebugPort} {
-			if err := cm.netnsNetwork.ForwardPort(runnerID, port); err != nil {
-				cm.chunkedLogger.WithField("port", port).WithError(err).Warn("Failed to forward port into namespace")
-			}
+	for _, port := range []int{snapshot.ThawAgentHealthPort, snapshot.ThawAgentDebugPort} {
+		if err := cm.netnsNetwork.ForwardPort(runnerID, port); err != nil {
+			cm.chunkedLogger.WithField("port", port).WithError(err).Warn("Failed to forward port into namespace")
 		}
-		// Forward user service port if start_command is configured
-		if req.StartCommand != nil && req.StartCommand.Port > 0 {
-			if err := cm.netnsNetwork.ForwardPort(runnerID, req.StartCommand.Port); err != nil {
-				cm.chunkedLogger.WithField("port", req.StartCommand.Port).WithError(err).Warn("Failed to forward service port into namespace")
-			}
+	}
+	// Forward user service port if start_command is configured
+	if req.StartCommand != nil && req.StartCommand.Port > 0 {
+		if err := cm.netnsNetwork.ForwardPort(runnerID, req.StartCommand.Port); err != nil {
+			cm.chunkedLogger.WithField("port", req.StartCommand.Port).WithError(err).Warn("Failed to forward service port into namespace")
 		}
 	}
 
@@ -791,7 +756,6 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		"runner_id":    runnerID,
 		"ip":           runner.InternalIP.String(),
 		"restore_time": restoreTime,
-		"use_netns":    cm.useNetNS,
 	}).Info("Runner allocated with chunked snapshot")
 
 	return runner, nil
@@ -858,6 +822,12 @@ func (cm *ChunkedManager) ReleaseRunnerChunked(ctx context.Context, runnerID str
 		delete(cm.uffdHandlers, runnerID)
 	}
 
+	// Stop auth proxy if one exists
+	if proxy, ok := cm.authProxies[runnerID]; ok {
+		proxy.Stop()
+		delete(cm.authProxies, runnerID)
+	}
+
 	// Cleanup rootfs FUSE disk
 	if disk, exists := cm.fuseDisks[runnerID]; exists {
 		disk.Unmount()
@@ -872,15 +842,10 @@ func (cm *ChunkedManager) ReleaseRunnerChunked(ctx context.Context, runnerID str
 	}
 
 	// Cleanup network
-	var tap *network.TapDevice
-	if cm.useNetNS && cm.netnsNetwork != nil {
-		cm.netnsNetwork.ReleaseNamespace(runnerID)
-	} else {
-		if slot, ok := cm.runnerToSlot[runnerID]; ok {
-			cm.network.ReleaseTapSlot(slot, runnerID)
-			delete(cm.slotToRunner, slot)
-			delete(cm.runnerToSlot, runnerID)
-		}
+	cm.netnsNetwork.ReleaseNamespace(runnerID)
+	if slot, ok := cm.runnerToSlot[runnerID]; ok {
+		delete(cm.slotToRunner, slot)
+		delete(cm.runnerToSlot, runnerID)
 	}
 
 	// Cleanup workspace
@@ -893,7 +858,6 @@ func (cm *ChunkedManager) ReleaseRunnerChunked(ctx context.Context, runnerID str
 
 	delete(cm.runners, runnerID)
 
-	_ = tap // silence unused variable warning
 	return nil
 }
 
@@ -913,6 +877,11 @@ func (cm *ChunkedManager) cleanupChunkedRunner(
 	if uffdHandler != nil {
 		uffdHandler.Stop()
 	}
+	// Stop auth proxy on allocation failure
+	if proxy, ok := cm.authProxies[runnerID]; ok {
+		proxy.Stop()
+		delete(cm.authProxies, runnerID)
+	}
 	if fuseDisk != nil {
 		fuseDisk.Unmount()
 	}
@@ -923,11 +892,9 @@ func (cm *ChunkedManager) cleanupChunkedRunner(
 		}
 		delete(cm.fuseExtensionDisks, runnerID)
 	}
-	if cm.useNetNS && cm.netnsNetwork != nil && netns != nil {
+	if netns != nil {
 		cm.netnsNetwork.ReleaseNamespace(runnerID)
-	} else if tap != nil {
 		if slot, ok := cm.runnerToSlot[runnerID]; ok {
-			cm.network.ReleaseTapSlot(slot, runnerID)
 			delete(cm.slotToRunner, slot)
 			delete(cm.runnerToSlot, runnerID)
 		}
@@ -1226,12 +1193,9 @@ func (cm *ChunkedManager) GetChunkStore() *snapshot.ChunkStore {
 	return cm.chunkStore
 }
 
-// GetSubnet returns the subnet from either netns or nat network
+// GetSubnet returns the subnet from the netns network
 func (cm *ChunkedManager) GetSubnet() *net.IPNet {
-	if cm.useNetNS && cm.netnsNetwork != nil {
-		return cm.netnsNetwork.GetSubnet()
-	}
-	return cm.network.GetSubnet()
+	return cm.netnsNetwork.GetSubnet()
 }
 
 // getAllDirtyExtensionDiskChunks returns all dirty FUSE extension disk chunks for a runner.

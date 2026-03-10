@@ -43,17 +43,11 @@ assert_manager_gcs_mode "$GCS_BUCKET"
 echo "Session ID: $SESSION_ID"
 
 # ---------------------------------------------------------------------------
-header "1. Discover workload key from built snapshot"
+header "1. Discover workload key and register config"
 # ---------------------------------------------------------------------------
-WORKLOAD_KEY=$(discover_workload_key || true)
-echo "  workload_key=$WORKLOAD_KEY"
-
-if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then
-  pass "Workload key discovered"
-else
-  fail "Could not discover workload key from snapshot-builder logs (set WORKLOAD_KEY=... to override)"
-  exit 1
-fi
+require_workload_key
+register_dev_config "checkpoint-test" '{"ttl": 300, "auto_pause": true, "session_max_age_seconds": 3600}'
+pass "Workload key discovered and config registered"
 
 # ---------------------------------------------------------------------------
 header "2. Allocate runner with session"
@@ -62,9 +56,7 @@ ALLOC_RESP=$(curl -s -X POST "$CP/api/v1/runners/allocate" \
   -H 'Content-Type: application/json' \
   -d "{
     \"workload_key\": \"$WORKLOAD_KEY\",
-    \"session_id\": \"$SESSION_ID\",
-    \"ttl_seconds\": 300,
-    \"auto_pause\": true
+    \"session_id\": \"$SESSION_ID\"
   }")
 RUNNER_ID=$(echo "$ALLOC_RESP" | jq -r '.runner_id // .runner.id')
 HOST_ADDR=$(echo "$ALLOC_RESP" | jq -r '.host_address')

@@ -30,14 +30,6 @@ assert_manager_gcs_mode() {
   fi
   cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline")
 
-  echo "$cmdline" | grep -q -- "--use-chunked-snapshots" || {
-    echo "FAIL: firecracker-manager is not running with --use-chunked-snapshots"
-    exit 1
-  }
-  echo "$cmdline" | grep -q -- "--enable-session-chunks" || {
-    echo "FAIL: firecracker-manager is not running with --enable-session-chunks"
-    exit 1
-  }
   echo "$cmdline" | grep -q -- "--snapshot-bucket=$bucket" || {
     echo "FAIL: firecracker-manager snapshot bucket does not match GCS_BUCKET=$bucket"
     echo "Command line: $cmdline"

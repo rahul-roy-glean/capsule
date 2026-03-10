@@ -30,7 +30,7 @@ The currently supported example wrapper fields are:
 | [ci-git-cache](ci-git-cache/) | Git-cache reference cloning for fast `actions/checkout` |
 | [ai-sandbox](ai-sandbox/) | Isolated microVMs for LLM-generated or user-submitted code |
 | [dev-environment](dev-environment/) | Persistent VS Code Server sessions, cross-host resumable |
-| [serverless-function](serverless-function/) | High-density function runtime with pool reuse |
+| [afs](afs/) | Internal-style sandbox service with prebuilt workload layers |
 
 ## How the platform handles different workloads
 

@@ -7,5 +7,5 @@ def base_url() -> str:
 
 
 @pytest.fixture
-def api_key() -> str:
-    return "test-api-key"
+def token() -> str:
+    return "test-token"

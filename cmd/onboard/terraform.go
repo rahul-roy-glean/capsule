@@ -202,9 +202,6 @@ func generateTFVars(cfg *Config, finalize bool, targetDir ...string) (string, er
 
 	// --- Snapshots & networking ---
 	addBool("use_custom_host_image", finalize)
-	addBool("use_chunked_snapshots", true)
-	addBool("enable_session_chunks", cfg.Session.Enabled)
-	addBool("use_netns", true)
 	addStr("db_password", cfg.ResolvedDBPassword)
 	if finalize && cfg.ResolvedControlPlaneURL != "" {
 		addStr("control_plane_addr", cfg.ResolvedControlPlaneURL)

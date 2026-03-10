@@ -4,8 +4,11 @@
 #
 # Prerequisites:
 #   - Stack running: make dev-stack
-#   - Snapshot built: make dev-snapshot
+#   - Snapshot built: GCS_BUCKET=<bucket> make dev-snapshot
 set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$REPO_ROOT/dev/lib-workload-key.sh"
 
 CP=http://localhost:8080
 MGR=http://localhost:9080
@@ -20,30 +23,10 @@ header() { echo ""; echo "=== $1 ==="; }
 # ---------------------------------------------------------------------------
 header "1. Register snapshot config with TTL + auto_pause"
 # ---------------------------------------------------------------------------
-# Register a config with 15s TTL and auto_pause enabled.
-# In a real scenario this would be done once per workload_key.
-CONFIG_RESP=$(curl -sf -X POST "$CP/api/v1/layered-configs" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "display_name": "pause-resume-test",
-    "layers": [{"name":"base","init_commands":[{"type":"shell","args":["echo","pause-test"]}]}],
-    "config": {
-      "ttl": 15,
-      "auto_pause": true,
-      "session_max_age_seconds": 3600
-    }
-  }')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.leaf_workload_key')
-echo "Registered config: workload_key=$WORKLOAD_KEY"
+require_workload_key
+register_dev_config "pause-resume-test" '{"ttl": 15, "auto_pause": true, "session_max_age_seconds": 3600}'
 echo "  TTL: 15s, auto_pause: true"
-
-if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then
-  pass "Snapshot config registered with TTL fields"
-else
-  fail "Snapshot config registration failed"
-  echo "$CONFIG_RESP"
-  exit 1
-fi
+pass "Snapshot config registered with TTL fields"
 
 # ---------------------------------------------------------------------------
 header "2. Allocate runner with session_id"

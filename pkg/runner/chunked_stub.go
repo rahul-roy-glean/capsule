@@ -23,7 +23,9 @@ type ChunkedManager struct {
 type ChunkedManagerConfig struct {
 	HostConfig
 	UseChunkedSnapshots bool
-	UseNetNS            bool
+	MicroVMSubnet       string
+	ExternalInterface   string
+	BridgeName          string
 	ChunkCacheSizeBytes int64
 	MemCacheSizeBytes   int64
 	MemBackend          string
@@ -86,9 +88,6 @@ func (cm *ChunkedManager) GetChunkStore() *snapshot.ChunkStore {
 
 // GetSubnet is a stub
 func (cm *ChunkedManager) GetSubnet() *net.IPNet {
-	if cm.Manager != nil {
-		return cm.Manager.network.GetSubnet()
-	}
 	return nil
 }
 

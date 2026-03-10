@@ -65,17 +65,15 @@ resource "google_compute_instance_template" "firecracker_host" {
   }
 
   metadata = {
-    snapshot-bucket       = google_storage_bucket.snapshots.name
-    microvm-subnet        = var.microvm_subnet
-    environment           = var.environment
-    control-plane         = var.control_plane_addr
+    snapshot-bucket         = google_storage_bucket.snapshots.name
+    microvm-subnet          = var.microvm_subnet
+    environment             = var.environment
+    control-plane           = var.control_plane_addr
+    host-bootstrap-token    = var.host_bootstrap_token
     max-runners             = var.max_runners_per_host
-    idle-target           = var.idle_runners_target
-    use-chunked-snapshots  = var.use_chunked_snapshots ? "true" : "false"
-    enable-session-chunks  = var.enable_session_chunks ? "true" : "false"
-    chunk-cache-size-gb    = var.chunk_cache_size_gb
-    mem-cache-size-gb      = var.mem_cache_size_gb
-    use-netns              = var.use_netns ? "true" : "false"
+    idle-target             = var.idle_runners_target
+    chunk-cache-size-gb     = var.chunk_cache_size_gb
+    mem-cache-size-gb       = var.mem_cache_size_gb
     otel-collector-endpoint = var.otel_collector_addr
   }
 
@@ -117,78 +115,13 @@ resource "google_compute_instance_template" "firecracker_host" {
     # Create directories
     mkdir -p /mnt/data/snapshots
 
-    # Download from GCS
-    if [ -n "$SNAPSHOT_BUCKET" ]; then
-      echo "Downloading Firecracker snapshot artifacts from GCS..."
-
-      # Resolve versioned directory via pointer file (use curl + metadata API for speed)
-      SNAPSHOT_VERSION=""
-      TOKEN=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])" 2>/dev/null || true)
-      if [ -n "$TOKEN" ]; then
-        SNAPSHOT_VERSION=$(curl -s -H "Authorization: Bearer $TOKEN" \
-          "https://storage.googleapis.com/$SNAPSHOT_BUCKET/current-pointer.json" | \
-          python3 -c "import sys,json; print(json.load(sys.stdin)['version'])" 2>/dev/null || true)
-      fi
-      if [ -z "$SNAPSHOT_VERSION" ]; then
-        # Fallback to gcloud CLI
-        POINTER_FILE=$(mktemp)
-        if gcloud storage cp "gs://$SNAPSHOT_BUCKET/current-pointer.json" "$POINTER_FILE" 2>/dev/null; then
-          SNAPSHOT_VERSION=$(python3 -c "import json; print(json.load(open('$POINTER_FILE'))['version'])" 2>/dev/null || true)
-        fi
-        rm -f "$POINTER_FILE"
-      fi
-
-      SNAPSHOT_DIR=""
-      if [ -n "$SNAPSHOT_VERSION" ]; then
-        echo "Resolved current pointer to version: $SNAPSHOT_VERSION"
-        SNAPSHOT_DIR="gs://$SNAPSHOT_BUCKET/$SNAPSHOT_VERSION"
-      else
-        echo "No pointer file found, falling back to current/ directory"
-        SNAPSHOT_DIR="gs://$SNAPSHOT_BUCKET/current"
-      fi
-
-      # Download snapshot artifacts (parallel composite download is faster than streaming)
-      gcloud storage rsync -r "$SNAPSHOT_DIR/" /mnt/data/snapshots/ || true
-
-      # Decompress snapshot.mem.zst in background while other setup continues
-      if [ -f "/mnt/data/snapshots/snapshot.mem.zst" ] && [ ! -f "/mnt/data/snapshots/snapshot.mem" ]; then
-        echo "Decompressing snapshot.mem.zst in background..."
-        zstd -d /mnt/data/snapshots/snapshot.mem.zst -o /mnt/data/snapshots/snapshot.mem --no-progress &
-        ZSTD_PID=$!
-      fi
-    fi
-
     # Create workspaces directory (per-VM, not in snapshot)
     mkdir -p /mnt/data/workspaces
     mkdir -p /var/run/firecracker
 
-    # Setup bridge networking for microVMs
-    echo "Setting up bridge networking..."
-    # Get the host interface MTU (GCP uses 1460, not 1500)
-    HOST_MTU=$(cat /sys/class/net/$(ip route | grep default | awk '{print $5}' | head -1)/mtu)
-    ip link add fcbr0 type bridge || true
-    ip link set fcbr0 mtu $HOST_MTU
-    ip addr add ${cidrhost(var.microvm_subnet, 1)}/24 dev fcbr0 || true
-    ip link set fcbr0 up
-    echo "Bridge MTU set to $HOST_MTU (matching host interface)"
-
     # Enable IP forwarding
     echo 1 > /proc/sys/net/ipv4/ip_forward
     echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
-
-    # Setup NAT for microVM egress
-    # Get the primary network interface
-    PRIMARY_IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
-    iptables -t nat -A POSTROUTING -s ${var.microvm_subnet} -o "$PRIMARY_IFACE" -j MASQUERADE
-    iptables -A FORWARD -i fcbr0 -o "$PRIMARY_IFACE" -j ACCEPT
-    iptables -A FORWARD -i "$PRIMARY_IFACE" -o fcbr0 -m state --state RELATED,ESTABLISHED -j ACCEPT
-
-    # Clamp TCP MSS to path MTU - guest VMs may have MTU 1500 while GCP uses 1460.
-    # Without this, large TCP segments get dropped after NAT (DF bit set, can't fragment).
-    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-
-    # Save iptables rules
-    iptables-save > /etc/iptables/rules.v4 || true
 
     # Load required kernel modules
     modprobe tun || true
@@ -223,11 +156,8 @@ LOGROTATE
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/idle-target || echo "2")
     CONTROL_PLANE=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/control-plane || echo "")
-
-    USE_CHUNKED_SNAPSHOTS=$(curl -sf -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/use-chunked-snapshots || echo "false")
-    USE_NETNS=$(curl -sf -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/use-netns || echo "false")
+    HOST_BOOTSTRAP_TOKEN=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/host-bootstrap-token || echo "")
 
     # Stop firecracker-manager if already running (from Packer image auto-start)
     # This ensures the override is applied before the service runs
@@ -247,29 +177,18 @@ LOGROTATE
     if [ -n "$CONTROL_PLANE" ]; then
       EXEC_START="$EXEC_START --control-plane=$CONTROL_PLANE"
     fi
-
-    # Add chunked snapshot flag if enabled
-    if [ "$USE_CHUNKED_SNAPSHOTS" = "true" ]; then
-      EXEC_START="$EXEC_START --use-chunked-snapshots"
-      EXEC_START="$EXEC_START --snapshot-bucket=$SNAPSHOT_BUCKET"
-      CHUNK_CACHE_SIZE_GB=$(curl -sf -H "Metadata-Flavor: Google" \
-        http://metadata.google.internal/computeMetadata/v1/instance/attributes/chunk-cache-size-gb || echo "2")
-      MEM_CACHE_SIZE_GB=$(curl -sf -H "Metadata-Flavor: Google" \
-        http://metadata.google.internal/computeMetadata/v1/instance/attributes/mem-cache-size-gb || echo "2")
-      EXEC_START="$EXEC_START --chunk-cache-size-gb=$CHUNK_CACHE_SIZE_GB"
-      EXEC_START="$EXEC_START --mem-cache-size-gb=$MEM_CACHE_SIZE_GB"
-
-      ENABLE_SESSION_CHUNKS=$(curl -sf -H "Metadata-Flavor: Google" \
-        http://metadata.google.internal/computeMetadata/v1/instance/attributes/enable-session-chunks || echo "false")
-      if [ "$ENABLE_SESSION_CHUNKS" = "true" ]; then
-        EXEC_START="$EXEC_START --enable-session-chunks"
-      fi
+    if [ -n "$HOST_BOOTSTRAP_TOKEN" ]; then
+      EXEC_START="$EXEC_START --host-bootstrap-token=$HOST_BOOTSTRAP_TOKEN"
     fi
 
-    # Add network namespace flag if enabled
-    if [ "$USE_NETNS" = "true" ]; then
-      EXEC_START="$EXEC_START --use-netns"
-    fi
+    # Add snapshot flags
+    EXEC_START="$EXEC_START --snapshot-bucket=$SNAPSHOT_BUCKET"
+    CHUNK_CACHE_SIZE_GB=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/chunk-cache-size-gb || echo "2")
+    MEM_CACHE_SIZE_GB=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/mem-cache-size-gb || echo "2")
+    EXEC_START="$EXEC_START --chunk-cache-size-gb=$CHUNK_CACHE_SIZE_GB"
+    EXEC_START="$EXEC_START --mem-cache-size-gb=$MEM_CACHE_SIZE_GB"
 
     # Read OTel collector endpoint from metadata (empty = OTel disabled)
     OTEL_ENDPOINT=$(curl -sf -H "Metadata-Flavor: Google" \
@@ -290,12 +209,6 @@ ExecStart=
 ExecStart=$EXEC_START
 $([ -n "$ENV_LINES" ] && echo -e "$ENV_LINES")
 OVERRIDE
-
-    # Wait for background decompression before starting firecracker-manager
-    if [ -n "$${ZSTD_PID:-}" ]; then
-      echo "Waiting for snapshot.mem decompression to finish..."
-      wait $ZSTD_PID && echo "snapshot.mem ready" || echo "WARNING: snapshot.mem decompression failed"
-    fi
 
     # Reload and restart firecracker-manager service with new config
     echo "Starting firecracker-manager with: max-runners=$MAX_RUNNERS, idle-target=$IDLE_TARGET, vcpus=$VCPUS_PER_RUNNER, memory=$MEMORY_PER_RUNNER"

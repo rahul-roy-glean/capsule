@@ -2,31 +2,39 @@
   <img src="assets/logo.png" width="220" alt="logo" />
 </p>
 
-# bazel-firecracker
+# Generic Workload Platform on Firecracker
 
-Firecracker microVM runtime with layered snapshots, workload-key routing, and optional
-cross-host session resume.
+Snapshot-first Firecracker microVM platform for fast-start sandboxes, resumable
+sessions, and general-purpose workload execution.
 
 ## Status
 
-The core runtime in this repository is a **generic workload platform**, not just a
-GitHub Actions runner system. The control plane manages layered configs, launches
-snapshot-builder VMs, allocates workload-keyed microVMs onto a host fleet, and can
-pause/resume session state through GCS-backed diff snapshots.
+This repository implements a **generic workload platform**. The control plane
+manages layered configs, launches snapshot-builder VMs, allocates workload-keyed
+microVMs onto a host fleet, and can pause/resume session state through GCS-backed
+diff snapshots.
+
+Current alpha scope:
+
+- Supported deployment: `GCP + Firecracker + Helm`
+- Network model: private-network-first control plane with bearer-token API auth
+- Python SDK is a tier-1 surface
+- API and SDK are alpha and may break before `v1`
+- Host images are built separately from the tagged release flow
 
 The canonical GCP path is the unified `onboard.yaml` flow documented in
 [docs/setup.md](docs/setup.md).
 
 ## What This Is
 
-`bazel-firecracker` snapshots Firecracker microVMs and restores them on demand with lazy
+The platform snapshots Firecracker microVMs and restores them on demand with lazy
 loading:
 
 - Memory is restored through UFFD-backed page fault handling.
 - Disk is restored through FUSE-backed chunk loading.
 - Snapshot chunks are content-addressed and shared across workloads in GCS.
 - Hosts keep warm pools of paused VMs for fast same-host reuse.
-- Session runners can pause dirty state to GCS and resume on another host.
+- Session-backed workloads can pause dirty state to GCS and resume on another host.
 
 The current API surface is built around **layered configs**:
 
@@ -59,14 +67,14 @@ flowchart TD
 At a high level:
 
 - `cmd/control-plane` stores layered configs, enqueues builds, tracks desired snapshot
-  versions, and allocates runners.
+  versions, and allocates workload instances.
 - `cmd/firecracker-manager` runs on each GCE host VM and restores or resumes microVMs.
 - `cmd/thaw-agent` runs inside the guest and handles warmup mode, `start_command`,
   exec/file APIs, and post-resume reconfiguration.
 - `cmd/snapshot-builder` builds chunked snapshots from a Docker base image plus warmup
   commands.
 - `sdk/python` provides the cleanest current client API for layered-config registration
-  and runner allocation.
+  and sandbox allocation.
 
 See [docs/architecture.md](docs/architecture.md) for the current code-grounded design.
 
@@ -81,7 +89,7 @@ See [docs/architecture.md](docs/architecture.md) for the current code-grounded d
    `current-pointer.json` for the leaf `workload_key`.
 5. Hosts heartbeat to the control plane, learn desired versions, and lazily sync
    manifests for workload keys they need.
-6. A runner allocation either resumes a paused session, reuses a pooled VM, or restores a
+6. An allocation request either resumes a paused session, reuses a pooled VM, or restores a
    fresh microVM from the chunked snapshot.
 7. Inside the guest, `thaw-agent` reads MMDS, configures networking, launches the
    `start_command`, and exposes the in-VM debug/exec/file APIs.
@@ -90,8 +98,8 @@ See [docs/architecture.md](docs/architecture.md) for the current code-grounded d
 
 - AI sandboxes with session resume across conversation turns.
 - Dev environments with pre-warmed toolchains and editor services.
-- Ephemeral CI runners where the CI-specific behavior is just a `start_command`.
-- Serverless-style HTTP services with pooled microVM reuse.
+- Long-lived service workloads with pooled microVM reuse.
+- CI workloads where the platform-specific behavior is just a `start_command`.
 
 The workload primitives are documented in [examples/README.md](examples/README.md).
 
@@ -163,7 +171,7 @@ If you prefer a client library, see [sdk/python/README.md](sdk/python/README.md)
 ## Examples
 
 The `examples/` directory shows intended workload shapes for CI, AI sandboxes, dev
-environments, serverless functions, and storage-heavy workloads.
+environments, and storage-heavy workloads.
 
 Those example `onboard.yaml` files are executable inputs for `make onboard` as long as
 you stay within the currently supported schema:
