@@ -59,6 +59,7 @@ if SDK_PATH not in sys.path:
 try:
     import bf_sdk
     from bf_sdk import BFClient, BFError, BFNotFound, BFServiceUnavailable
+    from bf_sdk._errors import BFRateLimited
     from bf_sdk._http import HttpClient
 except ImportError as exc:
     print(f"[FATAL] Cannot import bf_sdk: {exc}")
@@ -202,7 +203,7 @@ def test_case(run: SimulationRun, suite: str, name: str, log: logging.Logger):
     except BFNotFound as exc:
         error = f"Not found: {exc}"
         log.warning("FAILED (not found)", extra={"suite": suite, "test": name, "error": error})
-    except BFServiceUnavailable as exc:
+    except (BFServiceUnavailable, BFRateLimited) as exc:
         error = f"Service unavailable: {exc}"
         log.warning("FAILED (service unavailable)", extra={"suite": suite, "test": name, "error": error})
     except BFError as exc:
@@ -1340,10 +1341,13 @@ def suite_concurrency(
                     request_id=request_id,
                     session_id=session_id,
                 )
-            except BFServiceUnavailable as exc:
+            except (BFServiceUnavailable, BFRateLimited) as exc:
                 last_exc = exc
                 if attempt < max_retries:
-                    time.sleep(backoff)
+                    delay = backoff
+                    if hasattr(exc, "retry_after") and exc.retry_after:
+                        delay = exc.retry_after
+                    time.sleep(delay)
                     backoff = min(backoff * 1.5, 15.0)
         raise last_exc  # type: ignore[misc]
 
@@ -1416,7 +1420,7 @@ def suite_concurrency(
             allocated_ids.append(resp.runner_id)
             to_release_after.append(resp.runner_id)
             return True, resp.runner_id, True
-        except BFServiceUnavailable as exc:
+        except (BFServiceUnavailable, BFRateLimited) as exc:
             if _is_capacity_error(str(exc)):
                 return True, f"capacity-limited: {exc}", False
             return False, str(exc), False
@@ -1469,7 +1473,7 @@ def suite_concurrency(
             client.runners.release(runner_id)
             runner_id = None
             return True, "", True
-        except BFServiceUnavailable as exc:
+        except (BFServiceUnavailable, BFRateLimited) as exc:
             if _is_capacity_error(str(exc)):
                 return True, f"capacity-limited: {exc}", False
             return False, str(exc), False
@@ -1528,7 +1532,7 @@ def suite_concurrency(
             client.runners.release(runner_id)
             runner_id = None
             return True, "", True
-        except BFServiceUnavailable as exc:
+        except (BFServiceUnavailable, BFRateLimited) as exc:
             if _is_capacity_error(str(exc)):
                 return True, f"capacity-limited: {exc}", False
             return False, str(exc), False
@@ -1562,7 +1566,7 @@ def suite_concurrency(
         )
         shared_runner_id = shared_resp.runner_id
         _cs.close()
-    except BFServiceUnavailable as exc:
+    except (BFServiceUnavailable, BFRateLimited) as exc:
         log.warning("Skipping thundering-herd test (capacity-limited)", extra={"error": str(exc)})
     except Exception as exc:  # noqa: BLE001
         log.warning("Could not allocate for thundering-herd test", extra={"error": str(exc)})
@@ -1623,7 +1627,7 @@ def suite_concurrency(
             resp = client.runners.allocate(leaf_workload_key, request_id=dedup_request_id)
             dedup_runner_ids.append(resp.runner_id)
             return True, resp.runner_id, True
-        except BFServiceUnavailable as exc:
+        except (BFServiceUnavailable, BFRateLimited) as exc:
             if _is_capacity_error(str(exc)):
                 dedup_runner_ids.append(f"error:{exc}")
                 return True, f"capacity-limited: {exc}", False
@@ -1671,7 +1675,7 @@ def suite_concurrency(
         )
         race_runner_id = race_resp.runner_id
         _cr2.close()
-    except BFServiceUnavailable as exc:
+    except (BFServiceUnavailable, BFRateLimited) as exc:
         log.warning("Skipping release-race test (capacity-limited)", extra={"error": str(exc)})
     except Exception as exc:  # noqa: BLE001
         log.warning("Could not allocate for release-race test", extra={"error": str(exc)})
@@ -1756,7 +1760,7 @@ def suite_concurrency(
             client.runners.release(runner_id)
             runner_id = None
             return True, "", True
-        except BFServiceUnavailable as exc:
+        except (BFServiceUnavailable, BFRateLimited) as exc:
             if _is_capacity_error(str(exc)):
                 return True, f"capacity-limited: {exc}", False
             return False, str(exc), False
@@ -1881,10 +1885,10 @@ def suite_realistic(
                     alloc_latency = time.monotonic() - alloc_start
                     last_exc = None
                     break
-                except BFServiceUnavailable as exc:
+                except (BFServiceUnavailable, BFRateLimited) as exc:
                     last_exc = exc
-                    status_code = 503
-                    log.debug("503 on allocate, retrying", extra={
+                    status_code = getattr(exc, "status_code", 503)
+                    log.debug("Capacity error on allocate, retrying", extra={
                         "runner_idx": runner_idx, "attempt": attempt + 1,
                     })
                     time.sleep(2)
