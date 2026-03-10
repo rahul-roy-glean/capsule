@@ -44,7 +44,7 @@ from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from threading import Barrier, Semaphore, Thread
+from threading import Barrier, BrokenBarrierError, Semaphore, Thread
 from typing import Any, Optional
 
 import httpx
@@ -1682,7 +1682,10 @@ def suite_concurrency(
             )
             runner_id = resp.runner_id
 
-            barrier.wait()  # all workers have a runner — storm begins
+            try:
+                barrier.wait(timeout=15)  # wait for peers; not all may allocate
+            except BrokenBarrierError:
+                pass  # some workers got 429 and never arrived — proceed anyway
 
             ops = random.choices(
                 ["status", "list", "connect", "status", "list"],
