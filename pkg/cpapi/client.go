@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Client talks to the control plane HTTP API.
@@ -151,6 +153,7 @@ func (c *Client) doWithRetry(method, path string, reqBody any, result any) error
 
 	backoff := c.initialBackoff()
 	maxRetries := c.maxRetries()
+	requestID := uuid.New().String()
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		req, err := http.NewRequest(method, c.BaseURL+path, bytes.NewReader(bodyBytes))
@@ -158,6 +161,7 @@ func (c *Client) doWithRetry(method, path string, reqBody any, result any) error
 			return fmt.Errorf("create request: %w", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Request-Id", requestID)
 
 		resp, err := c.httpClient().Do(req)
 		if err != nil {

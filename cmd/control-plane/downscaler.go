@@ -42,7 +42,7 @@ func loadDownscalerConfig(logger *logrus.Entry) downscalerConfig {
 		enabled = projectID != "" && region != "" && migName != ""
 	}
 
-	interval := 60 * time.Second
+	interval := 10 * time.Second
 	if raw := strings.TrimSpace(os.Getenv("DOWNSCALER_INTERVAL")); raw != "" {
 		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
 			interval = d
@@ -194,6 +194,7 @@ type hostStore interface {
 	SetHostStatusByInstanceName(ctx context.Context, instanceName, status string) error
 	CleanupHostRunners(ctx context.Context, hostID string) error
 	RemoveHost(hostID string)
+	DrainAllocFailures() int64
 }
 
 // gcpMIGClient wraps a real GCP compute.Service for production use.
@@ -341,11 +342,6 @@ func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, mc migClient, h
 	}
 
 	// Phase 2: utilization-based scale-up / scale-down.
-	// Skip if within cooldown.
-	if !lastScaleAction.IsZero() && time.Since(lastScaleAction) < cfg.Cooldown {
-		return false, nil
-	}
-
 	// Collect ready hosts with valid CPU info and fresh heartbeat.
 	var readyHosts []*Host
 	for _, h := range hosts {
@@ -361,7 +357,18 @@ func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, mc migClient, h
 		readyHosts = append(readyHosts, h)
 	}
 
-	decision := computeAutoscaleDecision(readyHosts, cfg.ScaleUpThreshold, cfg.ScaleDownThreshold)
+	allocFailures := hs.DrainAllocFailures()
+
+	// Demand-driven scale-up bypasses cooldown
+	demandDriven := allocFailures > 0 || len(readyHosts) == 0
+	if !demandDriven {
+		// Normal cooldown check — only for utilization-based decisions
+		if !lastScaleAction.IsZero() && time.Since(lastScaleAction) < cfg.Cooldown {
+			return false, nil
+		}
+	}
+
+	decision := computeAutoscaleDecision(readyHosts, cfg.ScaleUpThreshold, cfg.ScaleDownThreshold, allocFailures)
 
 	switch decision.action {
 	case scaleActionUp:
@@ -408,7 +415,17 @@ type autoscaleDecision struct {
 
 // computeAutoscaleDecision is the pure decision logic for scale-up / scale-down.
 // It examines ready hosts' CPU utilization to decide what to do.
-func computeAutoscaleDecision(readyHosts []*Host, scaleUpThreshold, scaleDownThreshold float64) autoscaleDecision {
+func computeAutoscaleDecision(readyHosts []*Host, scaleUpThreshold, scaleDownThreshold float64, allocFailures int64) autoscaleDecision {
+	// Demand-driven: allocation failures since last check
+	if allocFailures > 0 {
+		return autoscaleDecision{action: scaleActionUp, reason: fmt.Sprintf("%d allocation failures since last check", allocFailures)}
+	}
+
+	// Zero capacity: no ready hosts at all
+	if len(readyHosts) == 0 {
+		return autoscaleDecision{action: scaleActionUp, reason: "no ready hosts available"}
+	}
+
 	type hostUtil struct {
 		host *Host
 		xi   float64

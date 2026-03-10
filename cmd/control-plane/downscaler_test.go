@@ -20,10 +20,10 @@ func makeHost(name string, usedCPU, totalCPU int, createdAt time.Time) *Host {
 	}
 }
 
-func TestComputeAutoscaleDecision_NoActionNoReadyHosts(t *testing.T) {
-	d := computeAutoscaleDecision(nil, 0.9, 0.5)
-	if d.action != scaleActionNone {
-		t.Fatalf("expected scaleActionNone, got %d", d.action)
+func TestComputeAutoscaleDecision_ScaleUpNoReadyHosts(t *testing.T) {
+	d := computeAutoscaleDecision(nil, 0.9, 0.5, 0)
+	if d.action != scaleActionUp {
+		t.Fatalf("expected scaleActionUp when no ready hosts, got %d", d.action)
 	}
 }
 
@@ -33,7 +33,7 @@ func TestComputeAutoscaleDecision_ScaleUpAllHostsAboveThreshold(t *testing.T) {
 		makeHost("h1", 950, 1000, now.Add(-2*time.Hour)),
 		makeHost("h2", 920, 1000, now.Add(-1*time.Hour)),
 	}
-	d := computeAutoscaleDecision(hosts, 0.9, 0.5)
+	d := computeAutoscaleDecision(hosts, 0.9, 0.5, 0)
 	if d.action != scaleActionUp {
 		t.Fatalf("expected scaleActionUp, got %d", d.action)
 	}
@@ -45,7 +45,7 @@ func TestComputeAutoscaleDecision_NoScaleUpWhenOneHostBelowThreshold(t *testing.
 		makeHost("h1", 950, 1000, now.Add(-2*time.Hour)),
 		makeHost("h2", 800, 1000, now.Add(-1*time.Hour)),
 	}
-	d := computeAutoscaleDecision(hosts, 0.9, 0.5)
+	d := computeAutoscaleDecision(hosts, 0.9, 0.5, 0)
 	if d.action == scaleActionUp {
 		t.Fatal("should not scale up when one host is below threshold")
 	}
@@ -57,7 +57,7 @@ func TestComputeAutoscaleDecision_ScaleDownLowUtilization(t *testing.T) {
 		makeHost("h1", 300, 1000, now.Add(-2*time.Hour)), // Xi=0.3
 		makeHost("h2", 600, 1000, now.Add(-1*time.Hour)), // Xi=0.6
 	}
-	d := computeAutoscaleDecision(hosts, 0.9, 0.5)
+	d := computeAutoscaleDecision(hosts, 0.9, 0.5, 0)
 	if d.action != scaleActionDown {
 		t.Fatalf("expected scaleActionDown, got %d", d.action)
 	}
@@ -75,7 +75,7 @@ func TestComputeAutoscaleDecision_ScaleDownPicksNewestLowestXi(t *testing.T) {
 		makeHost("h-mid", 400, 1000, now.Add(-2*time.Hour)), // Xi=0.4
 		makeHost("h-new", 100, 1000, now.Add(-1*time.Hour)), // Xi=0.1 (newest)
 	}
-	d := computeAutoscaleDecision(hosts, 0.9, 0.5)
+	d := computeAutoscaleDecision(hosts, 0.9, 0.5, 0)
 	if d.action != scaleActionDown {
 		t.Fatalf("expected scaleActionDown, got %d", d.action)
 	}
@@ -96,7 +96,7 @@ func TestComputeAutoscaleDecision_ScaleDownExcludesNewestFromMinXi(t *testing.T)
 		makeHost("h-old", 600, 1000, now.Add(-2*time.Hour)), // Xi=0.6
 		makeHost("h-new", 0, 1000, now),                     // Xi=0.0 (newest, excluded)
 	}
-	d := computeAutoscaleDecision(hosts, 0.9, 0.5)
+	d := computeAutoscaleDecision(hosts, 0.9, 0.5, 0)
 	// min(Xi) excluding newest = 0.6 >= 0.5 → no scale-down
 	if d.action != scaleActionNone {
 		t.Fatalf("expected scaleActionNone (newest excluded), got %d", d.action)
@@ -108,7 +108,7 @@ func TestComputeAutoscaleDecision_NeverScaleBelowOne(t *testing.T) {
 	hosts := []*Host{
 		makeHost("h1", 100, 1000, now), // Xi=0.1, well below threshold
 	}
-	d := computeAutoscaleDecision(hosts, 0.9, 0.5)
+	d := computeAutoscaleDecision(hosts, 0.9, 0.5, 0)
 	if d.action == scaleActionDown {
 		t.Fatal("should never scale down to 0 hosts")
 	}
@@ -120,7 +120,7 @@ func TestComputeAutoscaleDecision_NoActionMidUtilization(t *testing.T) {
 		makeHost("h1", 700, 1000, now.Add(-2*time.Hour)), // Xi=0.7
 		makeHost("h2", 600, 1000, now.Add(-1*time.Hour)), // Xi=0.6
 	}
-	d := computeAutoscaleDecision(hosts, 0.9, 0.5)
+	d := computeAutoscaleDecision(hosts, 0.9, 0.5, 0)
 	// min(Xi) excluding newest(h2) = 0.7 >= 0.5 → no scale down
 	// min(Xi) overall = 0.6, not > 0.9 → no scale up
 	if d.action != scaleActionNone {
@@ -133,7 +133,7 @@ func TestComputeAutoscaleDecision_ScaleUpSingleHostAboveThreshold(t *testing.T) 
 	hosts := []*Host{
 		makeHost("h1", 950, 1000, now), // Xi=0.95
 	}
-	d := computeAutoscaleDecision(hosts, 0.9, 0.5)
+	d := computeAutoscaleDecision(hosts, 0.9, 0.5, 0)
 	if d.action != scaleActionUp {
 		t.Fatalf("expected scaleActionUp for single overloaded host, got %d", d.action)
 	}
@@ -144,7 +144,7 @@ func TestComputeAutoscaleDecision_ScaleUpExactlyAtThresholdNoScaleUp(t *testing.
 	hosts := []*Host{
 		makeHost("h1", 900, 1000, now), // Xi=0.9, exactly at threshold (not >)
 	}
-	d := computeAutoscaleDecision(hosts, 0.9, 0.5)
+	d := computeAutoscaleDecision(hosts, 0.9, 0.5, 0)
 	if d.action == scaleActionUp {
 		t.Fatal("should not scale up when Xi equals threshold (need >)")
 	}
@@ -156,7 +156,7 @@ func TestComputeAutoscaleDecision_ScaleDownExactlyAtThresholdNoScaleDown(t *test
 		makeHost("h1", 500, 1000, now.Add(-2*time.Hour)), // Xi=0.5, exactly at threshold (need <)
 		makeHost("h2", 700, 1000, now.Add(-1*time.Hour)), // Xi=0.7
 	}
-	d := computeAutoscaleDecision(hosts, 0.9, 0.5)
+	d := computeAutoscaleDecision(hosts, 0.9, 0.5, 0)
 	if d.action == scaleActionDown {
 		t.Fatal("should not scale down when min Xi equals threshold (need <)")
 	}
@@ -169,7 +169,7 @@ func TestComputeAutoscaleDecision_MultipleHostsAllHigh(t *testing.T) {
 		makeHost("h2", 960, 1000, now.Add(-2*time.Hour)),
 		makeHost("h3", 970, 1000, now.Add(-1*time.Hour)),
 	}
-	d := computeAutoscaleDecision(hosts, 0.9, 0.5)
+	d := computeAutoscaleDecision(hosts, 0.9, 0.5, 0)
 	if d.action != scaleActionUp {
 		t.Fatalf("expected scaleActionUp when all hosts above threshold, got %d", d.action)
 	}
@@ -183,7 +183,7 @@ func TestComputeAutoscaleDecision_VictimSelectionPrefersNewest(t *testing.T) {
 		makeHost("h-mid", 200, 1000, now.Add(-2*time.Hour)), // Xi=0.2
 		makeHost("h-new", 200, 1000, now.Add(-1*time.Hour)), // Xi=0.2
 	}
-	d := computeAutoscaleDecision(hosts, 0.9, 0.5)
+	d := computeAutoscaleDecision(hosts, 0.9, 0.5, 0)
 	if d.action != scaleActionDown {
 		t.Fatalf("expected scaleActionDown, got %d", d.action)
 	}
@@ -201,13 +201,13 @@ func TestComputeAutoscaleDecision_CustomThresholds(t *testing.T) {
 	}
 
 	// With threshold 0.7, min(Xi)=0.75 > 0.7 → scale up.
-	d := computeAutoscaleDecision(hosts, 0.7, 0.5)
+	d := computeAutoscaleDecision(hosts, 0.7, 0.5, 0)
 	if d.action != scaleActionUp {
 		t.Fatalf("expected scaleActionUp with lower threshold, got %d", d.action)
 	}
 
 	// With threshold 0.9, min(Xi)=0.75 not > 0.9 → no scale up.
-	d = computeAutoscaleDecision(hosts, 0.9, 0.5)
+	d = computeAutoscaleDecision(hosts, 0.9, 0.5, 0)
 	if d.action == scaleActionUp {
 		t.Fatal("should not scale up with default threshold")
 	}
@@ -221,13 +221,13 @@ func TestComputeAutoscaleDecision_CustomScaleDownThreshold(t *testing.T) {
 	}
 
 	// With scale-down threshold 0.3, min(Xi excluding newest)=0.35 >= 0.3 → no scale down.
-	d := computeAutoscaleDecision(hosts, 0.9, 0.3)
+	d := computeAutoscaleDecision(hosts, 0.9, 0.3, 0)
 	if d.action == scaleActionDown {
 		t.Fatal("should not scale down when min Xi >= custom threshold")
 	}
 
 	// With scale-down threshold 0.5, min(Xi excluding newest)=0.35 < 0.5 → scale down.
-	d = computeAutoscaleDecision(hosts, 0.9, 0.5)
+	d = computeAutoscaleDecision(hosts, 0.9, 0.5, 0)
 	if d.action != scaleActionDown {
 		t.Fatalf("expected scaleActionDown with higher threshold, got %d", d.action)
 	}
@@ -357,6 +357,7 @@ type mockHostStore struct {
 	statusUpdates map[string]string // instanceName → last status set
 	removedHosts  []string          // host IDs removed
 	cleanedUp     []string          // host IDs cleaned up
+	allocFailures int64
 }
 
 func newMockHostStore(hosts []*Host) *mockHostStore {
@@ -382,6 +383,12 @@ func (m *mockHostStore) CleanupHostRunners(_ context.Context, hostID string) err
 
 func (m *mockHostStore) RemoveHost(hostID string) {
 	m.removedHosts = append(m.removedHosts, hostID)
+}
+
+func (m *mockHostStore) DrainAllocFailures() int64 {
+	v := m.allocFailures
+	m.allocFailures = 0
+	return v
 }
 
 func defaultTestConfig() downscalerConfig {
@@ -669,5 +676,100 @@ func TestRunDownscaleOnce_ResizeErrorReturnsError(t *testing.T) {
 	}
 	if acted {
 		t.Fatal("expected no action on error")
+	}
+}
+
+func TestComputeAutoscaleDecision_ScaleUpOnAllocFailures(t *testing.T) {
+	now := time.Now()
+	// Low utilization host — would normally not trigger scale-up
+	hosts := []*Host{
+		makeHost("h1", 300, 1000, now),
+	}
+	d := computeAutoscaleDecision(hosts, 0.9, 0.5, 5)
+	if d.action != scaleActionUp {
+		t.Fatalf("expected scaleActionUp on alloc failures, got %d", d.action)
+	}
+	if d.reason != "5 allocation failures since last check" {
+		t.Fatalf("unexpected reason: %s", d.reason)
+	}
+}
+
+func TestComputeAutoscaleDecision_ScaleUpOnZeroReadyHosts(t *testing.T) {
+	d := computeAutoscaleDecision(nil, 0.9, 0.5, 0)
+	if d.action != scaleActionUp {
+		t.Fatalf("expected scaleActionUp with zero ready hosts, got %d", d.action)
+	}
+	if d.reason != "no ready hosts available" {
+		t.Fatalf("unexpected reason: %s", d.reason)
+	}
+
+	d = computeAutoscaleDecision([]*Host{}, 0.9, 0.5, 0)
+	if d.action != scaleActionUp {
+		t.Fatalf("expected scaleActionUp with empty ready hosts, got %d", d.action)
+	}
+}
+
+func TestComputeAutoscaleDecision_AllocFailuresTakePriority(t *testing.T) {
+	now := time.Now()
+	// Mid utilization — would normally be "no action"
+	hosts := []*Host{
+		makeHost("h1", 700, 1000, now.Add(-2*time.Hour)),
+		makeHost("h2", 600, 1000, now.Add(-1*time.Hour)),
+	}
+	d := computeAutoscaleDecision(hosts, 0.9, 0.5, 3)
+	if d.action != scaleActionUp {
+		t.Fatalf("expected scaleActionUp from alloc failures overriding mid-util, got %d", d.action)
+	}
+}
+
+func TestRunDownscaleOnce_DemandDrivenBypassesCooldown(t *testing.T) {
+	now := time.Now()
+	hosts := []*Host{
+		{ID: "1", InstanceName: "h1", Status: "ready", TotalCPUMillicores: 1000, UsedCPUMillicores: 300, CreatedAt: now.Add(-2 * time.Hour), LastHeartbeat: now},
+	}
+
+	mc := &mockMIGClient{targetSize: 1, instances: map[string]string{"h1": "url/h1"}}
+	hs := newMockHostStore(hosts)
+	hs.allocFailures = 2 // simulate allocation failures
+	log := newTestLogger().WithField("test", true)
+
+	// Last action was 1 minute ago, cooldown is 5 minutes → normally would skip.
+	// But demand-driven should bypass cooldown.
+	lastAction := now.Add(-1 * time.Minute)
+	acted, err := runDownscaleOnce(context.Background(), defaultTestConfig(), mc, hs, lastAction, log)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !acted {
+		t.Fatal("expected action taken despite cooldown (demand-driven bypass)")
+	}
+	if mc.resizedTo != 2 {
+		t.Fatalf("expected MIG resized to 2, got %d", mc.resizedTo)
+	}
+}
+
+func TestRunDownscaleOnce_ZeroReadyHostsBypassesCooldown(t *testing.T) {
+	now := time.Now()
+	// No ready hosts (all draining)
+	hosts := []*Host{
+		{ID: "1", InstanceName: "h1", Status: "draining", BusyRunners: 1, TotalCPUMillicores: 1000, UsedCPUMillicores: 500, CreatedAt: now.Add(-2 * time.Hour), LastHeartbeat: now},
+	}
+
+	mc := &mockMIGClient{targetSize: 1, instances: map[string]string{"h1": "url/h1"}}
+	hs := newMockHostStore(hosts)
+	log := newTestLogger().WithField("test", true)
+
+	// Last action was 1 minute ago, cooldown is 5 minutes → normally would skip.
+	// But zero ready hosts should bypass cooldown.
+	lastAction := now.Add(-1 * time.Minute)
+	acted, err := runDownscaleOnce(context.Background(), defaultTestConfig(), mc, hs, lastAction, log)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !acted {
+		t.Fatal("expected action taken despite cooldown (zero ready hosts bypass)")
+	}
+	if mc.resizedTo != 2 {
+		t.Fatalf("expected MIG resized to 2, got %d", mc.resizedTo)
 	}
 }

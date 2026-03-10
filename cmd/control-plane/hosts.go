@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -73,11 +74,20 @@ type Runner struct {
 
 // HostRegistry manages host registration and tracking
 type HostRegistry struct {
-	db      *sql.DB
-	hosts   map[string]*Host
-	runners map[string]*Runner
-	mu      sync.RWMutex
-	logger  *logrus.Entry
+	db            *sql.DB
+	hosts         map[string]*Host
+	runners       map[string]*Runner
+	mu            sync.RWMutex
+	logger        *logrus.Entry
+	allocFailures atomic.Int64
+}
+
+func (hr *HostRegistry) RecordAllocFailure() {
+	hr.allocFailures.Add(1)
+}
+
+func (hr *HostRegistry) DrainAllocFailures() int64 {
+	return hr.allocFailures.Swap(0)
 }
 
 // NewHostRegistry creates a new host registry

@@ -764,6 +764,9 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		return
 	}
 	if req.RequestID == "" {
+		req.RequestID = r.Header.Get("X-Request-Id")
+	}
+	if req.RequestID == "" {
 		req.RequestID = fmt.Sprintf("manual-%d", time.Now().UnixNano())
 	}
 
