@@ -980,8 +980,11 @@ func (m *Manager) GetStatus() ManagerStatus {
 		case StateBusy:
 			busy++
 		}
-		usedCPU += r.Resources.VCPUs * 1000
-		usedMem += r.Resources.MemoryMB
+		switch r.State {
+		case StateBooting, StateInitializing, StateIdle, StateBusy, StateDraining, StateQuarantined, StateRetiring, StatePausing:
+			usedCPU += r.Resources.VCPUs * 1000
+			usedMem += r.Resources.MemoryMB
+		}
 	}
 
 	return ManagerStatus{

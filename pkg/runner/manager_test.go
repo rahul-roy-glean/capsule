@@ -301,6 +301,40 @@ func TestIdleCount_NoneIdle(t *testing.T) {
 	}
 }
 
+func TestGetStatus_ExcludesSuspendedAndPausedResourceUsage(t *testing.T) {
+	m := newTestManager(func(m *Manager) {
+		m.config.TotalCPUMillicores = 16000
+		m.config.TotalMemoryMB = 32768
+	})
+	m.runners["active"] = &Runner{
+		ID:        "active",
+		State:     StateBusy,
+		Resources: Resources{VCPUs: 2, MemoryMB: 4096},
+	}
+	m.runners["suspended"] = &Runner{
+		ID:        "suspended",
+		State:     StateSuspended,
+		Resources: Resources{VCPUs: 4, MemoryMB: 8192},
+	}
+	m.runners["paused"] = &Runner{
+		ID:        "paused",
+		State:     StatePaused,
+		Resources: Resources{VCPUs: 1, MemoryMB: 2048},
+	}
+
+	status := m.GetStatus()
+
+	if status.UsedCPUMillicores != 2000 {
+		t.Fatalf("UsedCPUMillicores = %d, want 2000", status.UsedCPUMillicores)
+	}
+	if status.UsedMemoryMB != 4096 {
+		t.Fatalf("UsedMemoryMB = %d, want 4096", status.UsedMemoryMB)
+	}
+	if status.BusyRunners != 1 {
+		t.Fatalf("BusyRunners = %d, want 1", status.BusyRunners)
+	}
+}
+
 func TestGetRunner(t *testing.T) {
 	m := newTestManager()
 	m.runners["r1"] = &Runner{ID: "r1", State: StateIdle}
