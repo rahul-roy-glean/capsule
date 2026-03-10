@@ -67,18 +67,6 @@ variable "fetch_targets" {
   default     = "//..."
 }
 
-variable "github_app_id" {
-  description = "GitHub App ID for generating installation tokens (for private repos)"
-  type        = string
-  default     = ""
-}
-
-variable "github_app_secret" {
-  description = "Secret Manager secret name containing GitHub App private key"
-  type        = string
-  default     = ""
-}
-
 variable "debug_mode" {
   description = "When true, VM starts but does NOT auto-run snapshot build (SSH in to run manually)"
   type        = bool

@@ -48,15 +48,19 @@ type HostRunnerInfo struct {
 
 // Runner represents a runner instance
 type Runner struct {
-	ID          string
-	HostID      string
-	Status      string
-	InternalIP  string
-	JobID       string
-	WorkloadKey string
-	CreatedAt   time.Time
-	StartedAt   time.Time
-	CompletedAt time.Time
+	ID                  string
+	HostID              string
+	Status              string
+	InternalIP          string
+	JobID               string
+	WorkloadKey         string
+	RunnerTTLSeconds    int
+	AutoPause           bool
+	NetworkPolicyPreset string
+	NetworkPolicyJSON   string
+	CreatedAt           time.Time
+	StartedAt           time.Time
+	CompletedAt         time.Time
 	// ReservedCPU and ReservedMemoryMB track the optimistic resource reservation
 	// made at allocate time, so ReleaseRunner can decrement them exactly.
 	ReservedCPU      int
@@ -291,14 +295,27 @@ func (hr *HostRegistry) AddRunner(ctx context.Context, runner *Runner) error {
 	hr.mu.Lock()
 	defer hr.mu.Unlock()
 
+	var networkPolicy any
+	if runner.NetworkPolicyJSON != "" {
+		networkPolicy = runner.NetworkPolicyJSON
+	}
+
 	_, err := hr.db.ExecContext(ctx, `
-		INSERT INTO runners (id, host_id, status, internal_ip, job_id, workload_key)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO runners (id, host_id, status, internal_ip, job_id, workload_key,
+			runner_ttl_seconds, auto_pause, network_policy_preset, network_policy)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (id) DO UPDATE SET
 			host_id = EXCLUDED.host_id,
 			status = EXCLUDED.status,
-			internal_ip = EXCLUDED.internal_ip
-	`, runner.ID, runner.HostID, runner.Status, runner.InternalIP, runner.JobID, runner.WorkloadKey)
+			internal_ip = EXCLUDED.internal_ip,
+			job_id = EXCLUDED.job_id,
+			workload_key = EXCLUDED.workload_key,
+			runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
+			auto_pause = EXCLUDED.auto_pause,
+			network_policy_preset = EXCLUDED.network_policy_preset,
+			network_policy = EXCLUDED.network_policy
+	`, runner.ID, runner.HostID, runner.Status, runner.InternalIP, runner.JobID, runner.WorkloadKey,
+		runner.RunnerTTLSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy)
 
 	if err != nil {
 		return err

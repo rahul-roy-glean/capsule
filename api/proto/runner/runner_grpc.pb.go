@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.0
 // - protoc             v5.29.3
-// source: runner.proto
+// source: api/proto/runner.proto
 
 package runner
 
@@ -23,7 +23,6 @@ const (
 	HostAgent_ReleaseRunner_FullMethodName       = "/runner.HostAgent/ReleaseRunner"
 	HostAgent_GetHostStatus_FullMethodName       = "/runner.HostAgent/GetHostStatus"
 	HostAgent_Heartbeat_FullMethodName           = "/runner.HostAgent/Heartbeat"
-	HostAgent_SyncSnapshot_FullMethodName        = "/runner.HostAgent/SyncSnapshot"
 	HostAgent_ListRunners_FullMethodName         = "/runner.HostAgent/ListRunners"
 	HostAgent_GetRunner_FullMethodName           = "/runner.HostAgent/GetRunner"
 	HostAgent_QuarantineRunner_FullMethodName    = "/runner.HostAgent/QuarantineRunner"
@@ -48,8 +47,6 @@ type HostAgentClient interface {
 	GetHostStatus(ctx context.Context, in *GetHostStatusRequest, opts ...grpc.CallOption) (*HostStatus, error)
 	// Heartbeat sends a heartbeat to the control plane
 	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
-	// SyncSnapshot triggers a snapshot sync from GCS
-	SyncSnapshot(ctx context.Context, in *SyncSnapshotRequest, opts ...grpc.CallOption) (*SyncSnapshotResponse, error)
 	// ListRunners lists all runners on this host
 	ListRunners(ctx context.Context, in *ListRunnersRequest, opts ...grpc.CallOption) (*ListRunnersResponse, error)
 	// GetRunner gets details about a specific runner
@@ -110,16 +107,6 @@ func (c *hostAgentClient) Heartbeat(ctx context.Context, in *HeartbeatRequest, o
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(HeartbeatResponse)
 	err := c.cc.Invoke(ctx, HostAgent_Heartbeat_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *hostAgentClient) SyncSnapshot(ctx context.Context, in *SyncSnapshotRequest, opts ...grpc.CallOption) (*SyncSnapshotResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(SyncSnapshotResponse)
-	err := c.cc.Invoke(ctx, HostAgent_SyncSnapshot_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -220,8 +207,6 @@ type HostAgentServer interface {
 	GetHostStatus(context.Context, *GetHostStatusRequest) (*HostStatus, error)
 	// Heartbeat sends a heartbeat to the control plane
 	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
-	// SyncSnapshot triggers a snapshot sync from GCS
-	SyncSnapshot(context.Context, *SyncSnapshotRequest) (*SyncSnapshotResponse, error)
 	// ListRunners lists all runners on this host
 	ListRunners(context.Context, *ListRunnersRequest) (*ListRunnersResponse, error)
 	// GetRunner gets details about a specific runner
@@ -259,9 +244,6 @@ func (UnimplementedHostAgentServer) GetHostStatus(context.Context, *GetHostStatu
 }
 func (UnimplementedHostAgentServer) Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Heartbeat not implemented")
-}
-func (UnimplementedHostAgentServer) SyncSnapshot(context.Context, *SyncSnapshotRequest) (*SyncSnapshotResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method SyncSnapshot not implemented")
 }
 func (UnimplementedHostAgentServer) ListRunners(context.Context, *ListRunnersRequest) (*ListRunnersResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListRunners not implemented")
@@ -376,24 +358,6 @@ func _HostAgent_Heartbeat_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(HostAgentServer).Heartbeat(ctx, req.(*HeartbeatRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _HostAgent_SyncSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(SyncSnapshotRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(HostAgentServer).SyncSnapshot(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: HostAgent_SyncSnapshot_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(HostAgentServer).SyncSnapshot(ctx, req.(*SyncSnapshotRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -566,10 +530,6 @@ var HostAgent_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _HostAgent_Heartbeat_Handler,
 		},
 		{
-			MethodName: "SyncSnapshot",
-			Handler:    _HostAgent_SyncSnapshot_Handler,
-		},
-		{
 			MethodName: "ListRunners",
 			Handler:    _HostAgent_ListRunners_Handler,
 		},
@@ -603,7 +563,7 @@ var HostAgent_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "runner.proto",
+	Metadata: "api/proto/runner.proto",
 }
 
 const (
@@ -871,5 +831,5 @@ var ControlPlane_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "runner.proto",
+	Metadata: "api/proto/runner.proto",
 }

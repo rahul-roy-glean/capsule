@@ -116,7 +116,6 @@ GCS_BUCKET=${GCS_BUCKET:-${SESSION_CHUNK_BUCKET:-}}
 MGR_CMD="$REPO_ROOT/bin/firecracker-manager \
   --http-port=9080 \
   --grpc-port=50052 \
-  --use-netns \
   --snapshot-cache=$SNAPSHOT_DIR \
   --socket-dir=/tmp/fc-dev/sockets \
   --workspace-dir=/tmp/fc-dev/workspaces \
@@ -127,7 +126,7 @@ MGR_CMD="$REPO_ROOT/bin/firecracker-manager \
   --log-level=debug"
 
 if [ -n "$GCS_BUCKET" ]; then
-  MGR_CMD="$MGR_CMD --use-chunked-snapshots --snapshot-bucket=$GCS_BUCKET --enable-session-chunks"
+  MGR_CMD="$MGR_CMD --snapshot-bucket=$GCS_BUCKET"
   echo "  GCS session chunks: enabled (bucket: $GCS_BUCKET)"
 else
   MGR_CMD="$MGR_CMD --snapshot-bucket=local-dev"

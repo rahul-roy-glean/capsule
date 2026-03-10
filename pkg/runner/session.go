@@ -434,6 +434,12 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 		handler.Stop()
 		delete(m.uffdHandlers, runnerID)
 	}
+
+	// Stop auth proxy — it binds inside the netns which is about to be released.
+	if proxy, ok := m.authProxies[runnerID]; ok {
+		proxy.Stop()
+		delete(m.authProxies, runnerID)
+	}
 	m.mu.Unlock()
 
 	// Unmount FUSE disks after VM stop (Firecracker no longer holds fds open).
@@ -444,19 +450,13 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 
 	m.mu.Lock()
 
-	// Release network namespace / TAP slot but keep overlay and extension drives
+	// Release network namespace and slot
 	if m.netnsNetwork != nil {
 		m.netnsNetwork.ReleaseNamespace(runnerID)
-		if slot, ok := m.runnerToSlot[runnerID]; ok {
-			delete(m.slotToRunner, slot)
-			delete(m.runnerToSlot, runnerID)
-		}
-	} else if slot, ok := m.runnerToSlot[runnerID]; ok {
-		m.network.ReleaseTapSlot(slot, runnerID)
+	}
+	if slot, ok := m.runnerToSlot[runnerID]; ok {
 		delete(m.slotToRunner, slot)
 		delete(m.runnerToSlot, runnerID)
-	} else {
-		m.network.ReleaseTap(runnerID)
 	}
 
 	// Remove socket
@@ -861,40 +861,23 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	// Use the original runner ID from the session
 	runnerID := metadata.RunnerID
 
-	// Allocate network
+	// Allocate network namespace
 	var tap *network.TapDevice
 	var nsInfo *network.VMNamespace
-	var slot int
-	useNetNS := m.netnsNetwork != nil
 
-	if useNetNS {
-		slot = m.findAvailableSlot()
-		if slot < 0 {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("no slots available")
-		}
-		nsInfo, err = m.netnsNetwork.CreateNamespaceForVM(runnerID, slot)
-		if err != nil {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("failed to create network namespace: %w", err)
-		}
-		tap = nsInfo.GetTapDevice(m.netnsNetwork.GetSubnet())
-		m.slotToRunner[slot] = runnerID
-		m.runnerToSlot[runnerID] = slot
-	} else {
-		slot = m.findAvailableSlot()
-		if slot < 0 {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("no TAP slots available")
-		}
-		tap, err = m.network.GetOrCreateTapSlot(slot, runnerID)
-		if err != nil {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("failed to get TAP slot: %w", err)
-		}
-		m.slotToRunner[slot] = runnerID
-		m.runnerToSlot[runnerID] = slot
+	slot := m.findAvailableSlot()
+	if slot < 0 {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("no slots available")
 	}
+	nsInfo, err = m.netnsNetwork.CreateNamespaceForVM(runnerID, slot)
+	if err != nil {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("failed to create network namespace: %w", err)
+	}
+	tap = nsInfo.GetTapDevice(m.netnsNetwork.GetSubnet())
+	m.slotToRunner[slot] = runnerID
+	m.runnerToSlot[runnerID] = slot
 	m.mu.Unlock()
 
 	// Use the session's rootfs overlay (preserved during pause)
@@ -1092,10 +1075,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	}
 
 	// Set up network config
-	internalIP := tap.IP
-	if useNetNS && nsInfo != nil {
-		internalIP = nsInfo.HostReachableIP
-	}
+	internalIP := nsInfo.HostReachableIP
 
 	// Create VM config
 	vmCfg := firecracker.VMConfig{
@@ -1115,9 +1095,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		LogPath: filepath.Join(m.config.LogDir, runnerID+".log"),
 	}
 
-	if useNetNS && nsInfo != nil {
-		vmCfg.NetNSPath = nsInfo.GetFirecrackerNetNSPath()
-	}
+	vmCfg.NetNSPath = nsInfo.GetFirecrackerNetNSPath()
 
 	vm, err := firecracker.NewVM(vmCfg, m.logger.Logger)
 	if err != nil {
@@ -1141,28 +1119,10 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		return nil, fmt.Errorf("failed to setup snapshot symlinks: %w", symlinkErr)
 	}
 
-	// Restore from snapshot with UFFD (paused — don't resume yet)
-	var restoreErr error
-	if useNetNS {
-		restoreErr = vm.RestoreFromSnapshotWithUFFD(ctx, latestStateFile, uffdSocketPath, false)
-		cleanup()
-	} else {
-		m.mu.Lock()
-		tapRestore, tapErr := m.setupSnapshotTAPRename(tap.Name)
-		m.mu.Unlock()
-		if tapErr != nil {
-			cleanup()
-			uffdHandler.Stop()
-			vm.Stop()
-			m.mu.Lock()
-			m.cleanupNetworkOnly(runnerID, tap.Name)
-			m.mu.Unlock()
-			return nil, fmt.Errorf("failed to setup TAP rename: %w", tapErr)
-		}
-		restoreErr = vm.RestoreFromSnapshotWithUFFD(ctx, latestStateFile, uffdSocketPath, false)
-		tapRestore()
-		cleanup()
-	}
+	// Restore from snapshot with UFFD (paused — don't resume yet).
+	// With per-VM namespaces, tap-slot-0 already exists — no TAP rename needed.
+	restoreErr := vm.RestoreFromSnapshotWithUFFD(ctx, latestStateFile, uffdSocketPath, false)
+	cleanup()
 
 	if restoreErr != nil {
 		uffdHandler.Stop()
@@ -1180,7 +1140,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	}
 
 	// Set up port forwarding for netns
-	if useNetNS && m.netnsNetwork != nil {
+	if m.netnsNetwork != nil {
 		if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentHealthPort); err != nil {
 			m.logger.WithError(err).Warn("Failed to forward thaw-agent health port")
 		}
@@ -1197,7 +1157,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		InternalIP:      internalIP,
 		TapDevice:       tap.Name,
 		MAC:             tap.MAC,
-		SnapshotVersion: m.snapshotCache.CurrentVersion(),
+		SnapshotVersion: "", // populated by chunked manager when applicable
 		WorkloadKey:     metadata.WorkloadKey,
 		Resources: Resources{
 			VCPUs:    metadata.VCPUs,
@@ -1258,16 +1218,10 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 func (m *Manager) cleanupNetworkOnly(runnerID, _ string) {
 	if m.netnsNetwork != nil {
 		m.netnsNetwork.ReleaseNamespace(runnerID)
-		if slot, ok := m.runnerToSlot[runnerID]; ok {
-			delete(m.slotToRunner, slot)
-			delete(m.runnerToSlot, runnerID)
-		}
-	} else if slot, ok := m.runnerToSlot[runnerID]; ok {
-		m.network.ReleaseTapSlot(slot, runnerID)
+	}
+	if slot, ok := m.runnerToSlot[runnerID]; ok {
 		delete(m.slotToRunner, slot)
 		delete(m.runnerToSlot, runnerID)
-	} else {
-		m.network.ReleaseTap(runnerID)
 	}
 	os.Remove(filepath.Join(m.config.SocketDir, runnerID+".sock"))
 }

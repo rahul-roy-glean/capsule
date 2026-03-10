@@ -228,14 +228,26 @@ func (m *mcpDeps) handlePause(ctx context.Context, _ *mcp.CallToolRequest, in Pa
 
 	// Update session_snapshots table
 	if resp.SessionId != "" && m.db != nil {
+		var networkPolicy any
+		if runner.NetworkPolicyJSON != "" {
+			networkPolicy = runner.NetworkPolicyJSON
+		}
 		_, _ = m.db.ExecContext(ctx, `
-			INSERT INTO session_snapshots (session_id, runner_id, workload_key, host_id, status, layer_count, paused_at)
-			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW())
+			INSERT INTO session_snapshots (
+				session_id, runner_id, workload_key, host_id, status, layer_count, paused_at,
+				runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
+			)
+			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9)
 			ON CONFLICT (session_id) DO UPDATE SET
 				status = 'suspended',
 				layer_count = EXCLUDED.layer_count,
-				paused_at = NOW()
-		`, resp.SessionId, in.SandboxID, runner.WorkloadKey, host.ID, resp.Layer+1)
+				paused_at = NOW(),
+				runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
+				auto_pause = EXCLUDED.auto_pause,
+				network_policy_preset = EXCLUDED.network_policy_preset,
+				network_policy = EXCLUDED.network_policy
+		`, resp.SessionId, in.SandboxID, runner.WorkloadKey, host.ID, resp.Layer+1,
+			runner.RunnerTTLSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy)
 	}
 
 	// Roll back resource reservation
@@ -270,12 +282,17 @@ func (m *mcpDeps) handleResume(ctx context.Context, _ *mcp.CallToolRequest, in R
 
 	// Look up suspended session
 	var sessionID, hostID, workloadKey, status string
+	var sessionTTL sql.NullInt64
+	var sessionAutoPause sql.NullBool
+	var sessionNPPreset sql.NullString
+	var sessionNPJSON sql.NullString
 	if m.db == nil {
 		return nil, ResumeSandboxOutput{}, fmt.Errorf("no database configured")
 	}
 	err := m.db.QueryRowContext(ctx,
-		`SELECT session_id, host_id, workload_key, status FROM session_snapshots WHERE runner_id = $1`,
-		in.SandboxID).Scan(&sessionID, &hostID, &workloadKey, &status)
+		`SELECT session_id, host_id, workload_key, status, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
+		 FROM session_snapshots WHERE runner_id = $1`,
+		in.SandboxID).Scan(&sessionID, &hostID, &workloadKey, &status, &sessionTTL, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON)
 	if err != nil || status != "suspended" {
 		return nil, ResumeSandboxOutput{}, fmt.Errorf("no suspended session found for sandbox %s", in.SandboxID)
 	}
@@ -299,7 +316,17 @@ func (m *mcpDeps) handleResume(ctx context.Context, _ *mcp.CallToolRequest, in R
 	defer conn.Close()
 
 	client := pb.NewHostAgentClient(conn)
-	resp, err := client.ResumeRunner(ctx, &pb.ResumeRunnerRequest{SessionId: sessionID})
+	resumeReq := &pb.ResumeRunnerRequest{
+		SessionId:           sessionID,
+		WorkloadKey:         workloadKey,
+		TtlSeconds:          int32(sessionTTL.Int64),
+		AutoPause:           sessionAutoPause.Valid && sessionAutoPause.Bool,
+		NetworkPolicyPreset: sessionNPPreset.String,
+	}
+	if sessionNPJSON.Valid {
+		resumeReq.NetworkPolicyJson = sessionNPJSON.String
+	}
+	resp, err := client.ResumeRunner(ctx, resumeReq)
 	if err != nil {
 		return nil, ResumeSandboxOutput{}, fmt.Errorf("resume failed: %w", err)
 	}
@@ -313,11 +340,15 @@ func (m *mcpDeps) handleResume(ctx context.Context, _ *mcp.CallToolRequest, in R
 	}
 
 	if err := m.hostRegistry.AddRunner(ctx, &Runner{
-		ID:          resumedRunnerID,
-		HostID:      resumeHost.ID,
-		Status:      "busy",
-		InternalIP:  resp.Runner.GetInternalIp(),
-		WorkloadKey: workloadKey,
+		ID:                  resumedRunnerID,
+		HostID:              resumeHost.ID,
+		Status:              "busy",
+		InternalIP:          resp.Runner.GetInternalIp(),
+		WorkloadKey:         workloadKey,
+		RunnerTTLSeconds:    int(sessionTTL.Int64),
+		AutoPause:           sessionAutoPause.Valid && sessionAutoPause.Bool,
+		NetworkPolicyPreset: sessionNPPreset.String,
+		NetworkPolicyJSON:   sessionNPJSON.String,
 	}); err != nil {
 		return nil, ResumeSandboxOutput{}, fmt.Errorf("register resumed runner: %w", err)
 	}

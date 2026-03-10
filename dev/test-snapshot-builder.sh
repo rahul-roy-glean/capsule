@@ -2,7 +2,7 @@
 # Snapshot-builder integration smoke tests.
 #
 # Covers:
-#   1. Legacy rootfs.img build path produces snapshot artifacts
+#   1. Rootfs.img build path produces snapshot artifacts
 #   2. Base-image path works with a digest-pinned Debian-like image
 #   3. Incremental base-image builds reject unpinned image references
 #   4. Unsupported base images fail before VM boot
@@ -84,7 +84,7 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 pass "Required binaries and /dev/kvm present"
 
-header "1. Legacy rootfs build smoke"
+header "1. Rootfs build smoke"
 LEGACY_OUT="$TEST_ROOT/legacy/out"
 mkdir -p "$LEGACY_OUT"
 LEGACY_LOG="$LOG_DIR/legacy.log"
@@ -98,19 +98,18 @@ if run_builder_capture "$LEGACY_LOG" \
   --vcpus=2 \
   --memory-mb=2048 \
   --warmup-timeout=5m \
-  --enable-chunked=false \
   --snapshot-commands='[{"type":"shell","args":["echo","dev-snapshot-ready"]}]' \
   --log-level=info; then
   if assert_artifacts_exist "$LEGACY_OUT"; then
-    pass "Legacy rootfs path produced snapshot artifacts"
+    pass "Rootfs path produced snapshot artifacts"
   else
-    fail "Legacy rootfs path exited successfully but missing snapshot artifacts"
+    fail "Rootfs path exited successfully but missing snapshot artifacts"
   fi
 else
   if assert_artifacts_exist "$LEGACY_OUT"; then
-    pass "Legacy rootfs path produced snapshot artifacts before upload failed (expected without GCS creds)"
+    pass "Rootfs path produced snapshot artifacts before upload failed (expected without GCS creds)"
   else
-    fail "Legacy rootfs path failed before producing snapshot artifacts (see $LEGACY_LOG)"
+    fail "Rootfs path failed before producing snapshot artifacts (see $LEGACY_LOG)"
   fi
 fi
 
@@ -136,7 +135,6 @@ if run_builder_capture "$BASE_LOG" \
   --vcpus=2 \
   --memory-mb=2048 \
   --warmup-timeout=5m \
-  --enable-chunked=false \
   --base-image="$PINNED_IMAGE" \
   --thaw-agent-path="$THAW_AGENT_BIN" \
   --snapshot-commands='[{"type":"shell","args":["echo","dev-snapshot-ready"]}]' \
@@ -165,7 +163,6 @@ if run_builder_capture "$INVALID_LOG" \
   --vcpus=2 \
   --memory-mb=2048 \
   --warmup-timeout=5m \
-  --enable-chunked=true \
   --build-type=refresh \
   --base-image="$BASE_IMAGE" \
   --thaw-agent-path="$THAW_AGENT_BIN" \
@@ -191,7 +188,6 @@ if run_builder_capture "$UNSUPPORTED_LOG" \
   --vcpus=2 \
   --memory-mb=2048 \
   --warmup-timeout=5m \
-  --enable-chunked=false \
   --base-image="$UNSUPPORTED_IMAGE" \
   --thaw-agent-path="$THAW_AGENT_BIN" \
   --snapshot-commands='[{"type":"shell","args":["echo","dev-snapshot-ready"]}]' \

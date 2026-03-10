@@ -4,6 +4,9 @@
 # Usage: make dev-test-pty
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$REPO_ROOT/dev/lib-workload-key.sh"
+
 CP=http://localhost:8080
 MGR=http://localhost:9080
 PASS=0
@@ -31,28 +34,11 @@ if ! python3 -c "import websockets" 2>/dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
-header "1. Register snapshot config"
+header "1. Discover workload key and register config"
 # ---------------------------------------------------------------------------
-SNAPSHOT_COMMANDS=${SNAPSHOT_COMMANDS:-'[{"type":"shell","args":["echo","dev-snapshot-ready"]}]'}
-CONFIG_RESP=$(curl -s -X POST "$CP/api/v1/layered-configs" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "display_name": "rootfs-durability-test",
-    "layers": [{"name":"base","init_commands":'"$SNAPSHOT_COMMANDS"'}],
-    "config": {
-      "ttl": 300,
-      "auto_pause": false
-    }
-  }')
-WORKLOAD_KEY=$(echo "$CONFIG_RESP" | jq -r '.leaf_workload_key')
-echo "  workload_key=$WORKLOAD_KEY"
-
-if [ -n "$WORKLOAD_KEY" ] && [ "$WORKLOAD_KEY" != "null" ]; then
-  pass "Snapshot config registered"
-else
-  fail "Snapshot config registration failed: $CONFIG_RESP"
-  exit 1
-fi
+require_workload_key
+register_dev_config "rootfs-durability-test" '{"ttl": 300, "auto_pause": false}'
+pass "Snapshot config registered"
 
 # ---------------------------------------------------------------------------
 header "2. Allocate runner"

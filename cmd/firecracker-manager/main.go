@@ -33,7 +33,6 @@ import (
 	"go.opentelemetry.io/otel/metric"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
 	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/runner"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
@@ -62,23 +61,10 @@ var (
 	gcpProject = flag.String("gcp-project", "", "GCP project")
 
 	// Chunked snapshot flags (BuildBuddy-style lazy loading)
-	useChunkedSnapshots = flag.Bool("use-chunked-snapshots", false, "Enable chunked snapshot restore with UFFD (lazy memory) and FUSE (lazy disk)")
 	chunkCacheSizeGB    = flag.Int("chunk-cache-size-gb", 2, "Size in GB of disk chunk LRU cache (FUSE)")
 	memCacheSizeGB      = flag.Int("mem-cache-size-gb", 2, "Size in GB of memory chunk LRU cache (UFFD)")
 	memBackend          = flag.String("mem-backend", "chunked", "Memory restore backend: 'chunked' (UFFD lazy loading, default) or 'file' (download full snapshot.mem at startup). Overrides the backend recorded in snapshot metadata.")
 	gcsPrefix           = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
-	enableSessionChunks = flag.Bool("enable-session-chunks", true, "Enable cloud-backed session pause/resume. Uses --snapshot-bucket for chunk storage. When enabled, PauseRunner uploads chunks to GCS and ResumeFromSession fetches lazily via UFFD+FUSE.")
-
-	// Network namespace mode (alternative to slot-based TAPs)
-	useNetNS = flag.Bool("use-netns", false, "Use network namespaces instead of slot-based TAP devices (simplifies snapshot restore)")
-
-	// Runner pooling flags (VM reuse across tasks)
-	poolEnabled           = flag.Bool("pool-enabled", false, "Enable runner pooling for VM reuse across tasks")
-	poolMaxRunners        = flag.Int("pool-max-runners", 0, "Max pooled runners (0 = derive from resources)")
-	poolMaxTotalMemoryGB  = flag.Int("pool-max-total-memory-gb", 0, "Max total memory for pooled runners in GB (0 = unlimited)")
-	poolMaxRunnerMemoryGB = flag.Int("pool-max-runner-memory-gb", 2, "Max memory per pooled runner in GB")
-	poolMaxRunnerDiskGB   = flag.Int("pool-max-runner-disk-gb", 16, "Max disk per pooled runner in GB")
-	poolRecycleTimeout    = flag.Int("pool-recycle-timeout-secs", 30, "Timeout for recycling operations in seconds")
 )
 
 // resumeGates prevents thundering-herd on concurrent auto-resume for the same runner.
@@ -158,25 +144,13 @@ func main() {
 		SnapshotBucket:    *snapshotBucket,
 		SnapshotCachePath: *snapshotCache,
 		QuarantineDir:     *quarantineDir,
-		MicroVMSubnet:     *microVMSubnet,
-		ExternalInterface: *extInterface,
-		BridgeName:        *bridgeName,
 		Environment:       *environment,
 		ControlPlaneAddr:  *controlPlane,
 		GCPProject:        gcpProjectVal,
-		// Runner pooling configuration
-		PoolEnabled:            *poolEnabled,
-		PoolMaxRunners:         *poolMaxRunners,
-		PoolMaxTotalMemoryGB:   *poolMaxTotalMemoryGB,
-		PoolMaxRunnerMemoryGB:  *poolMaxRunnerMemoryGB,
-		PoolMaxRunnerDiskGB:    *poolMaxRunnerDiskGB,
-		PoolRecycleTimeoutSecs: *poolRecycleTimeout,
 	}
 
 	// Enable cloud-backed session chunks using the snapshot bucket.
-	if *enableSessionChunks {
-		cfg.SessionChunkBucket = *snapshotBucket
-	}
+	cfg.SessionChunkBucket = *snapshotBucket
 	cfg.GCSPrefix = *gcsPrefix
 
 	// Detect host resources for bin-packing scheduler
@@ -185,68 +159,35 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Create runner manager (optionally with chunked snapshot support)
-	var mgr *runner.Manager
-	var chunkedMgr *runner.ChunkedManager
+	// Create runner manager with chunked snapshot support
+	log.WithFields(logrus.Fields{
+		"disk_cache_gb": *chunkCacheSizeGB,
+		"mem_cache_gb":  *memCacheSizeGB,
+	}).Info("Creating chunked manager with BuildBuddy-style optimizations")
 
-	if *useChunkedSnapshots {
-		log.WithFields(logrus.Fields{
-			"chunked_snapshots": *useChunkedSnapshots,
-			"use_netns":         *useNetNS,
-			"disk_cache_gb":     *chunkCacheSizeGB,
-			"mem_cache_gb":      *memCacheSizeGB,
-		}).Info("Creating chunked manager with BuildBuddy-style optimizations")
-
-		chunkedCfg := runner.ChunkedManagerConfig{
-			HostConfig:          cfg,
-			UseChunkedSnapshots: *useChunkedSnapshots,
-			UseNetNS:            *useNetNS,
-			ChunkCacheSizeBytes: int64(*chunkCacheSizeGB) * 1024 * 1024 * 1024,
-			MemCacheSizeBytes:   int64(*memCacheSizeGB) * 1024 * 1024 * 1024,
-			MemBackend:          *memBackend,
-			GCSPrefix:           *gcsPrefix,
-		}
-
-		var err error
-		chunkedMgr, err = runner.NewChunkedManager(ctx, chunkedCfg, logger)
-		if err != nil {
-			log.WithError(err).Fatal("Failed to create chunked runner manager")
-		}
-		defer chunkedMgr.Close()
-		mgr = chunkedMgr.Manager // Use embedded manager for compatibility
-
-		// In chunked mode, no downloads happen at startup. The kernel,
-		// snapshot.mem (file mode), and manifest are all fetched on demand
-		// when the first SyncManifest (heartbeat) or AllocateRunner arrives.
-		log.Info("Chunked mode: deferring all downloads until first manifest sync")
-	} else {
-		var err error
-		mgr, err = runner.NewManager(ctx, cfg, logger)
-		if err != nil {
-			log.WithError(err).Fatal("Failed to create runner manager")
-		}
-		defer mgr.Close()
-
-		// Wire --use-netns to the base manager for per-VM namespace isolation.
-		// When --use-netns is set without --use-chunked-snapshots, the base
-		// manager creates per-VM namespaces instead of using the shared bridge.
-		if *useNetNS {
-			netnsNet, err := network.NewNetNSNetwork(network.NetNSConfig{
-				BridgeName:    *bridgeName,
-				Subnet:        *microVMSubnet,
-				ExternalIface: *extInterface,
-				Logger:        logger,
-			})
-			if err != nil {
-				log.WithError(err).Fatal("Failed to create netns network for base manager")
-			}
-			if err := netnsNet.Setup(); err != nil {
-				log.WithError(err).Fatal("Failed to setup netns network for base manager")
-			}
-			mgr.SetNetNSNetwork(netnsNet)
-			log.Info("Network namespace mode enabled for base manager")
-		}
+	chunkedCfg := runner.ChunkedManagerConfig{
+		HostConfig:          cfg,
+		UseChunkedSnapshots: true,
+		MicroVMSubnet:       *microVMSubnet,
+		ExternalInterface:   *extInterface,
+		BridgeName:          *bridgeName,
+		ChunkCacheSizeBytes: int64(*chunkCacheSizeGB) * 1024 * 1024 * 1024,
+		MemCacheSizeBytes:   int64(*memCacheSizeGB) * 1024 * 1024 * 1024,
+		MemBackend:          *memBackend,
+		GCSPrefix:           *gcsPrefix,
 	}
+
+	chunkedMgr, err := runner.NewChunkedManager(ctx, chunkedCfg, logger)
+	if err != nil {
+		log.WithError(err).Fatal("Failed to create chunked runner manager")
+	}
+	defer chunkedMgr.Close()
+	mgr := chunkedMgr.Manager // Use embedded manager for compatibility
+
+	// In chunked mode, no downloads happen at startup. The kernel,
+	// snapshot.mem (file mode), and manifest are all fetched on demand
+	// when the first SyncManifest (heartbeat) or AllocateRunner arrives.
+	log.Info("Chunked mode: deferring all downloads until first manifest sync")
 
 	// Reconcile orphaned resources from previous incarnation
 	go mgr.ReconcileOrphans(ctx)
@@ -293,17 +234,6 @@ func main() {
 	diskReadsGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedDiskReads))
 	diskWritesGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedDiskWrites))
 
-	// Pool metrics (gauges for absolute values reported each iteration)
-	poolRunnersGauge, _ := fcrotel.NewGauge(meter, fcrotel.PoolRunners)
-	poolMemUsedGauge, _ := fcrotel.NewGauge(meter, fcrotel.PoolMemoryUsed)
-	poolMemMaxGauge, _ := fcrotel.NewGauge(meter, fcrotel.PoolMemoryMax)
-	poolHitRatioGauge, _ := fcrotel.NewFloat64Gauge(meter, fcrotel.PoolHitRatio)
-	// Cumulative counters reported as absolute values from GetPoolStats - use gauges
-	poolHitsGauge, _ := meter.Int64Gauge(string(fcrotel.PoolHits))
-	poolMissesGauge, _ := meter.Int64Gauge(string(fcrotel.PoolMisses))
-	poolEvictionsGauge, _ := meter.Int64Gauge(string(fcrotel.PoolEvictions))
-	poolRecycleFailsGauge, _ := meter.Int64Gauge(string(fcrotel.PoolRecycleFailures))
-
 	// Heartbeat
 	hbLatencyHist, _ := fcrotel.NewHistogram(meter, fcrotel.HostHeartbeatLatency)
 
@@ -323,12 +253,7 @@ func main() {
 	)
 
 	// Register services
-	var hostAgentServer *HostAgentServer
-	if chunkedMgr != nil {
-		hostAgentServer = NewHostAgentServerWithChunked(mgr, chunkedMgr, logger)
-	} else {
-		hostAgentServer = NewHostAgentServer(mgr, logger)
-	}
+	hostAgentServer := NewHostAgentServer(mgr, chunkedMgr, logger)
 	pb.RegisterHostAgentServer(grpcServer, hostAgentServer)
 	hostAgentServer.SetOTelInstruments(sessionPauseHist, sessionPauseCounter, sessionResumeHist, sessionResumeCounter)
 
@@ -369,10 +294,7 @@ func main() {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
-	httpMux.HandleFunc("/snapshot/sync", snapshotSyncHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/gc", gcHandler(mgr, logger))
-	httpMux.HandleFunc("/api/v1/pool/flush", poolFlushHandler(mgr, logger))
-	httpMux.HandleFunc("/api/v1/pool/stats", poolStatsHandler(mgr, logger))
 	httpMux.HandleFunc("/api/v1/runners/", drainingGuard(mgr, runnerProxyHandler(mgr, logger)))
 
 	httpServer := &http.Server{
@@ -410,14 +332,6 @@ func main() {
 		diskWrites:       diskWritesGauge,
 		dirtyChunks:      dirtyChunksGauge,
 		cacheHitRatio:    cacheHitRatioGauge,
-		poolRunners:      poolRunnersGauge,
-		poolHits:         poolHitsGauge,
-		poolMisses:       poolMissesGauge,
-		poolEvictions:    poolEvictionsGauge,
-		poolRecycleFails: poolRecycleFailsGauge,
-		poolMemUsed:      poolMemUsedGauge,
-		poolMemMax:       poolMemMaxGauge,
-		poolHitRatio:     poolHitRatioGauge,
 	})
 
 	// Start heartbeat loop if control plane is configured
@@ -490,90 +404,38 @@ func healthHandler(mgr *runner.Manager) http.HandlerFunc {
 func readyHandler(mgr *runner.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		status := mgr.GetStatus()
-		if status.SnapshotVersion == "" {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte("No snapshot loaded"))
-			return
-		}
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "Ready: %d runners, snapshot: %s",
-			status.ActiveRunners, status.SnapshotVersion)
-	}
-}
-
-func snapshotSyncHandler(mgr *runner.Manager, logger *logrus.Logger) http.HandlerFunc {
-	log := logger.WithField("handler", "snapshot-sync")
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Get version from header or query param
-		version := r.Header.Get("X-Snapshot-Version")
-		if version == "" {
-			version = r.URL.Query().Get("version")
-		}
-		// version is empty if not specified; SyncFromGCS will resolve via
-		// current-pointer.json.
-
-		log.WithField("version", version).Info("Snapshot sync requested")
-
-		// Sync snapshot in background to avoid blocking the HTTP request
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			defer cancel()
-
-			if err := mgr.SyncSnapshot(ctx, version); err != nil {
-				log.WithError(err).Error("Failed to sync snapshot")
-			} else {
-				log.WithField("version", version).Info("Snapshot sync completed")
-			}
-		}()
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "syncing",
-			"version": version,
-		})
+		fmt.Fprintf(w, "Ready: %d runners", status.ActiveRunners)
 	}
 }
 
 // autoscaleInstruments holds OTel instruments used by the autoscale loop.
 type autoscaleInstruments struct {
-	vmAllocCounter   metric.Int64Counter
-	vmBootHist       metric.Float64Histogram
-	hostCPUTotal     metric.Int64Gauge
-	hostCPUUsed      metric.Int64Gauge
-	hostMemTotal     metric.Int64Gauge
-	hostMemUsed      metric.Int64Gauge
-	hostRunnersIdle  metric.Int64UpDownCounter
-	hostRunnersBusy  metric.Int64UpDownCounter
-	diskCacheSize    metric.Int64Gauge
-	diskCacheMax     metric.Int64Gauge
-	diskCacheItems   metric.Int64Gauge
-	memCacheSize     metric.Int64Gauge
-	memCacheMax      metric.Int64Gauge
-	memCacheItems    metric.Int64Gauge
-	pageFaults       metric.Int64Gauge
-	cacheHits        metric.Int64Gauge
-	chunkFetches     metric.Int64Gauge
-	diskReads        metric.Int64Gauge
-	diskWrites       metric.Int64Gauge
-	dirtyChunks      metric.Int64Gauge
-	cacheHitRatio    metric.Float64Gauge
-	poolRunners      metric.Int64Gauge
-	poolHits         metric.Int64Gauge
-	poolMisses       metric.Int64Gauge
-	poolEvictions    metric.Int64Gauge
-	poolRecycleFails metric.Int64Gauge
-	poolMemUsed      metric.Int64Gauge
-	poolMemMax       metric.Int64Gauge
-	poolHitRatio     metric.Float64Gauge
+	vmAllocCounter  metric.Int64Counter
+	vmBootHist      metric.Float64Histogram
+	hostCPUTotal    metric.Int64Gauge
+	hostCPUUsed     metric.Int64Gauge
+	hostMemTotal    metric.Int64Gauge
+	hostMemUsed     metric.Int64Gauge
+	hostRunnersIdle metric.Int64UpDownCounter
+	hostRunnersBusy metric.Int64UpDownCounter
+	diskCacheSize   metric.Int64Gauge
+	diskCacheMax    metric.Int64Gauge
+	diskCacheItems  metric.Int64Gauge
+	memCacheSize    metric.Int64Gauge
+	memCacheMax     metric.Int64Gauge
+	memCacheItems   metric.Int64Gauge
+	pageFaults      metric.Int64Gauge
+	cacheHits       metric.Int64Gauge
+	chunkFetches    metric.Int64Gauge
+	diskReads       metric.Int64Gauge
+	diskWrites      metric.Int64Gauge
+	dirtyChunks     metric.Int64Gauge
+	cacheHitRatio   metric.Float64Gauge
 }
 
 func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, idleTarget int, logger *logrus.Logger, instruments autoscaleInstruments) {
-	log := logger.WithField("component", "autoscaler")
+	_ = idleTarget // reserved for future use
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -587,37 +449,9 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 		case <-ticker.C:
 			status := mgr.GetStatus()
 
-			// Maintain idle target.
-			// In chunked mode, skip pre-allocation: each workload key needs a different
-			// snapshot, so generic warm VMs would load the wrong data and be
-			// useless when an actual job arrives. The control plane drives
-			// allocation on-demand via gRPC AllocateRunner with the correct
-			// WorkloadKey. In single-snapshot (non-chunked) mode, warm pool is fine
-			// because there is only one snapshot.
-			if chunkedMgr != nil {
-				// Chunked mode: no local pre-allocation; control plane drives it.
-			} else if mgr.DiskUsage() > 0.85 {
-				log.Warn("Disk usage exceeds 85%, skipping runner allocation")
-			} else if !mgr.IsDraining() && status.IdleRunners < idleTarget && mgr.CanAddRunner(0, 0) {
-				log.Debug("Adding runner to maintain idle pool")
-				allocStart := time.Now()
-				_, err := mgr.AllocateRunner(ctx, runner.AllocateRequest{})
-				if err != nil {
-					log.WithError(err).Warn("Failed to allocate idle runner")
-					instruments.vmAllocCounter.Add(ctx, 1, metric.WithAttributes(
-						fcrotel.AttrResult.String(fcrotel.ResultFailure),
-						fcrotel.AttrReason.String("idle_pool"),
-					))
-				} else {
-					instruments.vmBootHist.Record(ctx, time.Since(allocStart).Seconds(), metric.WithAttributes(
-						fcrotel.AttrReason.String("idle_pool"),
-					))
-					instruments.vmAllocCounter.Add(ctx, 1, metric.WithAttributes(
-						fcrotel.AttrResult.String(fcrotel.ResultSuccess),
-						fcrotel.AttrReason.String("idle_pool"),
-					))
-				}
-			}
+			// Chunked mode: no local pre-allocation; control plane drives it.
+			// Each workload key needs a different snapshot, so generic warm VMs
+			// would load the wrong data and be useless when an actual job arrives.
 
 			// Record host metrics
 			instruments.hostCPUTotal.Record(ctx, int64(status.TotalCPUMillicores))
@@ -634,39 +468,21 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			prevBusy = status.BusyRunners
 
 			// Record chunked snapshot metrics
-			if chunkedMgr != nil {
-				cs := chunkedMgr.GetChunkedStats()
-				instruments.diskCacheSize.Record(ctx, cs.DiskCacheSize)
-				instruments.diskCacheMax.Record(ctx, cs.DiskCacheMaxSize)
-				instruments.diskCacheItems.Record(ctx, int64(cs.DiskCacheItems))
-				instruments.memCacheSize.Record(ctx, cs.MemCacheSize)
-				instruments.memCacheMax.Record(ctx, cs.MemCacheMaxSize)
-				instruments.memCacheItems.Record(ctx, int64(cs.MemCacheItems))
-				instruments.pageFaults.Record(ctx, int64(cs.TotalPageFaults))
-				instruments.cacheHits.Record(ctx, int64(cs.TotalCacheHits))
-				instruments.chunkFetches.Record(ctx, int64(cs.TotalChunkFetches))
-				instruments.diskReads.Record(ctx, int64(cs.TotalDiskReads))
-				instruments.diskWrites.Record(ctx, int64(cs.TotalDiskWrites))
-				instruments.dirtyChunks.Record(ctx, int64(cs.TotalDirtyChunks))
-				if cs.TotalPageFaults > 0 {
-					instruments.cacheHitRatio.Record(ctx, float64(cs.TotalCacheHits)/float64(cs.TotalPageFaults))
-				}
-			}
-
-			// Record runner pool metrics
-			if pool := mgr.GetPool(); pool != nil {
-				ps := pool.Stats()
-				instruments.poolRunners.Record(ctx, int64(ps.PooledRunners))
-				instruments.poolHits.Record(ctx, ps.PoolHits)
-				instruments.poolMisses.Record(ctx, ps.PoolMisses)
-				instruments.poolEvictions.Record(ctx, ps.Evictions)
-				instruments.poolRecycleFails.Record(ctx, ps.RecycleFailures)
-				instruments.poolMemUsed.Record(ctx, ps.MemoryUsageBytes)
-				instruments.poolMemMax.Record(ctx, ps.MaxMemoryBytes)
-				totalPoolLookups := ps.PoolHits + ps.PoolMisses
-				if totalPoolLookups > 0 {
-					instruments.poolHitRatio.Record(ctx, float64(ps.PoolHits)/float64(totalPoolLookups))
-				}
+			cs := chunkedMgr.GetChunkedStats()
+			instruments.diskCacheSize.Record(ctx, cs.DiskCacheSize)
+			instruments.diskCacheMax.Record(ctx, cs.DiskCacheMaxSize)
+			instruments.diskCacheItems.Record(ctx, int64(cs.DiskCacheItems))
+			instruments.memCacheSize.Record(ctx, cs.MemCacheSize)
+			instruments.memCacheMax.Record(ctx, cs.MemCacheMaxSize)
+			instruments.memCacheItems.Record(ctx, int64(cs.MemCacheItems))
+			instruments.pageFaults.Record(ctx, int64(cs.TotalPageFaults))
+			instruments.cacheHits.Record(ctx, int64(cs.TotalCacheHits))
+			instruments.chunkFetches.Record(ctx, int64(cs.TotalChunkFetches))
+			instruments.diskReads.Record(ctx, int64(cs.TotalDiskReads))
+			instruments.diskWrites.Record(ctx, int64(cs.TotalDiskWrites))
+			instruments.dirtyChunks.Record(ctx, int64(cs.TotalDirtyChunks))
+			if cs.TotalPageFaults > 0 {
+				instruments.cacheHitRatio.Record(ctx, float64(cs.TotalCacheHits)/float64(cs.TotalPageFaults))
 			}
 		}
 	}
@@ -679,7 +495,6 @@ type hostHeartbeatRequest struct {
 	HTTPAddress        string                       `json:"http_address"`
 	IdleRunners        int                          `json:"idle_runners"`
 	BusyRunners        int                          `json:"busy_runners"`
-	SnapshotVersion    string                       `json:"snapshot_version"`
 	Draining           bool                         `json:"draining"`
 	DiskUsage          float64                      `json:"disk_usage"`
 	TotalCPUMillicores int                          `json:"total_cpu_millicores"`
@@ -691,13 +506,10 @@ type hostHeartbeatRequest struct {
 }
 
 type hostHeartbeatResponse struct {
-	Acknowledged       bool              `json:"acknowledged"`
-	ShouldDrain        bool              `json:"should_drain"`
-	ShouldSyncSnapshot bool              `json:"should_sync_snapshot,omitempty"`
-	SnapshotVersion    string            `json:"snapshot_version,omitempty"`
-	DesiredVersions    map[string]string `json:"desired_versions,omitempty"`
-	SyncVersions       map[string]string `json:"sync_versions,omitempty"`
-	Error              string            `json:"error,omitempty"`
+	Acknowledged bool              `json:"acknowledged"`
+	ShouldDrain  bool              `json:"should_drain"`
+	SyncVersions map[string]string `json:"sync_versions,omitempty"`
+	Error        string            `json:"error,omitempty"`
 }
 
 func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, controlPlane, hostBootstrapToken, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger, hbLatencyHist metric.Float64Histogram) {
@@ -733,7 +545,6 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				HTTPAddress:        fmt.Sprintf("%s:%d", internalIP, httpPort),
 				IdleRunners:        status.IdleRunners,
 				BusyRunners:        status.BusyRunners,
-				SnapshotVersion:    status.SnapshotVersion,
 				Draining:           status.Draining,
 				DiskUsage:          mgr.DiskUsage(),
 				TotalCPUMillicores: status.TotalCPUMillicores,
@@ -741,9 +552,7 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				TotalMemoryMB:      status.TotalMemoryMB,
 				UsedMemoryMB:       status.UsedMemoryMB,
 			}
-			if chunkedMgr != nil {
-				reqBody.LoadedManifests = chunkedMgr.GetLoadedManifests()
-			}
+			reqBody.LoadedManifests = chunkedMgr.GetLoadedManifests()
 			reqBody.Runners = mgr.GetRunnerHeartbeatInfo()
 
 			b, _ := json.Marshal(reqBody)
@@ -815,22 +624,8 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 				_, _ = mgr.PauseSessionRunners(ctx)
 			}
 
-			// Handle snapshot sync directive from control plane
-			if hbResp.ShouldSyncSnapshot && hbResp.SnapshotVersion != "" {
-				log.WithField("snapshot_version", hbResp.SnapshotVersion).Info("Control plane requested snapshot sync")
-				go func(version string) {
-					syncCtx, syncCancel := context.WithTimeout(context.Background(), 10*time.Minute)
-					defer syncCancel()
-					if err := mgr.SyncSnapshot(syncCtx, version); err != nil {
-						log.WithError(err).WithField("snapshot_version", version).Error("Failed to sync snapshot")
-					} else {
-						log.WithField("snapshot_version", version).Info("Snapshot sync completed")
-					}
-				}(hbResp.SnapshotVersion)
-			}
-
 			// Handle per-workload-key manifest sync directives
-			if len(hbResp.SyncVersions) > 0 && chunkedMgr != nil {
+			if len(hbResp.SyncVersions) > 0 {
 				for workloadKey, version := range hbResp.SyncVersions {
 					go func(key, ver string) {
 						syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -872,7 +667,6 @@ func sendDrainHeartbeat(mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, 
 		HTTPAddress:        fmt.Sprintf("%s:%d", internalIP, httpPort),
 		IdleRunners:        status.IdleRunners,
 		BusyRunners:        status.BusyRunners,
-		SnapshotVersion:    status.SnapshotVersion,
 		Draining:           true,
 		DiskUsage:          mgr.DiskUsage(),
 		TotalCPUMillicores: status.TotalCPUMillicores,
@@ -880,9 +674,7 @@ func sendDrainHeartbeat(mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, 
 		TotalMemoryMB:      status.TotalMemoryMB,
 		UsedMemoryMB:       status.UsedMemoryMB,
 	}
-	if chunkedMgr != nil {
-		reqBody.LoadedManifests = chunkedMgr.GetLoadedManifests()
-	}
+	reqBody.LoadedManifests = chunkedMgr.GetLoadedManifests()
 	reqBody.Runners = mgr.GetRunnerHeartbeatInfo()
 
 	b, _ := json.Marshal(reqBody)
@@ -1133,43 +925,6 @@ func gcHandler(mgr *runner.Manager, logger *logrus.Logger) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "GC not yet implemented"})
-	}
-}
-
-func poolFlushHandler(mgr *runner.Manager, logger *logrus.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		pool := mgr.GetPool()
-		if pool == nil {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{"status": "pool_disabled"})
-			return
-		}
-		olderThan := r.URL.Query().Get("older_than")
-		ctx := r.Context()
-		evicted := pool.FlushOlderThan(ctx, olderThan)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "ok",
-			"evicted": evicted,
-		})
-	}
-}
-
-func poolStatsHandler(mgr *runner.Manager, logger *logrus.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		pool := mgr.GetPool()
-		if pool == nil {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{"status": "pool_disabled"})
-			return
-		}
-		stats := pool.Stats()
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(stats)
 	}
 }
 

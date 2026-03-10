@@ -146,6 +146,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	var autoPause bool
 	var configNetworkPolicyPreset string
 	var configNetworkPolicyJSON string
+	var resumeFromSessionConfig bool
 	var authConfigJSON string
 	if workloadKey != "" {
 		var wc *WorkloadConfig
@@ -180,7 +181,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			var npJSON sql.NullString
 			var configJSON sql.NullString
 
-			err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, start_command, tier, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, config_json FROM layered_configs WHERE leaf_workload_key = $1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON, &configJSON)
+			err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, start_command, tier, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, config_json FROM layered_configs WHERE leaf_workload_key = $1 ORDER BY created_at DESC LIMIT 1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON, &configJSON)
 			if err == nil {
 				if tierCol.Valid && tierCol.String != "" {
 					tierName = tierCol.String
@@ -266,15 +267,38 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 
 	// Session stickiness: if this is a session resume, prefer the host where
 	// the session was paused. This keeps the LRU chunk cache warm and avoids
-	// cold GCS fetches on resume.
+	// cold GCS fetches on resume. When resuming a suspended session, also use
+	// the TTL/network policy persisted on that session instead of re-reading
+	// mutable layered-config defaults by workload key.
 	var host *Host
 	if req.SessionID != "" && s.db != nil {
 		var sessionHostID string
 		var status string
+		var sessionTTL sql.NullInt64
+		var sessionAutoPause sql.NullBool
+		var sessionNPPreset sql.NullString
+		var sessionNPJSON sql.NullString
 		err := s.db.QueryRowContext(ctx,
-			`SELECT host_id, status FROM session_snapshots WHERE session_id = $1`,
-			req.SessionID).Scan(&sessionHostID, &status)
+			`SELECT host_id, status, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
+			 FROM session_snapshots WHERE session_id = $1`,
+			req.SessionID).Scan(&sessionHostID, &status, &sessionTTL, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON)
 		if err == nil && status == "suspended" && sessionHostID != "" {
+			resumeFromSessionConfig = true
+			if sessionTTL.Valid {
+				runnerTTLSeconds = int(sessionTTL.Int64)
+			} else {
+				runnerTTLSeconds = 0
+			}
+			autoPause = sessionAutoPause.Valid && sessionAutoPause.Bool
+			configNetworkPolicyPreset = ""
+			if sessionNPPreset.Valid {
+				configNetworkPolicyPreset = sessionNPPreset.String
+			}
+			configNetworkPolicyJSON = ""
+			if sessionNPJSON.Valid {
+				configNetworkPolicyJSON = sessionNPJSON.String
+			}
+
 			for _, h := range eligible {
 				if h.ID == sessionHostID {
 					host = h
@@ -365,14 +389,17 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	}
 	// Pass network policy fields via labels (proto fields 17-18 not in
 	// generated wire descriptor; labels are serialized reliably).
-	// Explicit request values take precedence; fall back to the config-stored policy.
-	effectiveNPPreset := req.NetworkPolicyPreset
-	if effectiveNPPreset == "" {
-		effectiveNPPreset = configNetworkPolicyPreset
-	}
-	effectiveNPJSON := req.NetworkPolicyJSON
-	if effectiveNPJSON == "" {
-		effectiveNPJSON = configNetworkPolicyJSON
+	// Fresh allocations may apply request-level overrides, but resumed sessions
+	// must keep the policy persisted with that session.
+	effectiveNPPreset := configNetworkPolicyPreset
+	effectiveNPJSON := configNetworkPolicyJSON
+	if !resumeFromSessionConfig {
+		if req.NetworkPolicyPreset != "" {
+			effectiveNPPreset = req.NetworkPolicyPreset
+		}
+		if req.NetworkPolicyJSON != "" {
+			effectiveNPJSON = req.NetworkPolicyJSON
+		}
 	}
 	if effectiveNPPreset != "" || effectiveNPJSON != "" {
 		if protoReq.Labels == nil {
@@ -447,13 +474,17 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// Register runner in our registry
 	if resp.Runner != nil {
 		if err := s.hostRegistry.AddRunner(ctx, &Runner{
-			ID:               resp.Runner.Id,
-			HostID:           host.ID,
-			InternalIP:       resp.Runner.InternalIp,
-			Status:           "busy",
-			WorkloadKey:      workloadKey,
-			ReservedCPU:      effectiveCPU,
-			ReservedMemoryMB: tier.MemoryMB,
+			ID:                  resp.Runner.Id,
+			HostID:              host.ID,
+			InternalIP:          resp.Runner.InternalIp,
+			Status:              "busy",
+			WorkloadKey:         workloadKey,
+			RunnerTTLSeconds:    runnerTTLSeconds,
+			AutoPause:           autoPause,
+			NetworkPolicyPreset: effectiveNPPreset,
+			NetworkPolicyJSON:   effectiveNPJSON,
+			ReservedCPU:         effectiveCPU,
+			ReservedMemoryMB:    tier.MemoryMB,
 		}); err != nil {
 			s.logger.WithError(err).Warn("Failed to register runner in control plane registry")
 		}
