@@ -49,8 +49,6 @@ var (
 	// Snapshot commands (replaces --repo-slug/--repo-url/--repo-branch/--bazel-version)
 	snapshotCommands = flag.String("snapshot-commands", "", "JSON array of SnapshotCommand describing what to bake into the snapshot (required)")
 
-	gcpProject      = flag.String("gcp-project", "", "GCP project for Secret Manager (defaults to metadata project)")
-
 	// Layer build flags
 	layerHash            = flag.String("layer-hash", "", "Layer hash for metadata tagging")
 	parentWorkloadKey    = flag.String("parent-workload-key", "", "Parent layer's hash, used as GCS workload key to load parent snapshot")
@@ -589,228 +587,228 @@ func run(logger *logrus.Logger) error {
 	log.Info("Building chunked snapshot for lazy loading...")
 
 	chunkStore, err := snapshot.NewChunkStore(ctx, snapshot.ChunkStoreConfig{
-			GCSBucket:      *gcsBucket,
-			GCSPrefix:      *gcsPrefix,
-			LocalCachePath: filepath.Join(*outputDir, "chunk-cache"),
-			ChunkSubdir:    "disk",
-			Logger:         logger,
-		})
-		if err != nil {
-			return fmt.Errorf("create chunk store: %w", err)
+		GCSBucket:      *gcsBucket,
+		GCSPrefix:      *gcsPrefix,
+		LocalCachePath: filepath.Join(*outputDir, "chunk-cache"),
+		ChunkSubdir:    "disk",
+		Logger:         logger,
+	})
+	if err != nil {
+		return fmt.Errorf("create chunk store: %w", err)
+	}
+	defer chunkStore.Close()
+
+	memChunkStore, err := snapshot.NewChunkStore(ctx, snapshot.ChunkStoreConfig{
+		GCSBucket:      *gcsBucket,
+		GCSPrefix:      *gcsPrefix,
+		LocalCachePath: filepath.Join(*outputDir, "chunk-cache"),
+		ChunkSubdir:    "mem",
+		Logger:         logger,
+	})
+	if err != nil {
+		return fmt.Errorf("create mem chunk store: %w", err)
+	}
+	defer memChunkStore.Close()
+
+	builder := snapshot.NewChunkedSnapshotBuilder(chunkStore, memChunkStore, logger)
+	builder.MemBackend = *memBackend
+
+	// Compute rootfs source hash for storing in metadata (enables incremental change detection).
+	// Only needed at upload time — the incremental path hashes independently for comparison.
+	if rootfsSourceHash == "" {
+		provenanceFlavor := rootfsFlavor("")
+		if *baseImage != "" {
+			provenanceFlavor = rootfsFlavorForProvenance
 		}
-		defer chunkStore.Close()
-
-		memChunkStore, err := snapshot.NewChunkStore(ctx, snapshot.ChunkStoreConfig{
-			GCSBucket:      *gcsBucket,
-			GCSPrefix:      *gcsPrefix,
-			LocalCachePath: filepath.Join(*outputDir, "chunk-cache"),
-			ChunkSubdir:    "mem",
-			Logger:         logger,
-		})
-		if err != nil {
-			return fmt.Errorf("create mem chunk store: %w", err)
-		}
-		defer memChunkStore.Close()
-
-		builder := snapshot.NewChunkedSnapshotBuilder(chunkStore, memChunkStore, logger)
-		builder.MemBackend = *memBackend
-
-		// Compute rootfs source hash for storing in metadata (enables incremental change detection).
-		// Only needed at upload time — the incremental path hashes independently for comparison.
-		if rootfsSourceHash == "" {
-			provenanceFlavor := rootfsFlavor("")
-			if *baseImage != "" {
-				provenanceFlavor = rootfsFlavorForProvenance
-			}
-			if h, err := computeRootfsSourceHash(*rootfsPath, *baseImage, *runnerUser, *thawAgentPath, *rootfsSizeGB, provenanceFlavor); err == nil {
-				rootfsSourceHash = h
-				log.WithField("hash", rootfsSourceHash[:12]).Info("Rootfs provenance hash computed for metadata")
-			} else if errors.Is(err, errBaseImageNotPinned) {
-				log.WithField("base_image", *baseImage).Warn("Base image is not digest-pinned; future incremental restores will fall back to cold boot")
-			} else {
-				log.WithError(err).Warn("Failed to compute rootfs provenance hash, future incremental builds won't detect rootfs changes")
-			}
-		}
-
-		if wasIncremental && incrementalRootfsChunks != nil {
-			// Incremental: rootfs chunks already in chunk store (original + dirty).
-			// Only chunk kernel, state, and mem (which are new). Skip rootfs chunking.
-			log.Info("Incremental chunked snapshot: reusing rootfs chunks, chunking mem/state/kernel...")
-
-			chunkedMeta := &snapshot.ChunkedSnapshotMetadata{
-				Version:          version,
-				WorkloadKey:      effectiveWorkloadKey,
-				Commands:         commands,
-				CreatedAt:        time.Now(),
-				ChunkSize:        snapshot.DefaultChunkSize,
-				RootfsSourceHash: rootfsSourceHash,
-				RootfsFlavor:     string(rootfsFlavorForProvenance),
-			}
-			// Populate layer fields if in layer mode
-			if *layerHash != "" {
-				chunkedMeta.LayerHash = *layerHash
-				chunkedMeta.ParentLayerHash = *parentWorkloadKey
-				chunkedMeta.ParentVersion = *parentVersion
-			}
-
-			// Chunk kernel
-			kernelData, err := os.ReadFile(kernelOutput)
-			if err != nil {
-				return fmt.Errorf("read kernel for chunking: %w", err)
-			}
-			kernelHash, _, err := chunkStore.StoreChunk(ctx, kernelData)
-			if err != nil {
-				return fmt.Errorf("store kernel chunk: %w", err)
-			}
-			chunkedMeta.KernelHash = kernelHash
-
-			// Chunk state
-			stateData, err := os.ReadFile(snapshotPath)
-			if err != nil {
-				return fmt.Errorf("read state for chunking: %w", err)
-			}
-			stateHash, _, err := chunkStore.StoreChunk(ctx, stateData)
-			if err != nil {
-				return fmt.Errorf("store state chunk: %w", err)
-			}
-			chunkedMeta.StateHash = stateHash
-
-			// Store memory according to --mem-backend flag.
-			if *memBackend == "file" {
-				memGCSPath := fmt.Sprintf("%s/snapshot_state/%s/snapshot.mem.zst", effectiveWorkloadKey, version)
-				_, _, err = memChunkStore.UploadRawFile(ctx, memPath, memGCSPath)
-				if err != nil {
-					return fmt.Errorf("upload raw memory file: %w", err)
-				}
-				chunkedMeta.MemFilePath = memGCSPath
-			} else {
-				memChunks, err := memChunkStore.ChunkFile(ctx, memPath, snapshot.DefaultChunkSize)
-				if err != nil {
-					return fmt.Errorf("chunk memory file: %w", err)
-				}
-				chunkedMeta.MemChunks = memChunks
-			}
-			memStat, _ := os.Stat(memPath)
-			if memStat != nil {
-				chunkedMeta.TotalMemSize = memStat.Size()
-			}
-			// Use rootfs chunks from FUSE (original + dirty writes already uploaded)
-			chunkedMeta.RootfsChunks = incrementalRootfsChunks
-			chunkedMeta.TotalDiskSize = int64(len(incrementalRootfsChunks)) * chunkedMeta.ChunkSize
-
-			// Add extension drives that were FUSE-tracked (dirty chunks already saved)
-			if len(incrementalExtChunks) > 0 {
-				if chunkedMeta.ExtensionDrives == nil {
-					chunkedMeta.ExtensionDrives = make(map[string]snapshot.ExtensionDrive)
-				}
-				for driveID, chunks := range incrementalExtChunks {
-					var totalSize int64
-					for _, c := range chunks {
-						if end := c.Offset + c.Size; end > totalSize {
-							totalSize = end
-						}
-					}
-					chunkedMeta.ExtensionDrives[driveID] = snapshot.ExtensionDrive{
-						Chunks:    chunks,
-						ReadOnly:  false,
-						SizeBytes: totalSize,
-					}
-				}
-			}
-
-			// Chunk any remaining extension drives from newDrives that weren't
-			// FUSE-tracked (e.g. freshly created drives for new layer configs).
-			for _, d := range newDrives {
-				if _, ok := chunkedMeta.ExtensionDrives[d.DriveID]; ok {
-					continue // already handled via FUSE dirty chunks
-				}
-				imgPath := filepath.Join(*outputDir, d.DriveID+".img")
-				if _, err := os.Stat(imgPath); err != nil {
-					// Try reattach subdir
-					imgPath = filepath.Join(*outputDir, "reattach", d.DriveID+".img")
-					if _, err := os.Stat(imgPath); err != nil {
-						log.WithField("drive_id", d.DriveID).Warn("Extension drive image not found, skipping")
-						continue
-					}
-				}
-				log.WithFields(logrus.Fields{
-					"drive_id": d.DriveID,
-					"path":     imgPath,
-				}).Info("Chunking extension drive from disk")
-				chunks, chunkErr := chunkStore.ChunkFile(ctx, imgPath, snapshot.DefaultChunkSize)
-				if chunkErr != nil {
-					return fmt.Errorf("chunk extension drive %s: %w", d.DriveID, chunkErr)
-				}
-				if chunkedMeta.ExtensionDrives == nil {
-					chunkedMeta.ExtensionDrives = make(map[string]snapshot.ExtensionDrive)
-				}
-				stat, _ := os.Stat(imgPath)
-				chunkedMeta.ExtensionDrives[d.DriveID] = snapshot.ExtensionDrive{
-					Chunks:    chunks,
-					ReadOnly:  d.ReadOnly,
-					SizeBytes: stat.Size(),
-				}
-			}
-
-			if err := builder.UploadChunkedMetadata(ctx, chunkedMeta); err != nil {
-				return fmt.Errorf("upload incremental chunked metadata: %w", err)
-			}
-
-			log.WithFields(logrus.Fields{
-				"mem_file":         chunkedMeta.MemFilePath,
-				"disk_chunks":      len(chunkedMeta.RootfsChunks),
-				"extension_drives": len(chunkedMeta.ExtensionDrives),
-			}).Info("Incremental chunked snapshot built and uploaded")
+		if h, err := computeRootfsSourceHash(*rootfsPath, *baseImage, *runnerUser, *thawAgentPath, *rootfsSizeGB, provenanceFlavor); err == nil {
+			rootfsSourceHash = h
+			log.WithField("hash", rootfsSourceHash[:12]).Info("Rootfs provenance hash computed for metadata")
+		} else if errors.Is(err, errBaseImageNotPinned) {
+			log.WithField("base_image", *baseImage).Warn("Base image is not digest-pinned; future incremental restores will fall back to cold boot")
 		} else {
-			// Cold boot: chunk everything from full files on disk.
-			// Include all drives so child layers can restore them via FUSE
-			// for filesystem consistency.
-			driveSpecs := []snapshot.DriveSpec{}
-			driveImages := map[string]string{}
+			log.WithError(err).Warn("Failed to compute rootfs provenance hash, future incremental builds won't detect rootfs changes")
+		}
+	}
 
-			if *layerHash != "" && len(newDrives) > 0 {
-				// Layer mode: include config-defined drives
-				for _, d := range newDrives {
-					imgPath := filepath.Join(*outputDir, d.DriveID+".img")
-					if _, err := os.Stat(imgPath); err == nil {
-						driveSpecs = append(driveSpecs, d)
-						driveImages[d.DriveID] = imgPath
+	if wasIncremental && incrementalRootfsChunks != nil {
+		// Incremental: rootfs chunks already in chunk store (original + dirty).
+		// Only chunk kernel, state, and mem (which are new). Skip rootfs chunking.
+		log.Info("Incremental chunked snapshot: reusing rootfs chunks, chunking mem/state/kernel...")
+
+		chunkedMeta := &snapshot.ChunkedSnapshotMetadata{
+			Version:          version,
+			WorkloadKey:      effectiveWorkloadKey,
+			Commands:         commands,
+			CreatedAt:        time.Now(),
+			ChunkSize:        snapshot.DefaultChunkSize,
+			RootfsSourceHash: rootfsSourceHash,
+			RootfsFlavor:     string(rootfsFlavorForProvenance),
+		}
+		// Populate layer fields if in layer mode
+		if *layerHash != "" {
+			chunkedMeta.LayerHash = *layerHash
+			chunkedMeta.ParentLayerHash = *parentWorkloadKey
+			chunkedMeta.ParentVersion = *parentVersion
+		}
+
+		// Chunk kernel
+		kernelData, err := os.ReadFile(kernelOutput)
+		if err != nil {
+			return fmt.Errorf("read kernel for chunking: %w", err)
+		}
+		kernelHash, _, err := chunkStore.StoreChunk(ctx, kernelData)
+		if err != nil {
+			return fmt.Errorf("store kernel chunk: %w", err)
+		}
+		chunkedMeta.KernelHash = kernelHash
+
+		// Chunk state
+		stateData, err := os.ReadFile(snapshotPath)
+		if err != nil {
+			return fmt.Errorf("read state for chunking: %w", err)
+		}
+		stateHash, _, err := chunkStore.StoreChunk(ctx, stateData)
+		if err != nil {
+			return fmt.Errorf("store state chunk: %w", err)
+		}
+		chunkedMeta.StateHash = stateHash
+
+		// Store memory according to --mem-backend flag.
+		if *memBackend == "file" {
+			memGCSPath := fmt.Sprintf("%s/snapshot_state/%s/snapshot.mem.zst", effectiveWorkloadKey, version)
+			_, _, err = memChunkStore.UploadRawFile(ctx, memPath, memGCSPath)
+			if err != nil {
+				return fmt.Errorf("upload raw memory file: %w", err)
+			}
+			chunkedMeta.MemFilePath = memGCSPath
+		} else {
+			memChunks, err := memChunkStore.ChunkFile(ctx, memPath, snapshot.DefaultChunkSize)
+			if err != nil {
+				return fmt.Errorf("chunk memory file: %w", err)
+			}
+			chunkedMeta.MemChunks = memChunks
+		}
+		memStat, _ := os.Stat(memPath)
+		if memStat != nil {
+			chunkedMeta.TotalMemSize = memStat.Size()
+		}
+		// Use rootfs chunks from FUSE (original + dirty writes already uploaded)
+		chunkedMeta.RootfsChunks = incrementalRootfsChunks
+		chunkedMeta.TotalDiskSize = int64(len(incrementalRootfsChunks)) * chunkedMeta.ChunkSize
+
+		// Add extension drives that were FUSE-tracked (dirty chunks already saved)
+		if len(incrementalExtChunks) > 0 {
+			if chunkedMeta.ExtensionDrives == nil {
+				chunkedMeta.ExtensionDrives = make(map[string]snapshot.ExtensionDrive)
+			}
+			for driveID, chunks := range incrementalExtChunks {
+				var totalSize int64
+				for _, c := range chunks {
+					if end := c.Offset + c.Size; end > totalSize {
+						totalSize = end
 					}
 				}
+				chunkedMeta.ExtensionDrives[driveID] = snapshot.ExtensionDrive{
+					Chunks:    chunks,
+					ReadOnly:  false,
+					SizeBytes: totalSize,
+				}
 			}
+		}
 
-			snapshotPaths := &snapshot.SnapshotPaths{
-				Kernel:               kernelOutput,
-				Rootfs:               workingRootfs,
-				Mem:                  memPath,
-				State:                snapshotPath,
-				Version:              version,
-				ExtensionDriveImages: driveImages,
+		// Chunk any remaining extension drives from newDrives that weren't
+		// FUSE-tracked (e.g. freshly created drives for new layer configs).
+		for _, d := range newDrives {
+			if _, ok := chunkedMeta.ExtensionDrives[d.DriveID]; ok {
+				continue // already handled via FUSE dirty chunks
 			}
-
-			chunkedMeta, err := builder.BuildChunkedSnapshot(ctx, snapshotPaths, driveSpecs, version, effectiveWorkloadKey)
-			if err != nil {
-				return fmt.Errorf("build chunked snapshot: %w", err)
+			imgPath := filepath.Join(*outputDir, d.DriveID+".img")
+			if _, err := os.Stat(imgPath); err != nil {
+				// Try reattach subdir
+				imgPath = filepath.Join(*outputDir, "reattach", d.DriveID+".img")
+				if _, err := os.Stat(imgPath); err != nil {
+					log.WithField("drive_id", d.DriveID).Warn("Extension drive image not found, skipping")
+					continue
+				}
 			}
-			chunkedMeta.RootfsSourceHash = rootfsSourceHash
-			chunkedMeta.RootfsFlavor = string(rootfsFlavorForProvenance)
-			chunkedMeta.Commands = commands
-			// Populate layer fields if in layer mode
-			if *layerHash != "" {
-				chunkedMeta.LayerHash = *layerHash
-				chunkedMeta.ParentLayerHash = *parentWorkloadKey
-				chunkedMeta.ParentVersion = *parentVersion
-			}
-
-			if err := builder.UploadChunkedMetadata(ctx, chunkedMeta); err != nil {
-				return fmt.Errorf("upload chunked metadata: %w", err)
-			}
-
 			log.WithFields(logrus.Fields{
-				"mem_chunks":       len(chunkedMeta.MemChunks),
-				"disk_chunks":      len(chunkedMeta.RootfsChunks),
-				"extension_drives": len(chunkedMeta.ExtensionDrives),
-			}).Info("Chunked snapshot built and uploaded")
+				"drive_id": d.DriveID,
+				"path":     imgPath,
+			}).Info("Chunking extension drive from disk")
+			chunks, chunkErr := chunkStore.ChunkFile(ctx, imgPath, snapshot.DefaultChunkSize)
+			if chunkErr != nil {
+				return fmt.Errorf("chunk extension drive %s: %w", d.DriveID, chunkErr)
+			}
+			if chunkedMeta.ExtensionDrives == nil {
+				chunkedMeta.ExtensionDrives = make(map[string]snapshot.ExtensionDrive)
+			}
+			stat, _ := os.Stat(imgPath)
+			chunkedMeta.ExtensionDrives[d.DriveID] = snapshot.ExtensionDrive{
+				Chunks:    chunks,
+				ReadOnly:  d.ReadOnly,
+				SizeBytes: stat.Size(),
+			}
+		}
+
+		if err := builder.UploadChunkedMetadata(ctx, chunkedMeta); err != nil {
+			return fmt.Errorf("upload incremental chunked metadata: %w", err)
+		}
+
+		log.WithFields(logrus.Fields{
+			"mem_file":         chunkedMeta.MemFilePath,
+			"disk_chunks":      len(chunkedMeta.RootfsChunks),
+			"extension_drives": len(chunkedMeta.ExtensionDrives),
+		}).Info("Incremental chunked snapshot built and uploaded")
+	} else {
+		// Cold boot: chunk everything from full files on disk.
+		// Include all drives so child layers can restore them via FUSE
+		// for filesystem consistency.
+		driveSpecs := []snapshot.DriveSpec{}
+		driveImages := map[string]string{}
+
+		if *layerHash != "" && len(newDrives) > 0 {
+			// Layer mode: include config-defined drives
+			for _, d := range newDrives {
+				imgPath := filepath.Join(*outputDir, d.DriveID+".img")
+				if _, err := os.Stat(imgPath); err == nil {
+					driveSpecs = append(driveSpecs, d)
+					driveImages[d.DriveID] = imgPath
+				}
+			}
+		}
+
+		snapshotPaths := &snapshot.SnapshotPaths{
+			Kernel:               kernelOutput,
+			Rootfs:               workingRootfs,
+			Mem:                  memPath,
+			State:                snapshotPath,
+			Version:              version,
+			ExtensionDriveImages: driveImages,
+		}
+
+		chunkedMeta, err := builder.BuildChunkedSnapshot(ctx, snapshotPaths, driveSpecs, version, effectiveWorkloadKey)
+		if err != nil {
+			return fmt.Errorf("build chunked snapshot: %w", err)
+		}
+		chunkedMeta.RootfsSourceHash = rootfsSourceHash
+		chunkedMeta.RootfsFlavor = string(rootfsFlavorForProvenance)
+		chunkedMeta.Commands = commands
+		// Populate layer fields if in layer mode
+		if *layerHash != "" {
+			chunkedMeta.LayerHash = *layerHash
+			chunkedMeta.ParentLayerHash = *parentWorkloadKey
+			chunkedMeta.ParentVersion = *parentVersion
+		}
+
+		if err := builder.UploadChunkedMetadata(ctx, chunkedMeta); err != nil {
+			return fmt.Errorf("upload chunked metadata: %w", err)
+		}
+
+		log.WithFields(logrus.Fields{
+			"mem_chunks":       len(chunkedMeta.MemChunks),
+			"disk_chunks":      len(chunkedMeta.RootfsChunks),
+			"extension_drives": len(chunkedMeta.ExtensionDrives),
+		}).Info("Chunked snapshot built and uploaded")
 	}
 
 	// Update current pointer (workload-key-scoped) — done last so the pointer
@@ -1148,20 +1146,6 @@ func getDefaultIface() string {
 		}
 	}
 	return "eth0"
-}
-
-func getGitCommit(dir string) string {
-	cmd := exec.Command("git", "rev-parse", "HEAD")
-	cmd.Dir = dir
-	out, err := cmd.Output()
-	if err != nil {
-		return "unknown"
-	}
-	commit := strings.TrimSpace(string(out))
-	if len(commit) > 40 {
-		return commit[:40]
-	}
-	return commit
 }
 
 // snapshotSymlinkDir matches the path used by the manager for snapshot symlinks.

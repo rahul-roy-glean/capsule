@@ -586,7 +586,7 @@ func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Req
 	w.Header().Set("Content-Type", "application/json")
 
 	hosts := s.hostRegistry.GetAllHosts()
-	var allRunners []map[string]interface{}
+	allRunners := make([]map[string]interface{}, 0)
 
 	for _, h := range hosts {
 		s.hostRegistry.mu.RLock()

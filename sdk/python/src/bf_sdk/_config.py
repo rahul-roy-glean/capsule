@@ -29,7 +29,7 @@ class ConnectionConfig:
             or "http://localhost:8080"
         ).rstrip("/")
 
-        resolved_token = token or os.environ.get("BF_TOKEN")
+        resolved_token = token if token is not None else os.environ.get("BF_TOKEN")
 
         return cls(
             base_url=resolved_base_url,

@@ -91,10 +91,12 @@ jobs:
           if [[ "$GITHUB_REF_NAME" == *"-alpha."* || "$GITHUB_REF_NAME" == *"-beta."* || "$GITHUB_REF_NAME" == *"-rc."* ]]; then
             prerelease=true
           fi
-          echo "release_version=${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "helm_version=${HELM_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "pypi_version=${PYPI_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+          {
+            echo "release_version=${RELEASE_VERSION}"
+            echo "helm_version=${HELM_VERSION}"
+            echo "pypi_version=${PYPI_VERSION}"
+            echo "prerelease=${prerelease}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Derive image names
         id: images
@@ -148,7 +150,7 @@ jobs:
 
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum * > checksums.txt
+        run: sha256sum ./* > checksums.txt
 
       - name: Build candidate container images
         run: |

@@ -61,10 +61,10 @@ var (
 	gcpProject = flag.String("gcp-project", "", "GCP project")
 
 	// Chunked snapshot flags (BuildBuddy-style lazy loading)
-	chunkCacheSizeGB    = flag.Int("chunk-cache-size-gb", 2, "Size in GB of disk chunk LRU cache (FUSE)")
-	memCacheSizeGB      = flag.Int("mem-cache-size-gb", 2, "Size in GB of memory chunk LRU cache (UFFD)")
-	memBackend          = flag.String("mem-backend", "chunked", "Memory restore backend: 'chunked' (UFFD lazy loading, default) or 'file' (download full snapshot.mem at startup). Overrides the backend recorded in snapshot metadata.")
-	gcsPrefix           = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
+	chunkCacheSizeGB = flag.Int("chunk-cache-size-gb", 2, "Size in GB of disk chunk LRU cache (FUSE)")
+	memCacheSizeGB   = flag.Int("mem-cache-size-gb", 2, "Size in GB of memory chunk LRU cache (UFFD)")
+	memBackend       = flag.String("mem-backend", "chunked", "Memory restore backend: 'chunked' (UFFD lazy loading, default) or 'file' (download full snapshot.mem at startup). Overrides the backend recorded in snapshot metadata.")
+	gcsPrefix        = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
 )
 
 // resumeGates prevents thundering-herd on concurrent auto-resume for the same runner.
@@ -311,27 +311,27 @@ func main() {
 
 	// Start autoscaler loop
 	go autoscaleLoop(ctx, mgr, chunkedMgr, *idleTarget, logger, autoscaleInstruments{
-		vmAllocCounter:   vmAllocCounter,
-		vmBootHist:       vmBootHist,
-		hostCPUTotal:     hostCPUTotalGauge,
-		hostCPUUsed:      hostCPUUsedGauge,
-		hostMemTotal:     hostMemTotalGauge,
-		hostMemUsed:      hostMemUsedGauge,
-		hostRunnersIdle:  hostRunnersIdleGauge,
-		hostRunnersBusy:  hostRunnersBusyGauge,
-		diskCacheSize:    diskCacheSizeGauge,
-		diskCacheMax:     diskCacheMaxGauge,
-		diskCacheItems:   diskCacheItemsGauge,
-		memCacheSize:     memCacheSizeGauge,
-		memCacheMax:      memCacheMaxGauge,
-		memCacheItems:    memCacheItemsGauge,
-		pageFaults:       pageFaultsGauge,
-		cacheHits:        cacheHitsGauge,
-		chunkFetches:     chunkFetchesGauge,
-		diskReads:        diskReadsGauge,
-		diskWrites:       diskWritesGauge,
-		dirtyChunks:      dirtyChunksGauge,
-		cacheHitRatio:    cacheHitRatioGauge,
+		vmAllocCounter:  vmAllocCounter,
+		vmBootHist:      vmBootHist,
+		hostCPUTotal:    hostCPUTotalGauge,
+		hostCPUUsed:     hostCPUUsedGauge,
+		hostMemTotal:    hostMemTotalGauge,
+		hostMemUsed:     hostMemUsedGauge,
+		hostRunnersIdle: hostRunnersIdleGauge,
+		hostRunnersBusy: hostRunnersBusyGauge,
+		diskCacheSize:   diskCacheSizeGauge,
+		diskCacheMax:    diskCacheMaxGauge,
+		diskCacheItems:  diskCacheItemsGauge,
+		memCacheSize:    memCacheSizeGauge,
+		memCacheMax:     memCacheMaxGauge,
+		memCacheItems:   memCacheItemsGauge,
+		pageFaults:      pageFaultsGauge,
+		cacheHits:       cacheHitsGauge,
+		chunkFetches:    chunkFetchesGauge,
+		diskReads:       diskReadsGauge,
+		diskWrites:      diskWritesGauge,
+		dirtyChunks:     dirtyChunksGauge,
+		cacheHitRatio:   cacheHitRatioGauge,
 	})
 
 	// Start heartbeat loop if control plane is configured
