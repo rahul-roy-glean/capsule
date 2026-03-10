@@ -22,6 +22,7 @@ Suites:
     canary      - Canary report endpoint
     edge        - Edge-case / error-path scenarios
     concurrency - Multi-client concurrent load scenarios
+    realistic   - Staggered arrivals, mixed workloads, natural concurrency
 
 Environment variables (override CLI flags):
     BF_BASE_URL  - Control plane base URL
@@ -33,7 +34,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
+import random
 import sys
 import time
 import uuid
@@ -41,8 +44,8 @@ from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from threading import Barrier, Thread
-from typing import Any
+from threading import Barrier, Semaphore, Thread
+from typing import Any, Optional
 
 import httpx
 
@@ -154,6 +157,28 @@ class SimulationRun:
         print("=" * 72)
         print(f"  TOTAL {s['total']}  |  PASSED {s['passed']}  |  FAILED {s['failed']}")
         print("=" * 72 + "\n")
+
+
+@dataclass
+class RealisticConfig:
+    total_runners: int = 30
+    arrival_rate: float = 2.0
+    lifetime_mean: float = 15.0
+    lifetime_stddev: float = 5.0
+    session_pct: float = 0.3
+    max_concurrent: int = 20
+    steady_seconds: float = 60.0
+
+
+@dataclass
+class RunnerLifecycleResult:
+    runner_id: str
+    alloc_latency: float
+    lifetime: float
+    is_session: bool
+    success: bool
+    error: Optional[str] = None
+    status_code: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1645,7 +1670,6 @@ def suite_concurrency(
     # Expect: server remains stable, no unexpected 500s.
     # ---------------------------------------------------------------
     log.info("Starting test", extra={"suite": SUITE, "test": "Mixed operation storm"})
-    import random as _random
     _free_slots(width)
 
     def _mixed_worker(wid: int, barrier: Barrier) -> tuple[bool, str, bool]:
@@ -1660,7 +1684,7 @@ def suite_concurrency(
 
             barrier.wait()  # all workers have a runner — storm begins
 
-            ops = _random.choices(
+            ops = random.choices(
                 ["status", "list", "connect", "status", "list"],
                 k=3,
             )
@@ -1708,6 +1732,338 @@ def suite_concurrency(
 
 
 # ===========================================================================
+# SUITE: realistic
+# ===========================================================================
+#
+# Models real production traffic patterns:
+# - Poisson arrivals (runners appear gradually, not all at once)
+# - Log-normal lifetimes (some runners are short, some long)
+# - Mixed workload types (standard allocate/release vs session lifecycle)
+# - Semaphore-gated concurrency (backpressure)
+# ===========================================================================
+
+def suite_realistic(
+    base_url: str,
+    token: str | None,
+    run: SimulationRun,
+    log: logging.Logger,
+    leaf_workload_key: str = FIXED_WORKLOAD_KEY,
+    *,
+    cfg: RealisticConfig | None = None,
+) -> None:
+    """Realistic staggered-load simulation with Poisson arrivals and log-normal lifetimes."""
+    SUITE = "realistic"
+    if cfg is None:
+        cfg = RealisticConfig()
+
+    log.info("Starting realistic suite", extra={
+        "total_runners": cfg.total_runners,
+        "arrival_rate": cfg.arrival_rate,
+        "lifetime_mean": cfg.lifetime_mean,
+        "lifetime_stddev": cfg.lifetime_stddev,
+        "session_pct": cfg.session_pct,
+        "max_concurrent": cfg.max_concurrent,
+        "workload_key": leaf_workload_key,
+    })
+
+    # Log-normal parameters from mean/stddev
+    mu = math.log(cfg.lifetime_mean**2 / math.sqrt(cfg.lifetime_stddev**2 + cfg.lifetime_mean**2))
+    sigma = math.sqrt(math.log(1 + (cfg.lifetime_stddev**2 / cfg.lifetime_mean**2)))
+
+    sem = Semaphore(cfg.max_concurrent)
+    lifecycle_results: list[RunnerLifecycleResult] = []
+    peak_concurrent = 0
+    _concurrent_count = 0
+    _concurrent_lock = __import__("threading").Lock()
+
+    def _track_concurrency(delta: int) -> None:
+        nonlocal _concurrent_count, peak_concurrent
+        with _concurrent_lock:
+            _concurrent_count += delta
+            if _concurrent_count > peak_concurrent:
+                peak_concurrent = _concurrent_count
+
+    def _runner_worker(runner_idx: int, is_session: bool) -> None:
+        runner_id_str = f"realistic-{runner_idx}"
+        lifetime = random.lognormvariate(mu, sigma)
+        lifetime = min(lifetime, cfg.steady_seconds)  # cap at steady-state duration
+
+        sem.acquire()
+        _track_concurrency(1)
+
+        client = _make_client(base_url, token)
+        alloc_latency = 0.0
+        success = False
+        error_msg: str | None = None
+        status_code: int | None = None
+        allocated_runner_id: str | None = None
+
+        try:
+            # --- Allocate with 503 retry ---
+            request_id = f"e2e-real-{runner_idx}-{uuid.uuid4().hex[:8]}"
+            alloc_start = time.monotonic()
+            last_exc: Exception | None = None
+            for attempt in range(3):
+                try:
+                    resp = client.runners.allocate(
+                        leaf_workload_key,
+                        request_id=request_id,
+                        session_id=uuid.uuid4().hex if is_session else None,
+                    )
+                    allocated_runner_id = resp.runner_id
+                    alloc_latency = time.monotonic() - alloc_start
+                    last_exc = None
+                    break
+                except BFServiceUnavailable as exc:
+                    last_exc = exc
+                    status_code = 503
+                    log.debug("503 on allocate, retrying", extra={
+                        "runner_idx": runner_idx, "attempt": attempt + 1,
+                    })
+                    time.sleep(2)
+
+            if last_exc is not None:
+                error_msg = f"Allocation failed after 3 retries: {last_exc}"
+                lifecycle_results.append(RunnerLifecycleResult(
+                    runner_id=runner_id_str,
+                    alloc_latency=time.monotonic() - alloc_start,
+                    lifetime=0,
+                    is_session=is_session,
+                    success=False,
+                    error=error_msg,
+                    status_code=status_code,
+                ))
+                return
+
+            log.info("Runner allocated", extra={
+                "runner_idx": runner_idx,
+                "runner_id": allocated_runner_id,
+                "alloc_latency_s": f"{alloc_latency:.2f}",
+                "is_session": is_session,
+                "planned_lifetime_s": f"{lifetime:.1f}",
+            })
+
+            # --- Session lifecycle (if session runner) ---
+            if is_session and allocated_runner_id:
+                try:
+                    client.runners.pause(allocated_runner_id)
+                    conn = client.runners.connect(allocated_runner_id)
+                    allocated_runner_id = conn.runner_id
+                except Exception as exc:
+                    error_msg = f"Session lifecycle error: {exc}"
+                    lifecycle_results.append(RunnerLifecycleResult(
+                        runner_id=allocated_runner_id or runner_id_str,
+                        alloc_latency=alloc_latency,
+                        lifetime=time.monotonic() - alloc_start - alloc_latency,
+                        is_session=is_session,
+                        success=False,
+                        error=error_msg,
+                    ))
+                    return
+
+            # --- Simulate work (sleep for log-normal lifetime) ---
+            work_start = time.monotonic()
+            remaining = lifetime
+            while remaining > 0:
+                sleep_chunk = min(remaining, 5.0)
+                time.sleep(sleep_chunk)
+                remaining -= sleep_chunk
+                # Optionally poll status mid-work
+                if allocated_runner_id and remaining > 2.0:
+                    try:
+                        client.runners.status(allocated_runner_id)
+                    except Exception:  # noqa: BLE001
+                        pass
+            actual_lifetime = time.monotonic() - work_start
+
+            # --- Release ---
+            if allocated_runner_id:
+                client.runners.release(allocated_runner_id)
+
+            success = True
+            lifecycle_results.append(RunnerLifecycleResult(
+                runner_id=allocated_runner_id or runner_id_str,
+                alloc_latency=alloc_latency,
+                lifetime=actual_lifetime,
+                is_session=is_session,
+                success=True,
+            ))
+
+        except BFError as exc:
+            error_msg = f"API error: {exc}"
+            sc = getattr(exc, "status_code", None)
+            lifecycle_results.append(RunnerLifecycleResult(
+                runner_id=allocated_runner_id or runner_id_str,
+                alloc_latency=alloc_latency,
+                lifetime=0,
+                is_session=is_session,
+                success=False,
+                error=error_msg,
+                status_code=sc,
+            ))
+        except Exception as exc:  # noqa: BLE001
+            error_msg = f"{type(exc).__name__}: {exc}"
+            lifecycle_results.append(RunnerLifecycleResult(
+                runner_id=allocated_runner_id or runner_id_str,
+                alloc_latency=alloc_latency,
+                lifetime=0,
+                is_session=is_session,
+                success=False,
+                error=error_msg,
+            ))
+        finally:
+            if allocated_runner_id and not success:
+                try:
+                    client.runners.release(allocated_runner_id)
+                except Exception:  # noqa: BLE001
+                    pass
+            client.close()
+            _track_concurrency(-1)
+            sem.release()
+
+    # ----- Main spawner: Poisson arrivals -----
+    with test_case(run, SUITE, "Realistic staggered load", log):
+        threads: list[Thread] = []
+        for i in range(cfg.total_runners):
+            is_session = random.random() < cfg.session_pct
+            t = Thread(
+                target=_runner_worker,
+                args=(i, is_session),
+                name=f"realistic-runner-{i}",
+            )
+            threads.append(t)
+            t.start()
+            # Poisson inter-arrival: exponential delay
+            delay = random.expovariate(cfg.arrival_rate)
+            log.debug("Next runner in", extra={"delay_s": f"{delay:.3f}", "runner_idx": i})
+            time.sleep(delay)
+
+        # Wait for all runners to complete
+        for t in threads:
+            t.join(timeout=cfg.steady_seconds + 60)
+
+        total = len(lifecycle_results)
+        succeeded = sum(1 for r in lifecycle_results if r.success)
+        log.info("Realistic load complete", extra={
+            "total_spawned": cfg.total_runners,
+            "results_collected": total,
+            "succeeded": succeeded,
+            "peak_concurrent": peak_concurrent,
+        })
+        assert total > 0, "No runner lifecycle results collected"
+
+    # ----- Scenario 2: Peak concurrency validation -----
+    with test_case(run, SUITE, "Peak concurrency validation", log):
+        log.info("Peak concurrency observed", extra={
+            "peak": peak_concurrent,
+            "max_allowed": cfg.max_concurrent,
+        })
+        assert peak_concurrent <= cfg.max_concurrent, (
+            f"Peak concurrency {peak_concurrent} exceeded max_concurrent {cfg.max_concurrent}"
+        )
+
+    # ----- Scenario 3: Allocation latency percentiles -----
+    with test_case(run, SUITE, "Allocation latency percentiles", log):
+        latencies = sorted(r.alloc_latency for r in lifecycle_results if r.alloc_latency > 0)
+        if not latencies:
+            log.warning("No successful allocations to measure latency")
+            assert False, "No allocation latency data"
+        else:
+            def _percentile(data: list[float], pct: float) -> float:
+                idx = int(len(data) * pct / 100)
+                return data[min(idx, len(data) - 1)]
+
+            p50 = _percentile(latencies, 50)
+            p95 = _percentile(latencies, 95)
+            p99 = _percentile(latencies, 99)
+            log.info("Allocation latency percentiles", extra={
+                "p50_s": f"{p50:.3f}",
+                "p95_s": f"{p95:.3f}",
+                "p99_s": f"{p99:.3f}",
+                "sample_count": len(latencies),
+            })
+            assert p99 < 30.0, (
+                f"P99 allocation latency {p99:.3f}s exceeds 30s threshold"
+            )
+
+    # ----- Scenario 4: Completion rate -----
+    with test_case(run, SUITE, "Completion rate", log):
+        total = len(lifecycle_results)
+        succeeded = sum(1 for r in lifecycle_results if r.success)
+        # Exclude runners that exhausted 503 retries from the denominator
+        retries_exhausted = sum(
+            1 for r in lifecycle_results
+            if not r.success and r.status_code == 503
+        )
+        effective_total = total - retries_exhausted
+        rate = (succeeded / effective_total * 100) if effective_total > 0 else 0
+        log.info("Completion rate", extra={
+            "succeeded": succeeded,
+            "total": total,
+            "retries_exhausted": retries_exhausted,
+            "effective_total": effective_total,
+            "rate_pct": f"{rate:.1f}",
+        })
+        assert rate >= 90.0, (
+            f"Completion rate {rate:.1f}% is below 90% threshold "
+            f"({succeeded}/{effective_total} succeeded)"
+        )
+
+    # ----- Scenario 5: No server errors -----
+    with test_case(run, SUITE, "No server errors", log):
+        server_errors = [
+            r for r in lifecycle_results
+            if not r.success
+            and r.status_code is not None
+            and 500 <= r.status_code < 600
+            and r.status_code != 503  # 503 is capacity, not a server bug
+        ]
+        if server_errors:
+            for err in server_errors[:5]:
+                log.warning("Server error", extra={
+                    "runner_id": err.runner_id,
+                    "status_code": err.status_code,
+                    "error": err.error,
+                })
+        assert len(server_errors) == 0, (
+            f"Found {len(server_errors)} server errors (5xx excluding 503): "
+            + "; ".join(f"{e.runner_id}: {e.error}" for e in server_errors[:3])
+        )
+
+    # ----- Scenario 6: Session lifecycle correctness -----
+    with test_case(run, SUITE, "Session lifecycle correctness", log):
+        session_runners = [r for r in lifecycle_results if r.is_session]
+        session_allocated = [r for r in session_runners if r.alloc_latency > 0]
+        session_ok = [r for r in session_allocated if r.success]
+        session_failed = [
+            r for r in session_allocated
+            if not r.success and r.status_code != 503
+        ]
+        log.info("Session lifecycle summary", extra={
+            "total_session_runners": len(session_runners),
+            "allocated": len(session_allocated),
+            "succeeded": len(session_ok),
+            "failed_non_503": len(session_failed),
+        })
+        if session_failed:
+            for sf in session_failed[:3]:
+                log.warning("Session runner failed", extra={
+                    "runner_id": sf.runner_id,
+                    "error": sf.error,
+                })
+        assert len(session_failed) == 0, (
+            f"{len(session_failed)} session runners failed after successful allocation: "
+            + "; ".join(f"{sf.runner_id}: {sf.error}" for sf in session_failed[:3])
+        )
+
+    log.info("Realistic suite complete", extra={
+        "suite": SUITE,
+        "total_runners": cfg.total_runners,
+        "peak_concurrent": peak_concurrent,
+    })
+
+
+# ===========================================================================
 # SUITE: cleanup
 # ===========================================================================
 
@@ -1749,7 +2105,7 @@ def _parse_args() -> argparse.Namespace:
         default="all",
         choices=["all", "health", "configs", "builds", "snapshots",
                  "runners", "session", "quarantine", "fleet", "canary",
-                 "edge", "concurrency"],
+                 "edge", "concurrency", "realistic"],
         help="Which test suite to run (default: all)",
     )
     p.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
@@ -1764,6 +2120,48 @@ def _parse_args() -> argparse.Namespace:
         default=5,
         metavar="N",
         help="Number of parallel workers per concurrency scenario (default: 5)",
+    )
+    p.add_argument(
+        "--realistic-runners",
+        type=int,
+        default=30,
+        metavar="N",
+        help="Total runners to spawn in realistic suite (default: 30)",
+    )
+    p.add_argument(
+        "--realistic-arrival-rate",
+        type=float,
+        default=2.0,
+        metavar="RATE",
+        help="Runners per second (Poisson λ) in realistic suite (default: 2.0)",
+    )
+    p.add_argument(
+        "--realistic-lifetime-mean",
+        type=float,
+        default=15.0,
+        metavar="SECS",
+        help="Mean runner lifetime in seconds (log-normal) (default: 15.0)",
+    )
+    p.add_argument(
+        "--realistic-session-pct",
+        type=float,
+        default=0.3,
+        metavar="PCT",
+        help="Fraction of runners that are session-type (default: 0.3)",
+    )
+    p.add_argument(
+        "--realistic-max-concurrent",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Max concurrent runners (semaphore cap) in realistic suite (default: 20)",
+    )
+    p.add_argument(
+        "--realistic-steady-seconds",
+        type=float,
+        default=60.0,
+        metavar="SECS",
+        help="Duration of steady-state phase in realistic suite (default: 60.0)",
     )
     return p.parse_args()
 
@@ -1854,6 +2252,26 @@ def main() -> int:
                 log,
                 leaf_workload_key=FIXED_WORKLOAD_KEY,
                 width=args.concurrency_width,
+            )
+
+        # -- Realistic --
+        if _run("realistic"):
+            rcfg = RealisticConfig(
+                total_runners=args.realistic_runners,
+                arrival_rate=args.realistic_arrival_rate,
+                lifetime_mean=args.realistic_lifetime_mean,
+                lifetime_stddev=5.0,
+                session_pct=args.realistic_session_pct,
+                max_concurrent=args.realistic_max_concurrent,
+                steady_seconds=args.realistic_steady_seconds,
+            )
+            suite_realistic(
+                args.base_url,
+                args.token or None,
+                run,
+                log,
+                leaf_workload_key=FIXED_WORKLOAD_KEY,
+                cfg=rcfg,
             )
 
         # -- Cleanup --
