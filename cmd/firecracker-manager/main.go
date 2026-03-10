@@ -481,8 +481,11 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			instruments.diskReads.Record(ctx, int64(cs.TotalDiskReads))
 			instruments.diskWrites.Record(ctx, int64(cs.TotalDiskWrites))
 			instruments.dirtyChunks.Record(ctx, int64(cs.TotalDirtyChunks))
-			if cs.TotalPageFaults > 0 {
-				instruments.cacheHitRatio.Record(ctx, float64(cs.TotalCacheHits)/float64(cs.TotalPageFaults))
+			// Compute cache hit ratio from the ChunkStore LRU stats, which
+			// persist across handler lifetimes (handler-level CacheHits is
+			// always 0 since page-level caching was removed).
+			if totalLookups := cs.MemCacheHits + cs.MemCacheMisses; totalLookups > 0 {
+				instruments.cacheHitRatio.Record(ctx, float64(cs.MemCacheHits)/float64(totalLookups))
 			}
 		}
 	}

@@ -60,6 +60,8 @@ type ChunkedStats struct {
 	MemCacheSize      int64
 	MemCacheMaxSize   int64
 	MemCacheItems     int
+	MemCacheHits      uint64
+	MemCacheMisses    uint64
 	TotalPageFaults   uint64
 	TotalCacheHits    uint64
 	TotalChunkFetches uint64

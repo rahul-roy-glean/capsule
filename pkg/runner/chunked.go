@@ -1117,6 +1117,11 @@ func (cm *ChunkedManager) GetChunkedStats() ChunkedStats {
 		stats.MemCacheSize = s.Size
 		stats.MemCacheMaxSize = s.MaxSize
 		stats.MemCacheItems = s.ItemCount
+		// Derive cache hit ratio from the ChunkStore LRU, which persists
+		// across handler lifetimes.  Handler-level CacheHits is always 0
+		// since page-level caching was removed in favor of chunk-level LRU.
+		stats.MemCacheHits = uint64(s.Hits)
+		stats.MemCacheMisses = uint64(s.Misses)
 	}
 
 	for _, handler := range cm.uffdHandlers {
@@ -1155,6 +1160,8 @@ type ChunkedStats struct {
 	MemCacheSize    int64
 	MemCacheMaxSize int64
 	MemCacheItems   int
+	MemCacheHits    uint64 // chunk-level LRU hits (persistent across handler lifetimes)
+	MemCacheMisses  uint64 // chunk-level LRU misses
 
 	// UFFD stats (aggregated across all runners)
 	TotalPageFaults   uint64

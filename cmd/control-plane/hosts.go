@@ -263,7 +263,8 @@ func (hr *HostRegistry) GetAllHosts() []*Host {
 
 	hosts := make([]*Host, 0, len(hr.hosts))
 	for _, h := range hr.hosts {
-		hosts = append(hosts, h)
+		cp := *h
+		hosts = append(hosts, &cp)
 	}
 	return hosts
 }

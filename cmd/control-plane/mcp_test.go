@@ -197,9 +197,12 @@ func TestHandleRelease_NotFound(t *testing.T) {
 	deps := newTestMCPDeps()
 
 	ctx := context.Background()
-	_, _, err := deps.handleRelease(ctx, nil, ReleaseSandboxInput{SandboxID: "nonexistent"})
-	if err == nil {
-		t.Fatal("expected error for nonexistent sandbox")
+	_, out, err := deps.handleRelease(ctx, nil, ReleaseSandboxInput{SandboxID: "nonexistent"})
+	if err != nil {
+		t.Fatalf("release of nonexistent runner should be idempotent, got error: %v", err)
+	}
+	if !out.Success {
+		t.Fatal("expected success=true for idempotent release")
 	}
 }
 

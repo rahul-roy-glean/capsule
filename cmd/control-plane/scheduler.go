@@ -420,16 +420,17 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		return nil, retErr
 	}
 
-	candidateHosts := available
-	var eligible []*Host
+	var candidateHosts []*Host
 	for _, h := range available {
 		usedCPU, usedMem := s.hostRegistry.effectiveUsageLocked(h)
 		if canFitWorkloadWithUsage(h, usedCPU, usedMem, tier) {
-			eligible = append(eligible, h)
+			candidateHosts = append(candidateHosts, h)
 		}
 	}
-	if len(eligible) > 0 {
-		candidateHosts = eligible
+	if len(candidateHosts) == 0 {
+		s.hostRegistry.mu.Unlock()
+		retErr = fmt.Errorf("no host with sufficient capacity for tier %s (need %d CPU, %d MB memory)", tierName, effectiveCPU, effectiveMemoryMB)
+		return nil, retErr
 	}
 
 	if sessionHostID != "" {
@@ -590,8 +591,20 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		}
 	}
 
-	// Call host agent to allocate runner
-	resp, err := client.AllocateRunner(ctx, protoReq)
+	// Call host agent to allocate runner with a timeout so a slow host
+	// doesn't block the caller indefinitely during bursts.
+	allocStart := time.Now()
+	grpcCtx, grpcCancel := context.WithTimeout(ctx, 30*time.Second)
+	resp, err := client.AllocateRunner(grpcCtx, protoReq)
+	grpcCancel()
+	allocDuration := time.Since(allocStart)
+	if allocDuration > 5*time.Second {
+		s.logger.WithFields(logrus.Fields{
+			"host":        host.InstanceName,
+			"duration_ms": allocDuration.Milliseconds(),
+			"request_id":  req.RequestID,
+		}).Warn("Slow runner allocation on host agent")
+	}
 	if err != nil {
 		s.hostRegistry.releasePendingReservation(host.ID, effectiveCPU, effectiveMemoryMB)
 		s.logger.WithError(err).WithField("host", host.InstanceName).Error("gRPC AllocateRunner failed")
@@ -728,25 +741,39 @@ func (s *Scheduler) scoreHostWithUsage(h *Host, usedCPU, usedMem int) float64 {
 		score += 20
 	}
 
+	// Penalize hosts with many pending (in-flight) allocations to spread
+	// burst load across hosts instead of queueing on one host agent.
+	if h.PendingCPUMillicores > 0 && h.TotalCPUMillicores > 0 {
+		pendingFraction := float64(h.PendingCPUMillicores) / float64(h.TotalCPUMillicores)
+		score -= pendingFraction * 30
+	}
+
 	return score
 }
 
-// ReleaseRunner releases a runner
+// ReleaseRunner releases a runner. The operation is idempotent: releasing a
+// runner that has already been removed returns nil so callers don't see 500s
+// on retries or concurrent release attempts.
 func (s *Scheduler) ReleaseRunner(ctx context.Context, runnerID string, destroy bool) error {
 	s.logger.WithFields(logrus.Fields{
 		"runner_id": runnerID,
 		"destroy":   destroy,
 	}).Info("Releasing runner")
 
-	// Get runner's host from registry
+	// Get runner's host from registry. If the runner is already gone, the
+	// release is a no-op (idempotent).
 	runner, err := s.hostRegistry.GetRunner(runnerID)
 	if err != nil {
-		return err
+		s.logger.WithField("runner_id", runnerID).Debug("Runner already removed from registry, release is no-op")
+		return nil
 	}
 
 	host, err := s.hostRegistry.GetHost(runner.HostID)
 	if err != nil {
-		return err
+		// Host gone — clean up the orphaned runner record and return success.
+		s.logger.WithField("runner_id", runnerID).Debug("Host gone, cleaning up orphaned runner")
+		_ = s.hostRegistry.RemoveRunner(runnerID)
+		return nil
 	}
 
 	// Connect to host and release
@@ -763,8 +790,13 @@ func (s *Scheduler) ReleaseRunner(ctx context.Context, runnerID string, destroy 
 	if err != nil {
 		return fmt.Errorf("host agent ReleaseRunner failed: %w", err)
 	}
+	// If the host agent says the runner is already gone, that's fine —
+	// still clean up our own registry below.
 	if resp.Error != "" {
-		return fmt.Errorf("host agent returned error: %s", resp.Error)
+		s.logger.WithFields(logrus.Fields{
+			"runner_id": runnerID,
+			"error":     resp.Error,
+		}).Warn("Host agent reported error during release, cleaning up registry")
 	}
 
 	// Update registry

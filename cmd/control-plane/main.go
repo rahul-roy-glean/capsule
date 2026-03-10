@@ -440,7 +440,7 @@ func main() {
 
 	// Start background workers
 	go hostRegistry.HealthCheckLoop(ctx)
-	go startDownscaler(ctx, db, hostRegistry, scheduler, logger)
+	go startDownscaler(ctx, db, hostRegistry, logger)
 	go jobQueue.jobRetryLoop(ctx)
 	go controlPlaneServer.startTTLEnforcement(ctx)
 	go layerBuildScheduler.Run(ctx)
@@ -784,7 +784,15 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 	if err != nil {
 		s.logger.WithError(err).Error("Manual allocation failed")
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
+		// Return 429 for transient capacity errors so clients can retry
+		// with backoff, and 503 for other failures.
+		if strings.Contains(err.Error(), "no host with sufficient capacity") ||
+			strings.Contains(err.Error(), "no available hosts") {
+			w.Header().Set("Retry-After", "2")
+			w.WriteHeader(http.StatusTooManyRequests)
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"error": err.Error(),
 		})
