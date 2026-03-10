@@ -26,6 +26,7 @@ type downscalerConfig struct {
 	ScaleUpThreshold     float64
 	ScaleDownThreshold   float64
 	Cooldown             time.Duration
+	BootCooldown         time.Duration // cooldown after demand-driven scale-up (host boot time)
 }
 
 func loadDownscalerConfig(logger *logrus.Entry) downscalerConfig {
@@ -92,6 +93,13 @@ func loadDownscalerConfig(logger *logrus.Entry) downscalerConfig {
 		}
 	}
 
+	bootCooldown := 3 * time.Minute
+	if raw := strings.TrimSpace(os.Getenv("AUTOSCALER_BOOT_COOLDOWN")); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			bootCooldown = d
+		}
+	}
+
 	return downscalerConfig{
 		Enabled:              enabled,
 		ProjectID:            projectID,
@@ -104,6 +112,7 @@ func loadDownscalerConfig(logger *logrus.Entry) downscalerConfig {
 		ScaleUpThreshold:     scaleUpThreshold,
 		ScaleDownThreshold:   scaleDownThreshold,
 		Cooldown:             cooldown,
+		BootCooldown:         bootCooldown,
 	}
 }
 
@@ -359,9 +368,19 @@ func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, mc migClient, h
 
 	allocFailures := hs.DrainAllocFailures()
 
-	// Demand-driven scale-up bypasses cooldown
+	// Demand-driven scale-up uses a shorter boot cooldown to give the new
+	// host time to start and register before we scale up again.
 	demandDriven := allocFailures > 0 || len(readyHosts) == 0
-	if !demandDriven {
+	if demandDriven {
+		if !lastScaleAction.IsZero() && time.Since(lastScaleAction) < cfg.BootCooldown {
+			log.WithFields(logrus.Fields{
+				"since_last_scale": time.Since(lastScaleAction).Round(time.Second),
+				"boot_cooldown":    cfg.BootCooldown,
+				"alloc_failures":   allocFailures,
+			}).Debug("Demand-driven scale-up suppressed: waiting for new host to boot")
+			return false, nil
+		}
+	} else {
 		// Normal cooldown check — only for utilization-based decisions
 		if !lastScaleAction.IsZero() && time.Since(lastScaleAction) < cfg.Cooldown {
 			return false, nil

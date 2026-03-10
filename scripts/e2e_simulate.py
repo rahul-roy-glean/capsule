@@ -1299,15 +1299,53 @@ def suite_concurrency(
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=60)
+            t.join(timeout=120)
 
         while len(results) < n:
-            results.append((False, "worker timed out after 60s", False))
+            results.append((False, "worker timed out after 120s", False))
         return results
 
     def _is_capacity_error(msg: str) -> bool:
-        """Return True if an error is a clean capacity/resource-exhaustion 503."""
-        return "no available hosts" in msg or "503" in msg
+        """Return True if an error is a clean capacity/resource-exhaustion 429/503."""
+        return any(s in msg for s in (
+            "no available hosts",
+            "no host with sufficient capacity",
+            "503",
+            "429",
+        ))
+
+    # Shared list for tracking per-runner allocation latencies across tests.
+    _alloc_latencies: list[tuple[str, float]] = []  # (test_name, seconds)
+
+    def _allocate_with_retry(
+        client: Any,
+        workload_key: str,
+        request_id: str,
+        *,
+        max_retries: int = 5,
+        initial_backoff: float = 2.0,
+        session_id: str | None = None,
+    ) -> Any:
+        """Allocate a runner with exponential backoff on 429/503.
+
+        Returns the allocate response on success.
+        Raises the last exception after exhausting retries.
+        """
+        backoff = initial_backoff
+        last_exc: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                return client.runners.allocate(
+                    workload_key,
+                    request_id=request_id,
+                    session_id=session_id,
+                )
+            except BFServiceUnavailable as exc:
+                last_exc = exc
+                if attempt < max_retries:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 1.5, 15.0)
+        raise last_exc  # type: ignore[misc]
 
     def _assert_workers(
         test_name: str,
@@ -1369,10 +1407,12 @@ def suite_concurrency(
         client = _make_client(base_url, token)
         try:
             barrier.wait()
-            resp = client.runners.allocate(
-                leaf_workload_key,
+            t0 = time.monotonic()
+            resp = _allocate_with_retry(
+                client, leaf_workload_key,
                 request_id=f"e2e-burst-{uuid.uuid4().hex[:12]}",
             )
+            _alloc_latencies.append(("allocate_burst", time.monotonic() - t0))
             allocated_ids.append(resp.runner_id)
             to_release_after.append(resp.runner_id)
             return True, resp.runner_id, True
@@ -1415,10 +1455,12 @@ def suite_concurrency(
         runner_id: str | None = None
         try:
             barrier.wait()
-            resp = client.runners.allocate(
-                leaf_workload_key,
+            t0 = time.monotonic()
+            resp = _allocate_with_retry(
+                client, leaf_workload_key,
                 request_id=f"e2e-lc-{wid}-{uuid.uuid4().hex[:8]}",
             )
+            _alloc_latencies.append(("lifecycle", time.monotonic() - t0))
             runner_id = resp.runner_id
             status = client.runners.status(runner_id)
             valid = {"ready", "pending", "unavailable", "suspended", "quarantined"}
@@ -1459,11 +1501,13 @@ def suite_concurrency(
         try:
             sess_id = uuid.uuid4().hex
             barrier.wait()
-            resp = client.runners.allocate(
-                leaf_workload_key,
+            t0 = time.monotonic()
+            resp = _allocate_with_retry(
+                client, leaf_workload_key,
                 request_id=f"e2e-sess-{wid}-{uuid.uuid4().hex[:8]}",
                 session_id=sess_id,
             )
+            _alloc_latencies.append(("session_lifecycle", time.monotonic() - t0))
             runner_id = resp.runner_id
 
             pause = client.runners.pause(runner_id)
@@ -1676,10 +1720,12 @@ def suite_concurrency(
         client = _make_client(base_url, token)
         runner_id: str | None = None
         try:
-            resp = client.runners.allocate(
-                leaf_workload_key,
+            t0 = time.monotonic()
+            resp = _allocate_with_retry(
+                client, leaf_workload_key,
                 request_id=f"e2e-storm-{wid}-{uuid.uuid4().hex[:8]}",
             )
+            _alloc_latencies.append(("mixed_storm", time.monotonic() - t0))
             runner_id = resp.runner_id
 
             try:
@@ -1727,6 +1773,24 @@ def suite_concurrency(
     storm_results = _run_workers("mixed_storm", _mixed_worker)
     _assert_workers("Mixed operation storm", storm_results)
 
+
+    # Log allocation latency summary
+    if _alloc_latencies:
+        by_test: dict[str, list[float]] = {}
+        for name, lat in _alloc_latencies:
+            by_test.setdefault(name, []).append(lat)
+        for name, lats in sorted(by_test.items()):
+            lats.sort()
+            p50 = lats[len(lats) // 2]
+            p99 = lats[int(len(lats) * 0.99)]
+            log.info("Allocation latency", extra={
+                "test": name,
+                "count": len(lats),
+                "p50_s": f"{p50:.2f}",
+                "p99_s": f"{p99:.2f}",
+                "max_s": f"{max(lats):.2f}",
+                "min_s": f"{min(lats):.2f}",
+            })
 
     log.info("Concurrency suite complete", extra={
         "suite": SUITE,

@@ -399,6 +399,7 @@ func defaultTestConfig() downscalerConfig {
 		ScaleUpThreshold:     0.9,
 		ScaleDownThreshold:   0.5,
 		Cooldown:             5 * time.Minute,
+		BootCooldown:         3 * time.Minute,
 	}
 }
 
@@ -722,33 +723,45 @@ func TestComputeAutoscaleDecision_AllocFailuresTakePriority(t *testing.T) {
 	}
 }
 
-func TestRunDownscaleOnce_DemandDrivenBypassesCooldown(t *testing.T) {
+func TestRunDownscaleOnce_DemandDrivenRespectsBootCooldown(t *testing.T) {
 	now := time.Now()
+
+	// Case 1: Within boot cooldown (1 min < 3 min) → suppressed
 	hosts := []*Host{
 		{ID: "1", InstanceName: "h1", Status: "ready", TotalCPUMillicores: 1000, UsedCPUMillicores: 300, CreatedAt: now.Add(-2 * time.Hour), LastHeartbeat: now},
 	}
-
 	mc := &mockMIGClient{targetSize: 1, instances: map[string]string{"h1": "url/h1"}}
 	hs := newMockHostStore(hosts)
-	hs.allocFailures = 2 // simulate allocation failures
+	hs.allocFailures = 2
 	log := newTestLogger().WithField("test", true)
 
-	// Last action was 1 minute ago, cooldown is 5 minutes → normally would skip.
-	// But demand-driven should bypass cooldown.
 	lastAction := now.Add(-1 * time.Minute)
 	acted, err := runDownscaleOnce(context.Background(), defaultTestConfig(), mc, hs, lastAction, log)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !acted {
-		t.Fatal("expected action taken despite cooldown (demand-driven bypass)")
+	if acted {
+		t.Fatal("expected demand-driven suppressed within boot cooldown")
 	}
-	if mc.resizedTo != 2 {
-		t.Fatalf("expected MIG resized to 2, got %d", mc.resizedTo)
+
+	// Case 2: After boot cooldown (4 min > 3 min) but within normal cooldown → proceeds
+	mc2 := &mockMIGClient{targetSize: 1, instances: map[string]string{"h1": "url/h1"}}
+	hs2 := newMockHostStore(hosts)
+	hs2.allocFailures = 2
+	lastAction2 := now.Add(-4 * time.Minute)
+	acted2, err2 := runDownscaleOnce(context.Background(), defaultTestConfig(), mc2, hs2, lastAction2, log)
+	if err2 != nil {
+		t.Fatalf("unexpected error: %v", err2)
+	}
+	if !acted2 {
+		t.Fatal("expected demand-driven to proceed after boot cooldown expired")
+	}
+	if mc2.resizedTo != 2 {
+		t.Fatalf("expected MIG resized to 2, got %d", mc2.resizedTo)
 	}
 }
 
-func TestRunDownscaleOnce_ZeroReadyHostsBypassesCooldown(t *testing.T) {
+func TestRunDownscaleOnce_ZeroReadyHostsRespectsBootCooldown(t *testing.T) {
 	now := time.Now()
 	// No ready hosts (all draining)
 	hosts := []*Host{
@@ -759,17 +772,28 @@ func TestRunDownscaleOnce_ZeroReadyHostsBypassesCooldown(t *testing.T) {
 	hs := newMockHostStore(hosts)
 	log := newTestLogger().WithField("test", true)
 
-	// Last action was 1 minute ago, cooldown is 5 minutes → normally would skip.
-	// But zero ready hosts should bypass cooldown.
+	// Within boot cooldown → suppressed
 	lastAction := now.Add(-1 * time.Minute)
 	acted, err := runDownscaleOnce(context.Background(), defaultTestConfig(), mc, hs, lastAction, log)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !acted {
-		t.Fatal("expected action taken despite cooldown (zero ready hosts bypass)")
+	if acted {
+		t.Fatal("expected suppressed within boot cooldown even with zero ready hosts")
 	}
-	if mc.resizedTo != 2 {
-		t.Fatalf("expected MIG resized to 2, got %d", mc.resizedTo)
+
+	// After boot cooldown → proceeds
+	mc2 := &mockMIGClient{targetSize: 1, instances: map[string]string{"h1": "url/h1"}}
+	hs2 := newMockHostStore(hosts)
+	lastAction2 := now.Add(-4 * time.Minute)
+	acted2, err2 := runDownscaleOnce(context.Background(), defaultTestConfig(), mc2, hs2, lastAction2, log)
+	if err2 != nil {
+		t.Fatalf("unexpected error: %v", err2)
+	}
+	if !acted2 {
+		t.Fatal("expected action after boot cooldown expired with zero ready hosts")
+	}
+	if mc2.resizedTo != 2 {
+		t.Fatalf("expected MIG resized to 2, got %d", mc2.resizedTo)
 	}
 }
