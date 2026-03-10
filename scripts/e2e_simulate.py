@@ -1281,6 +1281,7 @@ def suite_concurrency(
         name: str,
         worker_fn: Any,  # (worker_id: int, barrier: Barrier) -> tuple[bool, str, bool]
         n: int = width,
+        join_timeout: int = 120,
     ) -> list[tuple[bool, str, bool]]:
         """
         Returns list of (passed, detail, did_real_work) per worker.
@@ -1300,10 +1301,10 @@ def suite_concurrency(
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=120)
+            t.join(timeout=join_timeout)
 
         while len(results) < n:
-            results.append((False, "worker timed out after 120s", False))
+            results.append((False, f"worker timed out after {join_timeout}s", False))
         return results
 
     def _is_capacity_error(msg: str) -> bool:
@@ -1500,7 +1501,10 @@ def suite_concurrency(
     _free_slots(width)
 
     def _session_worker(wid: int, barrier: Barrier) -> tuple[bool, str, bool]:
-        client = _make_client(base_url, token)
+        # Session operations (pause, connect) involve GCS snapshot uploads/
+        # downloads that can take >30s under concurrent load. Use a longer
+        # timeout to avoid spurious timeouts that trigger duplicate work.
+        client = BFClient(base_url=base_url, token=token, timeout=120.0)
         runner_id: str | None = None
         try:
             sess_id = uuid.uuid4().hex
@@ -1546,7 +1550,7 @@ def suite_concurrency(
                     pass
             client.close()
 
-    sess_results = _run_workers("session_lifecycle", _session_worker)
+    sess_results = _run_workers("session_lifecycle", _session_worker, join_timeout=300)
     _assert_workers("Concurrent session lifecycle (alloc→pause→resume→release)", sess_results)
 
     # ---------------------------------------------------------------

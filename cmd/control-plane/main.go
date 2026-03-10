@@ -974,7 +974,13 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 	defer conn.Close()
 
 	client := pb.NewHostAgentClient(conn)
-	resp, err := client.PauseRunner(r.Context(), &pb.PauseRunnerRequest{RunnerId: req.RunnerID})
+	// Use a detached context with a generous timeout so the GCS upload
+	// inside PauseRunner completes even if the HTTP client disconnects.
+	// The default SDK timeout is 30s, but pause involves diff snapshot +
+	// GCS chunk upload which can exceed that.
+	pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer pauseCancel()
+	resp, err := client.PauseRunner(pauseCtx, &pb.PauseRunnerRequest{RunnerId: req.RunnerID})
 	if err != nil {
 		http.Error(w, "pause failed: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -992,7 +998,7 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 		if runner.NetworkPolicyJSON != "" {
 			networkPolicy = runner.NetworkPolicyJSON
 		}
-		if _, dbErr := s.scheduler.db.ExecContext(r.Context(), `
+		if _, dbErr := s.scheduler.db.ExecContext(pauseCtx, `
 			INSERT INTO session_snapshots (
 				session_id, runner_id, workload_key, host_id, status, layer_count, paused_at,
 				runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
@@ -1105,7 +1111,11 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 		if sessionNPJSON.Valid {
 			resumeReq.NetworkPolicyJson = sessionNPJSON.String
 		}
-		resp, err := client.ResumeRunner(r.Context(), resumeReq)
+		// Use a detached context so the GCS-backed resume completes even if
+		// the HTTP client disconnects (same rationale as HandlePauseRunner).
+		resumeCtx, resumeCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer resumeCancel()
+		resp, err := client.ResumeRunner(resumeCtx, resumeReq)
 		if err != nil || resp.Error != "" {
 			var errMsg string
 			if err != nil {

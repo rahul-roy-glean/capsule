@@ -252,7 +252,11 @@ class HttpClient:
 
             except httpx.TimeoutException as exc:
                 last_exc = exc
-                if attempt < _MAX_RETRIES - 1:
+                # Only retry timeouts for idempotent methods. Retrying a
+                # POST/DELETE timeout is dangerous: the server may have
+                # received the request and started processing it, so a
+                # retry would create a duplicate operation.
+                if method == "GET" and attempt < _MAX_RETRIES - 1:
                     self._backoff(attempt)
                     continue
                 raise BFTimeoutError(str(exc)) from exc

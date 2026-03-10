@@ -233,7 +233,12 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 		newMemIndex, err := uploader.MergeAndUploadMem(ctx, memDiffFile, baseMemIndex)
 		mergeDuration := time.Since(mergeStart)
 		if err != nil {
-			m.logger.WithError(err).Warn("GCS mem chunk upload failed; falling back to local-only session")
+			// In chunked mode, local-only fallback won't work (no rootfs.img or
+			// snapshot.mem on disk), so a GCS upload failure is fatal for the pause.
+			m.mu.Lock()
+			runner.State = StateIdle
+			m.mu.Unlock()
+			return nil, fmt.Errorf("failed to upload session memory chunks to GCS: %w", err)
 		} else {
 			m.logger.WithField("merge_upload_ms", mergeDuration.Milliseconds()).Info("Pause: MergeAndUploadMem complete")
 			// Attach prefetch mapping from UFFD handler if available.
@@ -247,7 +252,11 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 			vmStateGCSPath := uploader.FullGCSPath(gcsBase + "/snapshot.state")
 
 			if uploadErr := uploader.UploadVMState(ctx, stateFile, vmStateGCSPath); uploadErr != nil {
-				m.logger.WithError(uploadErr).Warn("GCS vmstate upload failed; falling back to local-only session")
+				// In chunked mode, local-only fallback won't work — fail the pause.
+				m.mu.Lock()
+				runner.State = StateIdle
+				m.mu.Unlock()
+				return nil, fmt.Errorf("failed to upload VM state to GCS: %w", uploadErr)
 			} else {
 				// Upload dirty FUSE extension disk chunks if available (per-drive).
 				newExtDiskIndexes := map[string]*snapshot.ChunkIndex{}
@@ -388,7 +397,11 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 				}
 
 				if writeErr := uploader.WriteManifestWithExtensions(ctx, gcsBase, man, newMemIndex, allDiskIndexes); writeErr != nil {
-					m.logger.WithError(writeErr).Warn("GCS manifest write failed; falling back to local-only session")
+					// In chunked mode, local-only fallback won't work — fail the pause.
+					m.mu.Lock()
+					runner.State = StateIdle
+					m.mu.Unlock()
+					return nil, fmt.Errorf("failed to write session manifest to GCS: %w", writeErr)
 				} else {
 					metadata.GCSManifestPath = uploader.FullGCSPath(gcsBase + "/snapshot_manifest.json")
 					metadata.GCSMemIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
@@ -607,7 +620,7 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 
 		newMemIndex, err := uploader.MergeAndUploadMem(ctx, memDiffFile, baseMemIndex)
 		if err != nil {
-			m.logger.WithError(err).Warn("Checkpoint: GCS mem chunk upload failed")
+			return nil, fmt.Errorf("checkpoint: failed to upload memory chunks to GCS: %w", err)
 		} else {
 			// Attach prefetch mapping from UFFD handler if available.
 			if handler, ok := m.uffdHandlers[runnerID].(*uffd.Handler); ok {
@@ -619,7 +632,7 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 
 			vmStateGCSPath := uploader.FullGCSPath(gcsBase + "/snapshot.state")
 			if uploadErr := uploader.UploadVMState(ctx, stateFile, vmStateGCSPath); uploadErr != nil {
-				m.logger.WithError(uploadErr).Warn("Checkpoint: GCS vmstate upload failed")
+				return nil, fmt.Errorf("checkpoint: failed to upload VM state to GCS: %w", uploadErr)
 			} else {
 				// Upload extension disk chunks
 				newExtDiskIndexes := map[string]*snapshot.ChunkIndex{}
@@ -742,7 +755,7 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 				}
 
 				if writeErr := uploader.WriteManifestWithExtensions(ctx, gcsBase, man, newMemIndex, allDiskIndexes); writeErr != nil {
-					m.logger.WithError(writeErr).Warn("Checkpoint: GCS manifest write failed")
+					return nil, fmt.Errorf("checkpoint: failed to write manifest to GCS: %w", writeErr)
 				} else {
 					metadata.GCSManifestPath = uploader.FullGCSPath(gcsBase + "/snapshot_manifest.json")
 					metadata.GCSMemIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
@@ -1029,15 +1042,24 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 			"gcs_vmstate": man.Firecracker.VMStateObject,
 			"rootfs":      overlayPath,
 		}).Info("Resuming from GCS-backed session (UFFD chunked)")
+	} else if m.sessionMemStore != nil {
+		// Chunked mode but no GCS manifest — the GCS upload during pause must
+		// have failed. Local resume is not possible in chunked mode because
+		// rootfs.img and snapshot.mem are not stored locally.
+		m.mu.Lock()
+		m.cleanupNetworkOnly(runnerID, tap.Name)
+		m.mu.Unlock()
+		return nil, fmt.Errorf("session %s has no GCS manifest (GCS upload likely failed during pause); "+
+			"local resume is not supported in chunked mode", sessionID)
 	} else {
-		// Local fallback: LayeredHandler uses golden snapshot.mem on this host.
-		// Full snapshot paths (including rootfs, mem) are required for local resume.
-		snapshotPaths, spErr := m.snapshotCache.GetSnapshotPaths()
-		if spErr != nil {
+		// Local fallback (non-chunked mode): LayeredHandler uses golden
+		// snapshot.mem on this host.
+		goldenMemPath := filepath.Join(m.config.SnapshotCachePath, "snapshot.mem")
+		if _, err := os.Stat(goldenMemPath); err != nil {
 			m.mu.Lock()
 			m.cleanupNetworkOnly(runnerID, tap.Name)
 			m.mu.Unlock()
-			return nil, fmt.Errorf("failed to get snapshot paths for local resume: %w", spErr)
+			return nil, fmt.Errorf("golden snapshot.mem not found for local resume: %w", err)
 		}
 
 		// Build diff layer paths (oldest first).
@@ -1053,7 +1075,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 
 		layeredHandler, handlerErr := uffd.NewLayeredHandler(uffd.LayeredHandlerConfig{
 			SocketPath:       uffdSocketPath,
-			GoldenMemPath:    snapshotPaths.Mem,
+			GoldenMemPath:    goldenMemPath,
 			DiffLayers:       diffLayers,
 			Logger:           m.logger.Logger,
 			FaultConcurrency: 32,
