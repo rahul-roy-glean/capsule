@@ -687,7 +687,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
 			return nil, fmt.Errorf("failed to create auth proxy: %w", proxyErr)
 		}
-		if startErr := proxy.Start(ctx); startErr != nil {
+		if startErr := proxy.Start(context.Background()); startErr != nil {
 			vm.Stop()
 			cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, uffdHandler)
 			return nil, fmt.Errorf("failed to start auth proxy: %w", startErr)

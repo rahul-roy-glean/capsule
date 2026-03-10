@@ -283,7 +283,7 @@ header "6. Verify proxy responds to HTTP CONNECT"
 # Send a raw CONNECT request to the proxy and check it responds.
 # We use /dev/tcp to make a TCP connection and send raw HTTP.
 # The proxy should respond with 200 (for allowed host) or 403 (for blocked host).
-CONNECT_TEST=$(vm_exec "$RUNNER_ID" "[\"bash\",\"-c\",\"echo -e 'CONNECT github.com:443 HTTP/1.1\\\\r\\\\nHost: github.com:443\\\\r\\\\n\\\\r\\\\n' | timeout 3 nc 172.16.0.1 3128 2>/dev/null | head -1 || echo CONNECT_FAIL\"]")
+CONNECT_TEST=$(vm_exec "$RUNNER_ID" "[\"bash\",\"-c\",\"exec 3<>/dev/tcp/172.16.0.1/3128; echo -e 'CONNECT github.com:443 HTTP/1.1\\\\r\\\\nHost: github.com:443\\\\r\\\\n\\\\r\\\\n' >&3; read -t 3 resp <&3; echo \\\"\$resp\\\"; exec 3>&- || echo CONNECT_FAIL\"]")
 if echo "$CONNECT_TEST" | grep -q "200"; then
   pass "Proxy responds 200 to CONNECT github.com:443"
 elif echo "$CONNECT_TEST" | grep -q "CONNECT_FAIL\|EXEC_PROXY_FAILED"; then
