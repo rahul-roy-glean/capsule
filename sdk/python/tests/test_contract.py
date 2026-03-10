@@ -27,7 +27,7 @@ def client(base_url: str, token: str) -> BFClient:
 
 @pytest.fixture
 def unauthenticated_client(base_url: str) -> BFClient:
-    with BFClient(base_url=base_url) as bf:
+    with BFClient(base_url=base_url, token="") as bf:
         yield bf
 
 

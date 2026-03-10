@@ -63,7 +63,7 @@ type Runner struct {
 	DynamicCIDRsAdded      int                    `json:"dynamic_cidrs_added,omitempty"`
 	EmergencyEgressBlocked bool                   `json:"emergency_egress_blocked,omitempty"`
 
-	PausedAt         time.Time  `json:"paused_at,omitempty"`
+	PausedAt time.Time `json:"paused_at,omitempty"`
 
 	// Session pause/resume fields
 	SessionID     string    `json:"session_id,omitempty"`
@@ -112,12 +112,12 @@ type AllocateRequest struct {
 type MMDSData struct {
 	Latest struct {
 		Meta struct {
-			RunnerID     string `json:"runner_id"`
-			HostID       string `json:"host_id"`
-			InstanceName string `json:"instance_name,omitempty"`
-			Environment  string `json:"environment"`
-			JobID        string `json:"job_id,omitempty"`
-			Mode         string `json:"mode,omitempty"`         // "warmup", "exec", or empty for normal runner
+			RunnerID     string            `json:"runner_id"`
+			HostID       string            `json:"host_id"`
+			InstanceName string            `json:"instance_name,omitempty"`
+			Environment  string            `json:"environment"`
+			JobID        string            `json:"job_id,omitempty"`
+			Mode         string            `json:"mode,omitempty"`         // "warmup", "exec", or empty for normal runner
 			CurrentTime  string            `json:"current_time,omitempty"` // RFC3339 timestamp from host for clock sync
 			Labels       map[string]string `json:"labels,omitempty"`
 		} `json:"meta"`
@@ -178,7 +178,7 @@ type HostConfig struct {
 	QuarantineDir string
 	// SessionDir is the base directory for session snapshot storage (pause/resume).
 	// Defaults to {SnapshotCachePath}/../sessions (e.g. /mnt/data/sessions).
-	SessionDir        string
+	SessionDir string
 	// WorkloadKey identifies which snapshot this host should use (hash of snapshot commands).
 	WorkloadKey      string
 	Environment      string

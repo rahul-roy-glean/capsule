@@ -79,14 +79,6 @@ func NewCache(ctx context.Context, cfg CacheConfig) (*Cache, error) {
 	return cache, nil
 }
 
-// gcsPath prepends the configured GCS prefix to a path.
-func (c *Cache) gcsPath(path string) string {
-	if c.gcsPrefix != "" {
-		return c.gcsPrefix + "/" + path
-	}
-	return path
-}
-
 // GetKernelPath returns the path to kernel.bin, verifying it exists.
 // Use this when only the kernel is needed (e.g. GCS-backed resume where
 // rootfs is provided via FUSE).

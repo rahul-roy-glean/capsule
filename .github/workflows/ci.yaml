@@ -140,7 +140,7 @@ jobs:
       - name: Pyright
         run: python -m pyright src/bf_sdk/
       - name: Pytest
-        run: python -m pytest tests/ -v --ignore=tests/e2e_live.py
+        run: python -m pytest tests/ -v --ignore=tests/e2e_live.py -m "not contract"
 
   workflow-lint:
     name: Workflow Lint
@@ -199,12 +199,10 @@ jobs:
             --db-user=postgres --db-password=postgres \
             --db-name=firecracker_runner \
             --api-auth-token=test-token > /tmp/control-plane.log 2>&1 &
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:8080/health && exit 0 || sleep 1
+          for _i in $(seq 1 30); do
+            curl -sf http://localhost:8080/health && break || sleep 1
           done
-          echo "Control plane failed to start"
-          cat /tmp/control-plane.log
-          exit 1
+          curl -sf http://localhost:8080/health || { echo "Control plane failed to start"; cat /tmp/control-plane.log; exit 1; }
       - name: Run contract tests
         run: |
           cd sdk/python
