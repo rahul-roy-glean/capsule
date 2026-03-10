@@ -250,20 +250,6 @@ func (m *mcpDeps) handlePause(ctx context.Context, _ *mcp.CallToolRequest, in Pa
 			runner.RunnerTTLSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy)
 	}
 
-	// Roll back resource reservation
-	if runner.ReservedCPU > 0 || runner.ReservedMemoryMB > 0 {
-		m.hostRegistry.mu.Lock()
-		host.UsedCPUMillicores -= runner.ReservedCPU
-		host.UsedMemoryMB -= runner.ReservedMemoryMB
-		if host.UsedCPUMillicores < 0 {
-			host.UsedCPUMillicores = 0
-		}
-		if host.UsedMemoryMB < 0 {
-			host.UsedMemoryMB = 0
-		}
-		m.hostRegistry.mu.Unlock()
-	}
-
 	_ = m.hostRegistry.RemoveRunner(in.SandboxID)
 
 	return nil, PauseSandboxOutput{

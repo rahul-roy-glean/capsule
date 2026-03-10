@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -391,6 +392,65 @@ func TestIdempotencyCleanup(t *testing.T) {
 	if _, ok := m.recentRequests["new-req"]; !ok {
 		t.Error("Fresh request should not have been cleaned up")
 	}
+}
+
+func TestIdempotentAllocationWaitsForLeader(t *testing.T) {
+	m := newTestManager()
+	m.recentRequests = make(map[string]*recentAllocation)
+
+	existing, alloc, leader := m.beginIdempotentAllocation("req-1")
+	if existing != nil {
+		t.Fatalf("unexpected existing runner: %+v", existing)
+	}
+	if !leader || alloc == nil {
+		t.Fatalf("expected leader allocation, got leader=%v alloc=%v", leader, alloc)
+	}
+
+	waitExisting, waitAlloc, waitLeader := m.beginIdempotentAllocation("req-1")
+	if waitExisting != nil {
+		t.Fatalf("unexpected existing runner for waiter: %+v", waitExisting)
+	}
+	if waitLeader || waitAlloc != alloc {
+		t.Fatalf("expected waiter to share inflight allocation, leader=%v sameAlloc=%v", waitLeader, waitAlloc == alloc)
+	}
+
+	runner := &Runner{ID: "runner-1", State: StateIdle}
+	m.runners[runner.ID] = runner
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		m.finishIdempotentAllocation("req-1", alloc, runner, nil)
+	}()
+
+	got, err := m.waitForIdempotentAllocation(context.Background(), "req-1", waitAlloc)
+	if err != nil {
+		t.Fatalf("waitForIdempotentAllocation() error = %v", err)
+	}
+	if got == nil || got.ID != runner.ID {
+		t.Fatalf("waitForIdempotentAllocation() = %+v, want %s", got, runner.ID)
+	}
+}
+
+func TestReserveAllocationSlotCountsPendingReservations(t *testing.T) {
+	m := newTestManager(func(m *Manager) {
+		m.config.MaxRunners = 1
+	})
+
+	if err := m.reserveAllocationSlot(); err != nil {
+		t.Fatalf("first reserveAllocationSlot() error = %v", err)
+	}
+	if m.CanAddRunner(0, 0) {
+		t.Fatal("CanAddRunner() should be false while a slot is reserved")
+	}
+	if err := m.reserveAllocationSlot(); err == nil {
+		t.Fatal("second reserveAllocationSlot() should fail at capacity")
+	}
+
+	m.releaseAllocationSlot()
+
+	if err := m.reserveAllocationSlot(); err != nil {
+		t.Fatalf("reserveAllocationSlot() after release error = %v", err)
+	}
+	m.releaseAllocationSlot()
 }
 
 func TestDrainBlocksAllocation(t *testing.T) {

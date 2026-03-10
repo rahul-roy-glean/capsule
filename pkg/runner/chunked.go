@@ -245,17 +245,26 @@ func (cm *ChunkedManager) getOrLoadManifest(ctx context.Context, workloadKey, ve
 }
 
 // AllocateRunnerChunked allocates a runner using chunked snapshots
-func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req AllocateRequest) (*Runner, error) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req AllocateRequest) (_ *Runner, retErr error) {
+	var idempotentAlloc *recentAllocation
+	var allocatedRunner *Runner
 
-	if cm.draining {
-		return nil, fmt.Errorf("host is draining")
+	if existing, alloc, leader := cm.beginIdempotentAllocation(req.RequestID); existing != nil {
+		return existing, nil
+	} else if !leader {
+		return cm.waitForIdempotentAllocation(ctx, req.RequestID, alloc)
+	} else {
+		idempotentAlloc = alloc
+		defer func() {
+			cm.finishIdempotentAllocation(req.RequestID, idempotentAlloc, allocatedRunner, retErr)
+		}()
 	}
 
-	if len(cm.runners) >= cm.config.MaxRunners {
-		return nil, fmt.Errorf("host at capacity: %d/%d runners", len(cm.runners), cm.config.MaxRunners)
+	if err := cm.reserveAllocationSlot(); err != nil {
+		retErr = err
+		return nil, retErr
 	}
+	defer cm.releaseAllocationSlot()
 
 	// Derive workload key — the request must always carry one (resolved upstream).
 	workloadKey := req.WorkloadKey
@@ -263,19 +272,26 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	// Get the appropriate manifest for this workload key
 	var meta *snapshot.ChunkedSnapshotMetadata
 	if cm.chunkStore != nil {
-		cm.mu.Unlock()
 		var err error
 		meta, err = cm.getOrLoadManifest(ctx, workloadKey, req.SnapshotVersion)
-		cm.mu.Lock()
 		if err != nil {
-			return nil, fmt.Errorf("failed to load manifest for workload key %q: %w", workloadKey, err)
+			retErr = fmt.Errorf("failed to load manifest for workload key %q: %w", workloadKey, err)
+			return nil, retErr
 		}
+	}
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.draining {
+		retErr = fmt.Errorf("host is draining")
+		return nil, retErr
 	}
 
 	// Check if we can use chunked restore
 	if meta == nil || cm.chunkStore == nil {
-		cm.mu.Unlock()
-		return nil, fmt.Errorf("chunked snapshots not available: meta=%v, chunkStore=%v", meta != nil, cm.chunkStore != nil)
+		retErr = fmt.Errorf("chunked snapshots not available: meta=%v, chunkStore=%v", meta != nil, cm.chunkStore != nil)
+		return nil, retErr
 	}
 
 	runnerID := uuid.New().String()
@@ -758,6 +774,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		"restore_time": restoreTime,
 	}).Info("Runner allocated with chunked snapshot")
 
+	allocatedRunner = runner
 	return runner, nil
 }
 

@@ -18,6 +18,8 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -56,6 +58,88 @@ var (
 	mcpPort      = flag.Int("mcp-port", 0, "MCP server port (0 = disabled)")
 	mcpAuthToken = flag.String("mcp-auth-token", "", "Bearer token for MCP authentication (or MCP_AUTH_TOKEN env var)")
 )
+
+type controlPlaneEndpointMetrics struct {
+	requests     metric.Int64Counter
+	requestDur   metric.Float64Histogram
+	requestSize  metric.Float64Histogram
+	responseSize metric.Float64Histogram
+	inflight     metric.Int64UpDownCounter
+}
+
+func newControlPlaneEndpointMetrics(meter metric.Meter) *controlPlaneEndpointMetrics {
+	requests, _ := fcrotel.NewCounter(meter, fcrotel.CPEndpointRequests)
+	requestDur, _ := fcrotel.NewHistogram(meter, fcrotel.CPEndpointRequestDuration)
+	requestSize, _ := fcrotel.NewHistogram(meter, fcrotel.CPEndpointRequestSize)
+	responseSize, _ := fcrotel.NewHistogram(meter, fcrotel.CPEndpointResponseSize)
+	inflight, _ := fcrotel.NewUpDownCounter(meter, fcrotel.CPEndpointRequestsInFlight)
+
+	return &controlPlaneEndpointMetrics{
+		requests:     requests,
+		requestDur:   requestDur,
+		requestSize:  requestSize,
+		responseSize: responseSize,
+		inflight:     inflight,
+	}
+}
+
+func instrumentControlPlaneEndpoint(route, operation string, metrics *controlPlaneEndpointMetrics, otelClient *fcrotel.Client, next http.Handler) http.Handler {
+	handler := otelhttp.WithRouteTag(route, otelhttp.NewHandler(
+		next,
+		operation,
+		otelhttp.WithTracerProvider(otelClient.TracerProvider),
+		otelhttp.WithMeterProvider(otelClient.MeterProvider),
+	))
+	handler = endpointMetricsMiddleware(route, metrics, handler)
+	return routeMetadataMiddleware(route, operation, handler)
+}
+
+func routeMetadataMiddleware(route, operation string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if recorder, ok := w.(interface{ SetRouteMetadata(string, string) }); ok {
+			recorder.SetRouteMetadata(route, operation)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func endpointMetricsMiddleware(route string, metrics *controlPlaneEndpointMetrics, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inflightAttrs := []attribute.KeyValue{
+			fcrotel.AttrRoute.String(route),
+			fcrotel.AttrMethod.String(r.Method),
+		}
+		metrics.inflight.Add(r.Context(), 1, metric.WithAttributes(inflightAttrs...))
+		defer metrics.inflight.Add(r.Context(), -1, metric.WithAttributes(inflightAttrs...))
+
+		rec := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+		requestSize := requestContentLength(r)
+		start := time.Now()
+		next.ServeHTTP(rec, r)
+
+		attrs := []attribute.KeyValue{
+			fcrotel.AttrRoute.String(route),
+			fcrotel.AttrMethod.String(r.Method),
+			fcrotel.AttrStatusCode.String(strconv.Itoa(rec.statusCode)),
+			fcrotel.AttrStatusClass.String(httpStatusClass(rec.statusCode)),
+		}
+		metrics.requests.Add(r.Context(), 1, metric.WithAttributes(attrs...))
+		metrics.requestDur.Record(r.Context(), time.Since(start).Seconds(), metric.WithAttributes(attrs...))
+		metrics.requestSize.Record(r.Context(), float64(requestSize), metric.WithAttributes(attrs...))
+		metrics.responseSize.Record(r.Context(), float64(rec.bytesWritten), metric.WithAttributes(attrs...))
+	})
+}
+
+func requestContentLength(r *http.Request) int64 {
+	if r.ContentLength < 0 {
+		return 0
+	}
+	return r.ContentLength
+}
+
+func httpStatusClass(statusCode int) string {
+	return fmt.Sprintf("%dxx", statusCode/100)
+}
 
 func main() {
 	flag.Parse()
@@ -182,6 +266,7 @@ func main() {
 	canarySuccessCounter, _ := fcrotel.NewCounter(meter, fcrotel.E2ECanarySuccess)
 	canaryFailureCounter, _ := fcrotel.NewCounter(meter, fcrotel.E2ECanaryFailure)
 	sessionResumeRoutingCounter, _ := fcrotel.NewCounter(meter, fcrotel.SessionResumeRouting)
+	endpointMetrics := newControlPlaneEndpointMetrics(meter)
 
 	// Create services
 	hostRegistry := NewHostRegistry(db, logger)
@@ -261,41 +346,48 @@ func main() {
 
 	// Start HTTP server
 	httpMux := http.NewServeMux()
-	httpMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	instrumentHTTPHandler := func(route, operation string, handler http.Handler) http.Handler {
+		return instrumentControlPlaneEndpoint(route, operation, endpointMetrics, otelClient, handler)
+	}
+	instrumentAuthenticatedHandler := func(route, operation string, handler http.Handler) http.Handler {
+		return instrumentHTTPHandler(route, operation, authMiddleware(*apiAuthToken, *hostBootstrapToken, handler))
+	}
+	httpMux.Handle("/health", instrumentHTTPHandler("/health", "control_plane.health", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
-	})
-	httpMux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+	})))
+	httpMux.Handle("/metrics", instrumentHTTPHandler("/metrics", "control_plane.metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("metrics served via OTel Collector"))
-	})
-	httpMux.HandleFunc("/api/v1/runners", controlPlaneServer.HandleGetRunners)
-	httpMux.HandleFunc("/api/v1/runners/allocate", controlPlaneServer.HandleAllocateRunner)
-	httpMux.HandleFunc("/api/v1/runners/status", controlPlaneServer.HandleRunnerStatus)
-	httpMux.HandleFunc("/api/v1/runners/release", controlPlaneServer.HandleRunnerRelease)
-	httpMux.HandleFunc("/api/v1/runners/pause", controlPlaneServer.HandlePauseRunner)
-	httpMux.HandleFunc("/api/v1/runners/connect", controlPlaneServer.HandleConnectRunner)
-	httpMux.HandleFunc("/api/v1/runners/quarantine", controlPlaneServer.HandleQuarantineRunner)
-	httpMux.HandleFunc("/api/v1/runners/unquarantine", controlPlaneServer.HandleUnquarantineRunner)
-	httpMux.HandleFunc("/api/v1/hosts", controlPlaneServer.HandleGetHosts)
-	httpMux.HandleFunc("/api/v1/hosts/heartbeat", controlPlaneServer.HandleHostHeartbeat)
-	httpMux.HandleFunc("/api/v1/snapshots", controlPlaneServer.HandleGetSnapshots)
+	})))
+	httpMux.Handle("/api/v1/runners", instrumentAuthenticatedHandler("/api/v1/runners", "control_plane.get_runners", http.HandlerFunc(controlPlaneServer.HandleGetRunners)))
+	httpMux.Handle("/api/v1/runners/allocate", instrumentAuthenticatedHandler("/api/v1/runners/allocate", "control_plane.allocate_runner", http.HandlerFunc(controlPlaneServer.HandleAllocateRunner)))
+	httpMux.Handle("/api/v1/runners/status", instrumentAuthenticatedHandler("/api/v1/runners/status", "control_plane.runner_status", http.HandlerFunc(controlPlaneServer.HandleRunnerStatus)))
+	httpMux.Handle("/api/v1/runners/release", instrumentAuthenticatedHandler("/api/v1/runners/release", "control_plane.release_runner", http.HandlerFunc(controlPlaneServer.HandleRunnerRelease)))
+	httpMux.Handle("/api/v1/runners/pause", instrumentAuthenticatedHandler("/api/v1/runners/pause", "control_plane.pause_runner", http.HandlerFunc(controlPlaneServer.HandlePauseRunner)))
+	httpMux.Handle("/api/v1/runners/connect", instrumentAuthenticatedHandler("/api/v1/runners/connect", "control_plane.connect_runner", http.HandlerFunc(controlPlaneServer.HandleConnectRunner)))
+	httpMux.Handle("/api/v1/runners/quarantine", instrumentAuthenticatedHandler("/api/v1/runners/quarantine", "control_plane.quarantine_runner", http.HandlerFunc(controlPlaneServer.HandleQuarantineRunner)))
+	httpMux.Handle("/api/v1/runners/unquarantine", instrumentAuthenticatedHandler("/api/v1/runners/unquarantine", "control_plane.unquarantine_runner", http.HandlerFunc(controlPlaneServer.HandleUnquarantineRunner)))
+	httpMux.Handle("/api/v1/hosts", instrumentAuthenticatedHandler("/api/v1/hosts", "control_plane.get_hosts", http.HandlerFunc(controlPlaneServer.HandleGetHosts)))
+	httpMux.Handle("/api/v1/hosts/heartbeat", instrumentAuthenticatedHandler("/api/v1/hosts/heartbeat", "control_plane.host_heartbeat", http.HandlerFunc(controlPlaneServer.HandleHostHeartbeat)))
+	httpMux.Handle("/api/v1/snapshots", instrumentAuthenticatedHandler("/api/v1/snapshots", "control_plane.get_snapshots", http.HandlerFunc(controlPlaneServer.HandleGetSnapshots)))
 	// Layered config registry endpoints
-	httpMux.HandleFunc("/api/v1/layered-configs/", layeredConfigRegistry.HandleLayeredConfigs)
-	httpMux.HandleFunc("/api/v1/layered-configs", layeredConfigRegistry.HandleLayeredConfigs)
+	httpMux.Handle("/api/v1/layered-configs/", instrumentAuthenticatedHandler("/api/v1/layered-configs/", "control_plane.layered_configs", http.HandlerFunc(layeredConfigRegistry.HandleLayeredConfigs)))
+	httpMux.Handle("/api/v1/layered-configs", instrumentAuthenticatedHandler("/api/v1/layered-configs", "control_plane.layered_configs", http.HandlerFunc(layeredConfigRegistry.HandleLayeredConfigs)))
 	// Version/rollout endpoints (Phase 4)
-	httpMux.HandleFunc("/api/v1/versions/desired", controlPlaneServer.HandleGetDesiredVersions)
-	httpMux.HandleFunc("/api/v1/versions/fleet", controlPlaneServer.HandleGetFleetConvergence)
+	httpMux.Handle("/api/v1/versions/desired", instrumentAuthenticatedHandler("/api/v1/versions/desired", "control_plane.get_desired_versions", http.HandlerFunc(controlPlaneServer.HandleGetDesiredVersions)))
+	httpMux.Handle("/api/v1/versions/fleet", instrumentAuthenticatedHandler("/api/v1/versions/fleet", "control_plane.get_fleet_convergence", http.HandlerFunc(controlPlaneServer.HandleGetFleetConvergence)))
 	// Canary report endpoint (Phase 6)
-	httpMux.HandleFunc("/api/v1/canary/report", controlPlaneServer.HandleCanaryReport)
+	httpMux.Handle("/api/v1/canary/report", instrumentAuthenticatedHandler("/api/v1/canary/report", "control_plane.canary_report", http.HandlerFunc(controlPlaneServer.HandleCanaryReport)))
+	httpMux.Handle("/api/v1/", instrumentAuthenticatedHandler("/api/v1/", "control_plane.api_not_found", http.NotFoundHandler()))
 	// Register webhook handler via CI adapter (replaces hardcoded CI_SYSTEM check)
 	if webhookAdapter != nil {
 		if h := webhookAdapter.WebhookHandler(); h != nil {
-			httpMux.Handle(webhookAdapter.WebhookPath(), h)
+			httpMux.Handle(webhookAdapter.WebhookPath(), instrumentHTTPHandler(webhookAdapter.WebhookPath(), "control_plane.webhook", h))
 		}
 	}
 
-	httpHandler := apiLoggingMiddleware(logger, authMiddleware(*apiAuthToken, *hostBootstrapToken, httpMux))
+	httpHandler := apiLoggingMiddleware(logger, httpMux)
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *httpPort),
 		Handler: httpHandler,
@@ -320,15 +412,15 @@ func main() {
 		mcpHandler := newMCPHandler(deps, *mcpAuthToken)
 
 		mcpMux := http.NewServeMux()
-		mcpMux.Handle("/mcp", mcpHandler)
-		mcpMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		mcpMux.Handle("/mcp", instrumentHTTPHandler("/mcp", "control_plane.mcp", mcpHandler))
+		mcpMux.Handle("/health", instrumentHTTPHandler("/mcp/health", "control_plane.mcp_health", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("OK"))
-		})
+		})))
 
 		mcpServer = &http.Server{
 			Addr:    fmt.Sprintf(":%d", *mcpPort),
-			Handler: mcpMux,
+			Handler: apiLoggingMiddleware(logger, mcpMux),
 		}
 		go func() {
 			log.WithField("port", *mcpPort).Info("Starting MCP server")
@@ -372,12 +464,26 @@ func main() {
 // statusRecorder wraps http.ResponseWriter to capture the status code.
 type statusRecorder struct {
 	http.ResponseWriter
-	statusCode int
+	statusCode   int
+	bytesWritten int64
+	route        string
+	operation    string
 }
 
 func (r *statusRecorder) WriteHeader(code int) {
 	r.statusCode = code
 	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(p []byte) (int, error) {
+	n, err := r.ResponseWriter.Write(p)
+	r.bytesWritten += int64(n)
+	return n, err
+}
+
+func (r *statusRecorder) SetRouteMetadata(route, operation string) {
+	r.route = route
+	r.operation = operation
 }
 
 // apiLoggingMiddleware logs every API request on completion with method, path,
@@ -396,11 +502,22 @@ func apiLoggingMiddleware(logger *logrus.Logger, next http.Handler) http.Handler
 		duration := time.Since(start)
 
 		fields := logrus.Fields{
-			"method":      r.Method,
-			"path":        r.URL.Path,
-			"status":      rec.statusCode,
-			"duration_ms": duration.Milliseconds(),
-			"remote_addr": r.RemoteAddr,
+			"method":         r.Method,
+			"path":           r.URL.Path,
+			"status":         rec.statusCode,
+			"status_class":   httpStatusClass(rec.statusCode),
+			"duration_ms":    duration.Milliseconds(),
+			"remote_addr":    r.RemoteAddr,
+			"response_bytes": rec.bytesWritten,
+		}
+		if rec.route != "" {
+			fields["route"] = rec.route
+		}
+		if rec.operation != "" {
+			fields["operation"] = rec.operation
+		}
+		if r.ContentLength >= 0 {
+			fields["request_bytes"] = r.ContentLength
 		}
 
 		// Extract identifiers from query string (GET endpoints)
@@ -873,22 +990,6 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 			runner.RunnerTTLSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy); dbErr != nil {
 			s.logger.WithError(dbErr).WithField("session_id", resp.SessionId).Error("Failed to update session_snapshots table")
 		}
-	}
-
-	// Roll back optimistic resource reservation — a paused runner no longer
-	// consumes host resources. Without this, UsedCPU/Memory accumulates
-	// until the next heartbeat.
-	if runner.ReservedCPU > 0 || runner.ReservedMemoryMB > 0 {
-		s.hostRegistry.mu.Lock()
-		host.UsedCPUMillicores -= runner.ReservedCPU
-		host.UsedMemoryMB -= runner.ReservedMemoryMB
-		if host.UsedCPUMillicores < 0 {
-			host.UsedCPUMillicores = 0
-		}
-		if host.UsedMemoryMB < 0 {
-			host.UsedMemoryMB = 0
-		}
-		s.hostRegistry.mu.Unlock()
 	}
 
 	// Remove the runner from the in-memory host registry so that

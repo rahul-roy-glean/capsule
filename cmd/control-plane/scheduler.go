@@ -246,33 +246,14 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	}
 	tier, _ := tiers.Lookup(tierName)
 
-	// Get available hosts
-	hosts := s.hostRegistry.GetAvailableHosts()
-	if len(hosts) == 0 {
-		return nil, fmt.Errorf("no available hosts")
-	}
-
-	// Filter hosts that can fit this workload's resource requirements
-	var eligible []*Host
-	for _, h := range hosts {
-		if canFitWorkload(h, tier) {
-			eligible = append(eligible, h)
-		}
-	}
-	if len(eligible) == 0 {
-		// Fall back to all available hosts if none pass resource check
-		// (handles hosts that don't yet report resources)
-		eligible = hosts
-	}
-
 	// Session stickiness: if this is a session resume, prefer the host where
 	// the session was paused. This keeps the LRU chunk cache warm and avoids
 	// cold GCS fetches on resume. When resuming a suspended session, also use
 	// the TTL/network policy persisted on that session instead of re-reading
 	// mutable layered-config defaults by workload key.
 	var host *Host
+	var sessionHostID string
 	if req.SessionID != "" && s.db != nil {
-		var sessionHostID string
 		var status string
 		var sessionTTL sql.NullInt64
 		var sessionAutoPause sql.NullBool
@@ -298,52 +279,100 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			if sessionNPJSON.Valid {
 				configNetworkPolicyJSON = sessionNPJSON.String
 			}
-
-			for _, h := range eligible {
-				if h.ID == sessionHostID {
-					host = h
-					s.logger.WithFields(logrus.Fields{
-						"session_id": req.SessionID,
-						"host_id":    sessionHostID,
-					}).Info("Session sticky routing: using original host")
-					if s.sessionResumeRoutingCounter != nil {
-						s.sessionResumeRoutingCounter.Add(ctx, 1, metric.WithAttributes(
-							fcrotel.AttrRouting.String(fcrotel.RoutingSameHost),
-						))
-					}
-					break
-				}
-			}
-			if host == nil {
-				s.logger.WithFields(logrus.Fields{
-					"session_id":      req.SessionID,
-					"original_host":   sessionHostID,
-					"available_hosts": len(eligible),
-				}).Warn("Session sticky host not available, falling back to best-fit")
-				if s.sessionResumeRoutingCounter != nil {
-					s.sessionResumeRoutingCounter.Add(ctx, 1, metric.WithAttributes(
-						fcrotel.AttrRouting.String(fcrotel.RoutingCrossHost),
-					))
-				}
-			}
 		}
 	}
 
-	// Fall back to workload-key cache affinity scoring
+	effectiveCPU := tiers.EffectiveCPUMillicores(tier)
+	effectiveMemoryMB := tier.MemoryMB
+	stickySelected := false
+	stickyFallback := false
+
+	s.hostRegistry.mu.Lock()
+	var available []*Host
+	for _, h := range s.hostRegistry.hosts {
+		usedCPU, usedMem := s.hostRegistry.effectiveUsageLocked(h)
+		if h.Status != "ready" {
+			continue
+		}
+		if time.Since(h.LastHeartbeat) >= 60*time.Second {
+			continue
+		}
+		if h.TotalCPUMillicores > 0 &&
+			(h.TotalCPUMillicores-usedCPU) > 0 &&
+			(h.TotalMemoryMB-usedMem) > 0 {
+			available = append(available, h)
+		}
+	}
+	if len(available) == 0 {
+		s.hostRegistry.mu.Unlock()
+		return nil, fmt.Errorf("no available hosts")
+	}
+
+	candidateHosts := available
+	var eligible []*Host
+	for _, h := range available {
+		usedCPU, usedMem := s.hostRegistry.effectiveUsageLocked(h)
+		if canFitWorkloadWithUsage(h, usedCPU, usedMem, tier) {
+			eligible = append(eligible, h)
+		}
+	}
+	if len(eligible) > 0 {
+		candidateHosts = eligible
+	}
+
+	if sessionHostID != "" {
+		for _, h := range candidateHosts {
+			if h.ID == sessionHostID {
+				host = h
+				stickySelected = true
+				break
+			}
+		}
+		stickyFallback = host == nil
+	}
+
 	if host == nil {
-		host = s.selectBestHostForWorkloadKey(eligible, workloadKey)
+		var bestScore float64
+		for _, h := range candidateHosts {
+			usedCPU, usedMem := s.hostRegistry.effectiveUsageLocked(h)
+			score := s.scoreHostForWorkloadKeyWithUsage(h, workloadKey, usedCPU, usedMem)
+			if host == nil || score > bestScore {
+				host = h
+				bestScore = score
+			}
+		}
 	}
 	if host == nil {
+		s.hostRegistry.mu.Unlock()
 		return nil, fmt.Errorf("no suitable host found")
 	}
 
-	// Optimistic reservation: increment used resources on the in-memory host.
-	// Next heartbeat from the host will correct any drift.
-	effectiveCPU := tiers.EffectiveCPUMillicores(tier)
-	s.hostRegistry.mu.Lock()
-	host.UsedCPUMillicores += effectiveCPU
-	host.UsedMemoryMB += tier.MemoryMB
+	host.PendingCPUMillicores += effectiveCPU
+	host.PendingMemoryMB += effectiveMemoryMB
 	s.hostRegistry.mu.Unlock()
+
+	if stickySelected {
+		s.logger.WithFields(logrus.Fields{
+			"session_id": req.SessionID,
+			"host_id":    sessionHostID,
+		}).Info("Session sticky routing: using original host")
+		if s.sessionResumeRoutingCounter != nil {
+			s.sessionResumeRoutingCounter.Add(ctx, 1, metric.WithAttributes(
+				fcrotel.AttrRouting.String(fcrotel.RoutingSameHost),
+			))
+		}
+	} else if stickyFallback {
+		s.logger.WithFields(logrus.Fields{
+			"session_id":      req.SessionID,
+			"original_host":   sessionHostID,
+			"available_hosts": len(candidateHosts),
+		}).Warn("Session sticky host not available, falling back to best-fit")
+		if s.sessionResumeRoutingCounter != nil {
+			s.sessionResumeRoutingCounter.Add(ctx, 1, metric.WithAttributes(
+				fcrotel.AttrRouting.String(fcrotel.RoutingCrossHost),
+			))
+		}
+	}
 
 	s.logger.WithFields(logrus.Fields{
 		"host_id":       host.ID,
@@ -354,6 +383,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// Connect to host agent (pooled connection)
 	conn, err := s.getHostConn(host.GRPCAddress)
 	if err != nil {
+		s.hostRegistry.releasePendingReservation(host.ID, effectiveCPU, effectiveMemoryMB)
 		return nil, err
 	}
 
@@ -449,21 +479,13 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// Call host agent to allocate runner
 	resp, err := client.AllocateRunner(ctx, protoReq)
 	if err != nil {
-		// Roll back optimistic reservation
-		s.hostRegistry.mu.Lock()
-		host.UsedCPUMillicores -= effectiveCPU
-		host.UsedMemoryMB -= tier.MemoryMB
-		s.hostRegistry.mu.Unlock()
+		s.hostRegistry.releasePendingReservation(host.ID, effectiveCPU, effectiveMemoryMB)
 		s.logger.WithError(err).WithField("host", host.InstanceName).Error("gRPC AllocateRunner failed")
 		return nil, fmt.Errorf("host agent AllocateRunner failed: %w", err)
 	}
 
 	if resp.Error != "" {
-		// Roll back optimistic reservation
-		s.hostRegistry.mu.Lock()
-		host.UsedCPUMillicores -= effectiveCPU
-		host.UsedMemoryMB -= tier.MemoryMB
-		s.hostRegistry.mu.Unlock()
+		s.hostRegistry.releasePendingReservation(host.ID, effectiveCPU, effectiveMemoryMB)
 		return &AllocateRunnerResponse{
 			HostID:      host.ID,
 			HostAddress: host.HTTPAddress,
@@ -489,6 +511,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			s.logger.WithError(err).Warn("Failed to register runner in control plane registry")
 		}
 	}
+	s.hostRegistry.releasePendingReservation(host.ID, effectiveCPU, effectiveMemoryMB)
 
 	return &AllocateRunnerResponse{
 		RunnerID:    resp.Runner.GetId(),
@@ -513,7 +536,13 @@ func (s *Scheduler) selectBestHostForWorkloadKey(hosts []*Host, workloadKey stri
 
 	var scored []scoredHost
 	for _, h := range hosts {
-		score := s.scoreHostForWorkloadKey(h, workloadKey)
+		usedCPU, usedMem := h.UsedCPUMillicores, h.UsedMemoryMB
+		if s.hostRegistry != nil {
+			s.hostRegistry.mu.RLock()
+			usedCPU, usedMem = s.hostRegistry.effectiveUsageLocked(h)
+			s.hostRegistry.mu.RUnlock()
+		}
+		score := s.scoreHostForWorkloadKeyWithUsage(h, workloadKey, usedCPU, usedMem)
 		scored = append(scored, scoredHost{host: h, score: score})
 	}
 
@@ -526,7 +555,11 @@ func (s *Scheduler) selectBestHostForWorkloadKey(hosts []*Host, workloadKey stri
 
 // scoreHostForWorkloadKey calculates a score for a host with workload-key cache affinity.
 func (s *Scheduler) scoreHostForWorkloadKey(h *Host, workloadKey string) float64 {
-	score := s.scoreHost(h)
+	return s.scoreHostForWorkloadKeyWithUsage(h, workloadKey, h.UsedCPUMillicores, h.UsedMemoryMB)
+}
+
+func (s *Scheduler) scoreHostForWorkloadKeyWithUsage(h *Host, workloadKey string, usedCPU, usedMem int) float64 {
+	score := s.scoreHostWithUsage(h, usedCPU, usedMem)
 
 	// Repo-aware cache affinity scoring:
 	// If we have loaded manifests info (from heartbeat), prefer hosts with warm caches.
@@ -549,24 +582,32 @@ func (s *Scheduler) scoreHostForWorkloadKey(h *Host, workloadKey string) float64
 // canFitWorkload checks whether a host has enough resources to run a workload
 // of the given tier.
 func canFitWorkload(h *Host, t tiers.Tier) bool {
+	return canFitWorkloadWithUsage(h, h.UsedCPUMillicores, h.UsedMemoryMB, t)
+}
+
+func canFitWorkloadWithUsage(h *Host, usedCPU, usedMem int, t tiers.Tier) bool {
 	if h.TotalCPUMillicores == 0 {
 		return false
 	}
 	effectiveCPU := tiers.EffectiveCPUMillicores(t)
-	return (h.TotalCPUMillicores-h.UsedCPUMillicores) >= effectiveCPU &&
-		(h.TotalMemoryMB-h.UsedMemoryMB) >= t.MemoryMB
+	return (h.TotalCPUMillicores-usedCPU) >= effectiveCPU &&
+		(h.TotalMemoryMB-usedMem) >= t.MemoryMB
 }
 
 // scoreHost calculates a base score for a host using resource-based metrics.
 func (s *Scheduler) scoreHost(h *Host) float64 {
+	return s.scoreHostWithUsage(h, h.UsedCPUMillicores, h.UsedMemoryMB)
+}
+
+func (s *Scheduler) scoreHostWithUsage(h *Host, usedCPU, usedMem int) float64 {
 	var score float64
 
 	// Prefer hosts with idle runners (cache warmth)
 	score += float64(h.IdleRunners) * 10
 
 	if h.TotalCPUMillicores > 0 {
-		cpuFree := float64(h.TotalCPUMillicores-h.UsedCPUMillicores) / float64(h.TotalCPUMillicores)
-		memFree := float64(h.TotalMemoryMB-h.UsedMemoryMB) / float64(h.TotalMemoryMB)
+		cpuFree := float64(h.TotalCPUMillicores-usedCPU) / float64(h.TotalCPUMillicores)
+		memFree := float64(h.TotalMemoryMB-usedMem) / float64(h.TotalMemoryMB)
 		score += cpuFree * 20
 		score += memFree * 15
 	}
@@ -618,25 +659,6 @@ func (s *Scheduler) ReleaseRunner(ctx context.Context, runnerID string, destroy 
 	// Update registry
 	if err := s.hostRegistry.RemoveRunner(runnerID); err != nil {
 		return err
-	}
-
-	// Roll back optimistic resource reservation made at allocate time.
-	// Without this, UsedCPU/Memory accumulates until the next heartbeat
-	// corrects it, causing spurious "no available hosts" under rapid
-	// allocate/release cycles.
-	if runner.ReservedCPU > 0 || runner.ReservedMemoryMB > 0 {
-		s.hostRegistry.mu.Lock()
-		if host != nil {
-			host.UsedCPUMillicores -= runner.ReservedCPU
-			host.UsedMemoryMB -= runner.ReservedMemoryMB
-			if host.UsedCPUMillicores < 0 {
-				host.UsedCPUMillicores = 0
-			}
-			if host.UsedMemoryMB < 0 {
-				host.UsedMemoryMB = 0
-			}
-		}
-		s.hostRegistry.mu.Unlock()
 	}
 
 	// Clean up session_snapshots row so stale entries don't accumulate.

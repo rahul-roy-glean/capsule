@@ -26,6 +26,9 @@ import (
 type recentAllocation struct {
 	runner    *Runner
 	allocTime time.Time
+	err       error
+	waitCh    chan struct{}
+	inFlight  bool
 }
 
 // uffdStopper is implemented by UFFD handlers that need cleanup on runner release.
@@ -94,6 +97,9 @@ type Manager struct {
 	// policyEnforcers tracks per-VM PolicyEnforcers for network policy enforcement.
 	// Key is runner ID. nil map when no policies are in use.
 	policyEnforcers map[string]*network.PolicyEnforcer
+	// pendingAllocations reserves runner slots for allocations that have passed the
+	// initial capacity check but have not yet been added to m.runners.
+	pendingAllocations int
 }
 
 type QuarantineOptions struct {
@@ -181,9 +187,110 @@ func (m *Manager) cleanupRecentRequests() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for reqID, alloc := range m.recentRequests {
+		if alloc.inFlight {
+			continue
+		}
 		if time.Since(alloc.allocTime) > 5*time.Minute {
 			delete(m.recentRequests, reqID)
 		}
+	}
+}
+
+func (m *Manager) beginIdempotentAllocation(reqID string) (*Runner, *recentAllocation, bool) {
+	if reqID == "" {
+		return nil, nil, true
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if alloc, ok := m.recentRequests[reqID]; ok {
+		if alloc.inFlight {
+			return nil, alloc, false
+		}
+		if alloc.runner != nil {
+			if runner, exists := m.runners[alloc.runner.ID]; exists {
+				alloc.runner = runner
+				alloc.allocTime = time.Now()
+				return runner, nil, false
+			}
+		}
+		delete(m.recentRequests, reqID)
+	}
+
+	alloc := &recentAllocation{
+		allocTime: time.Now(),
+		waitCh:    make(chan struct{}),
+		inFlight:  true,
+	}
+	m.recentRequests[reqID] = alloc
+	return nil, alloc, true
+}
+
+func (m *Manager) waitForIdempotentAllocation(ctx context.Context, reqID string, alloc *recentAllocation) (*Runner, error) {
+	if reqID == "" || alloc == nil {
+		return nil, nil
+	}
+
+	select {
+	case <-alloc.waitCh:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	if alloc.runner != nil {
+		return alloc.runner, nil
+	}
+	if alloc.err != nil {
+		return nil, alloc.err
+	}
+	return nil, fmt.Errorf("allocation for request %q completed without a runner", reqID)
+}
+
+func (m *Manager) finishIdempotentAllocation(reqID string, alloc *recentAllocation, runner *Runner, err error) {
+	if reqID == "" || alloc == nil {
+		return
+	}
+
+	m.mu.Lock()
+	if err == nil && runner != nil {
+		alloc.runner = runner
+		alloc.allocTime = time.Now()
+	} else {
+		alloc.err = err
+		delete(m.recentRequests, reqID)
+	}
+	alloc.inFlight = false
+	waitCh := alloc.waitCh
+	alloc.waitCh = nil
+	m.mu.Unlock()
+
+	if waitCh != nil {
+		close(waitCh)
+	}
+}
+
+func (m *Manager) reserveAllocationSlot() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.draining {
+		return fmt.Errorf("host is draining")
+	}
+	if len(m.runners)+m.pendingAllocations >= m.config.MaxRunners {
+		return fmt.Errorf("host at capacity: %d/%d runners", len(m.runners)+m.pendingAllocations, m.config.MaxRunners)
+	}
+
+	m.pendingAllocations++
+	return nil
+}
+
+func (m *Manager) releaseAllocationSlot() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.pendingAllocations > 0 {
+		m.pendingAllocations--
 	}
 }
 
@@ -928,7 +1035,7 @@ func (m *Manager) CanAddRunner(vcpus, memoryMB int) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	if m.draining || len(m.runners) >= m.config.MaxRunners {
+	if m.draining || len(m.runners)+m.pendingAllocations >= m.config.MaxRunners {
 		return false
 	}
 

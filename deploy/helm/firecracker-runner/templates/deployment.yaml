@@ -105,7 +105,7 @@ spec:
             - name: DOWNSCALER_HEARTBEAT_STALE
               value: {{ .Values.downscaler.heartbeatStale | quote }}
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: {{ if .Values.otelCollector.enabled }}"localhost:4317"{{ else }}"otel-collector.{{ include "firecracker-runner.namespace" . }}.svc.cluster.local:4317"{{ end }}
+              value: {{ if .Values.otelCollector.enabled }}"127.0.0.1:4317"{{ else }}"otel-collector.{{ include "firecracker-runner.namespace" . }}.svc.cluster.local:4317"{{ end }}
             - name: ENVIRONMENT
               value: {{ .Values.config.environment | default "prod" | quote }}
           resources:
@@ -136,6 +136,17 @@ spec:
           ports:
             - name: otlp-grpc
               containerPort: 4317
+          readinessProbe:
+            tcpSocket:
+              port: 4317
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            failureThreshold: 5
+          livenessProbe:
+            tcpSocket:
+              port: 4317
+            initialDelaySeconds: 10
+            periodSeconds: 15
           volumeMounts:
             - name: otel-config
               mountPath: /etc/otelcol

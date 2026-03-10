@@ -1,230 +1,1267 @@
+# Canonical Cloud Monitoring dashboard catalog for Firecracker Runner.
+# The previous Prometheus/Grafana manifests that lived here had drifted badly
+# from the metrics the system actually emits today via OpenTelemetry.
+#
+# These JSON payloads are intended to be the source of truth for dashboards we
+# can import into GCP Cloud Monitoring or translate into Terraform
+# `google_monitoring_dashboard` resources.
+#
+# Example import flow:
+#   kubectl -n firecracker-runner get configmap cloud-monitoring-dashboard-catalog \
+#     -o jsonpath='{.data.control-plane-endpoint-health\.json}' > /tmp/control-plane-endpoint-health.json
+#   gcloud monitoring dashboards create --config-from-file=/tmp/control-plane-endpoint-health.json
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: prometheus-config
+  name: cloud-monitoring-dashboard-catalog
   namespace: firecracker-runner
 data:
-  prometheus.yml: |
-    global:
-      scrape_interval: 15s
-      evaluation_interval: 15s
-
-    alerting:
-      alertmanagers:
-      - static_configs:
-        - targets:
-          - alertmanager:9093
-
-    rule_files:
-      - /etc/prometheus/rules/*.yml
-
-    scrape_configs:
-      # Control plane metrics are now exported via OTel Collector to GCP Cloud Trace
-      # and Cloud Monitoring. The prometheus.io annotations have been removed.
-
-      # Host agent metrics (via federation or push gateway)
-      - job_name: 'firecracker-hosts'
-        gce_sd_configs:
-        - project: ${PROJECT_ID}
-          zone: ${ZONE}
-          # Filter to only include Firecracker host VMs. Update this to match your
-          # deployment (tags, labels, instance group name, etc).
-          filter: 'tags.items=firecracker-host'
-          port: 9090
-        relabel_configs:
-        - source_labels: [__meta_gce_instance_name]
-          target_label: instance_name
-        - source_labels: [__meta_gce_zone]
-          target_label: zone
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: prometheus-rules
-  namespace: firecracker-runner
-data:
-  firecracker-alerts.yml: |
-    groups:
-    - name: firecracker-host-alerts
-      rules:
-      - alert: HostUnhealthy
-        expr: up{job="firecracker-hosts"} == 0
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Firecracker host {{ $labels.instance_name }} is unhealthy"
-          description: "Host has been down for more than 2 minutes"
-
-      - alert: HostHighCPU
-        expr: firecracker_host_cpu_usage > 0.9
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High CPU on host {{ $labels.instance_name }}"
-          description: "CPU usage is above 90% for 5 minutes"
-
-      - alert: HostAtCapacity
-        expr: firecracker_host_used_slots / firecracker_host_total_slots > 0.95
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Host {{ $labels.instance_name }} at capacity"
-          description: "Host has less than 5% capacity remaining"
-
-      - alert: NoIdleRunners
-        expr: sum(firecracker_host_idle_runners) == 0
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "No idle runners available"
-          description: "All runners are busy, new jobs may be delayed"
-
-    - name: firecracker-runner-alerts
-      rules:
-      - alert: RunnerRestoreSlowdown
-        expr: histogram_quantile(0.95, firecracker_runner_restore_latency_seconds_bucket) > 5
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Runner restore latency is high"
-          description: "P95 restore latency is above 5 seconds"
-
-      - alert: RunnerAllocationFailures
-        expr: rate(firecracker_runner_allocations_total{status="failed"}[5m]) > 0.1
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Runner allocation failures detected"
-          description: "More than 10% of allocations are failing"
-
-    - name: firecracker-snapshot-alerts
-      rules:
-      - alert: SnapshotSyncFailure
-        expr: increase(firecracker_snapshot_sync_errors_total[1h]) > 0
-        labels:
-          severity: warning
-        annotations:
-          summary: "Snapshot sync failures detected"
-          description: "One or more hosts failed to sync snapshots"
-
-      - alert: SnapshotCacheStale
-        expr: time() - firecracker_snapshot_cache_last_sync_timestamp > 7200
-        labels:
-          severity: warning
-        annotations:
-          summary: "Snapshot cache is stale"
-          description: "Local cache hasn't been updated in over 2 hours"
-
-      - alert: SnapshotTooOld
-        expr: time() - firecracker_snapshot_created_timestamp > 86400
-        labels:
-          severity: info
-        annotations:
-          summary: "Active snapshot is more than 24 hours old"
-          description: "Consider building a fresh snapshot"
-
-    - name: firecracker-control-plane-alerts
-      rules:
-      - alert: ControlPlaneHighLatency
-        expr: histogram_quantile(0.95, firecracker_grpc_request_duration_seconds_bucket) > 1
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Control plane latency is high"
-          description: "P95 gRPC latency is above 1 second"
-
-      - alert: QueueDepthHigh
-        expr: firecracker_scheduler_queue_depth > 50
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Job queue depth is high"
-          description: "More than 50 jobs waiting for runners"
-
-      - alert: DatabaseConnectionFailure
-        expr: firecracker_db_connection_errors_total > 0
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Database connection failures"
-          description: "Control plane cannot connect to database"
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: grafana-dashboards
-  namespace: firecracker-runner
-data:
-  firecracker-overview.json: |
+  control-plane-endpoint-health.json: |
     {
-      "dashboard": {
-        "title": "Firecracker Runner Overview",
-        "panels": [
+      "displayName": "Firecracker Control Plane Endpoint Health",
+      "mosaicLayout": {
+        "columns": 12,
+        "tiles": [
           {
-            "title": "Total Hosts",
-            "type": "stat",
-            "targets": [
-              {"expr": "count(up{job=\"firecracker-hosts\"})"}
-            ]
+            "xPos": 0,
+            "yPos": 0,
+            "width": 2,
+            "height": 2,
+            "widget": {
+              "title": "Requests / 5m",
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\"",
+                    "aggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_DELTA",
+                      "crossSeriesReducer": "REDUCE_SUM"
+                    }
+                  }
+                }
+              }
+            }
           },
           {
-            "title": "Total Runners",
-            "type": "stat",
-            "targets": [
-              {"expr": "sum(firecracker_host_used_slots)"}
-            ]
+            "xPos": 2,
+            "yPos": 0,
+            "width": 2,
+            "height": 2,
+            "widget": {
+              "title": "5xx / 5m",
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\" AND metric.label.status_class=\"5xx\"",
+                    "aggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_DELTA",
+                      "crossSeriesReducer": "REDUCE_SUM"
+                    }
+                  }
+                }
+              }
+            }
           },
           {
-            "title": "Idle Runners",
-            "type": "stat",
-            "targets": [
-              {"expr": "sum(firecracker_host_idle_runners)"}
-            ]
+            "xPos": 4,
+            "yPos": 0,
+            "width": 2,
+            "height": 2,
+            "widget": {
+              "title": "Allocate P95",
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/allocate\"",
+                    "aggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_DELTA",
+                      "crossSeriesReducer": "REDUCE_SUM"
+                    },
+                    "secondaryAggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_PERCENTILE_95",
+                      "crossSeriesReducer": "REDUCE_MEAN"
+                    }
+                  }
+                }
+              }
+            }
           },
           {
-            "title": "Busy Runners",
-            "type": "stat",
-            "targets": [
-              {"expr": "sum(firecracker_host_busy_runners)"}
-            ]
+            "xPos": 6,
+            "yPos": 0,
+            "width": 2,
+            "height": 2,
+            "widget": {
+              "title": "Pause P95",
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/pause\"",
+                    "aggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_DELTA",
+                      "crossSeriesReducer": "REDUCE_SUM"
+                    },
+                    "secondaryAggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_PERCENTILE_95",
+                      "crossSeriesReducer": "REDUCE_MEAN"
+                    }
+                  }
+                }
+              }
+            }
           },
           {
-            "title": "Runner Restore Latency (P95)",
-            "type": "graph",
-            "targets": [
-              {"expr": "histogram_quantile(0.95, sum(rate(firecracker_runner_restore_latency_seconds_bucket[5m])) by (le))"}
-            ]
+            "xPos": 8,
+            "yPos": 0,
+            "width": 2,
+            "height": 2,
+            "widget": {
+              "title": "Connect/Resume P95",
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/connect\"",
+                    "aggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_DELTA",
+                      "crossSeriesReducer": "REDUCE_SUM"
+                    },
+                    "secondaryAggregation": {
+                      "alignmentPeriod": "300s",
+                      "perSeriesAligner": "ALIGN_PERCENTILE_95",
+                      "crossSeriesReducer": "REDUCE_MEAN"
+                    }
+                  }
+                }
+              }
+            }
           },
           {
-            "title": "Allocations per Minute",
-            "type": "graph",
-            "targets": [
-              {"expr": "sum(rate(firecracker_runner_allocations_total[1m])) * 60"}
-            ]
+            "xPos": 10,
+            "yPos": 0,
+            "width": 2,
+            "height": 2,
+            "widget": {
+              "title": "Max Inflight Requests",
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests.inflight\" AND metric.label.service_name=\"control-plane\"",
+                    "aggregation": {
+                      "alignmentPeriod": "60s",
+                      "perSeriesAligner": "ALIGN_MAX",
+                      "crossSeriesReducer": "REDUCE_SUM"
+                    }
+                  }
+                }
+              }
+            }
           },
           {
-            "title": "Host Capacity",
-            "type": "graph",
-            "targets": [
-              {"expr": "firecracker_host_used_slots / firecracker_host_total_slots", "legendFormat": "{{instance_name}}"}
-            ]
+            "xPos": 0,
+            "yPos": 2,
+            "width": 12,
+            "height": 4,
+            "widget": {
+              "title": "Key Endpoint Request Volume",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/allocate\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "allocate",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/pause\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "pause",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/connect\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "connect/resume",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/release\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "release",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/status\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "status",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "requests/min"
+                }
+              }
+            }
           },
           {
-            "title": "Snapshot Sync Duration",
-            "type": "graph",
-            "targets": [
-              {"expr": "histogram_quantile(0.95, sum(rate(firecracker_snapshot_sync_duration_seconds_bucket[5m])) by (le))"}
-            ]
+            "xPos": 0,
+            "yPos": 6,
+            "width": 12,
+            "height": 4,
+            "widget": {
+              "title": "Key Endpoint P95 Latency",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/allocate\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        },
+                        "secondaryAggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_PERCENTILE_95",
+                          "crossSeriesReducer": "REDUCE_MEAN"
+                        }
+                      }
+                    },
+                    "legendTemplate": "allocate",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/pause\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        },
+                        "secondaryAggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_PERCENTILE_95",
+                          "crossSeriesReducer": "REDUCE_MEAN"
+                        }
+                      }
+                    },
+                    "legendTemplate": "pause",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/connect\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        },
+                        "secondaryAggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_PERCENTILE_95",
+                          "crossSeriesReducer": "REDUCE_MEAN"
+                        }
+                      }
+                    },
+                    "legendTemplate": "connect/resume",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/release\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        },
+                        "secondaryAggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_PERCENTILE_95",
+                          "crossSeriesReducer": "REDUCE_MEAN"
+                        }
+                      }
+                    },
+                    "legendTemplate": "release",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.request.duration\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/status\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        },
+                        "secondaryAggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_PERCENTILE_95",
+                          "crossSeriesReducer": "REDUCE_MEAN"
+                        }
+                      }
+                    },
+                    "legendTemplate": "status",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "seconds"
+                }
+              }
+            }
+          },
+          {
+            "xPos": 0,
+            "yPos": 10,
+            "width": 12,
+            "height": 4,
+            "widget": {
+              "title": "Key Endpoint Error Volume",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/allocate\" AND metric.label.status_class=\"4xx\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "allocate 4xx",
+                    "plotType": "STACKED_BAR"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/allocate\" AND metric.label.status_class=\"5xx\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "allocate 5xx",
+                    "plotType": "STACKED_BAR"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/pause\" AND metric.label.status_class=\"4xx\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "pause 4xx",
+                    "plotType": "STACKED_BAR"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/pause\" AND metric.label.status_class=\"5xx\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "pause 5xx",
+                    "plotType": "STACKED_BAR"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/connect\" AND metric.label.status_class=\"4xx\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "connect/resume 4xx",
+                    "plotType": "STACKED_BAR"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/connect\" AND metric.label.status_class=\"5xx\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "connect/resume 5xx",
+                    "plotType": "STACKED_BAR"
+                  }
+                ],
+                "yAxis": {
+                  "label": "errors/min"
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  fleet-capacity-and-scheduling.json: |
+    {
+      "displayName": "Firecracker Fleet Capacity And Scheduling",
+      "mosaicLayout": {
+        "columns": 12,
+        "tiles": [
+          {
+            "xPos": 0,
+            "yPos": 0,
+            "width": 3,
+            "height": 2,
+            "widget": {
+              "title": "Ready Hosts",
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/control_plane.hosts\" AND metric.label.service_name=\"control-plane\" AND metric.label.status=\"ready\"",
+                    "aggregation": {
+                      "alignmentPeriod": "60s",
+                      "perSeriesAligner": "ALIGN_MAX",
+                      "crossSeriesReducer": "REDUCE_SUM"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "xPos": 3,
+            "yPos": 0,
+            "width": 3,
+            "height": 2,
+            "widget": {
+              "title": "Queue Depth",
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/control_plane.queue.depth\" AND metric.label.service_name=\"control-plane\"",
+                    "aggregation": {
+                      "alignmentPeriod": "60s",
+                      "perSeriesAligner": "ALIGN_MAX",
+                      "crossSeriesReducer": "REDUCE_SUM"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "xPos": 6,
+            "yPos": 0,
+            "width": 3,
+            "height": 2,
+            "widget": {
+              "title": "Fleet Utilization",
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/control_plane.fleet.utilization\" AND metric.label.service_name=\"control-plane\"",
+                    "aggregation": {
+                      "alignmentPeriod": "60s",
+                      "perSeriesAligner": "ALIGN_MEAN",
+                      "crossSeriesReducer": "REDUCE_MEAN"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "xPos": 9,
+            "yPos": 0,
+            "width": 3,
+            "height": 2,
+            "widget": {
+              "title": "Canary Failures / Hour",
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/e2e.canary.failure\" AND metric.label.service_name=\"control-plane\"",
+                    "aggregation": {
+                      "alignmentPeriod": "3600s",
+                      "perSeriesAligner": "ALIGN_DELTA",
+                      "crossSeriesReducer": "REDUCE_SUM"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "xPos": 0,
+            "yPos": 2,
+            "width": 6,
+            "height": 4,
+            "widget": {
+              "title": "Ready Hosts Over Time",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.hosts\" AND metric.label.service_name=\"control-plane\" AND metric.label.status=\"ready\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "ready",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "hosts"
+                }
+              }
+            }
+          },
+          {
+            "xPos": 6,
+            "yPos": 2,
+            "width": 6,
+            "height": 4,
+            "widget": {
+              "title": "Queue Depth Over Time",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.queue.depth\" AND metric.label.service_name=\"control-plane\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "queue depth",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "queued requests"
+                }
+              }
+            }
+          },
+          {
+            "xPos": 0,
+            "yPos": 6,
+            "width": 6,
+            "height": 4,
+            "widget": {
+              "title": "Fleet CPU Used / Free / Total",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.fleet.cpu_millicores.used\" AND metric.label.service_name=\"control-plane\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MEAN",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "used",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.fleet.cpu_millicores.free\" AND metric.label.service_name=\"control-plane\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MEAN",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "free",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.fleet.cpu_millicores.total\" AND metric.label.service_name=\"control-plane\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MEAN",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "total",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "millicores"
+                }
+              }
+            }
+          },
+          {
+            "xPos": 6,
+            "yPos": 6,
+            "width": 6,
+            "height": 4,
+            "widget": {
+              "title": "Fleet Memory Used / Free / Total",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.fleet.memory_mb.used\" AND metric.label.service_name=\"control-plane\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MEAN",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "used",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.fleet.memory_mb.free\" AND metric.label.service_name=\"control-plane\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MEAN",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "free",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.fleet.memory_mb.total\" AND metric.label.service_name=\"control-plane\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MEAN",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "total",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "MB"
+                }
+              }
+            }
+          },
+          {
+            "xPos": 0,
+            "yPos": 10,
+            "width": 6,
+            "height": 4,
+            "widget": {
+              "title": "Fleet Utilization",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.fleet.utilization\" AND metric.label.service_name=\"control-plane\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MEAN",
+                          "crossSeriesReducer": "REDUCE_MEAN"
+                        }
+                      }
+                    },
+                    "legendTemplate": "utilization",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "ratio"
+                }
+              }
+            }
+          },
+          {
+            "xPos": 6,
+            "yPos": 10,
+            "width": 6,
+            "height": 4,
+            "widget": {
+              "title": "Snapshot Age",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/snapshot.age\" AND metric.label.service_name=\"control-plane\"",
+                        "aggregation": {
+                          "alignmentPeriod": "300s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_MAX"
+                        }
+                      }
+                    },
+                    "legendTemplate": "snapshot age",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "seconds"
+                }
+              }
+            }
+          },
+          {
+            "xPos": 0,
+            "yPos": 14,
+            "width": 6,
+            "height": 4,
+            "widget": {
+              "title": "Canary Outcomes / Hour",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/e2e.canary.success\" AND metric.label.service_name=\"control-plane\"",
+                        "aggregation": {
+                          "alignmentPeriod": "3600s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "success",
+                    "plotType": "STACKED_BAR"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/e2e.canary.failure\" AND metric.label.service_name=\"control-plane\"",
+                        "aggregation": {
+                          "alignmentPeriod": "3600s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "failure",
+                    "plotType": "STACKED_BAR"
+                  }
+                ],
+                "yAxis": {
+                  "label": "checks / hour"
+                }
+              }
+            }
+          },
+          {
+            "xPos": 6,
+            "yPos": 14,
+            "width": 6,
+            "height": 4,
+            "widget": {
+              "title": "Endpoint 5xx / 5m",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/allocate\" AND metric.label.status_class=\"5xx\"",
+                        "aggregation": {
+                          "alignmentPeriod": "300s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "allocate 5xx",
+                    "plotType": "STACKED_BAR"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/connect\" AND metric.label.status_class=\"5xx\"",
+                        "aggregation": {
+                          "alignmentPeriod": "300s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "connect/resume 5xx",
+                    "plotType": "STACKED_BAR"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/release\" AND metric.label.status_class=\"5xx\"",
+                        "aggregation": {
+                          "alignmentPeriod": "300s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "release 5xx",
+                    "plotType": "STACKED_BAR"
+                  }
+                ],
+                "yAxis": {
+                  "label": "errors / 5m"
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  chunked-runtime-and-cache.json: |
+    {
+      "displayName": "Firecracker Chunked Runtime And Cache",
+      "mosaicLayout": {
+        "columns": 12,
+        "tiles": [
+          {
+            "xPos": 0,
+            "yPos": 0,
+            "width": 3,
+            "height": 2,
+            "widget": {
+              "title": "Chunk Cache Hit Ratio",
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/chunked.cache_hit_ratio\" AND metric.label.service_name=\"firecracker-manager\"",
+                    "aggregation": {
+                      "alignmentPeriod": "60s",
+                      "perSeriesAligner": "ALIGN_MEAN",
+                      "crossSeriesReducer": "REDUCE_MEAN"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "xPos": 3,
+            "yPos": 0,
+            "width": 3,
+            "height": 2,
+            "widget": {
+              "title": "Disk Cache Used",
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/chunked.disk_cache.size\" AND metric.label.service_name=\"firecracker-manager\"",
+                    "aggregation": {
+                      "alignmentPeriod": "60s",
+                      "perSeriesAligner": "ALIGN_MAX",
+                      "crossSeriesReducer": "REDUCE_SUM"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "xPos": 6,
+            "yPos": 0,
+            "width": 3,
+            "height": 2,
+            "widget": {
+              "title": "Memory Cache Used",
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/chunked.mem_cache.size\" AND metric.label.service_name=\"firecracker-manager\"",
+                    "aggregation": {
+                      "alignmentPeriod": "60s",
+                      "perSeriesAligner": "ALIGN_MAX",
+                      "crossSeriesReducer": "REDUCE_SUM"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "xPos": 9,
+            "yPos": 0,
+            "width": 3,
+            "height": 2,
+            "widget": {
+              "title": "Dirty Chunks",
+              "scorecard": {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"workload.googleapis.com/chunked.dirty_chunks\" AND metric.label.service_name=\"firecracker-manager\"",
+                    "aggregation": {
+                      "alignmentPeriod": "60s",
+                      "perSeriesAligner": "ALIGN_MAX",
+                      "crossSeriesReducer": "REDUCE_SUM"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "xPos": 0,
+            "yPos": 2,
+            "width": 6,
+            "height": 4,
+            "widget": {
+              "title": "Chunk Activity Totals",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.page_faults\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "page faults",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.cache_hits\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "cache hits",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.chunk_fetches\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "chunk fetches",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "latest total"
+                }
+              }
+            }
+          },
+          {
+            "xPos": 6,
+            "yPos": 2,
+            "width": 6,
+            "height": 4,
+            "widget": {
+              "title": "Chunked Disk IO Totals",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_reads\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "disk reads",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_writes\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "disk writes",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "latest total"
+                }
+              }
+            }
+          },
+          {
+            "xPos": 0,
+            "yPos": 6,
+            "width": 6,
+            "height": 4,
+            "widget": {
+              "title": "Disk Cache Used Vs Max",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_cache.size\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "used",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_cache.max\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "max",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "bytes"
+                }
+              }
+            }
+          },
+          {
+            "xPos": 6,
+            "yPos": 6,
+            "width": 6,
+            "height": 4,
+            "widget": {
+              "title": "Memory Cache Used Vs Max",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.mem_cache.size\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "used",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.mem_cache.max\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "max",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "bytes"
+                }
+              }
+            }
+          },
+          {
+            "xPos": 0,
+            "yPos": 10,
+            "width": 6,
+            "height": 4,
+            "widget": {
+              "title": "Host CPU Used Vs Total",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.cpu_millicores.used\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MEAN",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "used",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.cpu_millicores.total\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MEAN",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "total",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "millicores"
+                }
+              }
+            }
+          },
+          {
+            "xPos": 6,
+            "yPos": 10,
+            "width": 6,
+            "height": 4,
+            "widget": {
+              "title": "Host Memory Used Vs Total",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.memory_mb.used\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MEAN",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "used",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.memory_mb.total\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MEAN",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "total",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "MB"
+                }
+              }
+            }
           }
         ]
       }

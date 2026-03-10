@@ -11,6 +11,7 @@ func TestAllHistogramsHaveDescriptions(t *testing.T) {
 		VMBootDuration, VMReadyDuration, VMLifetime, VMJobDuration,
 		HostBootDuration, HostGCSSyncDuration, HostHeartbeatLatency,
 		CPWebhookLatency, CPAllocationLatency, CPQueueWait,
+		CPEndpointRequestDuration, CPEndpointRequestSize, CPEndpointResponseSize,
 		SnapshotBuildDuration, SnapshotUploadDuration,
 		SessionPauseDuration, SessionResumeDuration,
 		CacheGitCloneDuration, GitHubRegistrationDuration, GitHubJobPickupLatency,
@@ -29,7 +30,7 @@ func TestAllHistogramsHaveDescriptions(t *testing.T) {
 func TestAllCountersHaveDescriptions(t *testing.T) {
 	counters := []CounterName{
 		VMAllocations, VMTerminations,
-		CPWebhookRequests, CPAllocations, CPDownscalerActions,
+		CPWebhookRequests, CPAllocations, CPEndpointRequests, CPDownscalerActions,
 		SnapshotRollouts,
 		CacheArtifactHits, CacheArtifactMisses, CacheGitClones,
 		CITokenRequests, CIJobs,
@@ -98,5 +99,16 @@ func TestNewGaugeCreatesInstrument(t *testing.T) {
 	}
 	if gauge == nil {
 		t.Error("NewGauge returned nil")
+	}
+}
+
+func TestAllUpDownCountersHaveDescriptions(t *testing.T) {
+	upDownCounters := []UpDownCounterName{
+		CPEndpointRequestsInFlight, HostRunnersIdle, HostRunnersBusy,
+	}
+	for _, name := range upDownCounters {
+		if _, ok := upDownCounterDescriptions[name]; !ok {
+			t.Errorf("up-down counter %q missing description", name)
+		}
 	}
 }

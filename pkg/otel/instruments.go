@@ -24,6 +24,9 @@ const (
 	CPWebhookLatency           HistogramName = "control_plane.webhook.latency"
 	CPAllocationLatency        HistogramName = "control_plane.allocation.latency"
 	CPQueueWait                HistogramName = "control_plane.queue.wait"
+	CPEndpointRequestDuration  HistogramName = "control_plane.endpoint.request.duration"
+	CPEndpointRequestSize      HistogramName = "control_plane.endpoint.request.size"
+	CPEndpointResponseSize     HistogramName = "control_plane.endpoint.response.size"
 	SnapshotBuildDuration      HistogramName = "snapshot.build.duration"
 	SnapshotUploadDuration     HistogramName = "snapshot.upload.duration"
 	SessionPauseDuration       HistogramName = "session.pause.duration"
@@ -41,6 +44,7 @@ const (
 	VMTerminations         CounterName = "vm.terminations"
 	CPWebhookRequests      CounterName = "control_plane.webhook.requests"
 	CPAllocations          CounterName = "control_plane.allocations"
+	CPEndpointRequests     CounterName = "control_plane.endpoint.requests"
 	CPDownscalerActions    CounterName = "control_plane.downscaler.actions"
 	SnapshotRollouts       CounterName = "snapshot.rollouts"
 	CacheArtifactHits      CounterName = "cache.artifact.hits"
@@ -111,8 +115,9 @@ const (
 
 // UpDownCounter names.
 const (
-	HostRunnersIdle UpDownCounterName = "host.runners.idle"
-	HostRunnersBusy UpDownCounterName = "host.runners.busy"
+	CPEndpointRequestsInFlight UpDownCounterName = "control_plane.endpoint.requests.inflight"
+	HostRunnersIdle            UpDownCounterName = "host.runners.idle"
+	HostRunnersBusy            UpDownCounterName = "host.runners.busy"
 )
 
 // Description and unit maps for counters.
@@ -121,6 +126,7 @@ var counterDescriptions = map[CounterName]string{
 	VMTerminations:         "Total number of VM terminations",
 	CPWebhookRequests:      "Total webhook requests received by the control plane",
 	CPAllocations:          "Total VM allocations performed by the control plane",
+	CPEndpointRequests:     "Total HTTP requests handled by control plane endpoints",
 	CPDownscalerActions:    "Total downscaler actions taken",
 	SnapshotRollouts:       "Total snapshot rollouts",
 	CacheArtifactHits:      "Artifact cache hits",
@@ -167,6 +173,9 @@ var histogramDescriptions = map[HistogramName]string{
 	CPWebhookLatency:           "Latency of control plane webhook handling",
 	CPAllocationLatency:        "Latency of control plane VM allocation",
 	CPQueueWait:                "Time spent waiting in the control plane queue",
+	CPEndpointRequestDuration:  "End-to-end latency of a control plane HTTP endpoint request",
+	CPEndpointRequestSize:      "Size of the incoming HTTP request body handled by a control plane endpoint",
+	CPEndpointResponseSize:     "Size of the HTTP response body returned by a control plane endpoint",
 	SnapshotBuildDuration:      "Duration of snapshot build",
 	SnapshotUploadDuration:     "Duration of snapshot upload",
 	SessionPauseDuration:       "Duration of session pause operation",
@@ -189,6 +198,9 @@ var histogramUnits = map[HistogramName]string{
 	CPWebhookLatency:           "s",
 	CPAllocationLatency:        "s",
 	CPQueueWait:                "s",
+	CPEndpointRequestDuration:  "s",
+	CPEndpointRequestSize:      "By",
+	CPEndpointResponseSize:     "By",
 	SnapshotBuildDuration:      "s",
 	SnapshotUploadDuration:     "s",
 	SessionPauseDuration:       "s",
@@ -246,8 +258,9 @@ var float64GaugeUnits = map[Float64GaugeName]string{}
 
 // Description and unit maps for up-down counters.
 var upDownCounterDescriptions = map[UpDownCounterName]string{
-	HostRunnersIdle: "Number of idle runners on the host",
-	HostRunnersBusy: "Number of busy runners on the host",
+	CPEndpointRequestsInFlight: "Number of in-flight HTTP requests for control plane endpoints",
+	HostRunnersIdle:            "Number of idle runners on the host",
+	HostRunnersBusy:            "Number of busy runners on the host",
 }
 
 var upDownCounterUnits = map[UpDownCounterName]string{}
@@ -316,10 +329,14 @@ func NewUpDownCounter(meter metric.Meter, name UpDownCounterName) (metric.Int64U
 const (
 	AttrResult      = attribute.Key("result")
 	AttrStatus      = attribute.Key("status")
+	AttrMethod      = attribute.Key("method")
+	AttrRoute       = attribute.Key("route")
 	AttrReason      = attribute.Key("reason")
 	AttrRouting     = attribute.Key("routing")
 	AttrSource      = attribute.Key("source")
 	AttrPhase       = attribute.Key("phase")
+	AttrStatusCode  = attribute.Key("status_code")
+	AttrStatusClass = attribute.Key("status_class")
 	AttrWorkloadKey = attribute.Key("workload_key")
 	AttrHostID      = attribute.Key("host_id")
 	AttrRunnerID    = attribute.Key("runner_id")
