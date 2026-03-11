@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from bf_sdk._config import ConnectionConfig
+from bf_sdk._errors import BFConflict, BFNotFound
 from bf_sdk._http import HttpClient
 from bf_sdk.models.layered_config import (
     BuildResponse,
@@ -14,7 +15,9 @@ from bf_sdk.models.layered_config import (
     RefreshResponse,
     StoredLayeredConfig,
 )
+from bf_sdk.models.workload import WorkloadSummary
 from bf_sdk.resources.layered_configs import LayeredConfigs
+from bf_sdk.runner_config import RunnerConfig
 
 
 @pytest.fixture
@@ -60,6 +63,12 @@ class TestLayeredConfigs:
         assert len(result) == 2
         assert all(isinstance(c, StoredLayeredConfig) for c in result)
 
+    def test_list_handles_null_configs(self, lc: LayeredConfigs, http_client: HttpClient) -> None:
+        mock_resp = httpx.Response(200, json={"configs": None, "count": 0})
+        with patch.object(http_client._client, "request", return_value=mock_resp):
+            result = lc.list()
+        assert result == []
+
     def test_get(self, lc: LayeredConfigs, http_client: HttpClient) -> None:
         resp_data = {
             "config": {"config_id": "c1", "display_name": "My Config"},
@@ -103,3 +112,36 @@ class TestLayeredConfigs:
         assert isinstance(result, RefreshResponse)
         assert result.layer_name == "deps"
         assert result.status == "refresh_enqueued"
+
+    def test_resolve_workload_key_from_create_response(self, lc: LayeredConfigs) -> None:
+        response = CreateConfigResponse(config_id="c1", leaf_workload_key="wk-leaf")
+        assert lc.resolve_workload_key(response) == "wk-leaf"
+
+    def test_resolve_workload_key_from_workload_summary(self, lc: LayeredConfigs) -> None:
+        summary = WorkloadSummary(display_name="My Sandbox", config_id="c1", workload_key="wk-leaf")
+        assert lc.resolve_workload_key(summary) == "wk-leaf"
+
+    def test_resolve_workload_key_from_display_name(self, lc: LayeredConfigs) -> None:
+        configs = [StoredLayeredConfig(config_id="c1", display_name="My Sandbox", leaf_workload_key="wk-leaf")]
+        with patch.object(lc, "list", return_value=configs):
+            assert lc.resolve_workload_key("My Sandbox") == "wk-leaf"
+
+    def test_resolve_workload_key_from_runner_config_name(self, lc: LayeredConfigs) -> None:
+        configs = [StoredLayeredConfig(config_id="c1", display_name="My Sandbox", leaf_workload_key="wk-leaf")]
+        cfg = RunnerConfig("My Sandbox").with_commands(["echo hi"])
+        with patch.object(lc, "list", return_value=configs):
+            assert lc.resolve_workload_key(cfg) == "wk-leaf"
+
+    def test_resolve_workload_key_raises_on_ambiguous_name(self, lc: LayeredConfigs) -> None:
+        configs = [
+            StoredLayeredConfig(config_id="c1", display_name="My Sandbox", leaf_workload_key="wk-1"),
+            StoredLayeredConfig(config_id="c2", display_name="My Sandbox", leaf_workload_key="wk-2"),
+        ]
+        with patch.object(lc, "list", return_value=configs):
+            with pytest.raises(BFConflict):
+                lc.resolve_workload_key("My Sandbox")
+
+    def test_resolve_workload_key_raises_on_missing_name(self, lc: LayeredConfigs) -> None:
+        with patch.object(lc, "list", return_value=[]):
+            with pytest.raises(BFNotFound):
+                lc.resolve_workload_key("Missing Sandbox")

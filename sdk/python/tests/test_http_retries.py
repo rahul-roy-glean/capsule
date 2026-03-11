@@ -12,10 +12,11 @@ from bf_sdk._errors import (
     BFHTTPError,
     BFNotFound,
     BFRateLimited,
+    BFRequestTimeoutError,
     BFServiceUnavailable,
-    BFTimeoutError,
 )
 from bf_sdk._http import HttpClient
+from bf_sdk.resources.runners import Runners
 
 
 @pytest.fixture
@@ -35,7 +36,9 @@ class TestHttpClient:
         mock_resp = httpx.Response(200, json={"runners": [], "count": 0})
         with patch.object(http._client, "request", return_value=mock_resp):
             result = http.get("/api/v1/runners")
-        assert result == {"runners": [], "count": 0}
+        assert result["runners"] == []
+        assert result["count"] == 0
+        assert result["request_id"]
 
     def test_post_success(self, http: HttpClient) -> None:
         mock_resp = httpx.Response(200, json={"runner_id": "r-1", "host_address": "h:8080"})
@@ -58,37 +61,49 @@ class TestHttpClient:
 
     def test_429_retries_then_raises(self, http: HttpClient) -> None:
         mock_resp = httpx.Response(429, json={"error": "rate limited"}, headers={"Retry-After": "0"})
-        with patch.object(http._client, "request", return_value=mock_resp):
+        with patch.object(http._client, "request", return_value=mock_resp) as request:
             with patch("bf_sdk._http.time.sleep"):  # skip actual sleep
                 with pytest.raises(BFRateLimited):
                     http.get("/api/v1/runners")
+        assert request.call_count == 4
 
     def test_503_retries_then_raises(self, http: HttpClient) -> None:
         mock_resp = httpx.Response(503, json={"error": "unavailable"}, headers={"Retry-After": "0"})
-        with patch.object(http._client, "request", return_value=mock_resp):
+        with patch.object(http._client, "request", return_value=mock_resp) as request:
             with patch("bf_sdk._http.time.sleep"):
                 with pytest.raises(BFServiceUnavailable) as exc_info:
                     http.get("/api/v1/runners/status")
                 assert exc_info.value.status_code == 503
+        assert request.call_count == 4
 
     def test_500_raises_http_error(self, http: HttpClient) -> None:
         mock_resp = httpx.Response(500, json={"error": "internal"})
-        with patch.object(http._client, "request", return_value=mock_resp):
+        with patch.object(http._client, "request", return_value=mock_resp) as request:
             with pytest.raises(BFHTTPError) as exc_info:
                 http.post("/api/v1/runners/release", json_body={"runner_id": "r-1"})
             assert exc_info.value.status_code == 500
+        assert request.call_count == 1
 
     def test_connection_error_retries(self, http: HttpClient) -> None:
-        with patch.object(http._client, "request", side_effect=httpx.ConnectError("refused")):
+        with patch.object(http._client, "request", side_effect=httpx.ConnectError("refused")) as request:
             with patch("bf_sdk._http.time.sleep"):
                 with pytest.raises(BFConnectionError):
                     http.get("/api/v1/runners")
+        assert request.call_count == 4
 
     def test_timeout_error_retries(self, http: HttpClient) -> None:
-        with patch.object(http._client, "request", side_effect=httpx.ReadTimeout("timeout")):
+        with patch.object(http._client, "request", side_effect=httpx.ReadTimeout("timeout")) as request:
             with patch("bf_sdk._http.time.sleep"):
-                with pytest.raises(BFTimeoutError):
+                with pytest.raises(BFRequestTimeoutError):
                     http.get("/api/v1/runners")
+        assert request.call_count == 4
+
+    def test_post_timeout_does_not_retry_by_default(self, http: HttpClient) -> None:
+        with patch.object(http._client, "request", side_effect=httpx.ReadTimeout("timeout")) as request:
+            with patch("bf_sdk._http.time.sleep"):
+                with pytest.raises(BFRequestTimeoutError):
+                    http.post("/api/v1/runners/release", json_body={"runner_id": "r-1"})
+        assert request.call_count == 1
 
     def test_retry_succeeds_on_second_attempt(self, http: HttpClient) -> None:
         fail_resp = httpx.Response(503, json={"error": "unavailable"}, headers={"Retry-After": "0"})
@@ -96,10 +111,39 @@ class TestHttpClient:
         with patch.object(http._client, "request", side_effect=[fail_resp, ok_resp]):
             with patch("bf_sdk._http.time.sleep"):
                 result = http.get("/api/v1/runners/status")
-        assert result == {"status": "ok"}
+        assert result["status"] == "ok"
+        assert result["request_id"]
 
     def test_delete_success(self, http: HttpClient) -> None:
         mock_resp = httpx.Response(204, text="")
         with patch.object(http._client, "request", return_value=mock_resp):
             result = http.delete("/api/v1/layered-configs/wk1/tags/stable")
-        assert result == {"_raw": ""}
+        assert result["_raw"] == ""
+
+    def test_post_429_does_not_retry_by_default(self, http: HttpClient) -> None:
+        mock_resp = httpx.Response(429, json={"error": "rate limited"}, headers={"Retry-After": "0"})
+        with patch.object(http._client, "request", return_value=mock_resp) as request:
+            with pytest.raises(BFRateLimited):
+                http.post("/api/v1/runners/release", json_body={"runner_id": "r-1"})
+        assert request.call_count == 1
+
+
+class TestAllocateRetries:
+    def test_allocate_retries_and_reuses_request_id(self, http: HttpClient) -> None:
+        runners = Runners(http)
+        fail_resp = httpx.Response(429, json={"error": "rate limited"}, headers={"Retry-After": "0"})
+        ok_resp = httpx.Response(200, json={"runner_id": "r-1", "host_address": "10.0.0.1:8080"})
+
+        with patch.object(http._client, "request", side_effect=[fail_resp, ok_resp]) as request:
+            with patch("bf_sdk.resources.runners.time.sleep"):
+                result = runners.allocate("wk-1", request_id="req-fixed", startup_timeout=2.0)
+
+        assert result.runner_id == "r-1"
+        assert result.request_id == "req-fixed"
+        assert request.call_count == 2
+        first_headers = request.call_args_list[0].kwargs["headers"]
+        second_headers = request.call_args_list[1].kwargs["headers"]
+        assert first_headers["X-Request-Id"] == "req-fixed"
+        assert second_headers["X-Request-Id"] == "req-fixed"
+        first_body = request.call_args_list[0].kwargs["json"]
+        assert first_body["request_id"] == "req-fixed"

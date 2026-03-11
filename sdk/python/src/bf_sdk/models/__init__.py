@@ -1,4 +1,14 @@
 from bf_sdk.models.common import BFModel, Resources
+from bf_sdk.models.file import (
+    FileEntry,
+    FileListResult,
+    FileMkdirResult,
+    FileReadResult,
+    FileRemoveResult,
+    FileStatResult,
+    FileUploadResult,
+    FileWriteResult,
+)
 from bf_sdk.models.layered_config import (
     BuildResponse,
     CreateConfigResponse,
@@ -22,6 +32,7 @@ from bf_sdk.models.runner import (
     RunnerStatus,
 )
 from bf_sdk.models.snapshot import Snapshot
+from bf_sdk.models.workload import WorkloadSummary
 
 __all__ = [
     "AllocateRunnerRequest",
@@ -34,6 +45,14 @@ __all__ = [
     "ExecEvent",
     "ExecRequest",
     "ExecResult",
+    "FileEntry",
+    "FileListResult",
+    "FileMkdirResult",
+    "FileReadResult",
+    "FileRemoveResult",
+    "FileStatResult",
+    "FileUploadResult",
+    "FileWriteResult",
     "LayerDef",
     "LayerStatus",
     "LayeredConfigConfig",
@@ -45,4 +64,5 @@ __all__ = [
     "RunnerStatus",
     "Snapshot",
     "StoredLayeredConfig",
+    "WorkloadSummary",
 ]
