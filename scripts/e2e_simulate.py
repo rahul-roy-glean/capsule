@@ -1806,6 +1806,8 @@ def suite_concurrency(
         client = BFClient(base_url=base_url, token=token, timeout=180.0)
         runner_id: str | None = None
         rng = random.Random(wid + int(time.monotonic() * 1000))
+        # Per-cycle timings: list of (exec_s, pause_s, resume_s) per cycle.
+        cycle_timings: list[dict[str, float]] = []
         try:
             sess_id = uuid.uuid4().hex
             barrier.wait()
@@ -1815,7 +1817,8 @@ def suite_concurrency(
                 request_id=f"e2e-dirty-{wid}-{uuid.uuid4().hex[:8]}",
                 session_id=sess_id,
             )
-            _alloc_latencies.append(("exec_dirty_cycles", time.monotonic() - t0))
+            alloc_dur = time.monotonic() - t0
+            _alloc_latencies.append(("exec_dirty_cycles", alloc_dur))
             runner_id = resp.runner_id
 
             for cycle in range(NUM_PAUSE_CYCLES):
@@ -1846,11 +1849,15 @@ def suite_concurrency(
                 # Wait for all background writes to finish, then sync to
                 # flush to the block device before pause.
                 script = " ".join(bg_cmds) + " wait && sync"
+
+                t_exec = time.monotonic()
                 exec_events = list(client.runners.exec(
                     runner_id,
                     ["sh", "-c", script],
                     timeout_seconds=60,
                 ))
+                exec_dur = time.monotonic() - t_exec
+
                 # Check for non-zero exit.
                 exit_events = [e for e in exec_events if e.type == "exit"]
                 if exit_events and exit_events[0].code != 0:
@@ -1863,10 +1870,14 @@ def suite_concurrency(
                     "worker": wid, "cycle": cycle,
                     "num_writes": num_writes + 1,  # +1 for shared file
                     "runner_id": runner_id,
+                    "exec_ms": round(exec_dur * 1000),
                 })
 
                 # --- Pause phase ---
+                t_pause = time.monotonic()
                 pause = client.runners.pause(runner_id)
+                pause_dur = time.monotonic() - t_pause
+
                 if not pause.success:
                     return False, (
                         f"Cycle {cycle}: pause returned success=False "
@@ -1883,11 +1894,15 @@ def suite_concurrency(
                     "worker": wid, "cycle": cycle,
                     "runner_id": runner_id,
                     "snapshot_size_bytes": pause.snapshot_size_bytes,
+                    "pause_ms": round(pause_dur * 1000),
                 })
 
                 # --- Resume phase ---
+                t_resume = time.monotonic()
                 conn = client.runners.connect(runner_id)
+                resume_dur = time.monotonic() - t_resume
                 runner_id = conn.runner_id
+
                 if conn.status not in {"connected", "resumed", "pending"}:
                     return False, (
                         f"Cycle {cycle}: unexpected post-resume status: "
@@ -1898,6 +1913,14 @@ def suite_concurrency(
                     "worker": wid, "cycle": cycle,
                     "runner_id": runner_id,
                     "status": conn.status,
+                    "resume_ms": round(resume_dur * 1000),
+                })
+
+                cycle_timings.append({
+                    "cycle": cycle,
+                    "exec_ms": round(exec_dur * 1000),
+                    "pause_ms": round(pause_dur * 1000),
+                    "resume_ms": round(resume_dur * 1000),
                 })
 
             # --- Final verification: read back a file to confirm data survived ---
@@ -1912,10 +1935,17 @@ def suite_concurrency(
             if not file_count_str or int(file_count_str) == 0:
                 return False, "No dirty files found after pause/resume cycles", True
 
+            log.info("Worker cycle timings", extra={
+                "worker": wid, "runner_id": runner_id,
+                "alloc_ms": round(alloc_dur * 1000),
+                "cycles": cycle_timings,
+            })
+
             client.runners.release(runner_id)
             runner_id = None
             return True, (
-                f"{NUM_PAUSE_CYCLES} cycles, files verified={file_count_str}"
+                f"{NUM_PAUSE_CYCLES} cycles, files verified={file_count_str}, "
+                f"timings={cycle_timings}"
             ), True
 
         except (BFServiceUnavailable, BFRateLimited) as exc:
