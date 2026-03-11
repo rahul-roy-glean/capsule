@@ -11,6 +11,7 @@ from bf_sdk._errors import BFAllocationTimeoutError, BFNotFound, BFOperationTime
 from bf_sdk._http import HttpClient
 from bf_sdk.models.layered_config import CreateConfigResponse
 from bf_sdk.models.runner import AllocateRunnerResponse, ConnectResult, PauseResult, RunnerStatus
+from bf_sdk.models.workload import ResolvedWorkloadRef
 from bf_sdk.resources.layered_configs import LayeredConfigs
 from bf_sdk.resources.runners import Runners
 from bf_sdk.runner_session import RunnerSession
@@ -56,7 +57,11 @@ class TestRunners:
         runners = Runners(http_client, layered_configs=layered_configs)
         resp_data = {"runner_id": "r-123", "host_address": "10.0.0.1:8080"}
         mock_resp = httpx.Response(200, json=resp_data)
-        with patch.object(layered_configs, "resolve_workload_key", return_value="wk-leaf") as resolve:
+        with patch.object(
+            layered_configs,
+            "resolve_workload_ref",
+            return_value=ResolvedWorkloadRef(display_name="My Sandbox", workload_key="wk-leaf"),
+        ) as resolve:
             with patch.object(http_client._client, "request", return_value=mock_resp):
                 result = runners.allocate("My Sandbox")
         assert result.runner_id == "r-123"
@@ -77,7 +82,7 @@ class TestRunners:
     ) -> None:
         runners = Runners(http_client, layered_configs=layered_configs)
         mock_resp = httpx.Response(200, json={"runner_id": "r-123", "host_address": "10.0.0.1:8080"})
-        with patch.object(layered_configs, "resolve_workload_key", side_effect=BFNotFound("missing")):
+        with patch.object(layered_configs, "resolve_workload_ref", side_effect=BFNotFound("missing")):
             with patch.object(http_client._client, "request", return_value=mock_resp) as request:
                 runners.allocate("wk-raw")
         assert request.call_args.kwargs["json"]["workload_key"] == "wk-raw"

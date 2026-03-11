@@ -8,7 +8,7 @@ import yaml
 
 from bf_sdk._errors import BFNotFound
 from bf_sdk.models.layered_config import BuildResponse, CreateConfigResponse, LayeredConfigDetail, StoredLayeredConfig
-from bf_sdk.models.workload import WorkloadSummary
+from bf_sdk.models.workload import ResolvedWorkloadRef, WorkloadSummary
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -61,6 +61,42 @@ class Workloads:
     def list(self) -> list[WorkloadSummary]:
         return [self._to_summary(cfg) for cfg in self._layered_configs.list()]
 
+    def _resolve_ref(
+        self,
+        workload: (
+            str
+            | WorkloadSummary
+            | CreateConfigResponse
+            | StoredLayeredConfig
+            | LayeredConfigDetail
+            | RunnerConfig
+        ),
+    ) -> ResolvedWorkloadRef:
+        if isinstance(workload, WorkloadSummary):
+            return ResolvedWorkloadRef(
+                display_name=workload.display_name,
+                config_id=workload.config_id,
+                workload_key=workload.workload_key,
+            )
+        if isinstance(workload, LayeredConfigDetail):
+            return ResolvedWorkloadRef(
+                display_name=workload.config.display_name,
+                config_id=workload.config.config_id,
+                workload_key=workload.config.leaf_workload_key,
+            )
+        if isinstance(workload, StoredLayeredConfig):
+            return ResolvedWorkloadRef(
+                display_name=workload.display_name,
+                config_id=workload.config_id,
+                workload_key=workload.leaf_workload_key,
+            )
+        if isinstance(workload, CreateConfigResponse):
+            return ResolvedWorkloadRef(
+                config_id=workload.config_id,
+                workload_key=workload.leaf_workload_key,
+            )
+        return self._layered_configs.resolve_workload_ref(workload)
+
     def get(
         self,
         workload: (
@@ -74,30 +110,8 @@ class Workloads:
     ) -> WorkloadSummary:
         if isinstance(workload, WorkloadSummary):
             return workload
-
-        if isinstance(workload, LayeredConfigDetail):
-            return self._to_summary(workload.config)
-
-        if isinstance(workload, StoredLayeredConfig):
-            return self._to_summary(workload)
-
-        if isinstance(workload, CreateConfigResponse):
-            detail = self._layered_configs.get(workload.config_id)
-            return self._to_summary(detail.config)
-
-        configs = self._layered_configs.list()
-        if isinstance(workload, str):
-            for cfg in configs:
-                if workload in {cfg.display_name, cfg.config_id, cfg.leaf_workload_key}:
-                    return self._to_summary(cfg)
-            raise BFNotFound(f"Workload {workload!r} was not found.")
-
-        if hasattr(workload, "display_name"):
-            display_name = cast(Any, workload).display_name
-            if isinstance(display_name, str):
-                return self.get(display_name)
-
-        raise BFNotFound("Could not resolve the requested workload.")
+        resolved = self._resolve_ref(workload)
+        return self._summary_from_resolved(resolved)
 
     def build(
         self,
@@ -146,7 +160,8 @@ class Workloads:
         ),
         **kwargs: Any,
     ) -> RunnerSession:
-        return self._runners.from_config(workload, **kwargs)
+        resolved = self._resolve_ref(workload)
+        return self._runners.from_config(resolved, **kwargs)
 
     def allocate(
         self,
@@ -160,7 +175,8 @@ class Workloads:
         ),
         **kwargs: Any,
     ) -> AllocateRunnerResponse:
-        return self._runners.allocate(workload, **kwargs)
+        resolved = self._resolve_ref(workload)
+        return self._runners.allocate(resolved, **kwargs)
 
     @staticmethod
     def _to_summary(cfg: StoredLayeredConfig) -> WorkloadSummary:
@@ -168,6 +184,17 @@ class Workloads:
             display_name=cfg.display_name or cfg.leaf_workload_key or cfg.config_id,
             config_id=cfg.config_id,
             workload_key=cfg.leaf_workload_key,
+        )
+
+    @staticmethod
+    def _summary_from_resolved(ref: ResolvedWorkloadRef) -> WorkloadSummary:
+        display_name = ref.display_name or ref.workload_key or ref.config_id
+        if not display_name:
+            raise BFNotFound("Resolved workload reference is missing a display name and identifiers.")
+        return WorkloadSummary(
+            display_name=display_name,
+            config_id=ref.config_id,
+            workload_key=ref.workload_key,
         )
 
     def _normalize_spec(

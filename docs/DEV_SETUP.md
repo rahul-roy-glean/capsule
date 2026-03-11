@@ -60,6 +60,21 @@ BF_BASE_URL=http://localhost:8080 BF_TOKEN=test-token \
   python -m pytest tests/test_contract.py -v -m contract
 ```
 
+If you want local hooks to catch most of the same checks before CI does:
+
+```bash
+python3 -m pip install pre-commit
+pre-commit install
+pre-commit install --hook-type pre-push
+```
+
+This will run Go formatting/build checks plus Python SDK `ruff` and `pyright`
+on commit when matching files change, and the heavier Go/Python test suites on
+push.
+
+`golangci-lint` remains a manual or CI-time check via `make lint`, since it can
+be sensitive to the exact local Go toolchain used to build the binary.
+
 ## Building
 
 ```bash

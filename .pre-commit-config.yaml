@@ -46,9 +46,48 @@ repos:
         name: migration guard
         entry: bash .github/scripts/check-migrations.sh --staged
         language: system
+        files: ^(cmd/control-plane/migrations/|cmd/control-plane/schema\.sql|\.github/scripts/check-migrations\.sh)
         pass_filenames: false
 
-  - repo: https://github.com/golangci/golangci-lint
-    rev: v1.64.8
-    hooks:
-      - id: golangci-lint
+      - id: sdk-python-ruff
+        name: sdk python ruff
+        entry: >-
+          bash -lc 'cd sdk/python &&
+          [ -x .venv/bin/python ] || {
+          echo "missing sdk/python/.venv; run: cd sdk/python && python3 -m venv .venv && . .venv/bin/activate && pip install -e \".[dev]\"";
+          exit 1; };
+          export VIRTUAL_ENV="$PWD/.venv";
+          export PATH="$VIRTUAL_ENV/bin:$PATH";
+          .venv/bin/python -m ruff check src/bf_sdk/ tests/'
+        language: system
+        files: ^sdk/python/
+        pass_filenames: false
+
+      - id: sdk-python-pyright
+        name: sdk python pyright
+        entry: >-
+          bash -lc 'cd sdk/python &&
+          [ -x .venv/bin/python ] || {
+          echo "missing sdk/python/.venv; run: cd sdk/python && python3 -m venv .venv && . .venv/bin/activate && pip install -e \".[dev]\"";
+          exit 1; };
+          export VIRTUAL_ENV="$PWD/.venv";
+          export PATH="$VIRTUAL_ENV/bin:$PATH";
+          .venv/bin/python -m pyright src/bf_sdk/'
+        language: system
+        files: ^sdk/python/
+        pass_filenames: false
+
+      - id: sdk-python-pytest
+        name: sdk python pytest
+        entry: >-
+          bash -lc 'cd sdk/python &&
+          [ -x .venv/bin/python ] || {
+          echo "missing sdk/python/.venv; run: cd sdk/python && python3 -m venv .venv && . .venv/bin/activate && pip install -e \".[dev]\"";
+          exit 1; };
+          export VIRTUAL_ENV="$PWD/.venv";
+          export PATH="$VIRTUAL_ENV/bin:$PATH";
+          .venv/bin/python -m pytest tests/ -v --ignore=tests/e2e_live.py -m "not contract"'
+        language: system
+        files: ^sdk/python/
+        pass_filenames: false
+        stages: [pre-push]

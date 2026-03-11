@@ -532,6 +532,7 @@ func (r *LayeredConfigRegistry) handleListLayeredConfigs(w http.ResponseWriter, 
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	configs = nonNilSlice(configs)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"configs": configs, "count": len(configs)})
 }

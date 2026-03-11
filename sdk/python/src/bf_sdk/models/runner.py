@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from enum import Enum
 
-from pydantic import ConfigDict
+from pydantic import ConfigDict, Field
 
 from bf_sdk.models.common import BFModel
+
+
+def _empty_runners() -> list[Runner]:
+    return []
 
 
 class RunnerState(str, Enum):
@@ -86,6 +90,13 @@ class ConnectResult(BFModel):
     status: str
     runner_id: str
     host_address: str | None = None
+
+
+class RunnerListResponse(BFModel):
+    """Response from listing runners."""
+
+    runners: list[Runner] = Field(default_factory=_empty_runners)
+    count: int | None = None
 
 
 class ExecRequest(BFModel):

@@ -5,6 +5,10 @@ from pydantic import AliasChoices, Field
 from bf_sdk.models.common import BFModel
 
 
+def _empty_snapshots() -> list[Snapshot]:
+    return []
+
+
 class SnapshotMetrics(BFModel):
     """Performance metadata recorded for a snapshot."""
 
@@ -23,3 +27,11 @@ class Snapshot(BFModel):
     size_bytes: int | None = Field(default=None, validation_alias=AliasChoices("size_bytes", "SizeBytes"))
     created_at: str | None = Field(default=None, validation_alias=AliasChoices("created_at", "CreatedAt"))
     metrics: SnapshotMetrics | None = Field(default=None, validation_alias=AliasChoices("metrics", "Metrics"))
+
+
+class SnapshotListResponse(BFModel):
+    """Response from listing snapshots."""
+
+    snapshots: list[Snapshot] = Field(default_factory=_empty_snapshots)
+    count: int | None = None
+    current_version: str | None = None

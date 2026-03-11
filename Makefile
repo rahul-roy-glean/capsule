@@ -3,7 +3,7 @@
 .PHONY: onboard onboard-validate onboard-plan bin-onboard
 .PHONY: firecracker-manager control-plane snapshot-builder thaw-agent
 .PHONY: test-unit test-race test-cover test-integration test-all check
-.PHONY: sdk-python-lint sdk-python-test sdk-python-typecheck sdk-python-e2e
+.PHONY: sdk-python-lint sdk-python-test sdk-python-typecheck sdk-python-check sdk-python-e2e
 .PHONY: dev-build dev-snapshot dev-stack dev-test-snapshot-builder dev-test-pause-resume dev-test-multi-pause-dedup dev-stop
 .PHONY: dev-test-gcs-pause-resume
 .PHONY: dev-test-file-ops dev-test-pty dev-test-checkpoint
@@ -444,6 +444,9 @@ sdk-python-test:
 
 sdk-python-typecheck:
 	cd sdk/python && python -m pyright src/bf_sdk/
+
+sdk-python-check: sdk-python-lint sdk-python-typecheck sdk-python-test
+	@echo "Python SDK checks passed"
 
 sdk-python-e2e:
 	cd sdk/python && python -m pytest tests/e2e_live.py -v
