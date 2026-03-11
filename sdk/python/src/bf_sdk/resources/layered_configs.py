@@ -34,7 +34,16 @@ class LayeredConfigs:
 
     def list(self) -> list[StoredLayeredConfig]:
         data = self._http.get("/api/v1/layered-configs")
-        raw_configs = data.get("configs") or []
+        raw_configs_value = data.get("configs")
+        raw_configs: list[dict[str, Any]]
+        if isinstance(raw_configs_value, list):
+            raw_configs = [
+                item
+                for item in raw_configs_value
+                if isinstance(item, dict)
+            ]
+        else:
+            raw_configs = []
         return [StoredLayeredConfig.model_validate(c) for c in raw_configs]
 
     def get(self, config_id: str) -> LayeredConfigDetail:
