@@ -135,3 +135,9 @@ variable "alert_snapshot_age_threshold_hours" {
   type        = number
   default     = 48
 }
+
+variable "alert_queue_depth_threshold" {
+  description = "Alert when job queue depth exceeds this threshold"
+  type        = number
+  default     = 10
+}

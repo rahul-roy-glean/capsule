@@ -429,128 +429,6 @@ resource "google_monitoring_dashboard" "vm_boot_phases" {
   })
 }
 
-# Alert: VM Boot Time Too High
-resource "google_monitoring_alert_policy" "vm_boot_slow" {
-  count        = var.enable_monitoring && var.enable_monitoring_alerts ? 1 : 0
-  display_name = "Firecracker VM Boot Time > ${var.alert_vm_boot_threshold_seconds}s"
-  combiner     = "OR"
-
-  conditions {
-    display_name = "VM boot p95 above threshold"
-    condition_threshold {
-      filter          = "metric.type=\"${local.metric_prefix}/vm.boot.duration\" AND metric.label.service_name=\"${local.mgr_service}\""
-      comparison      = "COMPARISON_GT"
-      threshold_value = var.alert_vm_boot_threshold_seconds
-      duration        = "300s"
-      aggregations {
-        alignment_period     = "60s"
-        per_series_aligner   = "ALIGN_DELTA"
-        cross_series_reducer = "REDUCE_SUM"
-      }
-      aggregations {
-        alignment_period     = "60s"
-        per_series_aligner   = "ALIGN_PERCENTILE_95"
-        cross_series_reducer = "REDUCE_MEAN"
-      }
-    }
-  }
-
-  notification_channels = var.monitoring_notification_channels
-
-  documentation {
-    content   = "VM boot time p95 exceeded ${var.alert_vm_boot_threshold_seconds} seconds. Check snapshot health and host resource availability."
-    mime_type = "text/markdown"
-  }
-
-  alert_strategy {
-    auto_close = "1800s"
-  }
-}
-
-# Alert: No Idle Runners
-resource "google_monitoring_alert_policy" "no_idle_runners" {
-  count        = var.enable_monitoring && var.enable_monitoring_alerts ? 1 : 0
-  display_name = "Firecracker No Idle Runners Available"
-  combiner     = "OR"
-
-  conditions {
-    display_name = "No idle runners for 5 minutes"
-    condition_threshold {
-      filter          = "metric.type=\"${local.metric_prefix}/control_plane.runners.idle\" AND metric.label.service_name=\"${local.cp_service}\""
-      comparison      = "COMPARISON_LT"
-      threshold_value = 1
-      duration        = "300s"
-      aggregations {
-        alignment_period     = "60s"
-        per_series_aligner   = "ALIGN_MAX"
-        cross_series_reducer = "REDUCE_SUM"
-      }
-    }
-  }
-
-  notification_channels = var.monitoring_notification_channels
-
-  documentation {
-    content   = "No idle runners available. Jobs will queue. Consider scaling up hosts."
-    mime_type = "text/markdown"
-  }
-}
-
-# Alert: Snapshot Age Too Old
-resource "google_monitoring_alert_policy" "snapshot_stale" {
-  count        = var.enable_monitoring && var.enable_monitoring_alerts ? 1 : 0
-  display_name = "Firecracker Snapshot Too Old"
-  combiner     = "OR"
-
-  conditions {
-    display_name = "Snapshot age above threshold"
-    condition_threshold {
-      filter          = "metric.type=\"${local.metric_prefix}/snapshot.age\" AND metric.label.service_name=\"${local.cp_service}\""
-      comparison      = "COMPARISON_GT"
-      threshold_value = var.alert_snapshot_age_threshold_hours * 3600
-      duration        = "3600s"
-      aggregations {
-        alignment_period   = "300s"
-        per_series_aligner = "ALIGN_MAX"
-      }
-    }
-  }
-
-  notification_channels = var.monitoring_notification_channels
-
-  documentation {
-    content   = "Active snapshot is older than ${var.alert_snapshot_age_threshold_hours} hours. Consider building a new snapshot."
-    mime_type = "text/markdown"
-  }
-}
-
-# Alert: Host Unhealthy
-resource "google_monitoring_alert_policy" "host_unhealthy" {
-  count        = var.enable_monitoring && var.enable_monitoring_alerts ? 1 : 0
-  display_name = "Firecracker Host Unhealthy"
-  combiner     = "OR"
-
-  conditions {
-    display_name = "Host heartbeat missing"
-    condition_absent {
-      filter   = "metric.type=\"${local.metric_prefix}/host.heartbeat.latency\" AND metric.label.service_name=\"${local.mgr_service}\""
-      duration = "300s"
-      aggregations {
-        alignment_period   = "60s"
-        per_series_aligner = "ALIGN_MEAN"
-        group_by_fields    = ["metric.label.host_id"]
-      }
-    }
-  }
-
-  notification_channels = var.monitoring_notification_channels
-
-  documentation {
-    content   = "A host has not sent a heartbeat in 5 minutes. Check host health and connectivity."
-    mime_type = "text/markdown"
-  }
-}
-
 # ============================================================================
 # Operations Dashboard (snapshot automation & fleet health)
 resource "google_monitoring_dashboard" "firecracker_operations" {
@@ -1511,7 +1389,7 @@ resource "google_monitoring_dashboard" "endpoint_health" {
                   { path = "/api/v1/runners/pause", label = "pause" },
                   { path = "/api/v1/runners/connect", label = "connect/resume" },
                   { path = "/api/v1/runners/release", label = "release" },
-                ] : {
+                  ] : {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
                       filter = "metric.type=\"${local.metric_prefix}/control_plane.endpoint.requests\" AND metric.label.service_name=\"${local.cp_service}\" AND metric.label.route=\"${route.path}\""
@@ -1544,7 +1422,7 @@ resource "google_monitoring_dashboard" "endpoint_health" {
                   { path = "/api/v1/runners/pause", label = "pause" },
                   { path = "/api/v1/runners/connect", label = "connect/resume" },
                   { path = "/api/v1/runners/release", label = "release" },
-                ] : [
+                  ] : [
                   for code in ["4xx", "5xx"] : {
                     timeSeriesQuery = {
                       timeSeriesFilter = {
@@ -1562,6 +1440,288 @@ resource "google_monitoring_dashboard" "endpoint_health" {
                 ]
               ])
               yAxis = { label = "errors/min" }
+            }
+          }
+        },
+        # ── Allocation And Placement ──────────────────────────────────
+        {
+          yPos   = 12
+          width  = 12
+          height = 1
+          widget = {
+            text = {
+              content = "## Allocation And Placement"
+              format  = "MARKDOWN"
+            }
+          }
+        },
+        {
+          yPos   = 13
+          width  = 6
+          height = 4
+          widget = {
+            title = "Allocation Outcomes / 5m"
+            xyChart = {
+              dataSets = flatten([
+                for source in ["api", "mcp"] : [
+                  for result in ["success", "failure"] : {
+                    timeSeriesQuery = {
+                      timeSeriesFilter = {
+                        filter = "metric.type=\"${local.metric_prefix}/control_plane.allocations\" AND metric.label.service_name=\"${local.cp_service}\" AND metric.label.result=\"${result}\" AND metric.label.source=\"${source}\""
+                        aggregation = {
+                          alignmentPeriod    = "300s"
+                          perSeriesAligner   = "ALIGN_DELTA"
+                          crossSeriesReducer = "REDUCE_SUM"
+                        }
+                      }
+                    }
+                    legendTemplate = "${source} ${result}"
+                    plotType       = "STACKED_BAR"
+                  }
+                ]
+              ])
+              yAxis = { label = "allocations / 5m" }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 13
+          width  = 6
+          height = 4
+          widget = {
+            title = "Allocation P95 By Source"
+            xyChart = {
+              dataSets = [
+                for source in ["api", "mcp"] : {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/control_plane.allocation.latency\" AND metric.label.service_name=\"${local.cp_service}\" AND metric.label.result=\"success\" AND metric.label.source=\"${source}\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                      secondaryAggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_PERCENTILE_95"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                      }
+                    }
+                  }
+                  legendTemplate = source
+                  plotType       = "LINE"
+                }
+              ]
+              yAxis = { label = "seconds" }
+            }
+          }
+        },
+        {
+          yPos   = 17
+          width  = 6
+          height = 4
+          widget = {
+            title = "Placement Decisions / 5m"
+            xyChart = {
+              dataSets = [
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/control_plane.placement.selections\" AND metric.label.service_name=\"${local.cp_service}\" AND metric.label.selection_reason=\"best_fit\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                        groupByFields      = ["metric.label.cache_state"]
+                      }
+                    }
+                  }
+                  legendTemplate = "best_fit $${metric.label.cache_state}"
+                  plotType       = "STACKED_BAR"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/control_plane.placement.selections\" AND metric.label.service_name=\"${local.cp_service}\" AND metric.label.selection_reason=\"sticky_same_host\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "sticky_same_host"
+                  plotType       = "STACKED_BAR"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/control_plane.placement.selections\" AND metric.label.service_name=\"${local.cp_service}\" AND metric.label.selection_reason=\"sticky_fallback\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                        groupByFields      = ["metric.label.cache_state"]
+                      }
+                    }
+                  }
+                  legendTemplate = "sticky_fallback $${metric.label.cache_state}"
+                  plotType       = "STACKED_BAR"
+                }
+              ]
+              yAxis = { label = "decisions / 5m" }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 17
+          width  = 6
+          height = 4
+          widget = {
+            title = "Resume Routing / 5m"
+            xyChart = {
+              dataSets = [
+                for routing in ["same_host", "cross_host"] : {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/session.resume.routing\" AND metric.label.service_name=\"${local.cp_service}\" AND metric.label.routing=\"${routing}\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                        groupByFields      = ["metric.label.source"]
+                      }
+                    }
+                  }
+                  legendTemplate = "${routing} $${metric.label.source}"
+                  plotType       = "STACKED_BAR"
+                }
+              ]
+              yAxis = { label = "resumes / 5m" }
+            }
+          }
+        },
+        # ── Workload Distribution ─────────────────────────────────────
+        {
+          yPos   = 21
+          width  = 12
+          height = 1
+          widget = {
+            text = {
+              content = "## Workload Distribution"
+              format  = "MARKDOWN"
+            }
+          }
+        },
+        {
+          yPos   = 22
+          width  = 6
+          height = 4
+          widget = {
+            title = "Runners Per Workload"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "metric.type=\"${local.metric_prefix}/control_plane.workload.runners.total\" AND metric.label.service_name=\"${local.cp_service}\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_MAX"
+                      crossSeriesReducer = "REDUCE_SUM"
+                      groupByFields      = ["metric.label.workload_key"]
+                    }
+                  }
+                }
+                legendTemplate = "$${metric.label.workload_key}"
+                plotType       = "STACKED_AREA"
+              }]
+              yAxis = { label = "runners" }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 22
+          width  = 6
+          height = 4
+          widget = {
+            title = "Busy Vs Idle Runners By Workload"
+            xyChart = {
+              dataSets = [
+                for state in ["idle", "busy"] : {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/control_plane.workload.runners.${state}\" AND metric.label.service_name=\"${local.cp_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_SUM"
+                        groupByFields      = ["metric.label.workload_key"]
+                      }
+                    }
+                  }
+                  legendTemplate = "${state} $${metric.label.workload_key}"
+                  plotType       = "STACKED_BAR"
+                }
+              ]
+              yAxis = { label = "runners" }
+            }
+          }
+        },
+        {
+          yPos   = 26
+          width  = 6
+          height = 4
+          widget = {
+            title = "Active Hosts Per Workload"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "metric.type=\"${local.metric_prefix}/control_plane.workload.hosts.active\" AND metric.label.service_name=\"${local.cp_service}\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_MAX"
+                      crossSeriesReducer = "REDUCE_SUM"
+                      groupByFields      = ["metric.label.workload_key"]
+                    }
+                  }
+                }
+                legendTemplate = "$${metric.label.workload_key}"
+                plotType       = "STACKED_AREA"
+              }]
+              yAxis = { label = "hosts" }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 26
+          width  = 6
+          height = 4
+          widget = {
+            title = "Allocation Outcomes By Workload / 5m"
+            xyChart = {
+              dataSets = [
+                for result in ["success", "failure"] : {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/control_plane.allocations\" AND metric.label.service_name=\"${local.cp_service}\" AND metric.label.result=\"${result}\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                        groupByFields      = ["metric.label.workload_key"]
+                      }
+                    }
+                  }
+                  legendTemplate = "${result} $${metric.label.workload_key}"
+                  plotType       = "STACKED_BAR"
+                }
+              ]
+              yAxis = { label = "allocations / 5m" }
             }
           }
         }
@@ -1632,26 +1792,6 @@ resource "google_monitoring_dashboard" "fleet_capacity" {
               timeSeriesQuery = {
                 timeSeriesFilter = {
                   filter = "metric.type=\"${local.metric_prefix}/control_plane.runners.idle\" AND metric.label.service_name=\"${local.cp_service}\""
-                  aggregation = {
-                    alignmentPeriod    = "60s"
-                    perSeriesAligner   = "ALIGN_MAX"
-                    crossSeriesReducer = "REDUCE_SUM"
-                  }
-                }
-              }
-            }
-          }
-        },
-        {
-          xPos   = 9
-          width  = 3
-          height = 2
-          widget = {
-            title = "Queue Depth"
-            scorecard = {
-              timeSeriesQuery = {
-                timeSeriesFilter = {
-                  filter = "metric.type=\"${local.metric_prefix}/control_plane.queue.depth\" AND metric.label.service_name=\"${local.cp_service}\""
                   aggregation = {
                     alignmentPeriod    = "60s"
                     perSeriesAligner   = "ALIGN_MAX"
@@ -1867,7 +2007,7 @@ resource "google_monitoring_dashboard" "fleet_capacity" {
                   { path = "/api/v1/runners/allocate", label = "allocate" },
                   { path = "/api/v1/runners/connect", label = "connect/resume" },
                   { path = "/api/v1/runners/release", label = "release" },
-                ] : {
+                  ] : {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
                       filter = "metric.type=\"${local.metric_prefix}/control_plane.endpoint.requests\" AND metric.label.service_name=\"${local.cp_service}\" AND metric.label.route=\"${route.path}\" AND metric.label.status_class=\"5xx\""
@@ -2191,6 +2331,642 @@ resource "google_monitoring_dashboard" "chunked_runtime" {
     }
   })
 }
+
+# Dashboard for Firecracker Manager Operations (host-agent side)
+resource "google_monitoring_dashboard" "manager_operations" {
+  count   = var.enable_monitoring ? 1 : 0
+  project = local.infra.project_id
+  dashboard_json = jsonencode({
+    displayName = "Firecracker Manager Operations"
+    labels = {
+      environment = local.infra.environment
+    }
+    mosaicLayout = {
+      columns = 12
+      tiles = [
+        # Row 1: Scorecards
+        {
+          width  = 3
+          height = 2
+          widget = {
+            title = "Manager HTTP Requests / 5m"
+            scorecard = {
+              timeSeriesQuery = {
+                timeSeriesFilter = {
+                  filter = "metric.type=\"${local.metric_prefix}/firecracker_manager.endpoint.requests\" AND metric.label.service_name=\"${local.mgr_service}\""
+                  aggregation = {
+                    alignmentPeriod    = "300s"
+                    perSeriesAligner   = "ALIGN_DELTA"
+                    crossSeriesReducer = "REDUCE_SUM"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          xPos   = 3
+          width  = 3
+          height = 2
+          widget = {
+            title = "Manager HTTP 5xx / 5m"
+            scorecard = {
+              timeSeriesQuery = {
+                timeSeriesFilter = {
+                  filter = "metric.type=\"${local.metric_prefix}/firecracker_manager.endpoint.requests\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.status_class=\"5xx\""
+                  aggregation = {
+                    alignmentPeriod    = "300s"
+                    perSeriesAligner   = "ALIGN_DELTA"
+                    crossSeriesReducer = "REDUCE_SUM"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          width  = 3
+          height = 2
+          widget = {
+            title = "Heartbeat Failures / 1h"
+            scorecard = {
+              timeSeriesQuery = {
+                timeSeriesFilter = {
+                  filter = "metric.type=\"${local.metric_prefix}/host.heartbeat.total\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.result=\"failure\""
+                  aggregation = {
+                    alignmentPeriod    = "3600s"
+                    perSeriesAligner   = "ALIGN_DELTA"
+                    crossSeriesReducer = "REDUCE_SUM"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          xPos   = 9
+          width  = 3
+          height = 2
+          widget = {
+            title = "Cache Hit Ratio"
+            scorecard = {
+              timeSeriesQuery = {
+                timeSeriesFilter = {
+                  filter = "metric.type=\"${local.metric_prefix}/chunked.cache_hit_ratio\" AND metric.label.service_name=\"${local.mgr_service}\""
+                  aggregation = {
+                    alignmentPeriod    = "60s"
+                    perSeriesAligner   = "ALIGN_MEAN"
+                    crossSeriesReducer = "REDUCE_MEAN"
+                  }
+                }
+              }
+            }
+          }
+        },
+        # Row 2: Manager HTTP volume and latency
+        {
+          yPos   = 2
+          width  = 6
+          height = 4
+          widget = {
+            title = "Manager HTTP Request Volume"
+            xyChart = {
+              dataSets = [
+                for route in [
+                  { path = "/api/v1/runners/:id/connect", label = "connect/resume" },
+                  { path = "/api/v1/runners/:id/pause", label = "pause" },
+                  { path = "/api/v1/runners/:id/exec", label = "exec" },
+                  { path = "/api/v1/runners/:id/proxy/*", label = "proxy" },
+                  ] : {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/firecracker_manager.endpoint.requests\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.route=\"${route.path}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = route.label
+                  plotType       = "LINE"
+                }
+              ]
+              yAxis = { label = "requests/min" }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 2
+          width  = 6
+          height = 4
+          widget = {
+            title = "Manager HTTP P95 Latency"
+            xyChart = {
+              dataSets = [
+                for route in [
+                  { path = "/api/v1/runners/:id/connect", label = "connect/resume" },
+                  { path = "/api/v1/runners/:id/pause", label = "pause" },
+                  { path = "/api/v1/runners/:id/exec", label = "exec" },
+                  { path = "/api/v1/runners/:id/proxy/*", label = "proxy" },
+                  ] : {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/firecracker_manager.endpoint.request.duration\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.route=\"${route.path}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                      secondaryAggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_PERCENTILE_95"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                      }
+                    }
+                  }
+                  legendTemplate = route.label
+                  plotType       = "LINE"
+                }
+              ]
+              yAxis = { label = "seconds" }
+            }
+          }
+        },
+        # Row 3: Heartbeat + Allocation outcomes
+        {
+          yPos   = 6
+          width  = 6
+          height = 4
+          widget = {
+            title = "Heartbeat Outcomes And Latency"
+            xyChart = {
+              dataSets = [
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/host.heartbeat.total\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.result=\"success\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "heartbeat success / 5m"
+                  plotType       = "STACKED_BAR"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/host.heartbeat.total\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.result=\"failure\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "heartbeat failure / 5m"
+                  plotType       = "STACKED_BAR"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/host.heartbeat.total\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.result=\"error\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "heartbeat error / 5m"
+                  plotType       = "STACKED_BAR"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/host.heartbeat.latency\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_PERCENTILE_95"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                      }
+                    }
+                  }
+                  legendTemplate = "heartbeat p95"
+                  plotType       = "LINE"
+                }
+              ]
+              yAxis = { label = "count / seconds" }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 6
+          width  = 6
+          height = 4
+          widget = {
+            title = "Allocation Outcomes And Ready Duration"
+            xyChart = {
+              dataSets = [
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/vm.allocations\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.result=\"success\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                        groupByFields      = ["metric.label.source"]
+                      }
+                    }
+                  }
+                  legendTemplate = "alloc success $${metric.label.source}"
+                  plotType       = "STACKED_BAR"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/vm.allocations\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.result=\"failure\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                        groupByFields      = ["metric.label.source"]
+                      }
+                    }
+                  }
+                  legendTemplate = "alloc failure $${metric.label.source}"
+                  plotType       = "STACKED_BAR"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/vm.ready.duration\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                        groupByFields      = ["metric.label.source"]
+                      }
+                      secondaryAggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_PERCENTILE_95"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.source"]
+                      }
+                    }
+                  }
+                  legendTemplate = "ready p95 $${metric.label.source}"
+                  plotType       = "LINE"
+                }
+              ]
+              yAxis = { label = "count / seconds" }
+            }
+          }
+        },
+        # Row 4: Pause/Resume + Host resources
+        {
+          yPos   = 10
+          width  = 6
+          height = 4
+          widget = {
+            title = "Pause / Resume Outcomes And Duration"
+            xyChart = {
+              dataSets = [
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/session.pause.total\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                        groupByFields      = ["metric.label.result"]
+                      }
+                    }
+                  }
+                  legendTemplate = "pause $${metric.label.result}"
+                  plotType       = "STACKED_BAR"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/session.resume.total\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                        groupByFields      = ["metric.label.result", "metric.label.source"]
+                      }
+                    }
+                  }
+                  legendTemplate = "resume $${metric.label.result} $${metric.label.source}"
+                  plotType       = "STACKED_BAR"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/session.pause.duration\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                      secondaryAggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_PERCENTILE_95"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                      }
+                    }
+                  }
+                  legendTemplate = "pause p95"
+                  plotType       = "LINE"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/session.resume.duration\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                        groupByFields      = ["metric.label.source"]
+                      }
+                      secondaryAggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_PERCENTILE_95"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.source"]
+                      }
+                    }
+                  }
+                  legendTemplate = "resume p95 $${metric.label.source}"
+                  plotType       = "LINE"
+                }
+              ]
+              yAxis = { label = "count / seconds" }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 10
+          width  = 6
+          height = 4
+          widget = {
+            title = "Host CPU / Memory / Runners"
+            xyChart = {
+              dataSets = [
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/host.cpu_millicores.used\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MEAN"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "cpu used"
+                  plotType       = "LINE"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/host.cpu_millicores.total\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MEAN"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "cpu total"
+                  plotType       = "LINE"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/host.memory_mb.used\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MEAN"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "mem used"
+                  plotType       = "LINE"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/host.memory_mb.total\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MEAN"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "mem total"
+                  plotType       = "LINE"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/host.runners.idle\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "idle runners"
+                  plotType       = "LINE"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/host.runners.busy\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "busy runners"
+                  plotType       = "LINE"
+                }
+              ]
+              yAxis = { label = "aggregate host state" }
+            }
+          }
+        },
+        # Row 5: Chunk activity + cache capacity
+        {
+          yPos   = 14
+          width  = 6
+          height = 4
+          widget = {
+            title = "Chunk Activity Rates"
+            xyChart = {
+              dataSets = [
+                for metric in [
+                  { name = "chunked.page_faults", label = "page faults/min" },
+                  { name = "chunked.chunk_fetches", label = "chunk fetches/min" },
+                  { name = "chunked.disk_reads", label = "disk reads/min" },
+                  { name = "chunked.disk_writes", label = "disk writes/min" },
+                  ] : {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/${metric.name}\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = metric.label
+                  plotType       = "LINE"
+                }
+              ]
+              yAxis = { label = "operations/min" }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 14
+          width  = 6
+          height = 4
+          widget = {
+            title = "Cache Capacity And Dirty Chunks"
+            xyChart = {
+              dataSets = [
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/chunked.disk_cache.size\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "disk cache used"
+                  plotType       = "LINE"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/chunked.disk_cache.max\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "disk cache max"
+                  plotType       = "LINE"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/chunked.mem_cache.size\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "mem cache used"
+                  plotType       = "LINE"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/chunked.mem_cache.max\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "mem cache max"
+                  plotType       = "LINE"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/chunked.dirty_chunks\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "dirty chunks"
+                  plotType       = "LINE"
+                }
+              ]
+              yAxis = { label = "bytes / chunks" }
+            }
+          }
+        },
+        # Row 6: gRPC Server P95
+        {
+          yPos   = 18
+          width  = 12
+          height = 4
+          widget = {
+            title = "gRPC Server P95 By Method"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "metric.type=\"${local.metric_prefix}/rpc.server.duration\" AND metric.label.service_name=\"${local.mgr_service}\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_DELTA"
+                      crossSeriesReducer = "REDUCE_SUM"
+                      groupByFields      = ["metric.label.rpc_method"]
+                    }
+                    secondaryAggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_PERCENTILE_95"
+                      crossSeriesReducer = "REDUCE_MEAN"
+                      groupByFields      = ["metric.label.rpc_method"]
+                    }
+                  }
+                }
+                legendTemplate = "$${metric.label.rpc_method}"
+                plotType       = "LINE"
+              }]
+              yAxis = { label = "seconds" }
+            }
+          }
+        }
+      ]
+    }
+  })
+}
+
 # Alert: VM Boot Time Too High
 resource "google_monitoring_alert_policy" "vm_boot_slow" {
   count        = var.enable_monitoring && var.enable_monitoring_alerts ? 1 : 0
