@@ -202,20 +202,10 @@ func stepControlPlaneDeploy(cfg *Config, logger *logrus.Logger, planOnly bool) e
 		return fmt.Errorf("failed to apply namespace: %w", err)
 	}
 
-	webhookSecret := cfg.Platform.GitHubWebhookSecret
-	if webhookSecret == "" {
-		webhookSecret = "unused-for-generic-workloads"
-	}
-
 	if err := applySecret("db-credentials", map[string]string{
 		"host":     dbPrivateIP,
 		"username": "postgres",
 		"password": cfg.ResolvedDBPassword,
-	}); err != nil {
-		return err
-	}
-	if err := applySecret("github-credentials", map[string]string{
-		"webhook_secret": webhookSecret,
 	}); err != nil {
 		return err
 	}

@@ -24,7 +24,6 @@ The currently supported example wrapper fields are:
 
 | Example | Description |
 |---|---|
-| [ci-github-actions](ci-github-actions/) | Ephemeral GitHub Actions runners with warm Bazel cache |
 | [ci-gitlab-runners](ci-gitlab-runners/) | GitLab CI runners — validates CI-agnostic design |
 | [ci-bazel-remote-exec](ci-bazel-remote-exec/) | Bazel + Buildbarn with artifact cache overlay and credentials drive |
 | [ci-git-cache](ci-git-cache/) | Git-cache reference cloning for fast `actions/checkout` |

@@ -122,8 +122,7 @@ type Handler struct {
 	chunkLookup []snapshot.ChunkRef
 
 	// Stats
-	pageFaults   uint64
-	chunkFetches uint64
+	pageFaults uint64
 
 	// Unix socket path for receiving UFFD from Firecracker
 	socketPath string

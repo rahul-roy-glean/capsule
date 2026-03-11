@@ -989,17 +989,6 @@ func (s *Scheduler) UnquarantineRunner(ctx context.Context, runnerID string, unb
 	return nil
 }
 
-// GetQueueDepth returns the current queue depth
-func (s *Scheduler) GetQueueDepth() int {
-	var count int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE status='queued'`).Scan(&count)
-	if err != nil {
-		s.logger.WithError(err).Warn("Failed to query queue depth")
-		return 0
-	}
-	return count
-}
-
 // GetStats returns scheduler statistics
 func (s *Scheduler) GetStats() SchedulerStats {
 	hosts := s.hostRegistry.GetAllHosts()
@@ -1022,7 +1011,6 @@ func (s *Scheduler) GetStats() SchedulerStats {
 		UsedMemoryMB:       usedMem,
 		IdleRunners:        idleRunners,
 		BusyRunners:        busyRunners,
-		QueueDepth:         s.GetQueueDepth(),
 	}
 }
 
@@ -1035,5 +1023,4 @@ type SchedulerStats struct {
 	UsedMemoryMB       int
 	IdleRunners        int
 	BusyRunners        int
-	QueueDepth         int
 }

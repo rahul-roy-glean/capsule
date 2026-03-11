@@ -26,12 +26,10 @@ type WorkloadConfig struct {
 	AuthConfigJSON       string // JSON-encoded authproxy.AuthConfig for injection into host agent
 }
 
-// ConfigCache provides in-memory lookup for repo→workload_key mappings and
-// workload_key→config metadata. Loaded from DB on startup, updated on
-// registration, with DB fallback on cache miss.
+// ConfigCache provides in-memory lookup for workload_key→config metadata.
+// Loaded from DB on startup, updated on registration, with DB fallback on cache miss.
 type ConfigCache struct {
 	mu             sync.RWMutex
-	repoToWorkload map[string]string          // repo (owner/name) → workload_key
 	workloadConfig map[string]*WorkloadConfig // workload_key → config
 	db             *sql.DB
 	logger         *logrus.Entry
@@ -40,7 +38,6 @@ type ConfigCache struct {
 // NewConfigCache creates and loads a ConfigCache from the database.
 func NewConfigCache(db *sql.DB, logger *logrus.Logger) *ConfigCache {
 	cc := &ConfigCache{
-		repoToWorkload: make(map[string]string),
 		workloadConfig: make(map[string]*WorkloadConfig),
 		db:             db,
 		logger:         logger.WithField("component", "config-cache"),
@@ -53,18 +50,6 @@ func NewConfigCache(db *sql.DB, logger *logrus.Logger) *ConfigCache {
 func (cc *ConfigCache) loadFromDB() {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
-
-	// Load repo_workload_mappings
-	rows, err := cc.db.Query(`SELECT repo, workload_key FROM repo_workload_mappings`)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var repo, wk string
-			if err := rows.Scan(&repo, &wk); err == nil {
-				cc.repoToWorkload[repo] = wk
-			}
-		}
-	}
 
 	lcRows, err := cc.db.Query(`SELECT DISTINCT ON (leaf_workload_key) leaf_workload_key, tier, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy, config_json FROM layered_configs ORDER BY leaf_workload_key, created_at DESC`)
 	if err == nil {
@@ -96,29 +81,8 @@ func (cc *ConfigCache) loadFromDB() {
 	}
 
 	cc.logger.WithFields(logrus.Fields{
-		"repo_mappings":    len(cc.repoToWorkload),
 		"workload_configs": len(cc.workloadConfig),
 	}).Info("Config cache loaded from DB")
-}
-
-// GetWorkloadKeyForRepo returns the workload_key for a repo, or "" if not found.
-// Checks in-memory cache first, then falls back to DB and backfills.
-func (cc *ConfigCache) GetWorkloadKeyForRepo(repo string) string {
-	cc.mu.RLock()
-	wk, ok := cc.repoToWorkload[repo]
-	cc.mu.RUnlock()
-	if ok {
-		return wk
-	}
-
-	// Cache miss: fall back to DB
-	wk = lookupWorkloadKeyForRepo(cc.db, repo)
-	if wk != "" {
-		cc.mu.Lock()
-		cc.repoToWorkload[repo] = wk
-		cc.mu.Unlock()
-	}
-	return wk
 }
 
 // GetWorkloadConfig returns the config for a workload_key, or nil if not found.
@@ -172,13 +136,6 @@ func (cc *ConfigCache) loadWorkloadConfigFromDB(ctx context.Context, workloadKey
 		wc.AuthConfigJSON = extractAuthConfigJSON(configJSON.String)
 	}
 	return &wc
-}
-
-// PutRepoMapping adds or updates a repo→workload_key mapping in the cache.
-func (cc *ConfigCache) PutRepoMapping(repo, workloadKey string) {
-	cc.mu.Lock()
-	cc.repoToWorkload[repo] = workloadKey
-	cc.mu.Unlock()
 }
 
 // PutWorkloadConfig adds or updates a workload config in the cache.

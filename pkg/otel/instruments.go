@@ -50,8 +50,6 @@ const (
 	CacheArtifactHits      CounterName = "cache.artifact.hits"
 	CacheArtifactMisses    CounterName = "cache.artifact.misses"
 	CacheGitClones         CounterName = "cache.git_clones"
-	CITokenRequests        CounterName = "ci.token_requests"
-	CIJobs                 CounterName = "ci.jobs"
 	ChunkedPageFaults      CounterName = "chunked.page_faults"
 	ChunkedCacheHits       CounterName = "chunked.cache_hits"
 	ChunkedCacheMisses     CounterName = "chunked.cache_misses"
@@ -90,7 +88,6 @@ const (
 	CPRunnersTotalCurrent GaugeName = "control_plane.runners.total"
 	CPRunnersIdleCurrent  GaugeName = "control_plane.runners.idle"
 	CPRunnersBusyCurrent  GaugeName = "control_plane.runners.busy"
-	CPQueueDepth          GaugeName = "control_plane.queue.depth"
 	CPFleetCPUTotal       GaugeName = "control_plane.fleet.cpu_millicores.total"
 	CPFleetCPUUsed        GaugeName = "control_plane.fleet.cpu_millicores.used"
 	CPFleetCPUFree        GaugeName = "control_plane.fleet.cpu_millicores.free"
@@ -141,8 +138,6 @@ var counterDescriptions = map[CounterName]string{
 	CacheArtifactHits:      "Artifact cache hits",
 	CacheArtifactMisses:    "Artifact cache misses",
 	CacheGitClones:         "Total git clone operations",
-	CITokenRequests:        "Total CI token requests",
-	CIJobs:                 "Total CI jobs processed",
 	ChunkedPageFaults:      "Total page faults handled by chunked loader",
 	ChunkedCacheHits:       "Chunk cache hits",
 	ChunkedCacheMisses:     "Chunk cache misses",
@@ -238,7 +233,6 @@ var gaugeDescriptions = map[GaugeName]string{
 	CPRunnersTotalCurrent: "Current total number of runners in the control plane",
 	CPRunnersIdleCurrent:  "Current number of idle runners in the control plane",
 	CPRunnersBusyCurrent:  "Current number of busy runners in the control plane",
-	CPQueueDepth:          "Current control plane queue depth",
 	CPFleetCPUTotal:       "Total fleet CPU millicores",
 	CPFleetCPUUsed:        "Used fleet CPU millicores",
 	CPFleetCPUFree:        "Free fleet CPU millicores",

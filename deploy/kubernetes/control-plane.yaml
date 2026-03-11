@@ -93,11 +93,6 @@ spec:
             configMapKeyRef:
               name: control-plane-config
               key: gcs_bucket
-        - name: GITHUB_WEBHOOK_SECRET
-          valueFrom:
-            secretKeyRef:
-              name: github-credentials
-              key: webhook_secret
         - name: OTEL_EXPORTER_OTLP_ENDPOINT
           value: "localhost:4317"
         - name: ENVIRONMENT
@@ -196,13 +191,6 @@ spec:
   - host: ${CONTROL_PLANE_DOMAIN}
     http:
       paths:
-      - path: /webhook/*
-        pathType: ImplementationSpecific
-        backend:
-          service:
-            name: control-plane
-            port:
-              number: 8080
       - path: /api/*
         pathType: ImplementationSpecific
         backend:

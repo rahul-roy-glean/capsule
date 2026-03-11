@@ -64,26 +64,6 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
           }
         },
         {
-          xPos   = 6
-          width  = 3
-          height = 2
-          widget = {
-            title = "Queue Depth"
-            scorecard = {
-              timeSeriesQuery = {
-                timeSeriesFilter = {
-                  filter = "metric.type=\"${local.metric_prefix}/control_plane.queue.depth\" AND metric.label.service_name=\"${local.cp_service}\""
-                  aggregation = {
-                    alignmentPeriod    = "60s"
-                    perSeriesAligner   = "ALIGN_MAX"
-                    crossSeriesReducer = "REDUCE_SUM"
-                  }
-                }
-              }
-            }
-          }
-        },
-        {
           xPos   = 9
           width  = 3
           height = 2
@@ -519,35 +499,6 @@ resource "google_monitoring_alert_policy" "no_idle_runners" {
 
   documentation {
     content   = "No idle runners available. Jobs will queue. Consider scaling up hosts."
-    mime_type = "text/markdown"
-  }
-}
-
-# Alert: High Queue Depth
-resource "google_monitoring_alert_policy" "high_queue_depth" {
-  count        = var.enable_monitoring && var.enable_monitoring_alerts ? 1 : 0
-  display_name = "Firecracker High Queue Depth"
-  combiner     = "OR"
-
-  conditions {
-    display_name = "Queue depth above threshold"
-    condition_threshold {
-      filter          = "metric.type=\"${local.metric_prefix}/control_plane.queue.depth\" AND metric.label.service_name=\"${local.cp_service}\""
-      comparison      = "COMPARISON_GT"
-      threshold_value = var.alert_queue_depth_threshold
-      duration        = "300s"
-      aggregations {
-        alignment_period     = "60s"
-        per_series_aligner   = "ALIGN_MAX"
-        cross_series_reducer = "REDUCE_SUM"
-      }
-    }
-  }
-
-  notification_channels = var.monitoring_notification_channels
-
-  documentation {
-    content   = "Job queue depth exceeded ${var.alert_queue_depth_threshold}. Jobs are waiting for runners. Consider scaling up."
     mime_type = "text/markdown"
   }
 }
