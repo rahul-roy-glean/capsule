@@ -312,6 +312,7 @@ func main() {
 
 	// Start autoscaler loop
 	go autoscaleLoop(ctx, mgr, chunkedMgr, *idleTarget, logger, autoscaleInstruments{
+		hostAttrs:       metric.WithAttributes(fcrotel.AttrHostID.String(instanceName)),
 		vmAllocCounter:  vmAllocCounter,
 		vmBootHist:      vmBootHist,
 		hostCPUTotal:    hostCPUTotalGauge,
@@ -413,6 +414,7 @@ func readyHandler(mgr *runner.Manager) http.HandlerFunc {
 
 // autoscaleInstruments holds OTel instruments used by the autoscale loop.
 type autoscaleInstruments struct {
+	hostAttrs       metric.MeasurementOption // host_id attribute for all recordings
 	vmAllocCounter  metric.Int64Counter
 	vmBootHist      metric.Float64Histogram
 	hostCPUTotal    metric.Int64Gauge
@@ -457,39 +459,40 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			// would load the wrong data and be useless when an actual job arrives.
 
 			// Record host metrics
-			instruments.hostCPUTotal.Record(ctx, int64(status.TotalCPUMillicores))
-			instruments.hostCPUUsed.Record(ctx, int64(status.UsedCPUMillicores))
-			instruments.hostMemTotal.Record(ctx, int64(status.TotalMemoryMB))
-			instruments.hostMemUsed.Record(ctx, int64(status.UsedMemoryMB))
+			ha := instruments.hostAttrs
+			instruments.hostCPUTotal.Record(ctx, int64(status.TotalCPUMillicores), ha)
+			instruments.hostCPUUsed.Record(ctx, int64(status.UsedCPUMillicores), ha)
+			instruments.hostMemTotal.Record(ctx, int64(status.TotalMemoryMB), ha)
+			instruments.hostMemUsed.Record(ctx, int64(status.UsedMemoryMB), ha)
 
 			// UpDownCounters need delta from previous value
 			idleDelta := int64(status.IdleRunners - prevIdle)
 			busyDelta := int64(status.BusyRunners - prevBusy)
-			instruments.hostRunnersIdle.Add(ctx, idleDelta)
-			instruments.hostRunnersBusy.Add(ctx, busyDelta)
+			instruments.hostRunnersIdle.Add(ctx, idleDelta, ha)
+			instruments.hostRunnersBusy.Add(ctx, busyDelta, ha)
 			prevIdle = status.IdleRunners
 			prevBusy = status.BusyRunners
 
 			// Record chunked snapshot metrics
 			cs := chunkedMgr.GetChunkedStats()
-			instruments.diskCacheSize.Record(ctx, cs.DiskCacheSize)
-			instruments.diskCacheMax.Record(ctx, cs.DiskCacheMaxSize)
-			instruments.diskCacheItems.Record(ctx, int64(cs.DiskCacheItems))
-			instruments.memCacheSize.Record(ctx, cs.MemCacheSize)
-			instruments.memCacheMax.Record(ctx, cs.MemCacheMaxSize)
-			instruments.memCacheItems.Record(ctx, int64(cs.MemCacheItems))
-			instruments.pageFaults.Record(ctx, int64(cs.TotalPageFaults))
-			instruments.cacheHits.Record(ctx, int64(cs.MemCacheHits))
-			instruments.cacheMisses.Record(ctx, int64(cs.MemCacheMisses))
-			instruments.chunkFetches.Record(ctx, int64(cs.TotalChunkFetches))
-			instruments.diskReads.Record(ctx, int64(cs.TotalDiskReads))
-			instruments.diskWrites.Record(ctx, int64(cs.TotalDiskWrites))
-			instruments.dirtyChunks.Record(ctx, int64(cs.TotalDirtyChunks))
+			instruments.diskCacheSize.Record(ctx, cs.DiskCacheSize, ha)
+			instruments.diskCacheMax.Record(ctx, cs.DiskCacheMaxSize, ha)
+			instruments.diskCacheItems.Record(ctx, int64(cs.DiskCacheItems), ha)
+			instruments.memCacheSize.Record(ctx, cs.MemCacheSize, ha)
+			instruments.memCacheMax.Record(ctx, cs.MemCacheMaxSize, ha)
+			instruments.memCacheItems.Record(ctx, int64(cs.MemCacheItems), ha)
+			instruments.pageFaults.Record(ctx, int64(cs.TotalPageFaults), ha)
+			instruments.cacheHits.Record(ctx, int64(cs.MemCacheHits), ha)
+			instruments.cacheMisses.Record(ctx, int64(cs.MemCacheMisses), ha)
+			instruments.chunkFetches.Record(ctx, int64(cs.TotalChunkFetches), ha)
+			instruments.diskReads.Record(ctx, int64(cs.TotalDiskReads), ha)
+			instruments.diskWrites.Record(ctx, int64(cs.TotalDiskWrites), ha)
+			instruments.dirtyChunks.Record(ctx, int64(cs.TotalDirtyChunks), ha)
 			// Compute cache hit ratio from the ChunkStore LRU stats, which
 			// persist across handler lifetimes (handler-level CacheHits is
 			// always 0 since page-level caching was removed).
 			if totalLookups := cs.MemCacheHits + cs.MemCacheMisses; totalLookups > 0 {
-				instruments.cacheHitRatio.Record(ctx, float64(cs.MemCacheHits)/float64(totalLookups))
+				instruments.cacheHitRatio.Record(ctx, float64(cs.MemCacheHits)/float64(totalLookups), ha)
 			}
 		}
 	}
