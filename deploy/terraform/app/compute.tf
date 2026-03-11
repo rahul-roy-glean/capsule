@@ -4,7 +4,7 @@
 data "google_compute_image" "host" {
   count   = var.use_custom_host_image ? 1 : 0
   family  = "firecracker-host"
-  project = var.project_id
+  project = local.infra.project_id
 }
 
 data "google_compute_image" "ubuntu" {
@@ -21,7 +21,7 @@ locals {
 resource "google_compute_instance_template" "firecracker_host" {
   name_prefix  = "${local.name_prefix}-host-"
   machine_type = var.host_machine_type
-  region       = var.region
+  region       = local.infra.region
 
   tags = ["firecracker-host"]
 
@@ -55,26 +55,26 @@ resource "google_compute_instance_template" "firecracker_host" {
   }
 
   network_interface {
-    subnetwork = google_compute_subnetwork.hosts.id
+    subnetwork = local.infra.host_subnet_id
     # No external IP - egress via Cloud NAT
   }
 
   service_account {
-    email  = google_service_account.host_agent.email
+    email  = local.infra.host_agent_email
     scopes = ["cloud-platform"]
   }
 
   metadata = {
-    snapshot-bucket         = google_storage_bucket.snapshots.name
+    snapshot-bucket         = local.infra.snapshot_bucket
     microvm-subnet          = var.microvm_subnet
-    environment             = var.environment
-    control-plane           = var.control_plane_addr
+    environment             = local.infra.environment
+    control-plane           = local.control_plane_addr
     host-bootstrap-token    = var.host_bootstrap_token
     max-runners             = var.max_runners_per_host
     idle-target             = var.idle_runners_target
     chunk-cache-size-gb     = var.chunk_cache_size_gb
     mem-cache-size-gb       = var.mem_cache_size_gb
-    otel-collector-endpoint = var.otel_collector_addr
+    otel-collector-endpoint = local.otel_collector_addr
   }
 
   metadata_startup_script = <<-EOF
@@ -165,7 +165,7 @@ LOGROTATE
 
     # Create systemd override for firecracker-manager with configured values
     mkdir -p /etc/systemd/system/firecracker-manager.service.d
-    
+
     # Build the ExecStart line with optional flags
     EXEC_START="/usr/local/bin/firecracker-manager"
     EXEC_START="$EXEC_START --max-runners=$MAX_RUNNERS"
@@ -226,8 +226,7 @@ OVERRIDE
   }
 
   depends_on = [
-    google_storage_bucket.snapshots,
-    google_compute_subnetwork.hosts,
+    data.kubernetes_service.control_plane,
   ]
 }
 
@@ -249,7 +248,7 @@ resource "google_compute_health_check" "host" {
 resource "google_compute_region_instance_group_manager" "hosts" {
   name               = "${local.name_prefix}-hosts"
   base_instance_name = "${local.name_prefix}-host"
-  region             = var.region
+  region             = local.infra.region
 
   version {
     instance_template = google_compute_instance_template.firecracker_host.id
