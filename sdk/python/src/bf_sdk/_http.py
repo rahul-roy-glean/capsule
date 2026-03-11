@@ -18,8 +18,8 @@ from bf_sdk._errors import (
     BFConnectionError,
     BFHTTPError,
     BFNotFound,
-    BFRequestTimeoutError,
     BFRateLimited,
+    BFRequestTimeoutError,
     BFServiceUnavailable,
 )
 
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class RetryPolicy:
     max_retries: int = 0
-    retry_status_codes: frozenset[int] = field(default_factory=frozenset)
+    retry_status_codes: frozenset[int] = field(default_factory=lambda: frozenset())
     retry_transport_errors: bool = False
     retry_timeouts: bool = False
 
@@ -57,7 +57,7 @@ class HttpClient:
         if config.token:
             headers["Authorization"] = f"Bearer {config.token}"
 
-        self._client = httpx.Client(
+        self._client: httpx.Client = httpx.Client(
             base_url=config.base_url,
             headers=headers,
             timeout=httpx.Timeout(config.request_timeout),
@@ -65,6 +65,14 @@ class HttpClient:
 
     def close(self) -> None:
         self._client.close()
+
+    @property
+    def startup_timeout(self) -> float:
+        return self._config.startup_timeout
+
+    @property
+    def operation_timeout(self) -> float:
+        return self._config.operation_timeout
 
     # -- Public request methods ------------------------------------------------
 
@@ -133,7 +141,7 @@ class HttpClient:
         headers = {"X-Request-Id": request_id}
         timeout_value = self._resolve_timeout(timeout, self._config.operation_timeout)
 
-        client = self._client
+        client: httpx.Client = self._client
         if base_url:
             client = httpx.Client(
                 base_url=base_url,
@@ -175,7 +183,7 @@ class HttpClient:
         headers = {"X-Request-Id": request_id, "Content-Type": "application/octet-stream"}
         timeout_value = self._resolve_timeout(timeout, self._config.operation_timeout)
 
-        client = self._client
+        client: httpx.Client = self._client
         if base_url:
             client = httpx.Client(
                 base_url=base_url,
@@ -184,7 +192,7 @@ class HttpClient:
             )
 
         try:
-            resp = client.post(url, content=data, params=params, headers=headers)
+            resp: httpx.Response = client.post(url, content=data, params=params, headers=headers)
             if resp.status_code >= 400:
                 self._raise_for_status(resp, request_id)
             return self._decode_response_body(resp, request_id)
@@ -215,7 +223,7 @@ class HttpClient:
         headers = {"X-Request-Id": request_id}
         timeout_value = self._resolve_timeout(timeout, self._config.operation_timeout)
 
-        client = self._client
+        client: httpx.Client = self._client
         if base_url:
             client = httpx.Client(
                 base_url=base_url,
@@ -224,7 +232,7 @@ class HttpClient:
             )
 
         try:
-            resp = client.post(url, json=json_body, headers=headers)
+            resp: httpx.Response = client.post(url, json=json_body, headers=headers)
             if resp.status_code >= 400:
                 self._raise_for_status(resp, request_id)
             return self._decode_response_body(resp, request_id)
@@ -255,7 +263,7 @@ class HttpClient:
         headers = {"X-Request-Id": request_id, "Accept": "application/x-ndjson"}
         timeout_value = self._resolve_timeout(timeout, self._config.operation_timeout)
 
-        client = self._client
+        client: httpx.Client = self._client
         if base_url:
             client = httpx.Client(
                 base_url=base_url,
@@ -314,7 +322,7 @@ class HttpClient:
 
         for attempt in range(policy.max_retries + 1):
             try:
-                resp = self._client.request(
+                resp: httpx.Response = self._client.request(
                     method,
                     url,
                     params=params,
@@ -434,8 +442,10 @@ class HttpClient:
         try:
             raw = resp.json()
             if isinstance(raw, dict):
-                raw.setdefault("request_id", request_id)
-                return cast(dict[str, Any], raw)
+                payload = cast(dict[str, Any], raw)
+                if "request_id" not in payload:
+                    payload["request_id"] = request_id
+                return payload
         except (json.JSONDecodeError, ValueError):
             pass
         return {"_raw": resp.text, "request_id": request_id}

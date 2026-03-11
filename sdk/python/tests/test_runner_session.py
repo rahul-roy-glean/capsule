@@ -219,7 +219,13 @@ class TestExecResult:
 
 class TestFromConfig:
     def test_from_config(self, runners: Runners, http_client: HttpClient) -> None:
-        ready_session = RunnerSession(runners, "r-42", host_address="10.0.0.1:8080", session_id="s-1", request_id="req-1")
+        ready_session = RunnerSession(
+            runners,
+            "r-42",
+            host_address="10.0.0.1:8080",
+            session_id="s-1",
+            request_id="req-1",
+        )
         with patch.object(runners, "allocate_ready", return_value=ready_session):
             session = runners.from_config("my-workload", tag="stable")
         assert isinstance(session, RunnerSession)

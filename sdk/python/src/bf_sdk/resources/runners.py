@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
 import logging
 import time
-from typing import TYPE_CHECKING, Any
-from urllib.parse import urlencode
 import uuid
+from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import urlencode
 
 from bf_sdk._errors import (
     BFAllocationTimeoutError,
@@ -19,7 +19,6 @@ from bf_sdk._errors import (
 )
 from bf_sdk._http import HttpClient, RetryPolicy
 from bf_sdk._shell import ShellSession
-from bf_sdk.models.layered_config import CreateConfigResponse, LayeredConfigDetail, StoredLayeredConfig
 from bf_sdk.models.file import (
     FileListResult,
     FileMkdirResult,
@@ -29,6 +28,7 @@ from bf_sdk.models.file import (
     FileUploadResult,
     FileWriteResult,
 )
+from bf_sdk.models.layered_config import CreateConfigResponse, LayeredConfigDetail, StoredLayeredConfig
 from bf_sdk.models.runner import (
     AllocateRunnerResponse,
     ConnectResult,
@@ -36,6 +36,7 @@ from bf_sdk.models.runner import (
     PauseResult,
     RunnerStatus,
 )
+from bf_sdk.models.workload import WorkloadSummary
 from bf_sdk.runner_session import RunnerSession
 
 if TYPE_CHECKING:
@@ -57,7 +58,7 @@ logger = logging.getLogger(__name__)
 class Runners:
     """Runner management — control plane + host agent operations."""
 
-    def __init__(self, http: HttpClient, layered_configs: "LayeredConfigs | None" = None) -> None:
+    def __init__(self, http: HttpClient, layered_configs: LayeredConfigs | None = None) -> None:
         self._http = http
         self._layered_configs = layered_configs
         self._host_cache: dict[str, str] = {}  # runner_id -> host_address
@@ -70,7 +71,14 @@ class Runners:
 
     def allocate(
         self,
-        workload: str | CreateConfigResponse | StoredLayeredConfig | LayeredConfigDetail | "RunnerConfig",
+        workload: (
+            str
+            | CreateConfigResponse
+            | StoredLayeredConfig
+            | LayeredConfigDetail
+            | RunnerConfig
+            | WorkloadSummary
+        ),
         *,
         request_id: str | None = None,
         labels: dict[str, str] | None = None,
@@ -254,7 +262,14 @@ class Runners:
 
     def allocate_ready(
         self,
-        workload: str | CreateConfigResponse | StoredLayeredConfig | LayeredConfigDetail | "RunnerConfig",
+        workload: (
+            str
+            | CreateConfigResponse
+            | StoredLayeredConfig
+            | LayeredConfigDetail
+            | RunnerConfig
+            | WorkloadSummary
+        ),
         *,
         request_id: str | None = None,
         labels: dict[str, str] | None = None,
@@ -307,7 +322,14 @@ class Runners:
 
     def from_config(
         self,
-        workload: str | CreateConfigResponse | StoredLayeredConfig | LayeredConfigDetail | "RunnerConfig",
+        workload: (
+            str
+            | CreateConfigResponse
+            | StoredLayeredConfig
+            | LayeredConfigDetail
+            | RunnerConfig
+            | WorkloadSummary
+        ),
         *,
         tag: str = "stable",
         request_id: str | None = None,
@@ -498,7 +520,7 @@ class Runners:
         return ShellSession(
             ws_url,
             reconnect_url_factory=lambda: self._refresh_shell_ws_url(runner_id, query),
-            connect_timeout=self._http._config.operation_timeout,
+            connect_timeout=self._http.operation_timeout,
         )
 
     def exec(
@@ -559,14 +581,21 @@ class Runners:
                 yield ExecEvent.model_validate(event_dict)
 
     def _resolve_startup_timeout(self, timeout: float | None) -> float:
-        return self._http._config.startup_timeout if timeout is None else timeout
+        return self._http.startup_timeout if timeout is None else timeout
 
     def _resolve_workload_key(
         self,
-        workload: str | CreateConfigResponse | StoredLayeredConfig | LayeredConfigDetail | "RunnerConfig",
+        workload: (
+            str
+            | CreateConfigResponse
+            | StoredLayeredConfig
+            | LayeredConfigDetail
+            | RunnerConfig
+            | WorkloadSummary
+        ),
     ) -> str:
         if hasattr(workload, "leaf_workload_key"):
-            value = getattr(workload, "leaf_workload_key")
+            value = cast(Any, workload).leaf_workload_key
             if isinstance(value, str) and value:
                 return value
 

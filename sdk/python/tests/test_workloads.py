@@ -74,7 +74,12 @@ workload:
         assert create_body["display_name"] == "yaml-sandbox"
         assert "platform" not in create_body
 
-    def test_onboard_yaml_path_uses_explicit_name(self, workloads: Workloads, layered_configs: LayeredConfigs, tmp_path: Path) -> None:
+    def test_onboard_yaml_path_uses_explicit_name(
+        self,
+        workloads: Workloads,
+        layered_configs: LayeredConfigs,
+        tmp_path: Path,
+    ) -> None:
         yaml_path = tmp_path / "onboard.yaml"
         yaml_path.write_text(
             """

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import yaml
 
@@ -22,13 +22,13 @@ if TYPE_CHECKING:
 class Workloads:
     """High-level workload onboarding and runtime API."""
 
-    def __init__(self, layered_configs: "LayeredConfigs", runners: "Runners") -> None:
+    def __init__(self, layered_configs: LayeredConfigs, runners: Runners) -> None:
         self._layered_configs = layered_configs
         self._runners = runners
 
     def onboard(
         self,
-        spec: "RunnerConfig | dict[str, Any] | str | PathLike[str]",
+        spec: RunnerConfig | dict[str, Any] | str | PathLike[str],
         *,
         name: str | None = None,
         build: bool = True,
@@ -48,7 +48,7 @@ class Workloads:
 
     def onboard_yaml(
         self,
-        yaml_spec: str | "PathLike[str]",
+        yaml_spec: str | PathLike[str],
         *,
         name: str | None = None,
         build: bool = True,
@@ -63,7 +63,14 @@ class Workloads:
 
     def get(
         self,
-        workload: "str | WorkloadSummary | CreateConfigResponse | StoredLayeredConfig | LayeredConfigDetail | RunnerConfig",
+        workload: (
+            str
+            | WorkloadSummary
+            | CreateConfigResponse
+            | StoredLayeredConfig
+            | LayeredConfigDetail
+            | RunnerConfig
+        ),
     ) -> WorkloadSummary:
         if isinstance(workload, WorkloadSummary):
             return workload
@@ -86,7 +93,7 @@ class Workloads:
             raise BFNotFound(f"Workload {workload!r} was not found.")
 
         if hasattr(workload, "display_name"):
-            display_name = getattr(workload, "display_name")
+            display_name = cast(Any, workload).display_name
             if isinstance(display_name, str):
                 return self.get(display_name)
 
@@ -94,7 +101,14 @@ class Workloads:
 
     def build(
         self,
-        workload: "str | WorkloadSummary | CreateConfigResponse | StoredLayeredConfig | LayeredConfigDetail | RunnerConfig",
+        workload: (
+            str
+            | WorkloadSummary
+            | CreateConfigResponse
+            | StoredLayeredConfig
+            | LayeredConfigDetail
+            | RunnerConfig
+        ),
         *,
         force: bool = False,
         clean: bool = False,
@@ -106,7 +120,14 @@ class Workloads:
 
     def delete(
         self,
-        workload: "str | WorkloadSummary | CreateConfigResponse | StoredLayeredConfig | LayeredConfigDetail | RunnerConfig",
+        workload: (
+            str
+            | WorkloadSummary
+            | CreateConfigResponse
+            | StoredLayeredConfig
+            | LayeredConfigDetail
+            | RunnerConfig
+        ),
     ) -> None:
         summary = self.get(workload)
         if not summary.config_id:
@@ -115,16 +136,30 @@ class Workloads:
 
     def start(
         self,
-        workload: "str | WorkloadSummary | CreateConfigResponse | StoredLayeredConfig | LayeredConfigDetail | RunnerConfig",
+        workload: (
+            str
+            | WorkloadSummary
+            | CreateConfigResponse
+            | StoredLayeredConfig
+            | LayeredConfigDetail
+            | RunnerConfig
+        ),
         **kwargs: Any,
-    ) -> "RunnerSession":
+    ) -> RunnerSession:
         return self._runners.from_config(workload, **kwargs)
 
     def allocate(
         self,
-        workload: "str | WorkloadSummary | CreateConfigResponse | StoredLayeredConfig | LayeredConfigDetail | RunnerConfig",
+        workload: (
+            str
+            | WorkloadSummary
+            | CreateConfigResponse
+            | StoredLayeredConfig
+            | LayeredConfigDetail
+            | RunnerConfig
+        ),
         **kwargs: Any,
-    ) -> "AllocateRunnerResponse":
+    ) -> AllocateRunnerResponse:
         return self._runners.allocate(workload, **kwargs)
 
     @staticmethod
@@ -137,12 +172,12 @@ class Workloads:
 
     def _normalize_spec(
         self,
-        spec: "RunnerConfig | dict[str, Any] | str | PathLike[str]",
+        spec: RunnerConfig | dict[str, Any] | str | PathLike[str],
         *,
         name: str | None = None,
     ) -> dict[str, Any]:
         if hasattr(spec, "to_create_body"):
-            body = spec.to_create_body()  # type: ignore[no-any-return]
+            body = cast(dict[str, Any], spec.to_create_body())  # type: ignore[no-any-return]
             return self._ensure_display_name(body, provided_name=name)
 
         if isinstance(spec, Mapping):
@@ -164,7 +199,11 @@ class Workloads:
         loaded = yaml.safe_load(raw_text)
         if not isinstance(loaded, Mapping):
             raise ValueError("Workload YAML must parse to a mapping/object.")
-        return self._normalize_mapping(loaded, provided_name=name, source_name=source_name)
+        return self._normalize_mapping(
+            cast(Mapping[str, Any], loaded),
+            provided_name=name,
+            source_name=source_name,
+        )
 
     def _normalize_mapping(
         self,
@@ -175,7 +214,11 @@ class Workloads:
     ) -> dict[str, Any]:
         raw = dict(spec)
         workload_spec = raw.get("workload")
-        body = dict(workload_spec) if isinstance(workload_spec, Mapping) else raw
+        body: dict[str, Any] = (
+            dict(cast(Mapping[str, Any], workload_spec))
+            if isinstance(workload_spec, Mapping)
+            else raw
+        )
         return self._ensure_display_name(body, provided_name=provided_name, source_name=source_name)
 
     @staticmethod

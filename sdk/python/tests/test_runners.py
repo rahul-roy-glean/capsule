@@ -9,7 +9,7 @@ import pytest
 from bf_sdk._config import ConnectionConfig
 from bf_sdk._errors import BFAllocationTimeoutError, BFNotFound, BFOperationTimeoutError, BFRunnerUnavailableError
 from bf_sdk._http import HttpClient
-from bf_sdk.models.layered_config import CreateConfigResponse, StoredLayeredConfig
+from bf_sdk.models.layered_config import CreateConfigResponse
 from bf_sdk.models.runner import AllocateRunnerResponse, ConnectResult, PauseResult, RunnerStatus
 from bf_sdk.resources.layered_configs import LayeredConfigs
 from bf_sdk.resources.runners import Runners
@@ -229,7 +229,11 @@ class TestRunners:
         assert session.request_id == "req-1"
         allocate.assert_called_once()
 
-    def test_from_config_passes_named_workload_through(self, http_client: HttpClient, layered_configs: LayeredConfigs) -> None:
+    def test_from_config_passes_named_workload_through(
+        self,
+        http_client: HttpClient,
+        layered_configs: LayeredConfigs,
+    ) -> None:
         runners = Runners(http_client, layered_configs=layered_configs)
         session = RunnerSession(runners, "r-42", host_address="10.0.0.1:8080", request_id="req-1")
         with patch.object(runners, "allocate_ready", return_value=session) as allocate_ready:

@@ -9,8 +9,8 @@ from bf_sdk._errors import (
     BFHTTPError,
     BFNotFound,
     BFOperationTimeoutError,
-    BFRequestTimeoutError,
     BFRateLimited,
+    BFRequestTimeoutError,
     BFRunnerUnavailableError,
     BFServiceUnavailable,
     BFTimeoutError,
@@ -18,9 +18,9 @@ from bf_sdk._errors import (
 from bf_sdk._version import __version__
 from bf_sdk.client import BFClient
 from bf_sdk.models.workload import WorkloadSummary
+from bf_sdk.resources.workloads import Workloads
 from bf_sdk.runner_config import RunnerConfig, RunnerConfigs
 from bf_sdk.runner_session import RunnerSession
-from bf_sdk.resources.workloads import Workloads
 
 __all__ = [
     "BFAuthError",

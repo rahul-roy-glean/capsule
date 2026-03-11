@@ -5,6 +5,10 @@ from pydantic import Field
 from bf_sdk.models.common import BFModel
 
 
+def _empty_entries() -> list["FileEntry"]:
+    return []
+
+
 class FileEntry(BFModel):
     name: str
     path: str | None = None
@@ -30,7 +34,7 @@ class FileUploadResult(BFModel):
 
 
 class FileListResult(BFModel):
-    entries: list[FileEntry] = Field(default_factory=list)
+    entries: list[FileEntry] = Field(default_factory=_empty_entries)
 
 
 class FileStatResult(BFModel):

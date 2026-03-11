@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
+from typing import cast
 
 from bf_sdk._errors import BFConflict, BFNotFound
 from bf_sdk._http import HttpClient
@@ -13,6 +14,7 @@ from bf_sdk.models.layered_config import (
 )
 
 if TYPE_CHECKING:
+    from bf_sdk.models.workload import WorkloadSummary
     from bf_sdk.runner_config import RunnerConfig
 
 
@@ -62,7 +64,14 @@ class LayeredConfigs:
 
     def resolve_workload_key(
         self,
-        config_ref: str | CreateConfigResponse | StoredLayeredConfig | LayeredConfigDetail | "RunnerConfig",
+        config_ref: (
+            str
+            | CreateConfigResponse
+            | StoredLayeredConfig
+            | LayeredConfigDetail
+            | RunnerConfig
+            | WorkloadSummary
+        ),
     ) -> str:
         """Resolve a user-facing config reference into a control-plane workload key."""
         direct = self._extract_direct_workload_key(config_ref)
@@ -102,18 +111,25 @@ class LayeredConfigs:
 
     @staticmethod
     def _extract_reference_value(
-        config_ref: str | CreateConfigResponse | StoredLayeredConfig | LayeredConfigDetail | "RunnerConfig",
+        config_ref: (
+            str
+            | CreateConfigResponse
+            | StoredLayeredConfig
+            | LayeredConfigDetail
+            | RunnerConfig
+            | WorkloadSummary
+        ),
     ) -> str:
         if isinstance(config_ref, str):
             return config_ref
 
         if hasattr(config_ref, "display_name"):
-            value = getattr(config_ref, "display_name")
+            value = cast(Any, config_ref).display_name
             if isinstance(value, str) and value:
                 return value
 
         if hasattr(config_ref, "config_id"):
-            value = getattr(config_ref, "config_id")
+            value = cast(Any, config_ref).config_id
             if isinstance(value, str) and value:
                 return value
 
@@ -121,14 +137,21 @@ class LayeredConfigs:
 
     @staticmethod
     def _extract_direct_workload_key(
-        config_ref: str | CreateConfigResponse | StoredLayeredConfig | LayeredConfigDetail | "RunnerConfig",
+        config_ref: (
+            str
+            | CreateConfigResponse
+            | StoredLayeredConfig
+            | LayeredConfigDetail
+            | RunnerConfig
+            | WorkloadSummary
+        ),
     ) -> str | None:
         if hasattr(config_ref, "workload_key"):
-            value = getattr(config_ref, "workload_key")
+            value = cast(Any, config_ref).workload_key
             if isinstance(value, str) and value:
                 return value
         if hasattr(config_ref, "leaf_workload_key"):
-            value = getattr(config_ref, "leaf_workload_key")
+            value = cast(Any, config_ref).leaf_workload_key
             if isinstance(value, str) and value:
                 return value
         return None

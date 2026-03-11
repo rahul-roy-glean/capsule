@@ -11,8 +11,8 @@ from bf_sdk._errors import (
     BFConnectionError,
     BFHTTPError,
     BFNotFound,
-    BFRequestTimeoutError,
     BFRateLimited,
+    BFRequestTimeoutError,
     BFServiceUnavailable,
 )
 from bf_sdk._http import HttpClient
