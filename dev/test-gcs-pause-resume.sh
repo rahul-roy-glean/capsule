@@ -44,7 +44,7 @@ dump_vm_sanity() {
 }
 
 extract_stdout() {
-  echo "$1" | jq -rs 'map(select(.type=="stdout") | .data) | join("")'
+  echo "$1" | awk '/^\{/{print}' | jq -rs 'map(select(.type=="stdout") | .data) | join("")' 2>/dev/null || true
 }
 
 PROC_STATE_SERVER_PY=$(cat <<'PY'
@@ -87,10 +87,30 @@ PY
 )
 PROC_STATE_SERVER_B64=$(printf '%s' "$PROC_STATE_SERVER_PY" | base64 -w0 2>/dev/null || printf '%s' "$PROC_STATE_SERVER_PY" | base64 | tr -d '\n')
 
+PROC_STATE_CLIENT_PY=$(cat <<'PY'
+import json
+import socket
+import sys
+
+payload = sys.argv[1] if len(sys.argv) > 1 else "STATE"
+sock_path = "/tmp/proc-state.sock"
+
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(sock_path)
+    s.sendall((payload + "\n").encode())
+    sys.stdout.write(s.recv(65536).decode())
+    s.close()
+except Exception as exc:
+    sys.stdout.write(json.dumps({"error": str(exc)}) + "\n")
+PY
+)
+PROC_STATE_CLIENT_B64=$(printf '%s' "$PROC_STATE_CLIENT_PY" | base64 -w0 2>/dev/null || printf '%s' "$PROC_STATE_CLIENT_PY" | base64 | tr -d '\n')
+
 proc_state_raw_runner() {
   local runner_id="$1"
   local payload="$2"
-  vm_exec_runner "$runner_id" "python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(\"/tmp/proc-state.sock\"); s.sendall((sys.argv[1] + \"\\n\").encode()); print(s.recv(65536).decode(), end=\"\")' '$payload'"
+  vm_exec_runner "$runner_id" "python3 /tmp/proc_state_client.py '$payload'"
 }
 
 proc_state_get_runner() {
@@ -107,13 +127,32 @@ proc_state_bump_runner() {
   extract_stdout "$(proc_state_raw_runner "$1" "BUMP")"
 }
 
+proc_state_wait_runner() {
+  local runner_id="$1"
+  local attempts="${2:-10}"
+  local json=""
+  for _ in $(seq 1 "$attempts"); do
+    json=$(proc_state_get_runner "$runner_id")
+    if [ -n "$json" ] && echo "$json" | jq -e '.pid and .blob_sha and (.counter >= 0)' >/dev/null 2>&1; then
+      echo "$json"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 dump_proc_state() {
   local runner_id="$1"
   local label="$2"
   local json
   json=$(proc_state_get_runner "$runner_id")
   echo "  --- ${label}: proc-state ---"
-  echo "$json" | jq . 2>/dev/null | sed 's/^/    /' || echo "    $json"
+  if [ -n "$json" ] && echo "$json" | jq . >/dev/null 2>&1; then
+    echo "$json" | jq . | sed 's/^/    /'
+  else
+    echo "    raw: $json"
+  fi
 }
 
 GCS_BUCKET=$(require_gcs_bucket)
@@ -339,7 +378,7 @@ fi
 # 4i. In-memory daemon: heap-resident state over a Unix socket
 echo "  --- 4i. In-memory daemon state ---"
 PROC_TOKEN="session-proof-$SESSION_ID"
-OUT=$(vm_exec "rm -f /tmp/proc-state.sock /tmp/proc_state_server.py /tmp/proc_state.log && printf '%s' '$PROC_STATE_SERVER_B64' | base64 -d >/tmp/proc_state_server.py && nohup python3 /tmp/proc_state_server.py >/tmp/proc_state.log 2>&1 & echo \$!")
+OUT=$(vm_exec "rm -f /tmp/proc-state.sock /tmp/proc_state_server.py /tmp/proc_state_client.py /tmp/proc_state.log && printf '%s' '$PROC_STATE_SERVER_B64' | base64 -d >/tmp/proc_state_server.py && printf '%s' '$PROC_STATE_CLIENT_B64' | base64 -d >/tmp/proc_state_client.py && nohup python3 /tmp/proc_state_server.py >/tmp/proc_state.log 2>&1 & echo \$!")
 echo "  $OUT"
 PROC_DAEMON_PID=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '\d+' | head -1)
 if [ -n "$PROC_DAEMON_PID" ]; then
@@ -350,6 +389,13 @@ fi
 
 sleep 1
 dump_proc_state "$RUNNER_ID" "fresh allocation"
+PROC_STATE_JSON=$(proc_state_wait_runner "$RUNNER_ID" 15 || true)
+if [ -z "$PROC_STATE_JSON" ]; then
+  fail "proc-state daemon not reachable after startup"
+  echo "  Raw proc-state log:"
+  vm_exec "cat /tmp/proc_state.log 2>/dev/null || true"
+  exit 1
+fi
 PROC_STATE_JSON=$(proc_state_set_runner "$RUNNER_ID" "$PROC_TOKEN")
 for _ in $(seq 1 7); do
   PROC_STATE_JSON=$(proc_state_bump_runner "$RUNNER_ID")
@@ -493,6 +539,7 @@ header "9. Verify ALL state preserved after GCS resume"
 # Wait for exec to actually work (thaw-agent needs time to re-bind after resume)
 echo "  --- Pre-check: waiting for exec to become responsive ---"
 EXEC_READY=false
+FIRST_EXEC_SUCCESS_S=0
 for i in $(seq 1 30); do
   PRECHECK=$(curl -s --no-buffer --max-time 5 -X POST "$MGR/api/v1/runners/$RESUME_RUNNER_ID/exec" \
     -H 'Content-Type: application/json' \
@@ -500,6 +547,7 @@ for i in $(seq 1 30); do
   if echo "$PRECHECK" | grep -q 'exec-alive'; then
     echo "  Exec responsive after ${i}s"
     EXEC_READY=true
+    FIRST_EXEC_SUCCESS_S=$i
     break
   fi
   echo -n "."
@@ -514,6 +562,40 @@ else
   echo "  Last response: $PRECHECK"
   echo "  Manager log (last 10 lines):"
   tail -10 /tmp/fc-dev/logs/firecracker-manager.log
+fi
+
+echo "  --- Pre-check: measure exec stability ---"
+EXEC_STABLE=true
+STABLE_TARGET=5
+STABLE_COUNT=0
+STABLE_WINDOW_S=0
+for i in $(seq 1 45); do
+  STABLE_OUT=$(curl -s --no-buffer --max-time 8 -X POST "$MGR/api/v1/runners/$RESUME_RUNNER_ID/exec" \
+    -H 'Content-Type: application/json' \
+    -d "{\"command\":[\"sh\",\"-c\",\"echo stable-$i\"],\"timeout_seconds\":5}" 2>&1 || echo "EXEC_TIMEOUT")
+  echo "    probe $i: $STABLE_OUT"
+  if echo "$STABLE_OUT" | grep -q "stable-$i"; then
+    STABLE_COUNT=$((STABLE_COUNT + 1))
+    if [ "$STABLE_COUNT" -eq "$STABLE_TARGET" ]; then
+      STABLE_WINDOW_S=$i
+      break
+    fi
+  else
+    STABLE_COUNT=0
+  fi
+  sleep 1
+done
+
+echo "  First exec success after: ${FIRST_EXEC_SUCCESS_S}s"
+if [ "$STABLE_WINDOW_S" -gt 0 ]; then
+  echo "  Stable exec window after: ${STABLE_WINDOW_S}s (${STABLE_TARGET} consecutive probes)"
+  pass "Exec became stably responsive after resume"
+else
+  EXEC_STABLE=false
+  fail "Resumed guest unstable: exec transport degraded after initial recovery"
+  echo "  Manager log (last 20 lines):"
+  tail -20 /tmp/fc-dev/logs/firecracker-manager.log
+  exit 1
 fi
 
 # Helper to run a command inside the resumed VM (never fails the script)

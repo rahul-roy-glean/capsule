@@ -38,7 +38,7 @@ skip() { echo "  ⊘ $1"; SKIP=$((SKIP + 1)); PASS=$((PASS + 1)); }
 header() { echo ""; echo "=== $1 ==="; }
 
 extract_stdout() {
-  echo "$1" | jq -rs 'map(select(.type=="stdout") | .data) | join("")'
+  echo "$1" | awk '/^\{/{print}' | jq -rs 'map(select(.type=="stdout") | .data) | join("")' 2>/dev/null || true
 }
 
 # Helper: exec inside a VM, return raw ndjson output
@@ -103,10 +103,30 @@ PY
 )
 PROC_STATE_SERVER_B64=$(printf '%s' "$PROC_STATE_SERVER_PY" | base64 -w0 2>/dev/null || printf '%s' "$PROC_STATE_SERVER_PY" | base64 | tr -d '\n')
 
+PROC_STATE_CLIENT_PY=$(cat <<'PY'
+import json
+import socket
+import sys
+
+payload = sys.argv[1] if len(sys.argv) > 1 else "STATE"
+sock_path = "/tmp/proc-state.sock"
+
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(sock_path)
+    s.sendall((payload + "\n").encode())
+    sys.stdout.write(s.recv(65536).decode())
+    s.close()
+except Exception as exc:
+    sys.stdout.write(json.dumps({"error": str(exc)}) + "\n")
+PY
+)
+PROC_STATE_CLIENT_B64=$(printf '%s' "$PROC_STATE_CLIENT_PY" | base64 -w0 2>/dev/null || printf '%s' "$PROC_STATE_CLIENT_PY" | base64 | tr -d '\n')
+
 proc_state_raw_runner() {
   local runner_id="$1"
   local payload="$2"
-  vm_exec "$runner_id" "[\"bash\",\"-lc\",\"python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(\\\"/tmp/proc-state.sock\\\"); s.sendall((sys.argv[1] + \\\"\\\\n\\\").encode()); print(s.recv(65536).decode(), end=\\\"\\\")' '$payload'\"]"
+  vm_exec "$runner_id" "[\"bash\",\"-lc\",\"python3 /tmp/proc_state_client.py '$payload'\"]"
 }
 
 proc_state_get_runner() {
@@ -123,13 +143,32 @@ proc_state_bump_runner() {
   extract_stdout "$(proc_state_raw_runner "$1" "BUMP")"
 }
 
+proc_state_wait_runner() {
+  local runner_id="$1"
+  local attempts="${2:-10}"
+  local json=""
+  for _ in $(seq 1 "$attempts"); do
+    json=$(proc_state_get_runner "$runner_id")
+    if [ -n "$json" ] && echo "$json" | jq -e '.pid and .blob_sha and (.counter >= 0)' >/dev/null 2>&1; then
+      echo "$json"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 dump_proc_state() {
   local runner_id="$1"
   local label="$2"
   local json
   json=$(proc_state_get_runner "$runner_id")
   echo "  --- ${label}: proc-state ---"
-  echo "$json" | jq . 2>/dev/null | sed 's/^/    /' || echo "    $json"
+  if [ -n "$json" ] && echo "$json" | jq . >/dev/null 2>&1; then
+    echo "$json" | jq . | sed 's/^/    /'
+  else
+    echo "    raw: $json"
+  fi
 }
 
 # Helper: exec with long timeout for Claude commands
@@ -519,7 +558,7 @@ fi
 header "10c. Start in-memory daemon"
 # ---------------------------------------------------------------------------
 PROC_TOKEN="agent-session-proof-$SESSION_ID"
-PROC_START=$(vm_exec "$RUNNER_ID" "[\"bash\",\"-lc\",\"rm -f /tmp/proc-state.sock /tmp/proc_state_server.py /tmp/proc_state.log && printf '%s' '$PROC_STATE_SERVER_B64' | base64 -d >/tmp/proc_state_server.py && nohup python3 /tmp/proc_state_server.py >/tmp/proc_state.log 2>&1 & echo \\$!\"]")
+PROC_START=$(vm_exec "$RUNNER_ID" "[\"bash\",\"-lc\",\"rm -f /tmp/proc-state.sock /tmp/proc_state_server.py /tmp/proc_state_client.py /tmp/proc_state.log && printf '%s' '$PROC_STATE_SERVER_B64' | base64 -d >/tmp/proc_state_server.py && printf '%s' '$PROC_STATE_CLIENT_B64' | base64 -d >/tmp/proc_state_client.py && nohup python3 /tmp/proc_state_server.py >/tmp/proc_state.log 2>&1 & echo \\$!\"]")
 PROC_DAEMON_PID=$(echo "$PROC_START" | grep -oE '[0-9]+' | head -1)
 if [ -n "$PROC_DAEMON_PID" ]; then
   pass "proc-state daemon started (pid=$PROC_DAEMON_PID)"
@@ -528,6 +567,13 @@ else
 fi
 sleep 1
 dump_proc_state "$RUNNER_ID" "fresh allocation"
+PROC_STATE_JSON=$(proc_state_wait_runner "$RUNNER_ID" 15 || true)
+if [ -z "$PROC_STATE_JSON" ]; then
+  fail "proc-state daemon not reachable after startup"
+  echo "  Raw proc-state log:"
+  vm_exec "$RUNNER_ID" "[\"bash\",\"-lc\",\"cat /tmp/proc_state.log 2>/dev/null || true\"]"
+  exit 1
+fi
 PROC_STATE_JSON=$(proc_state_set_runner "$RUNNER_ID" "$PROC_TOKEN")
 for _ in $(seq 1 7); do
   PROC_STATE_JSON=$(proc_state_bump_runner "$RUNNER_ID")
