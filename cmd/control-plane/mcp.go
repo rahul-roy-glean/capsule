@@ -177,6 +177,7 @@ func (m *mcpDeps) handleAllocate(ctx context.Context, _ *mcp.CallToolRequest, in
 	resp, err := m.scheduler.AllocateRunner(ctx, AllocateRunnerRequest{
 		RequestID:           fmt.Sprintf("mcp-%d", time.Now().UnixNano()),
 		WorkloadKey:         in.WorkloadKey,
+		Source:              "mcp",
 		SessionID:           in.SessionID,
 		SnapshotTag:         in.SnapshotTag,
 		NetworkPolicyPreset: in.NetworkPolicyPreset,
