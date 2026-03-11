@@ -89,7 +89,7 @@ class TestContract:
 
     def test_invalid_layered_config_returns_http_400(self, client: BFClient) -> None:
         with pytest.raises(BFHTTPError) as exc:
-            client.layered_configs.create({"display_name": "invalid", "layers": []})
+            client.layered_configs.create({"display_name": "invalid", "layers": [{"name": "", "init_commands": []}]})
 
         assert exc.value.status_code == 400
-        assert "at least one layer is required" in exc.value.message
+        assert "layer name must not be empty" in exc.value.message

@@ -55,10 +55,6 @@ type LayerMaterialized struct {
 
 // ValidateLayeredConfig checks a LayeredConfig for correctness.
 func ValidateLayeredConfig(cfg *LayeredConfig) error {
-	if len(cfg.Layers) == 0 {
-		return fmt.Errorf("at least one layer is required")
-	}
-
 	names := make(map[string]bool)
 	driveIDs := make(map[string]string) // driveID -> layer name
 	for _, layer := range cfg.Layers {

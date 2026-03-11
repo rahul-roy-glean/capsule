@@ -1827,6 +1827,7 @@ def suite_concurrency(
     def _exec_dirty_worker(wid: int, barrier: Barrier) -> tuple[bool, str, bool]:
         client = BFClient(base_url=base_url, token=token, timeout=180.0)
         runner_id: str | None = None
+        allocated_runner_id: str | None = None  # preserved for logging after release
         rng = random.Random(wid + int(time.monotonic() * 1000))
         # Per-cycle timings: list of (exec_s, pause_s, resume_s) per cycle.
         cycle_timings: list[dict[str, float]] = []
@@ -1843,6 +1844,7 @@ def suite_concurrency(
             alloc_dur = time.monotonic() - t0
             _alloc_latencies.append(("exec_dirty_cycles", alloc_dur))
             runner_id = resp.runner_id
+            allocated_runner_id = runner_id
 
             for cycle in range(NUM_PAUSE_CYCLES):
                 # --- Exec phase: write random data to random offsets ---
@@ -1876,13 +1878,32 @@ def suite_concurrency(
                 # flush to the block device before pause.
                 script = " ".join(bg_cmds) + " wait && sync"
 
+                # Exec with retry: the thaw agent exec endpoint can
+                # transiently 502/503 right after resume even though the
+                # readiness probe passed moments earlier.
                 t_exec = time.monotonic()
-                exec_events = list(client.runners.exec(
-                    runner_id,
-                    ["sh", "-c", script],
-                    timeout_seconds=60,
-                ))
+                exec_events = None
+                last_exec_err = None
+                for attempt in range(3):
+                    try:
+                        exec_events = list(client.runners.exec(
+                            runner_id,
+                            ["sh", "-c", script],
+                            timeout_seconds=60,
+                        ))
+                        last_exec_err = None
+                        break
+                    except (BFServiceUnavailable, BFRateLimited) as exc:
+                        last_exec_err = exc
+                        if attempt < 2:
+                            time.sleep(2 * (attempt + 1))
                 exec_dur = time.monotonic() - t_exec
+
+                if last_exec_err is not None or exec_events is None:
+                    return False, (
+                        f"Cycle {cycle}: exec failed after 3 retries: "
+                        f"{last_exec_err} (worker {wid})"
+                    ), True
 
                 # Check for non-zero exit.
                 exit_events = [e for e in exec_events if e.type == "exit"]
@@ -2011,7 +2032,7 @@ def suite_concurrency(
             # Always log timings, even on failure, so we capture partial data.
             if cycle_timings:
                 log.info("Worker cycle timings", extra={
-                    "worker": wid, "runner_id": runner_id,
+                    "worker": wid, "runner_id": allocated_runner_id,
                     "alloc_ms": round(alloc_dur * 1000),
                     "cycles": cycle_timings,
                 })
