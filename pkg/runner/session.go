@@ -1189,7 +1189,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	return runner, nil
 }
 
-
 // buildExtensionDriveBaseIndex constructs a ChunkIndex for an extension drive
 // from the golden CI metadata's ExtensionDrives map. If the drive is not found
 // in the metadata (or metadata is nil), an empty base is returned.
