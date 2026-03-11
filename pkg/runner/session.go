@@ -13,7 +13,6 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/uffd"
 )
@@ -76,6 +75,44 @@ type SessionMetadata struct {
 	GCSDiskIndexObjects map[string]string `json:"gcs_disk_index_objects,omitempty"` // driveID → GCS path
 }
 
+// TryAcquireExec atomically checks that the runner is in a state that allows
+// exec and increments ActiveExecs. Returns an error if the runner is
+// pausing, suspended, terminated, or quarantined.
+func (m *Manager) TryAcquireExec(runnerID string) error {
+	m.mu.RLock()
+	runner, exists := m.runners[runnerID]
+	m.mu.RUnlock()
+	if !exists {
+		return fmt.Errorf("runner not found: %s", runnerID)
+	}
+
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+
+	switch runner.State {
+	case StatePausing, StateSuspended, StateTerminated, StateQuarantined:
+		return fmt.Errorf("runner %s is %s", runnerID, runner.State)
+	}
+
+	atomic.AddInt32(&runner.ActiveExecs, 1)
+	return nil
+}
+
+// ReleaseExec decrements ActiveExecs and updates LastExecAt under runner.mu.
+func (m *Manager) ReleaseExec(runnerID string) {
+	m.mu.RLock()
+	runner, exists := m.runners[runnerID]
+	m.mu.RUnlock()
+	if !exists {
+		return
+	}
+
+	runner.mu.Lock()
+	atomic.AddInt32(&runner.ActiveExecs, -1)
+	runner.LastExecAt = time.Now()
+	runner.mu.Unlock()
+}
+
 // PauseRunner creates a diff snapshot of the runner's VM, saves session state,
 // and destroys the VM. The runner transitions to StateSuspended.
 func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResult, error) {
@@ -86,34 +123,39 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 		return nil, fmt.Errorf("runner not found: %s", runnerID)
 	}
 
+	vm := m.vms[runnerID]
+	// Snapshot the golden metadata under lock — it's written by SetGoldenChunkedMeta
+	// from a different goroutine (SyncManifest/heartbeat loop).
+	goldenMeta := m.goldenChunkedMeta
+	m.mu.Unlock()
+
+	if vm == nil {
+		return nil, fmt.Errorf("VM not found for runner %s", runnerID)
+	}
+
+	// Take runner.mu to atomically check state+ActiveExecs and transition to
+	// StatePausing. This makes pause and exec acquisition mutually exclusive.
+	runner.mu.Lock()
 	if runner.SessionID == "" {
-		m.mu.Unlock()
+		runner.mu.Unlock()
 		return nil, fmt.Errorf("runner %s has no session_id, cannot pause", runnerID)
 	}
 
-	if runner.State == StatePausing || runner.State == StateSuspended {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("runner %s is already %s", runnerID, runner.State)
+	switch runner.State {
+	case StatePausing, StateSuspended, StateTerminated:
+		runner.mu.Unlock()
+		return nil, fmt.Errorf("runner %s is %s, cannot pause", runnerID, runner.State)
 	}
 
 	if atomic.LoadInt32(&runner.ActiveExecs) > 0 {
-		m.mu.Unlock()
+		runner.mu.Unlock()
 		return nil, fmt.Errorf("runner %s has active execs, cannot pause", runnerID)
-	}
-
-	vm := m.vms[runnerID]
-	if vm == nil {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("VM not found for runner %s", runnerID)
 	}
 
 	runner.State = StatePausing
 	sessionID := runner.SessionID
 	layerN := runner.SessionLayers
-	// Snapshot the golden metadata under lock — it's written by SetGoldenChunkedMeta
-	// from a different goroutine (SyncManifest/heartbeat loop).
-	goldenMeta := m.goldenChunkedMeta
-	m.mu.Unlock()
+	runner.mu.Unlock()
 
 	m.logger.WithFields(logrus.Fields{
 		"runner_id":  runnerID,
@@ -233,7 +275,12 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 		newMemIndex, err := uploader.MergeAndUploadMem(ctx, memDiffFile, baseMemIndex)
 		mergeDuration := time.Since(mergeStart)
 		if err != nil {
-			m.logger.WithError(err).Warn("GCS mem chunk upload failed; falling back to local-only session")
+			// In chunked mode, local-only fallback won't work (no rootfs.img or
+			// snapshot.mem on disk), so a GCS upload failure is fatal for the pause.
+			m.mu.Lock()
+			runner.State = StateIdle
+			m.mu.Unlock()
+			return nil, fmt.Errorf("failed to upload session memory chunks to GCS: %w", err)
 		} else {
 			m.logger.WithField("merge_upload_ms", mergeDuration.Milliseconds()).Info("Pause: MergeAndUploadMem complete")
 			// Attach prefetch mapping from UFFD handler if available.
@@ -247,7 +294,11 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 			vmStateGCSPath := uploader.FullGCSPath(gcsBase + "/snapshot.state")
 
 			if uploadErr := uploader.UploadVMState(ctx, stateFile, vmStateGCSPath); uploadErr != nil {
-				m.logger.WithError(uploadErr).Warn("GCS vmstate upload failed; falling back to local-only session")
+				// In chunked mode, local-only fallback won't work — fail the pause.
+				m.mu.Lock()
+				runner.State = StateIdle
+				m.mu.Unlock()
+				return nil, fmt.Errorf("failed to upload VM state to GCS: %w", uploadErr)
 			} else {
 				// Upload dirty FUSE extension disk chunks if available (per-drive).
 				newExtDiskIndexes := map[string]*snapshot.ChunkIndex{}
@@ -388,7 +439,11 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 				}
 
 				if writeErr := uploader.WriteManifestWithExtensions(ctx, gcsBase, man, newMemIndex, allDiskIndexes); writeErr != nil {
-					m.logger.WithError(writeErr).Warn("GCS manifest write failed; falling back to local-only session")
+					// In chunked mode, local-only fallback won't work — fail the pause.
+					m.mu.Lock()
+					runner.State = StateIdle
+					m.mu.Unlock()
+					return nil, fmt.Errorf("failed to write session manifest to GCS: %w", writeErr)
 				} else {
 					metadata.GCSManifestPath = uploader.FullGCSPath(gcsBase + "/snapshot_manifest.json")
 					metadata.GCSMemIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
@@ -426,21 +481,21 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 	// Stop VM and clean up resources (but NOT the rootfs overlay or extension drives — session needs them)
 	vm.Stop()
 
+	// Extract resources from maps under lock, then stop them outside.
 	m.mu.Lock()
 	delete(m.vms, runnerID)
-
-	// Stop UFFD handler if one exists (from a previous resume)
-	if handler, ok := m.uffdHandlers[runnerID]; ok {
-		handler.Stop()
-		delete(m.uffdHandlers, runnerID)
-	}
-
-	// Stop auth proxy — it binds inside the netns which is about to be released.
-	if proxy, ok := m.authProxies[runnerID]; ok {
-		proxy.Stop()
-		delete(m.authProxies, runnerID)
-	}
+	handler := m.uffdHandlers[runnerID]
+	delete(m.uffdHandlers, runnerID)
+	proxy := m.authProxies[runnerID]
+	delete(m.authProxies, runnerID)
 	m.mu.Unlock()
+
+	if handler != nil {
+		handler.Stop()
+	}
+	if proxy != nil {
+		proxy.Stop()
+	}
 
 	// Unmount FUSE disks after VM stop (Firecracker no longer holds fds open).
 	// This prevents stale mounts from colliding with fresh FUSE mounts on re-resume.
@@ -448,21 +503,18 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 		m.cleanupFUSEDisks(runnerID)
 	}
 
-	m.mu.Lock()
-
-	// Release network namespace and slot
+	// Release network namespace outside lock (involves syscalls).
 	if m.netnsNetwork != nil {
 		m.netnsNetwork.ReleaseNamespace(runnerID)
 	}
+
+	// Final map cleanup and state update under lock (fast ops only).
+	m.mu.Lock()
 	if slot, ok := m.runnerToSlot[runnerID]; ok {
 		delete(m.slotToRunner, slot)
 		delete(m.runnerToSlot, runnerID)
 	}
-
-	// Remove socket
 	os.Remove(filepath.Join(m.config.SocketDir, runnerID+".sock"))
-
-	// Update runner state
 	runner.State = StateSuspended
 	runner.SessionLayers = layerN + 1
 	runner.SessionDir = sessionDir
@@ -607,7 +659,7 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 
 		newMemIndex, err := uploader.MergeAndUploadMem(ctx, memDiffFile, baseMemIndex)
 		if err != nil {
-			m.logger.WithError(err).Warn("Checkpoint: GCS mem chunk upload failed")
+			return nil, fmt.Errorf("checkpoint: failed to upload memory chunks to GCS: %w", err)
 		} else {
 			// Attach prefetch mapping from UFFD handler if available.
 			if handler, ok := m.uffdHandlers[runnerID].(*uffd.Handler); ok {
@@ -619,7 +671,7 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 
 			vmStateGCSPath := uploader.FullGCSPath(gcsBase + "/snapshot.state")
 			if uploadErr := uploader.UploadVMState(ctx, stateFile, vmStateGCSPath); uploadErr != nil {
-				m.logger.WithError(uploadErr).Warn("Checkpoint: GCS vmstate upload failed")
+				return nil, fmt.Errorf("checkpoint: failed to upload VM state to GCS: %w", uploadErr)
 			} else {
 				// Upload extension disk chunks
 				newExtDiskIndexes := map[string]*snapshot.ChunkIndex{}
@@ -742,7 +794,7 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 				}
 
 				if writeErr := uploader.WriteManifestWithExtensions(ctx, gcsBase, man, newMemIndex, allDiskIndexes); writeErr != nil {
-					m.logger.WithError(writeErr).Warn("Checkpoint: GCS manifest write failed")
+					return nil, fmt.Errorf("checkpoint: failed to write manifest to GCS: %w", writeErr)
 				} else {
 					metadata.GCSManifestPath = uploader.FullGCSPath(gcsBase + "/snapshot_manifest.json")
 					metadata.GCSMemIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
@@ -816,31 +868,16 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		return nil, fmt.Errorf("session %s has no layers", sessionID)
 	}
 
-	m.mu.Lock()
-	if m.draining {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("host is draining")
-	}
-	// Count active runners (exclude suspended ones — they don't consume VM resources)
-	activeCount := 0
-	for _, r := range m.runners {
-		if r.State != StateSuspended {
-			activeCount++
-		}
-	}
-	if activeCount >= m.config.MaxRunners {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("host at capacity: %d/%d runners", activeCount, m.config.MaxRunners)
-	}
+	// Use the original runner ID from the session
+	runnerID := metadata.RunnerID
 
-	// Check if there's already a runner for this session that's not suspended
-	for _, r := range m.runners {
-		if r.SessionID == sessionID && r.State != StateSuspended {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("session %s already has an active runner %s in state %s", sessionID, r.ID, r.State)
-		}
+	// Acquire lease: atomically checks capacity, validates session uniqueness,
+	// reserves slot, and creates network namespace.
+	lease, err := m.AcquireBringupLease(runnerID, sessionID)
+	if err != nil {
+		return nil, err
 	}
-	m.mu.Unlock()
+	defer lease.Release()
 
 	m.logger.WithFields(logrus.Fields{
 		"session_id":   sessionID,
@@ -856,29 +893,8 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		return nil, fmt.Errorf("failed to get kernel path: %w", err)
 	}
 
-	m.mu.Lock()
-
-	// Use the original runner ID from the session
-	runnerID := metadata.RunnerID
-
-	// Allocate network namespace
-	var tap *network.TapDevice
-	var nsInfo *network.VMNamespace
-
-	slot := m.findAvailableSlot()
-	if slot < 0 {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("no slots available")
-	}
-	nsInfo, err = m.netnsNetwork.CreateNamespaceForVM(runnerID, slot)
-	if err != nil {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("failed to create network namespace: %w", err)
-	}
-	tap = nsInfo.GetTapDevice(m.netnsNetwork.GetSubnet())
-	m.slotToRunner[slot] = runnerID
-	m.runnerToSlot[runnerID] = slot
-	m.mu.Unlock()
+	tap := lease.Tap
+	nsInfo := lease.NsInfo
 
 	// Use the session's rootfs overlay (preserved during pause)
 	overlayPath := metadata.RootfsPath
@@ -898,17 +914,11 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 
 		man, dlErr := uploader.DownloadManifest(ctx, metadata.GCSManifestPath)
 		if dlErr != nil {
-			m.mu.Lock()
-			m.cleanupNetworkOnly(runnerID, tap.Name)
-			m.mu.Unlock()
 			return nil, fmt.Errorf("failed to download session manifest: %w", dlErr)
 		}
 
 		memIdx, dlErr := uploader.DownloadChunkIndex(ctx, man.Memory.ChunkIndexObject)
 		if dlErr != nil {
-			m.mu.Lock()
-			m.cleanupNetworkOnly(runnerID, tap.Name)
-			m.mu.Unlock()
 			return nil, fmt.Errorf("failed to download mem chunk index: %w", dlErr)
 		}
 
@@ -922,16 +932,10 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 			EnablePrefetchTracking: true,
 		})
 		if handlerErr != nil {
-			m.mu.Lock()
-			m.cleanupNetworkOnly(runnerID, tap.Name)
-			m.mu.Unlock()
 			return nil, fmt.Errorf("failed to create GCS UFFD handler: %w", handlerErr)
 		}
 		if startErr := gcsHandler.Start(); startErr != nil {
 			gcsHandler.Stop()
-			m.mu.Lock()
-			m.cleanupNetworkOnly(runnerID, tap.Name)
-			m.mu.Unlock()
 			return nil, fmt.Errorf("failed to start GCS UFFD handler: %w", startErr)
 		}
 
@@ -959,17 +963,11 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		localStateDir := filepath.Join(m.config.SocketDir, "session-state")
 		if mkdirErr := os.MkdirAll(localStateDir, 0755); mkdirErr != nil {
 			gcsHandler.Stop()
-			m.mu.Lock()
-			m.cleanupNetworkOnly(runnerID, tap.Name)
-			m.mu.Unlock()
 			return nil, fmt.Errorf("failed to create local state dir: %w", mkdirErr)
 		}
 		latestStateFile = filepath.Join(localStateDir, runnerID+".state")
 		if dlErr := uploader.DownloadVMState(ctx, man.Firecracker.VMStateObject, latestStateFile); dlErr != nil {
 			gcsHandler.Stop()
-			m.mu.Lock()
-			m.cleanupNetworkOnly(runnerID, tap.Name)
-			m.mu.Unlock()
 			return nil, fmt.Errorf("failed to download VM state from GCS: %w", dlErr)
 		}
 
@@ -982,9 +980,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 				diskIdx, diskDlErr := uploader.DownloadChunkIndex(ctx, diskSection.ChunkIndexObject)
 				if diskDlErr != nil {
 					gcsHandler.Stop()
-					m.mu.Lock()
-					m.cleanupNetworkOnly(runnerID, tap.Name)
-					m.mu.Unlock()
 					return nil, fmt.Errorf("failed to download disk chunk index for drive %s: %w", driveID, diskDlErr)
 				}
 				// Convert ChunkIndex extents to dense ChunkRef slice for FUSE.
@@ -992,9 +987,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 				fusePath, fuseErr := m.setupExtensionFUSEDisk(runnerID, driveID, diskRefs, diskIdx.Region.LogicalSizeBytes, diskIdx.ChunkSizeBytes)
 				if fuseErr != nil {
 					gcsHandler.Stop()
-					m.mu.Lock()
-					m.cleanupNetworkOnly(runnerID, tap.Name)
-					m.mu.Unlock()
 					return nil, fmt.Errorf("failed to setup FUSE disk for drive %s session resume: %w", driveID, fuseErr)
 				}
 				extensionDrivePaths[driveID] = fusePath
@@ -1006,18 +998,12 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 			rootfsDiskIdx, diskDlErr := uploader.DownloadChunkIndex(ctx, man.Disk.ChunkIndexObject)
 			if diskDlErr != nil {
 				gcsHandler.Stop()
-				m.mu.Lock()
-				m.cleanupNetworkOnly(runnerID, tap.Name)
-				m.mu.Unlock()
 				return nil, fmt.Errorf("failed to download rootfs disk chunk index: %w", diskDlErr)
 			}
 			rootfsRefs := snapshot.ChunkIndexToRefs(rootfsDiskIdx)
 			rootfsFusePath, fuseErr := m.setupRootfsFUSEDisk(runnerID, rootfsRefs, rootfsDiskIdx.Region.LogicalSizeBytes, rootfsDiskIdx.ChunkSizeBytes)
 			if fuseErr != nil {
 				gcsHandler.Stop()
-				m.mu.Lock()
-				m.cleanupNetworkOnly(runnerID, tap.Name)
-				m.mu.Unlock()
 				return nil, fmt.Errorf("failed to setup FUSE rootfs disk for session resume: %w", fuseErr)
 			}
 			overlayPath = rootfsFusePath
@@ -1029,15 +1015,18 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 			"gcs_vmstate": man.Firecracker.VMStateObject,
 			"rootfs":      overlayPath,
 		}).Info("Resuming from GCS-backed session (UFFD chunked)")
+	} else if m.sessionMemStore != nil {
+		// Chunked mode but no GCS manifest — the GCS upload during pause must
+		// have failed. Local resume is not possible in chunked mode because
+		// rootfs.img and snapshot.mem are not stored locally.
+		return nil, fmt.Errorf("session %s has no GCS manifest (GCS upload likely failed during pause); "+
+			"local resume is not supported in chunked mode", sessionID)
 	} else {
-		// Local fallback: LayeredHandler uses golden snapshot.mem on this host.
-		// Full snapshot paths (including rootfs, mem) are required for local resume.
-		snapshotPaths, spErr := m.snapshotCache.GetSnapshotPaths()
-		if spErr != nil {
-			m.mu.Lock()
-			m.cleanupNetworkOnly(runnerID, tap.Name)
-			m.mu.Unlock()
-			return nil, fmt.Errorf("failed to get snapshot paths for local resume: %w", spErr)
+		// Local fallback (non-chunked mode): LayeredHandler uses golden
+		// snapshot.mem on this host.
+		goldenMemPath := filepath.Join(m.config.SnapshotCachePath, "snapshot.mem")
+		if _, err := os.Stat(goldenMemPath); err != nil {
+			return nil, fmt.Errorf("golden snapshot.mem not found for local resume: %w", err)
 		}
 
 		// Build diff layer paths (oldest first).
@@ -1053,22 +1042,16 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 
 		layeredHandler, handlerErr := uffd.NewLayeredHandler(uffd.LayeredHandlerConfig{
 			SocketPath:       uffdSocketPath,
-			GoldenMemPath:    snapshotPaths.Mem,
+			GoldenMemPath:    goldenMemPath,
 			DiffLayers:       diffLayers,
 			Logger:           m.logger.Logger,
 			FaultConcurrency: 32,
 		})
 		if handlerErr != nil {
-			m.mu.Lock()
-			m.cleanupNetworkOnly(runnerID, tap.Name)
-			m.mu.Unlock()
 			return nil, fmt.Errorf("failed to create layered UFFD handler: %w", handlerErr)
 		}
 		if startErr := layeredHandler.Start(); startErr != nil {
 			layeredHandler.Stop()
-			m.mu.Lock()
-			m.cleanupNetworkOnly(runnerID, tap.Name)
-			m.mu.Unlock()
 			return nil, fmt.Errorf("failed to start UFFD handler: %w", startErr)
 		}
 		uffdHandler = layeredHandler
@@ -1097,39 +1080,30 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 
 	vmCfg.NetNSPath = nsInfo.GetFirecrackerNetNSPath()
 
+	// Set up per-runner snapshot symlinks before creating the VM so the
+	// SnapshotDir is available for the private mount namespace.
+	snapshotDir, symlinkCleanup, symlinkErr := m.setupSnapshotSymlinks(runnerID, overlayPath, extensionDrivePaths)
+	if symlinkErr != nil {
+		uffdHandler.Stop()
+		return nil, fmt.Errorf("failed to setup snapshot symlinks: %w", symlinkErr)
+	}
+	defer symlinkCleanup()
+
+	vmCfg.SnapshotDir = snapshotDir
+
 	vm, err := firecracker.NewVM(vmCfg, m.logger.Logger)
 	if err != nil {
 		uffdHandler.Stop()
-		m.mu.Lock()
-		m.cleanupNetworkOnly(runnerID, tap.Name)
-		m.mu.Unlock()
 		return nil, fmt.Errorf("failed to create VM: %w", err)
-	}
-
-	// Setup symlinks for snapshot restore
-	m.mu.Lock()
-	cleanup, symlinkErr := m.setupSnapshotSymlinks(overlayPath, extensionDrivePaths)
-	m.mu.Unlock()
-	if symlinkErr != nil {
-		uffdHandler.Stop()
-		vm.Stop()
-		m.mu.Lock()
-		m.cleanupNetworkOnly(runnerID, tap.Name)
-		m.mu.Unlock()
-		return nil, fmt.Errorf("failed to setup snapshot symlinks: %w", symlinkErr)
 	}
 
 	// Restore from snapshot with UFFD (paused — don't resume yet).
 	// With per-VM namespaces, tap-slot-0 already exists — no TAP rename needed.
 	restoreErr := vm.RestoreFromSnapshotWithUFFD(ctx, latestStateFile, uffdSocketPath, false)
-	cleanup()
 
 	if restoreErr != nil {
 		uffdHandler.Stop()
 		vm.Stop()
-		m.mu.Lock()
-		m.cleanupNetworkOnly(runnerID, tap.Name)
-		m.mu.Unlock()
 		return nil, fmt.Errorf("failed to restore from session snapshot: %w", restoreErr)
 	}
 
@@ -1183,6 +1157,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	m.vms[runnerID] = vm
 	m.uffdHandlers[runnerID] = uffdHandler
 	m.mu.Unlock()
+	lease.Commit()
 
 	// Inject MMDS data BEFORE resuming so the thaw-agent sees fresh config
 	mmdsData := m.buildMMDSData(ctx, runner, tap, AllocateRequest{
@@ -1200,7 +1175,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		delete(m.runners, runnerID)
 		delete(m.vms, runnerID)
 		delete(m.uffdHandlers, runnerID)
-		m.cleanupNetworkOnly(runnerID, tap.Name)
+		m.cleanupRunner(runnerID, tap.Name, "")
 		m.mu.Unlock()
 		return nil, fmt.Errorf("failed to resume VM after MMDS injection: %w", err)
 	}
@@ -1212,18 +1187,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	}).Info("Runner resumed from session snapshot successfully")
 
 	return runner, nil
-}
-
-// cleanupNetworkOnly releases network resources without touching overlay or extension drives.
-func (m *Manager) cleanupNetworkOnly(runnerID, _ string) {
-	if m.netnsNetwork != nil {
-		m.netnsNetwork.ReleaseNamespace(runnerID)
-	}
-	if slot, ok := m.runnerToSlot[runnerID]; ok {
-		delete(m.slotToRunner, slot)
-		delete(m.runnerToSlot, runnerID)
-	}
-	os.Remove(filepath.Join(m.config.SocketDir, runnerID+".sock"))
 }
 
 // buildExtensionDriveBaseIndex constructs a ChunkIndex for an extension drive
@@ -1309,17 +1272,9 @@ func (m *Manager) IncrementActiveExecs(runnerID string) {
 }
 
 // DecrementActiveExecs atomically decrements the active exec count and updates LastExecAt.
+// Deprecated: Use ReleaseExec for state-safe release.
 func (m *Manager) DecrementActiveExecs(runnerID string) {
-	m.mu.RLock()
-	runner, exists := m.runners[runnerID]
-	m.mu.RUnlock()
-	if !exists {
-		return
-	}
-	atomic.AddInt32(&runner.ActiveExecs, -1)
-	m.mu.Lock()
-	runner.LastExecAt = time.Now()
-	m.mu.Unlock()
+	m.ReleaseExec(runnerID)
 }
 
 // ResetTTL updates LastExecAt for a runner, extending its idle TTL timer.

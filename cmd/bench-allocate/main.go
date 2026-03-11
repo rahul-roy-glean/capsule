@@ -17,7 +17,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -25,6 +24,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/cpapi"
 )
 
 var (
@@ -39,19 +40,6 @@ var (
 	flagReadyPoll    = flag.Duration("ready-poll", 500*time.Millisecond, "interval between runner ready polls")
 )
 
-type allocateResp struct {
-	RunnerID    string `json:"runner_id"`
-	HostAddress string `json:"host_address"`
-	SessionID   string `json:"session_id"`
-	Resumed     bool   `json:"resumed"`
-	Error       string `json:"error"`
-}
-
-type releaseResp struct {
-	Success bool   `json:"success"`
-	Error   string `json:"error"`
-}
-
 type runResult struct {
 	Duration time.Duration
 }
@@ -65,16 +53,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	client := &http.Client{Timeout: *flagTimeout}
-	cp := strings.TrimRight(*flagCP, "/")
+	cp := &cpapi.Client{
+		BaseURL:    strings.TrimRight(*flagCP, "/"),
+		HTTPClient: &http.Client{Timeout: *flagTimeout},
+	}
 	mgr := strings.TrimRight(*flagMgr, "/")
+	mgrClient := &http.Client{Timeout: *flagTimeout}
 
 	fmt.Fprintf(os.Stderr, "bench-allocate config:\n")
-	fmt.Fprintf(os.Stderr, "  cp=%s mgr=%s workload_key=%s\n", cp, mgr, *flagWorkloadKey)
+	fmt.Fprintf(os.Stderr, "  cp=%s mgr=%s workload_key=%s\n", cp.BaseURL, mgr, *flagWorkloadKey)
 	fmt.Fprintf(os.Stderr, "  warmup=%d iterations=%d cmd=%q\n", *flagWarmup, *flagIterations, *flagCmd)
 
 	for i := range *flagWarmup {
-		if _, err := runOnce(client, cp, mgr, *flagWorkloadKey, *flagCmd, *flagReadyTimeout, *flagReadyPoll); err != nil {
+		if _, err := runOnce(cp, mgrClient, mgr, *flagWorkloadKey, *flagCmd, *flagReadyTimeout, *flagReadyPoll); err != nil {
 			fmt.Fprintf(os.Stderr, "warmup [%d/%d] failed: %v\n", i+1, *flagWarmup, err)
 		} else {
 			fmt.Fprintf(os.Stderr, "warmup [%d/%d] ok\n", i+1, *flagWarmup)
@@ -83,7 +74,7 @@ func main() {
 
 	results := make([]runResult, 0, *flagIterations)
 	for i := range *flagIterations {
-		res, err := runOnce(client, cp, mgr, *flagWorkloadKey, *flagCmd, *flagReadyTimeout, *flagReadyPoll)
+		res, err := runOnce(cp, mgrClient, mgr, *flagWorkloadKey, *flagCmd, *flagReadyTimeout, *flagReadyPoll)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "run [%d/%d] failed: %v\n", i+1, *flagIterations, err)
 			continue
@@ -128,26 +119,27 @@ func main() {
 
 // runOnce performs one full cycle: allocate → poll ready → exec → release.
 // The timer runs from allocate request to end of exec response; release is untimed.
-func runOnce(client *http.Client, cp, mgr, workloadKey, cmd string, readyTimeout, readyPoll time.Duration) (runResult, error) {
+func runOnce(cp *cpapi.Client, mgrClient *http.Client, mgr, workloadKey, cmd string, readyTimeout, readyPoll time.Duration) (runResult, error) {
 	start := time.Now()
 
-	runnerID, err := allocateRunner(client, cp, workloadKey)
+	resp, err := cp.AllocateRunner(cpapi.AllocateRequest{WorkloadKey: workloadKey})
 	if err != nil {
 		return runResult{}, fmt.Errorf("allocate: %w", err)
 	}
+	runnerID := resp.RunnerID
 
 	release := func() {
-		if rErr := releaseRunner(client, cp, runnerID); rErr != nil {
+		if rErr := cp.ReleaseRunner(runnerID); rErr != nil {
 			fmt.Fprintf(os.Stderr, "  release %s failed: %v\n", runnerID, rErr)
 		}
 	}
 
-	if err := waitReady(client, cp, runnerID, readyTimeout, readyPoll); err != nil {
+	if err := cp.WaitReady(runnerID, readyTimeout, readyPoll); err != nil {
 		release()
 		return runResult{}, fmt.Errorf("wait ready: %w", err)
 	}
 
-	if err := execInRunner(client, mgr, runnerID, cmd); err != nil {
+	if err := execInRunner(mgrClient, mgr, runnerID, cmd); err != nil {
 		release()
 		return runResult{}, fmt.Errorf("exec: %w", err)
 	}
@@ -155,39 +147,6 @@ func runOnce(client *http.Client, cp, mgr, workloadKey, cmd string, readyTimeout
 	elapsed := time.Since(start)
 	release()
 	return runResult{Duration: elapsed}, nil
-}
-
-func allocateRunner(client *http.Client, cp, workloadKey string) (string, error) {
-	body, _ := json.Marshal(map[string]string{"workload_key": workloadKey})
-	req, _ := http.NewRequest(http.MethodPost, cp+"/api/v1/runners/allocate", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	raw, err := doJSON(client, req)
-	if err != nil {
-		return "", err
-	}
-	var resp allocateResp
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return "", fmt.Errorf("decode allocate response: %w (body=%q)", err, strings.TrimSpace(string(raw)))
-	}
-	if resp.Error != "" || resp.RunnerID == "" {
-		return "", fmt.Errorf("allocate failed: error=%q runner_id=%q", resp.Error, resp.RunnerID)
-	}
-	return resp.RunnerID, nil
-}
-
-func waitReady(client *http.Client, cp, runnerID string, timeout, poll time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		resp, err := client.Get(cp + "/api/v1/runners/status?runner_id=" + runnerID)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return nil
-			}
-		}
-		time.Sleep(poll)
-	}
-	return fmt.Errorf("runner %s not ready after %s", runnerID, timeout)
 }
 
 func execInRunner(client *http.Client, mgr, runnerID, cmd string) error {
@@ -205,53 +164,25 @@ func execInRunner(client *http.Client, mgr, runnerID, cmd string) error {
 		}
 		req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(bodyBytes))
 		req.Header.Set("Content-Type", "application/json")
-		_, err := doJSON(client, req)
-		if err == nil {
-			return nil
+		resp, err := client.Do(req)
+		if err != nil {
+			if strings.Contains(err.Error(), "connection reset by peer") ||
+				strings.Contains(err.Error(), "EOF") ||
+				strings.Contains(err.Error(), "connection refused") {
+				lastErr = err
+				continue
+			}
+			return err
 		}
-		if strings.Contains(err.Error(), "connection reset by peer") ||
-			strings.Contains(err.Error(), "EOF") ||
-			strings.Contains(err.Error(), "connection refused") {
-			lastErr = err
-			continue
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("exec status %d body=%s", resp.StatusCode, strings.TrimSpace(buf.String()))
 		}
-		return err
+		return nil
 	}
 	return lastErr
-}
-
-func releaseRunner(client *http.Client, cp, runnerID string) error {
-	body, _ := json.Marshal(map[string]string{"runner_id": runnerID})
-	req, _ := http.NewRequest(http.MethodPost, cp+"/api/v1/runners/release", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	raw, err := doJSON(client, req)
-	if err != nil {
-		return err
-	}
-	var resp releaseResp
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return fmt.Errorf("decode release response: %w (body=%q)", err, strings.TrimSpace(string(raw)))
-	}
-	if resp.Error != "" {
-		return errors.New(resp.Error)
-	}
-	return nil
-}
-
-func doJSON(client *http.Client, req *http.Request) ([]byte, error) {
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	buf := new(bytes.Buffer)
-	if _, err := buf.ReadFrom(resp.Body); err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("status %d body=%s", resp.StatusCode, strings.TrimSpace(buf.String()))
-	}
-	return buf.Bytes(), nil
 }
 
 func percentile(values []time.Duration, p float64) time.Duration {

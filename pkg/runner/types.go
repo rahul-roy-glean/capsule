@@ -2,6 +2,7 @@ package runner
 
 import (
 	"net"
+	"sync"
 	"time"
 
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
@@ -29,6 +30,7 @@ const (
 
 // Runner represents a single runner instance
 type Runner struct {
+	mu                      sync.Mutex `json:"-"`
 	ID                      string
 	HostID                  string
 	State                   State

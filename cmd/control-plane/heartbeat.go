@@ -88,6 +88,25 @@ func (s *ControlPlaneServer) HandleHostHeartbeat(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// Log host usage metrics for observability.
+	logFields := map[string]any{
+		"instance_name":        req.InstanceName,
+		"status":               host.Status,
+		"idle_runners":         req.IdleRunners,
+		"busy_runners":         req.BusyRunners,
+		"total_cpu_millicores": req.TotalCPUMillicores,
+		"used_cpu_millicores":  req.UsedCPUMillicores,
+		"total_memory_mb":      req.TotalMemoryMB,
+		"used_memory_mb":       req.UsedMemoryMB,
+	}
+	if req.TotalCPUMillicores > 0 {
+		logFields["cpu_util_pct"] = float64(req.UsedCPUMillicores) / float64(req.TotalCPUMillicores) * 100
+	}
+	if req.TotalMemoryMB > 0 {
+		logFields["mem_util_pct"] = float64(req.UsedMemoryMB) / float64(req.TotalMemoryMB) * 100
+	}
+	s.logger.WithFields(logFields).Info("Host heartbeat")
+
 	// If the host reported itself as draining (e.g. SIGTERM received), mark it
 	// in the registry so the scheduler stops allocating to it.
 	if req.Draining {

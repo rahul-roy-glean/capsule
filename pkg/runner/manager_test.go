@@ -1,11 +1,14 @@
 package runner
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
 	"github.com/sirupsen/logrus"
 )
 
@@ -13,12 +16,15 @@ func newTestManager(opts ...func(*Manager)) *Manager {
 	logger := logrus.New()
 	logger.SetLevel(logrus.DebugLevel)
 	m := &Manager{
-		config:       HostConfig{MaxRunners: 4, HostID: "test-host", Environment: "test"},
-		runners:      make(map[string]*Runner),
-		slotToRunner: make(map[int]string),
-		runnerToSlot: make(map[string]int),
-		uffdHandlers: make(map[string]uffdStopper),
-		logger:       logger.WithField("test", true),
+		config:          HostConfig{MaxRunners: 4, HostID: "test-host", Environment: "test"},
+		runners:         make(map[string]*Runner),
+		vms:             make(map[string]*firecracker.VM),
+		slotToRunner:    make(map[int]string),
+		runnerToSlot:    make(map[string]int),
+		pendingSessions: make(map[string]string),
+		uffdHandlers:    make(map[string]uffdStopper),
+		authProxies:     make(map[string]*authproxy.AuthProxy),
+		logger:          logger.WithField("test", true),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -300,6 +306,40 @@ func TestIdleCount_NoneIdle(t *testing.T) {
 	}
 }
 
+func TestGetStatus_ExcludesSuspendedAndPausedResourceUsage(t *testing.T) {
+	m := newTestManager(func(m *Manager) {
+		m.config.TotalCPUMillicores = 16000
+		m.config.TotalMemoryMB = 32768
+	})
+	m.runners["active"] = &Runner{
+		ID:        "active",
+		State:     StateBusy,
+		Resources: Resources{VCPUs: 2, MemoryMB: 4096},
+	}
+	m.runners["suspended"] = &Runner{
+		ID:        "suspended",
+		State:     StateSuspended,
+		Resources: Resources{VCPUs: 4, MemoryMB: 8192},
+	}
+	m.runners["paused"] = &Runner{
+		ID:        "paused",
+		State:     StatePaused,
+		Resources: Resources{VCPUs: 1, MemoryMB: 2048},
+	}
+
+	status := m.GetStatus()
+
+	if status.UsedCPUMillicores != 2000 {
+		t.Fatalf("UsedCPUMillicores = %d, want 2000", status.UsedCPUMillicores)
+	}
+	if status.UsedMemoryMB != 4096 {
+		t.Fatalf("UsedMemoryMB = %d, want 4096", status.UsedMemoryMB)
+	}
+	if status.BusyRunners != 1 {
+		t.Fatalf("BusyRunners = %d, want 1", status.BusyRunners)
+	}
+}
+
 func TestGetRunner(t *testing.T) {
 	m := newTestManager()
 	m.runners["r1"] = &Runner{ID: "r1", State: StateIdle}
@@ -391,6 +431,67 @@ func TestIdempotencyCleanup(t *testing.T) {
 	if _, ok := m.recentRequests["new-req"]; !ok {
 		t.Error("Fresh request should not have been cleaned up")
 	}
+}
+
+func TestIdempotentAllocationWaitsForLeader(t *testing.T) {
+	m := newTestManager()
+	m.recentRequests = make(map[string]*recentAllocation)
+
+	existing, alloc, leader := m.beginIdempotentAllocation("req-1")
+	if existing != nil {
+		t.Fatalf("unexpected existing runner: %+v", existing)
+	}
+	if !leader || alloc == nil {
+		t.Fatalf("expected leader allocation, got leader=%v alloc=%v", leader, alloc)
+	}
+
+	waitExisting, waitAlloc, waitLeader := m.beginIdempotentAllocation("req-1")
+	if waitExisting != nil {
+		t.Fatalf("unexpected existing runner for waiter: %+v", waitExisting)
+	}
+	if waitLeader || waitAlloc != alloc {
+		t.Fatalf("expected waiter to share inflight allocation, leader=%v sameAlloc=%v", waitLeader, waitAlloc == alloc)
+	}
+
+	runner := &Runner{ID: "runner-1", State: StateIdle}
+	m.runners[runner.ID] = runner
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		m.finishIdempotentAllocation("req-1", alloc, runner, nil)
+	}()
+
+	got, err := m.waitForIdempotentAllocation(context.Background(), "req-1", waitAlloc)
+	if err != nil {
+		t.Fatalf("waitForIdempotentAllocation() error = %v", err)
+	}
+	if got == nil || got.ID != runner.ID {
+		t.Fatalf("waitForIdempotentAllocation() = %+v, want %s", got, runner.ID)
+	}
+}
+
+func TestAcquireBringupLeaseCountsPendingReservations(t *testing.T) {
+	m := newTestManager(func(m *Manager) {
+		m.config.MaxRunners = 1
+	})
+
+	lease, err := m.AcquireBringupLease("runner-1", "")
+	if err != nil {
+		t.Fatalf("first AcquireBringupLease() error = %v", err)
+	}
+	if m.CanAddRunner(0, 0) {
+		t.Fatal("CanAddRunner() should be false while a lease is held")
+	}
+	if _, err := m.AcquireBringupLease("runner-2", ""); err == nil {
+		t.Fatal("second AcquireBringupLease() should fail at capacity")
+	}
+
+	lease.Release()
+
+	lease2, err := m.AcquireBringupLease("runner-3", "")
+	if err != nil {
+		t.Fatalf("AcquireBringupLease() after release error = %v", err)
+	}
+	lease2.Release()
 }
 
 func TestDrainBlocksAllocation(t *testing.T) {

@@ -24,6 +24,9 @@ const (
 	CPWebhookLatency           HistogramName = "control_plane.webhook.latency"
 	CPAllocationLatency        HistogramName = "control_plane.allocation.latency"
 	CPQueueWait                HistogramName = "control_plane.queue.wait"
+	CPEndpointRequestDuration  HistogramName = "control_plane.endpoint.request.duration"
+	CPEndpointRequestSize      HistogramName = "control_plane.endpoint.request.size"
+	CPEndpointResponseSize     HistogramName = "control_plane.endpoint.response.size"
 	SnapshotBuildDuration      HistogramName = "snapshot.build.duration"
 	SnapshotUploadDuration     HistogramName = "snapshot.upload.duration"
 	SessionPauseDuration       HistogramName = "session.pause.duration"
@@ -41,6 +44,7 @@ const (
 	VMTerminations         CounterName = "vm.terminations"
 	CPWebhookRequests      CounterName = "control_plane.webhook.requests"
 	CPAllocations          CounterName = "control_plane.allocations"
+	CPEndpointRequests     CounterName = "control_plane.endpoint.requests"
 	CPDownscalerActions    CounterName = "control_plane.downscaler.actions"
 	SnapshotRollouts       CounterName = "snapshot.rollouts"
 	CacheArtifactHits      CounterName = "cache.artifact.hits"
@@ -50,6 +54,7 @@ const (
 	CIJobs                 CounterName = "ci.jobs"
 	ChunkedPageFaults      CounterName = "chunked.page_faults"
 	ChunkedCacheHits       CounterName = "chunked.cache_hits"
+	ChunkedCacheMisses     CounterName = "chunked.cache_misses"
 	ChunkedChunkFetches    CounterName = "chunked.chunk_fetches"
 	ChunkedDiskReads       CounterName = "chunked.disk_reads"
 	ChunkedDiskWrites      CounterName = "chunked.disk_writes"
@@ -76,7 +81,15 @@ const (
 	HostMemTotal          GaugeName = "host.memory_mb.total"
 	HostMemUsed           GaugeName = "host.memory_mb.used"
 	CPHostsTotal          GaugeName = "control_plane.hosts"
+	CPHostsReady          GaugeName = "control_plane.hosts.ready"
+	CPHostsDraining       GaugeName = "control_plane.hosts.draining"
+	CPHostsTerminating    GaugeName = "control_plane.hosts.terminating"
+	CPHostsUnhealthy      GaugeName = "control_plane.hosts.unhealthy"
+	CPHostsTerminated     GaugeName = "control_plane.hosts.terminated"
 	CPRunnersTotal        GaugeName = "control_plane.runners"
+	CPRunnersTotalCurrent GaugeName = "control_plane.runners.total"
+	CPRunnersIdleCurrent  GaugeName = "control_plane.runners.idle"
+	CPRunnersBusyCurrent  GaugeName = "control_plane.runners.busy"
 	CPQueueDepth          GaugeName = "control_plane.queue.depth"
 	CPFleetCPUTotal       GaugeName = "control_plane.fleet.cpu_millicores.total"
 	CPFleetCPUUsed        GaugeName = "control_plane.fleet.cpu_millicores.used"
@@ -111,8 +124,9 @@ const (
 
 // UpDownCounter names.
 const (
-	HostRunnersIdle UpDownCounterName = "host.runners.idle"
-	HostRunnersBusy UpDownCounterName = "host.runners.busy"
+	CPEndpointRequestsInFlight UpDownCounterName = "control_plane.endpoint.requests.inflight"
+	HostRunnersIdle            UpDownCounterName = "host.runners.idle"
+	HostRunnersBusy            UpDownCounterName = "host.runners.busy"
 )
 
 // Description and unit maps for counters.
@@ -121,6 +135,7 @@ var counterDescriptions = map[CounterName]string{
 	VMTerminations:         "Total number of VM terminations",
 	CPWebhookRequests:      "Total webhook requests received by the control plane",
 	CPAllocations:          "Total VM allocations performed by the control plane",
+	CPEndpointRequests:     "Total HTTP requests handled by control plane endpoints",
 	CPDownscalerActions:    "Total downscaler actions taken",
 	SnapshotRollouts:       "Total snapshot rollouts",
 	CacheArtifactHits:      "Artifact cache hits",
@@ -130,6 +145,7 @@ var counterDescriptions = map[CounterName]string{
 	CIJobs:                 "Total CI jobs processed",
 	ChunkedPageFaults:      "Total page faults handled by chunked loader",
 	ChunkedCacheHits:       "Chunk cache hits",
+	ChunkedCacheMisses:     "Chunk cache misses",
 	ChunkedChunkFetches:    "Total chunk fetches from remote storage",
 	ChunkedDiskReads:       "Total disk read operations for chunked storage",
 	ChunkedDiskWrites:      "Total disk write operations for chunked storage",
@@ -167,6 +183,9 @@ var histogramDescriptions = map[HistogramName]string{
 	CPWebhookLatency:           "Latency of control plane webhook handling",
 	CPAllocationLatency:        "Latency of control plane VM allocation",
 	CPQueueWait:                "Time spent waiting in the control plane queue",
+	CPEndpointRequestDuration:  "End-to-end latency of a control plane HTTP endpoint request",
+	CPEndpointRequestSize:      "Size of the incoming HTTP request body handled by a control plane endpoint",
+	CPEndpointResponseSize:     "Size of the HTTP response body returned by a control plane endpoint",
 	SnapshotBuildDuration:      "Duration of snapshot build",
 	SnapshotUploadDuration:     "Duration of snapshot upload",
 	SessionPauseDuration:       "Duration of session pause operation",
@@ -189,6 +208,9 @@ var histogramUnits = map[HistogramName]string{
 	CPWebhookLatency:           "s",
 	CPAllocationLatency:        "s",
 	CPQueueWait:                "s",
+	CPEndpointRequestDuration:  "s",
+	CPEndpointRequestSize:      "By",
+	CPEndpointResponseSize:     "By",
 	SnapshotBuildDuration:      "s",
 	SnapshotUploadDuration:     "s",
 	SessionPauseDuration:       "s",
@@ -207,7 +229,15 @@ var gaugeDescriptions = map[GaugeName]string{
 	HostMemTotal:          "Total memory in MB on the host",
 	HostMemUsed:           "Used memory in MB on the host",
 	CPHostsTotal:          "Total number of hosts in the control plane",
+	CPHostsReady:          "Number of ready hosts in the control plane",
+	CPHostsDraining:       "Number of draining hosts in the control plane",
+	CPHostsTerminating:    "Number of terminating hosts in the control plane",
+	CPHostsUnhealthy:      "Number of unhealthy hosts in the control plane",
+	CPHostsTerminated:     "Number of terminated hosts tracked by the control plane",
 	CPRunnersTotal:        "Total number of runners in the control plane",
+	CPRunnersTotalCurrent: "Current total number of runners in the control plane",
+	CPRunnersIdleCurrent:  "Current number of idle runners in the control plane",
+	CPRunnersBusyCurrent:  "Current number of busy runners in the control plane",
 	CPQueueDepth:          "Current control plane queue depth",
 	CPFleetCPUTotal:       "Total fleet CPU millicores",
 	CPFleetCPUUsed:        "Used fleet CPU millicores",
@@ -246,8 +276,9 @@ var float64GaugeUnits = map[Float64GaugeName]string{}
 
 // Description and unit maps for up-down counters.
 var upDownCounterDescriptions = map[UpDownCounterName]string{
-	HostRunnersIdle: "Number of idle runners on the host",
-	HostRunnersBusy: "Number of busy runners on the host",
+	CPEndpointRequestsInFlight: "Number of in-flight HTTP requests for control plane endpoints",
+	HostRunnersIdle:            "Number of idle runners on the host",
+	HostRunnersBusy:            "Number of busy runners on the host",
 }
 
 var upDownCounterUnits = map[UpDownCounterName]string{}
@@ -316,10 +347,14 @@ func NewUpDownCounter(meter metric.Meter, name UpDownCounterName) (metric.Int64U
 const (
 	AttrResult      = attribute.Key("result")
 	AttrStatus      = attribute.Key("status")
+	AttrMethod      = attribute.Key("method")
+	AttrRoute       = attribute.Key("route")
 	AttrReason      = attribute.Key("reason")
 	AttrRouting     = attribute.Key("routing")
 	AttrSource      = attribute.Key("source")
 	AttrPhase       = attribute.Key("phase")
+	AttrStatusCode  = attribute.Key("status_code")
+	AttrStatusClass = attribute.Key("status_class")
 	AttrWorkloadKey = attribute.Key("workload_key")
 	AttrHostID      = attribute.Key("host_id")
 	AttrRunnerID    = attribute.Key("runner_id")

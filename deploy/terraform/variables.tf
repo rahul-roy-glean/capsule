@@ -42,7 +42,7 @@ variable "host_data_disk_size_gb" {
 variable "min_hosts" {
   description = "Minimum number of host VMs in MIG"
   type        = number
-  default     = 2
+  default     = 1
 }
 
 variable "max_hosts" {

@@ -230,6 +230,7 @@ func main() {
 	// Cumulative counters reported as absolute values from GetChunkedStats - use gauges
 	pageFaultsGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedPageFaults))
 	cacheHitsGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedCacheHits))
+	cacheMissesGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedCacheMisses))
 	chunkFetchesGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedChunkFetches))
 	diskReadsGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedDiskReads))
 	diskWritesGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedDiskWrites))
@@ -311,6 +312,7 @@ func main() {
 
 	// Start autoscaler loop
 	go autoscaleLoop(ctx, mgr, chunkedMgr, *idleTarget, logger, autoscaleInstruments{
+		hostAttrs:       metric.WithAttributes(fcrotel.AttrHostID.String(instanceName)),
 		vmAllocCounter:  vmAllocCounter,
 		vmBootHist:      vmBootHist,
 		hostCPUTotal:    hostCPUTotalGauge,
@@ -327,6 +329,7 @@ func main() {
 		memCacheItems:   memCacheItemsGauge,
 		pageFaults:      pageFaultsGauge,
 		cacheHits:       cacheHitsGauge,
+		cacheMisses:     cacheMissesGauge,
 		chunkFetches:    chunkFetchesGauge,
 		diskReads:       diskReadsGauge,
 		diskWrites:      diskWritesGauge,
@@ -411,6 +414,7 @@ func readyHandler(mgr *runner.Manager) http.HandlerFunc {
 
 // autoscaleInstruments holds OTel instruments used by the autoscale loop.
 type autoscaleInstruments struct {
+	hostAttrs       metric.MeasurementOption // host_id attribute for all recordings
 	vmAllocCounter  metric.Int64Counter
 	vmBootHist      metric.Float64Histogram
 	hostCPUTotal    metric.Int64Gauge
@@ -427,6 +431,7 @@ type autoscaleInstruments struct {
 	memCacheItems   metric.Int64Gauge
 	pageFaults      metric.Int64Gauge
 	cacheHits       metric.Int64Gauge
+	cacheMisses     metric.Int64Gauge
 	chunkFetches    metric.Int64Gauge
 	diskReads       metric.Int64Gauge
 	diskWrites      metric.Int64Gauge
@@ -454,35 +459,40 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			// would load the wrong data and be useless when an actual job arrives.
 
 			// Record host metrics
-			instruments.hostCPUTotal.Record(ctx, int64(status.TotalCPUMillicores))
-			instruments.hostCPUUsed.Record(ctx, int64(status.UsedCPUMillicores))
-			instruments.hostMemTotal.Record(ctx, int64(status.TotalMemoryMB))
-			instruments.hostMemUsed.Record(ctx, int64(status.UsedMemoryMB))
+			ha := instruments.hostAttrs
+			instruments.hostCPUTotal.Record(ctx, int64(status.TotalCPUMillicores), ha)
+			instruments.hostCPUUsed.Record(ctx, int64(status.UsedCPUMillicores), ha)
+			instruments.hostMemTotal.Record(ctx, int64(status.TotalMemoryMB), ha)
+			instruments.hostMemUsed.Record(ctx, int64(status.UsedMemoryMB), ha)
 
 			// UpDownCounters need delta from previous value
 			idleDelta := int64(status.IdleRunners - prevIdle)
 			busyDelta := int64(status.BusyRunners - prevBusy)
-			instruments.hostRunnersIdle.Add(ctx, idleDelta)
-			instruments.hostRunnersBusy.Add(ctx, busyDelta)
+			instruments.hostRunnersIdle.Add(ctx, idleDelta, ha)
+			instruments.hostRunnersBusy.Add(ctx, busyDelta, ha)
 			prevIdle = status.IdleRunners
 			prevBusy = status.BusyRunners
 
 			// Record chunked snapshot metrics
 			cs := chunkedMgr.GetChunkedStats()
-			instruments.diskCacheSize.Record(ctx, cs.DiskCacheSize)
-			instruments.diskCacheMax.Record(ctx, cs.DiskCacheMaxSize)
-			instruments.diskCacheItems.Record(ctx, int64(cs.DiskCacheItems))
-			instruments.memCacheSize.Record(ctx, cs.MemCacheSize)
-			instruments.memCacheMax.Record(ctx, cs.MemCacheMaxSize)
-			instruments.memCacheItems.Record(ctx, int64(cs.MemCacheItems))
-			instruments.pageFaults.Record(ctx, int64(cs.TotalPageFaults))
-			instruments.cacheHits.Record(ctx, int64(cs.TotalCacheHits))
-			instruments.chunkFetches.Record(ctx, int64(cs.TotalChunkFetches))
-			instruments.diskReads.Record(ctx, int64(cs.TotalDiskReads))
-			instruments.diskWrites.Record(ctx, int64(cs.TotalDiskWrites))
-			instruments.dirtyChunks.Record(ctx, int64(cs.TotalDirtyChunks))
-			if cs.TotalPageFaults > 0 {
-				instruments.cacheHitRatio.Record(ctx, float64(cs.TotalCacheHits)/float64(cs.TotalPageFaults))
+			instruments.diskCacheSize.Record(ctx, cs.DiskCacheSize, ha)
+			instruments.diskCacheMax.Record(ctx, cs.DiskCacheMaxSize, ha)
+			instruments.diskCacheItems.Record(ctx, int64(cs.DiskCacheItems), ha)
+			instruments.memCacheSize.Record(ctx, cs.MemCacheSize, ha)
+			instruments.memCacheMax.Record(ctx, cs.MemCacheMaxSize, ha)
+			instruments.memCacheItems.Record(ctx, int64(cs.MemCacheItems), ha)
+			instruments.pageFaults.Record(ctx, int64(cs.TotalPageFaults), ha)
+			instruments.cacheHits.Record(ctx, int64(cs.MemCacheHits), ha)
+			instruments.cacheMisses.Record(ctx, int64(cs.MemCacheMisses), ha)
+			instruments.chunkFetches.Record(ctx, int64(cs.TotalChunkFetches), ha)
+			instruments.diskReads.Record(ctx, int64(cs.TotalDiskReads), ha)
+			instruments.diskWrites.Record(ctx, int64(cs.TotalDiskWrites), ha)
+			instruments.dirtyChunks.Record(ctx, int64(cs.TotalDirtyChunks), ha)
+			// Compute cache hit ratio from the ChunkStore LRU stats, which
+			// persist across handler lifetimes (handler-level CacheHits is
+			// always 0 since page-level caching was removed).
+			if totalLookups := cs.MemCacheHits + cs.MemCacheMisses; totalLookups > 0 {
+				instruments.cacheHitRatio.Record(ctx, float64(cs.MemCacheHits)/float64(totalLookups), ha)
 			}
 		}
 	}
@@ -1126,8 +1136,11 @@ func handleExecCommand(w http.ResponseWriter, r *http.Request, mgr *runner.Manag
 	}).Debug("Proxying exec request to thaw-agent")
 
 	// Track active execs for TTL enforcement
-	mgr.IncrementActiveExecs(runnerID)
-	defer mgr.DecrementActiveExecs(runnerID)
+	if err := mgr.TryAcquireExec(runnerID); err != nil {
+		http.Error(w, "runner unavailable: "+err.Error(), http.StatusConflict)
+		return
+	}
+	defer mgr.ReleaseExec(runnerID)
 
 	// Forward the request to thaw-agent
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, r.Body)
@@ -1199,8 +1212,11 @@ func handlePTYProxy(w http.ResponseWriter, r *http.Request, mgr *runner.Manager,
 	}
 
 	// Track active execs for TTL enforcement
-	mgr.IncrementActiveExecs(runnerID)
-	defer mgr.DecrementActiveExecs(runnerID)
+	if err := mgr.TryAcquireExec(runnerID); err != nil {
+		http.Error(w, "runner unavailable: "+err.Error(), http.StatusConflict)
+		return
+	}
+	defer mgr.ReleaseExec(runnerID)
 
 	// Build backend WebSocket URL (thaw-agent debug port)
 	backendURL := fmt.Sprintf("ws://%s:%d/pty?%s", rn.InternalIP.String(), snapshot.ThawAgentDebugPort, r.URL.RawQuery)
@@ -1322,8 +1338,11 @@ func handleFileOp(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, l
 		"target":    targetURL,
 	}).Debug("Proxying file op request to thaw-agent")
 
-	mgr.IncrementActiveExecs(runnerID)
-	defer mgr.DecrementActiveExecs(runnerID)
+	if err := mgr.TryAcquireExec(runnerID); err != nil {
+		http.Error(w, "runner unavailable: "+err.Error(), http.StatusConflict)
+		return
+	}
+	defer mgr.ReleaseExec(runnerID)
 
 	method := r.Method
 	var body io.Reader

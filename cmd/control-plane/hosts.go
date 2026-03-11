@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -33,6 +34,10 @@ type Host struct {
 	UsedCPUMillicores  int
 	TotalMemoryMB      int
 	UsedMemoryMB       int
+	// Pending resources reserve capacity for allocations that have been assigned
+	// to this host but have not yet been confirmed by the host heartbeat.
+	PendingCPUMillicores int
+	PendingMemoryMB      int
 	// RunnerInfos is per-runner status from the latest heartbeat, used for
 	// centralized TTL enforcement.
 	RunnerInfos []HostRunnerInfo
@@ -69,11 +74,20 @@ type Runner struct {
 
 // HostRegistry manages host registration and tracking
 type HostRegistry struct {
-	db      *sql.DB
-	hosts   map[string]*Host
-	runners map[string]*Runner
-	mu      sync.RWMutex
-	logger  *logrus.Entry
+	db            *sql.DB
+	hosts         map[string]*Host
+	runners       map[string]*Runner
+	mu            sync.RWMutex
+	logger        *logrus.Entry
+	allocFailures atomic.Int64
+}
+
+func (hr *HostRegistry) RecordAllocFailure() {
+	hr.allocFailures.Add(1)
+}
+
+func (hr *HostRegistry) DrainAllocFailures() int64 {
+	return hr.allocFailures.Swap(0)
 }
 
 // NewHostRegistry creates a new host registry
@@ -259,7 +273,8 @@ func (hr *HostRegistry) GetAllHosts() []*Host {
 
 	hosts := make([]*Host, 0, len(hr.hosts))
 	for _, h := range hr.hosts {
-		hosts = append(hosts, h)
+		cp := *h
+		hosts = append(hosts, &cp)
 	}
 	return hosts
 }
@@ -273,6 +288,7 @@ func (hr *HostRegistry) GetAvailableHosts() []*Host {
 
 	var available []*Host
 	for _, h := range hr.hosts {
+		usedCPU, usedMem := hr.effectiveUsageLocked(h)
 		if h.Status != "ready" {
 			continue
 		}
@@ -280,12 +296,70 @@ func (hr *HostRegistry) GetAvailableHosts() []*Host {
 			continue
 		}
 		if h.TotalCPUMillicores > 0 &&
-			(h.TotalCPUMillicores-h.UsedCPUMillicores) > 0 &&
-			(h.TotalMemoryMB-h.UsedMemoryMB) > 0 {
+			(h.TotalCPUMillicores-usedCPU) > 0 &&
+			(h.TotalMemoryMB-usedMem) > 0 {
 			available = append(available, h)
 		}
 	}
 	return available
+}
+
+func (hr *HostRegistry) effectiveUsageLocked(host *Host) (cpu int, mem int) {
+	if host == nil {
+		return 0, 0
+	}
+
+	cpu = max(host.UsedCPUMillicores, 0) + max(host.PendingCPUMillicores, 0)
+	mem = max(host.UsedMemoryMB, 0) + max(host.PendingMemoryMB, 0)
+
+	reported := make(map[string]struct{}, len(host.RunnerInfos))
+	for _, info := range host.RunnerInfos {
+		reported[info.RunnerID] = struct{}{}
+	}
+
+	for _, runner := range hr.runners {
+		if runner.HostID != host.ID {
+			continue
+		}
+		if _, ok := reported[runner.ID]; ok {
+			continue
+		}
+		cpu += runner.ReservedCPU
+		mem += runner.ReservedMemoryMB
+	}
+
+	return cpu, mem
+}
+
+func (hr *HostRegistry) runnerReportedLocked(host *Host, runnerID string) bool {
+	if host == nil {
+		return false
+	}
+	for _, info := range host.RunnerInfos {
+		if info.RunnerID == runnerID {
+			return true
+		}
+	}
+	return false
+}
+
+func (hr *HostRegistry) releasePendingReservation(hostID string, cpu, mem int) {
+	hr.mu.Lock()
+	defer hr.mu.Unlock()
+
+	host := hr.hosts[hostID]
+	if host == nil {
+		return
+	}
+
+	host.PendingCPUMillicores -= cpu
+	host.PendingMemoryMB -= mem
+	if host.PendingCPUMillicores < 0 {
+		host.PendingCPUMillicores = 0
+	}
+	if host.PendingMemoryMB < 0 {
+		host.PendingMemoryMB = 0
+	}
 }
 
 // AddRunner adds or updates a runner in the registry.
@@ -300,25 +374,26 @@ func (hr *HostRegistry) AddRunner(ctx context.Context, runner *Runner) error {
 		networkPolicy = runner.NetworkPolicyJSON
 	}
 
-	_, err := hr.db.ExecContext(ctx, `
-		INSERT INTO runners (id, host_id, status, internal_ip, job_id, workload_key,
-			runner_ttl_seconds, auto_pause, network_policy_preset, network_policy)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		ON CONFLICT (id) DO UPDATE SET
-			host_id = EXCLUDED.host_id,
-			status = EXCLUDED.status,
-			internal_ip = EXCLUDED.internal_ip,
-			job_id = EXCLUDED.job_id,
-			workload_key = EXCLUDED.workload_key,
-			runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
-			auto_pause = EXCLUDED.auto_pause,
-			network_policy_preset = EXCLUDED.network_policy_preset,
-			network_policy = EXCLUDED.network_policy
-	`, runner.ID, runner.HostID, runner.Status, runner.InternalIP, runner.JobID, runner.WorkloadKey,
-		runner.RunnerTTLSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy)
-
-	if err != nil {
-		return err
+	if hr.db != nil {
+		_, err := hr.db.ExecContext(ctx, `
+			INSERT INTO runners (id, host_id, status, internal_ip, job_id, workload_key,
+				runner_ttl_seconds, auto_pause, network_policy_preset, network_policy)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			ON CONFLICT (id) DO UPDATE SET
+				host_id = EXCLUDED.host_id,
+				status = EXCLUDED.status,
+				internal_ip = EXCLUDED.internal_ip,
+				job_id = EXCLUDED.job_id,
+				workload_key = EXCLUDED.workload_key,
+				runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
+				auto_pause = EXCLUDED.auto_pause,
+				network_policy_preset = EXCLUDED.network_policy_preset,
+				network_policy = EXCLUDED.network_policy
+		`, runner.ID, runner.HostID, runner.Status, runner.InternalIP, runner.JobID, runner.WorkloadKey,
+			runner.RunnerTTLSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy)
+		if err != nil {
+			return err
+		}
 	}
 
 	hr.runners[runner.ID] = runner
@@ -342,9 +417,25 @@ func (hr *HostRegistry) RemoveRunner(runnerID string) error {
 	hr.mu.Lock()
 	defer hr.mu.Unlock()
 
-	_, err := hr.db.Exec(`DELETE FROM runners WHERE id = $1`, runnerID)
-	if err != nil {
-		return err
+	runner := hr.runners[runnerID]
+	if runner != nil {
+		if host := hr.hosts[runner.HostID]; host != nil && hr.runnerReportedLocked(host, runnerID) {
+			host.UsedCPUMillicores -= runner.ReservedCPU
+			host.UsedMemoryMB -= runner.ReservedMemoryMB
+			if host.UsedCPUMillicores < 0 {
+				host.UsedCPUMillicores = 0
+			}
+			if host.UsedMemoryMB < 0 {
+				host.UsedMemoryMB = 0
+			}
+		}
+	}
+
+	if hr.db != nil {
+		_, err := hr.db.Exec(`DELETE FROM runners WHERE id = $1`, runnerID)
+		if err != nil {
+			return err
+		}
 	}
 
 	delete(hr.runners, runnerID)

@@ -26,6 +26,7 @@ type downscalerConfig struct {
 	ScaleUpThreshold     float64
 	ScaleDownThreshold   float64
 	Cooldown             time.Duration
+	BootCooldown         time.Duration // cooldown after demand-driven scale-up (host boot time)
 }
 
 func loadDownscalerConfig(logger *logrus.Entry) downscalerConfig {
@@ -42,7 +43,7 @@ func loadDownscalerConfig(logger *logrus.Entry) downscalerConfig {
 		enabled = projectID != "" && region != "" && migName != ""
 	}
 
-	interval := 60 * time.Second
+	interval := 10 * time.Second
 	if raw := strings.TrimSpace(os.Getenv("DOWNSCALER_INTERVAL")); raw != "" {
 		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
 			interval = d
@@ -92,6 +93,13 @@ func loadDownscalerConfig(logger *logrus.Entry) downscalerConfig {
 		}
 	}
 
+	bootCooldown := 3 * time.Minute
+	if raw := strings.TrimSpace(os.Getenv("AUTOSCALER_BOOT_COOLDOWN")); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			bootCooldown = d
+		}
+	}
+
 	return downscalerConfig{
 		Enabled:              enabled,
 		ProjectID:            projectID,
@@ -104,10 +112,11 @@ func loadDownscalerConfig(logger *logrus.Entry) downscalerConfig {
 		ScaleUpThreshold:     scaleUpThreshold,
 		ScaleDownThreshold:   scaleDownThreshold,
 		Cooldown:             cooldown,
+		BootCooldown:         bootCooldown,
 	}
 }
 
-func startDownscaler(ctx context.Context, db *sql.DB, hr *HostRegistry, sched *Scheduler, logger *logrus.Logger) {
+func startDownscaler(ctx context.Context, db *sql.DB, hr *HostRegistry, logger *logrus.Logger) {
 	log := logger.WithField("component", "downscaler")
 	cfg := loadDownscalerConfig(log)
 	if !cfg.Enabled {
@@ -151,22 +160,31 @@ func startDownscaler(ctx context.Context, db *sql.DB, hr *HostRegistry, sched *S
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			ok, err := tryAdvisoryLock(ctx, db, 42424242)
+			conn, err := db.Conn(ctx)
 			if err != nil {
-				log.WithError(err).Warn("Failed to acquire downscaler lock")
-				continue
-			}
-			if !ok {
+				log.WithError(err).Warn("Failed to get DB connection for downscaler lock")
 				continue
 			}
 
-			if acted, err := runDownscaleOnce(ctx, cfg, mc, hr, sched, lastScaleAction, log); err != nil {
+			ok, lockErr := tryAdvisoryLock(ctx, conn, 42424242)
+			if lockErr != nil {
+				log.WithError(lockErr).Warn("Failed to acquire downscaler lock")
+				conn.Close()
+				continue
+			}
+			if !ok {
+				conn.Close()
+				continue
+			}
+
+			if acted, err := runDownscaleOnce(ctx, cfg, mc, hr, lastScaleAction, log); err != nil {
 				log.WithError(err).Warn("Downscale iteration failed")
 			} else if acted {
 				lastScaleAction = time.Now()
 			}
 
-			_ = advisoryUnlock(ctx, db, 42424242)
+			_ = advisoryUnlock(ctx, conn, 42424242)
+			conn.Close()
 		}
 	}
 }
@@ -185,11 +203,7 @@ type hostStore interface {
 	SetHostStatusByInstanceName(ctx context.Context, instanceName, status string) error
 	CleanupHostRunners(ctx context.Context, hostID string) error
 	RemoveHost(hostID string)
-}
-
-// queueDepthSource abstracts queue depth retrieval for testability.
-type queueDepthSource interface {
-	GetQueueDepth() int
+	DrainAllocFailures() int64
 }
 
 // gcpMIGClient wraps a real GCP compute.Service for production use.
@@ -238,7 +252,7 @@ func (g *gcpMIGClient) Resize(ctx context.Context, newSize int64) error {
 
 // runDownscaleOnce returns (actionTaken, error). actionTaken is true when a
 // scale-up resize or scale-down drain was performed (used for cooldown tracking).
-func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, mc migClient, hs hostStore, qds queueDepthSource, lastScaleAction time.Time, log *logrus.Entry) (bool, error) {
+func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, mc migClient, hs hostStore, lastScaleAction time.Time, log *logrus.Entry) (bool, error) {
 	currentTarget, err := mc.GetTargetSize(ctx)
 	if err != nil {
 		return false, err
@@ -304,7 +318,7 @@ func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, mc migClient, h
 	}
 
 	// Phase 1: delete draining+idle hosts via DeleteInstances.
-	deleted := int64(0)
+	deleted := int64(phase0Deleted)
 	for instanceName, instanceURL := range instanceByName {
 		if deleted >= int64(cfg.MaxDeletesPerCycle) {
 			break
@@ -331,16 +345,12 @@ func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, mc migClient, h
 		deleted++
 	}
 
-	if deleted > 0 {
-		log.WithField("deleted", deleted).Info("Phase 1: deleted draining+idle hosts")
+	phase1Deleted := deleted - int64(phase0Deleted)
+	if phase1Deleted > 0 {
+		log.WithField("deleted", phase1Deleted).Info("Phase 1: deleted draining+idle hosts")
 	}
 
 	// Phase 2: utilization-based scale-up / scale-down.
-	// Skip if within cooldown.
-	if !lastScaleAction.IsZero() && time.Since(lastScaleAction) < cfg.Cooldown {
-		return false, nil
-	}
-
 	// Collect ready hosts with valid CPU info and fresh heartbeat.
 	var readyHosts []*Host
 	for _, h := range hosts {
@@ -356,7 +366,28 @@ func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, mc migClient, h
 		readyHosts = append(readyHosts, h)
 	}
 
-	decision := computeAutoscaleDecision(readyHosts, qds.GetQueueDepth(), cfg.ScaleUpThreshold, cfg.ScaleDownThreshold)
+	allocFailures := hs.DrainAllocFailures()
+
+	// Demand-driven scale-up uses a shorter boot cooldown to give the new
+	// host time to start and register before we scale up again.
+	demandDriven := allocFailures > 0 || len(readyHosts) == 0
+	if demandDriven {
+		if !lastScaleAction.IsZero() && time.Since(lastScaleAction) < cfg.BootCooldown {
+			log.WithFields(logrus.Fields{
+				"since_last_scale": time.Since(lastScaleAction).Round(time.Second),
+				"boot_cooldown":    cfg.BootCooldown,
+				"alloc_failures":   allocFailures,
+			}).Debug("Demand-driven scale-up suppressed: waiting for new host to boot")
+			return false, nil
+		}
+	} else {
+		// Normal cooldown check — only for utilization-based decisions
+		if !lastScaleAction.IsZero() && time.Since(lastScaleAction) < cfg.Cooldown {
+			return false, nil
+		}
+	}
+
+	decision := computeAutoscaleDecision(readyHosts, cfg.ScaleUpThreshold, cfg.ScaleDownThreshold, allocFailures)
 
 	switch decision.action {
 	case scaleActionUp:
@@ -402,8 +433,18 @@ type autoscaleDecision struct {
 }
 
 // computeAutoscaleDecision is the pure decision logic for scale-up / scale-down.
-// It examines ready hosts' CPU utilization and queue depth to decide what to do.
-func computeAutoscaleDecision(readyHosts []*Host, queueDepth int, scaleUpThreshold, scaleDownThreshold float64) autoscaleDecision {
+// It examines ready hosts' CPU utilization to decide what to do.
+func computeAutoscaleDecision(readyHosts []*Host, scaleUpThreshold, scaleDownThreshold float64, allocFailures int64) autoscaleDecision {
+	// Demand-driven: allocation failures since last check
+	if allocFailures > 0 {
+		return autoscaleDecision{action: scaleActionUp, reason: fmt.Sprintf("%d allocation failures since last check", allocFailures)}
+	}
+
+	// Zero capacity: no ready hosts at all
+	if len(readyHosts) == 0 {
+		return autoscaleDecision{action: scaleActionUp, reason: "no ready hosts available"}
+	}
+
 	type hostUtil struct {
 		host *Host
 		xi   float64
@@ -418,9 +459,6 @@ func computeAutoscaleDecision(readyHosts []*Host, queueDepth int, scaleUpThresho
 	}
 
 	// --- Scale up ---
-	if len(readyHosts) == 0 && queueDepth > 0 {
-		return autoscaleDecision{action: scaleActionUp, reason: "no ready hosts with queued jobs"}
-	}
 	if len(utils) > 0 {
 		minXi := utils[0].xi
 		for _, u := range utils[1:] {
@@ -471,17 +509,17 @@ func computeAutoscaleDecision(readyHosts []*Host, queueDepth int, scaleUpThresho
 	}
 }
 
-func tryAdvisoryLock(ctx context.Context, db *sql.DB, key int64) (bool, error) {
+func tryAdvisoryLock(ctx context.Context, conn *sql.Conn, key int64) (bool, error) {
 	var ok bool
-	if err := db.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&ok); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&ok); err != nil {
 		return false, err
 	}
 	return ok, nil
 }
 
-func advisoryUnlock(ctx context.Context, db *sql.DB, key int64) error {
+func advisoryUnlock(ctx context.Context, conn *sql.Conn, key int64) error {
 	var ok bool
-	return db.QueryRowContext(ctx, `SELECT pg_advisory_unlock($1)`, key).Scan(&ok)
+	return conn.QueryRowContext(ctx, `SELECT pg_advisory_unlock($1)`, key).Scan(&ok)
 }
 
 func instanceNameFromURL(u string) string {

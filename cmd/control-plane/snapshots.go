@@ -917,6 +917,42 @@ func (sm *SnapshotManager) GetDesiredVersions(ctx context.Context, hostID string
 	return result, nil
 }
 
+// GetTargetVersionsByWorkloadKey returns the fleet-wide target version for a
+// workload key and any per-host overrides from version_assignments. This
+// allows batch resolution of per-host target versions for scoring without
+// N+1 queries.
+func (sm *SnapshotManager) GetTargetVersionsByWorkloadKey(ctx context.Context, workloadKey string) (fleetVersion string, hostOverrides map[string]string) {
+	hostOverrides = make(map[string]string)
+	if sm.db == nil || workloadKey == "" {
+		return "", hostOverrides
+	}
+
+	// Fleet-wide default (host_id IS NULL)
+	_ = sm.db.QueryRowContext(ctx, `
+		SELECT version FROM version_assignments
+		WHERE workload_key = $1 AND host_id IS NULL
+	`, workloadKey).Scan(&fleetVersion)
+
+	// Per-host overrides
+	rows, err := sm.db.QueryContext(ctx, `
+		SELECT host_id, version FROM version_assignments
+		WHERE workload_key = $1 AND host_id IS NOT NULL
+	`, workloadKey)
+	if err != nil {
+		return fleetVersion, hostOverrides
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var hostID, version string
+		if rows.Scan(&hostID, &version) == nil {
+			hostOverrides[hostID] = version
+		}
+	}
+
+	return fleetVersion, hostOverrides
+}
+
 // GetFleetConvergence returns the convergence status for all hosts for a given repo.
 type HostVersionStatus struct {
 	HostID         string `json:"host_id"`

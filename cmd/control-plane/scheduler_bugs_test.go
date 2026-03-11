@@ -127,3 +127,72 @@ func TestAllocateRunner_MissingSnapshotTagFailsFast(t *testing.T) {
 		t.Fatalf("unexpected error: %s", got)
 	}
 }
+
+func TestSchedulerIdempotentAllocationWaitsForLeader(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+	hr := NewHostRegistry(nil, logger)
+	s := NewScheduler(hr, nil, nil, nil, logger)
+
+	existing, alloc, leader := s.beginIdempotentAllocation("req-1")
+	if existing != nil {
+		t.Fatalf("unexpected cached response: %+v", existing)
+	}
+	if !leader || alloc == nil {
+		t.Fatalf("expected leader allocation, got leader=%v alloc=%v", leader, alloc)
+	}
+
+	waitExisting, waitAlloc, waitLeader := s.beginIdempotentAllocation("req-1")
+	if waitExisting != nil {
+		t.Fatalf("unexpected cached response for waiter: %+v", waitExisting)
+	}
+	if waitLeader || waitAlloc != alloc {
+		t.Fatalf("expected waiter to share inflight allocation, leader=%v sameAlloc=%v", waitLeader, waitAlloc == alloc)
+	}
+
+	hr.runners["runner-1"] = &Runner{ID: "runner-1", HostID: "host-1"}
+	resp := &AllocateRunnerResponse{RunnerID: "runner-1", HostID: "host-1", HostAddress: "10.0.0.1:8080"}
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		s.finishIdempotentAllocation("req-1", alloc, resp, nil)
+	}()
+
+	got, err := s.waitForIdempotentAllocation(context.Background(), "req-1", waitAlloc)
+	if err != nil {
+		t.Fatalf("waitForIdempotentAllocation() error = %v", err)
+	}
+	if got == nil || got.RunnerID != resp.RunnerID {
+		t.Fatalf("waitForIdempotentAllocation() = %+v, want runner %s", got, resp.RunnerID)
+	}
+}
+
+func TestSchedulerCachedIdempotentAllocationRequiresLiveRunner(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+	hr := NewHostRegistry(nil, logger)
+	s := NewScheduler(hr, nil, nil, nil, logger)
+
+	resp := &AllocateRunnerResponse{RunnerID: "runner-1", HostID: "host-1", HostAddress: "10.0.0.1:8080"}
+	s.recentRequests["req-1"] = &recentSchedulerAllocation{
+		resp:      resp,
+		allocTime: time.Now(),
+	}
+
+	// No live runner tracked: same request_id should be allowed to allocate again.
+	existing, alloc, leader := s.beginIdempotentAllocation("req-1")
+	if existing != nil || !leader || alloc == nil {
+		t.Fatalf("expected stale cached response to be discarded, got existing=%+v leader=%v alloc=%v", existing, leader, alloc)
+	}
+
+	s.finishIdempotentAllocation("req-1", alloc, resp, nil)
+	hr.runners["runner-1"] = &Runner{ID: "runner-1", HostID: "host-1"}
+
+	existing, alloc, leader = s.beginIdempotentAllocation("req-1")
+	if alloc != nil || leader {
+		t.Fatalf("expected cached response to be reused once runner is live, got alloc=%v leader=%v", alloc, leader)
+	}
+	if existing == nil || existing.RunnerID != "runner-1" {
+		t.Fatalf("expected cached live runner response, got %+v", existing)
+	}
+}

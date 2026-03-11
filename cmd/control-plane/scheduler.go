@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,13 +14,25 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
 	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/tiers"
 )
+
+const schedulerRequestTTL = 5 * time.Minute
+
+type recentSchedulerAllocation struct {
+	resp      *AllocateRunnerResponse
+	allocTime time.Time
+	err       error
+	waitCh    chan struct{}
+	inFlight  bool
+}
 
 // Scheduler handles runner allocation across hosts
 type Scheduler struct {
@@ -37,6 +50,9 @@ type Scheduler struct {
 	// gRPC connections are multiplexed and designed to be long-lived, so
 	// reusing them avoids TCP+TLS handshake latency on every RPC.
 	connPool sync.Map // map[string]*grpc.ClientConn
+
+	requestMu      sync.Mutex
+	recentRequests map[string]*recentSchedulerAllocation
 }
 
 // NewScheduler creates a new scheduler
@@ -47,7 +63,91 @@ func NewScheduler(hr *HostRegistry, db *sql.DB, sm *SnapshotManager, tr *Snapsho
 		snapshotManager: sm,
 		tagRegistry:     tr,
 		logger:          logger.WithField("component", "scheduler"),
+		recentRequests:  make(map[string]*recentSchedulerAllocation),
 	}
+}
+
+func (s *Scheduler) beginIdempotentAllocation(reqID string) (*AllocateRunnerResponse, *recentSchedulerAllocation, bool) {
+	if reqID == "" {
+		return nil, nil, true
+	}
+
+	s.requestMu.Lock()
+	defer s.requestMu.Unlock()
+
+	if alloc, ok := s.recentRequests[reqID]; ok {
+		if alloc.inFlight {
+			return nil, alloc, false
+		}
+		if time.Since(alloc.allocTime) <= schedulerRequestTTL && s.cachedAllocationStillValid(alloc) {
+			return alloc.resp, nil, false
+		}
+		delete(s.recentRequests, reqID)
+	}
+
+	alloc := &recentSchedulerAllocation{
+		allocTime: time.Now(),
+		waitCh:    make(chan struct{}),
+		inFlight:  true,
+	}
+	s.recentRequests[reqID] = alloc
+	return nil, alloc, true
+}
+
+func (s *Scheduler) waitForIdempotentAllocation(ctx context.Context, reqID string, alloc *recentSchedulerAllocation) (*AllocateRunnerResponse, error) {
+	if reqID == "" || alloc == nil {
+		return nil, nil
+	}
+
+	select {
+	case <-alloc.waitCh:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	s.requestMu.Lock()
+	defer s.requestMu.Unlock()
+
+	if alloc.resp != nil && s.cachedAllocationStillValid(alloc) {
+		return alloc.resp, nil
+	}
+	if alloc.err != nil {
+		return nil, alloc.err
+	}
+	return nil, fmt.Errorf("allocation for request %q completed without a runner", reqID)
+}
+
+func (s *Scheduler) finishIdempotentAllocation(reqID string, alloc *recentSchedulerAllocation, resp *AllocateRunnerResponse, err error) {
+	if reqID == "" || alloc == nil {
+		return
+	}
+
+	s.requestMu.Lock()
+	if err == nil && resp != nil {
+		alloc.resp = resp
+		alloc.allocTime = time.Now()
+	} else {
+		alloc.err = err
+		delete(s.recentRequests, reqID)
+	}
+	alloc.inFlight = false
+	waitCh := alloc.waitCh
+	s.requestMu.Unlock()
+
+	if waitCh != nil {
+		close(waitCh)
+	}
+}
+
+func (s *Scheduler) cachedAllocationStillValid(alloc *recentSchedulerAllocation) bool {
+	if alloc == nil || alloc.resp == nil || alloc.resp.RunnerID == "" {
+		return false
+	}
+	if s.hostRegistry == nil {
+		return true
+	}
+	_, err := s.hostRegistry.GetRunner(alloc.resp.RunnerID)
+	return err == nil
 }
 
 // SetOTel attaches OTel instruments for distributed tracing and metrics.
@@ -128,7 +228,21 @@ type AllocateRunnerResponse struct {
 }
 
 // AllocateRunner allocates a runner on the best available host
-func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerRequest) (*AllocateRunnerResponse, error) {
+func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerRequest) (_ *AllocateRunnerResponse, retErr error) {
+	var idempotentAlloc *recentSchedulerAllocation
+	var allocatedResp *AllocateRunnerResponse
+
+	if existing, alloc, leader := s.beginIdempotentAllocation(req.RequestID); existing != nil {
+		return existing, nil
+	} else if !leader {
+		return s.waitForIdempotentAllocation(ctx, req.RequestID, alloc)
+	} else {
+		idempotentAlloc = alloc
+		defer func() {
+			s.finishIdempotentAllocation(req.RequestID, idempotentAlloc, allocatedResp, retErr)
+		}()
+	}
+
 	s.logger.WithFields(logrus.Fields{
 		"request_id":   req.RequestID,
 		"workload_key": req.WorkloadKey,
@@ -246,33 +360,13 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	}
 	tier, _ := tiers.Lookup(tierName)
 
-	// Get available hosts
-	hosts := s.hostRegistry.GetAvailableHosts()
-	if len(hosts) == 0 {
-		return nil, fmt.Errorf("no available hosts")
-	}
-
-	// Filter hosts that can fit this workload's resource requirements
-	var eligible []*Host
-	for _, h := range hosts {
-		if canFitWorkload(h, tier) {
-			eligible = append(eligible, h)
-		}
-	}
-	if len(eligible) == 0 {
-		// Fall back to all available hosts if none pass resource check
-		// (handles hosts that don't yet report resources)
-		eligible = hosts
-	}
-
 	// Session stickiness: if this is a session resume, prefer the host where
 	// the session was paused. This keeps the LRU chunk cache warm and avoids
 	// cold GCS fetches on resume. When resuming a suspended session, also use
 	// the TTL/network policy persisted on that session instead of re-reading
 	// mutable layered-config defaults by workload key.
-	var host *Host
+	var sessionHostID string
 	if req.SessionID != "" && s.db != nil {
-		var sessionHostID string
 		var status string
 		var sessionTTL sql.NullInt64
 		var sessionAutoPause sql.NullBool
@@ -298,99 +392,144 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			if sessionNPJSON.Valid {
 				configNetworkPolicyJSON = sessionNPJSON.String
 			}
-
-			for _, h := range eligible {
-				if h.ID == sessionHostID {
-					host = h
-					s.logger.WithFields(logrus.Fields{
-						"session_id": req.SessionID,
-						"host_id":    sessionHostID,
-					}).Info("Session sticky routing: using original host")
-					if s.sessionResumeRoutingCounter != nil {
-						s.sessionResumeRoutingCounter.Add(ctx, 1, metric.WithAttributes(
-							fcrotel.AttrRouting.String(fcrotel.RoutingSameHost),
-						))
-					}
-					break
-				}
-			}
-			if host == nil {
-				s.logger.WithFields(logrus.Fields{
-					"session_id":      req.SessionID,
-					"original_host":   sessionHostID,
-					"available_hosts": len(eligible),
-				}).Warn("Session sticky host not available, falling back to best-fit")
-				if s.sessionResumeRoutingCounter != nil {
-					s.sessionResumeRoutingCounter.Add(ctx, 1, metric.WithAttributes(
-						fcrotel.AttrRouting.String(fcrotel.RoutingCrossHost),
-					))
-				}
-			}
 		}
 	}
 
-	// Fall back to workload-key cache affinity scoring
-	if host == nil {
-		host = s.selectBestHostForWorkloadKey(eligible, workloadKey)
-	}
-	if host == nil {
-		return nil, fmt.Errorf("no suitable host found")
-	}
-
-	// Optimistic reservation: increment used resources on the in-memory host.
-	// Next heartbeat from the host will correct any drift.
 	effectiveCPU := tiers.EffectiveCPUMillicores(tier)
-	s.hostRegistry.mu.Lock()
-	host.UsedCPUMillicores += effectiveCPU
-	host.UsedMemoryMB += tier.MemoryMB
-	s.hostRegistry.mu.Unlock()
+	effectiveMemoryMB := tier.MemoryMB
+	stickySelected := false
+	stickyFallback := false
 
-	s.logger.WithFields(logrus.Fields{
-		"host_id":       host.ID,
-		"instance_name": host.InstanceName,
-		"grpc_address":  host.GRPCAddress,
-	}).Debug("Selected host")
-
-	// Connect to host agent (pooled connection)
-	conn, err := s.getHostConn(host.GRPCAddress)
-	if err != nil {
-		return nil, err
-	}
-
-	// Create host agent client
-	client := pb.NewHostAgentClient(conn)
-
-	// Resolve the desired snapshot version for this workload_key + host
-	var snapshotVersion string
-
+	// Pre-scoring version resolution: resolve per-host target versions so
+	// scoring reflects the version each host will actually boot, not just
+	// the fleet-wide latest. This matters during canary or per-host override
+	// rollouts where different hosts have different desired versions.
+	var scoringVersion string
+	var hostVersionOverrides map[string]string
 	if taggedSnapshotVersion != "" {
-		snapshotVersion = taggedSnapshotVersion
-	}
-
-	if snapshotVersion == "" && workloadKey != "" && s.snapshotManager != nil && s.snapshotManager.db != nil {
-		desired, _ := s.snapshotManager.GetDesiredVersions(ctx, host.ID)
-		if v, ok := desired[workloadKey]; ok {
-			snapshotVersion = v
+		scoringVersion = taggedSnapshotVersion
+	} else if workloadKey != "" && s.snapshotManager != nil && s.snapshotManager.db != nil {
+		var fleetAssigned string
+		fleetAssigned, hostVersionOverrides = s.snapshotManager.GetTargetVersionsByWorkloadKey(ctx, workloadKey)
+		if fleetAssigned != "" {
+			scoringVersion = fleetAssigned
 		}
 	}
-	if snapshotVersion == "" && workloadKey != "" && s.snapshotManager != nil {
-		snapshotVersion = s.snapshotManager.GetCurrentVersionForKey(workloadKey)
+	if scoringVersion == "" && workloadKey != "" && s.snapshotManager != nil {
+		scoringVersion = s.snapshotManager.GetCurrentVersionForKey(workloadKey)
 	}
 
-	// Build the proto request
-	protoReq := &pb.AllocateRunnerRequest{
-		RequestId:       req.RequestID,
-		Labels:          req.Labels,
-		WorkloadKey:     workloadKey,
-		SessionId:       req.SessionID,
-		SnapshotVersion: snapshotVersion,
-		TtlSeconds:      int32(runnerTTLSeconds),
-		AutoPause:       autoPause,
+	// --- Step A: Snapshot under RLock ---
+	// Take a read lock to capture candidate host data. This allows heartbeats
+	// (which take a write lock) to proceed without blocking.
+	type candidateSnapshot struct {
+		host    *Host
+		usedCPU int
+		usedMem int
+		score   float64
 	}
-	// Pass network policy fields via labels (proto fields 17-18 not in
-	// generated wire descriptor; labels are serialized reliably).
-	// Fresh allocations may apply request-level overrides, but resumed sessions
-	// must keep the policy persisted with that session.
+
+	s.hostRegistry.mu.RLock()
+	var anyAvailable bool
+	var candidates []candidateSnapshot
+	for _, h := range s.hostRegistry.hosts {
+		if h.Status != "ready" {
+			continue
+		}
+		if time.Since(h.LastHeartbeat) >= 60*time.Second {
+			continue
+		}
+		usedCPU, usedMem := s.hostRegistry.effectiveUsageLocked(h)
+		if h.TotalCPUMillicores <= 0 ||
+			(h.TotalCPUMillicores-usedCPU) <= 0 ||
+			(h.TotalMemoryMB-usedMem) <= 0 {
+			continue
+		}
+		anyAvailable = true
+		if canFitWorkloadWithUsage(h, usedCPU, usedMem, tier) {
+			candidates = append(candidates, candidateSnapshot{
+				host:    h,
+				usedCPU: usedCPU,
+				usedMem: usedMem,
+			})
+		}
+	}
+	s.hostRegistry.mu.RUnlock()
+
+	if !anyAvailable {
+		s.hostRegistry.RecordAllocFailure()
+		retErr = fmt.Errorf("no available hosts")
+		return nil, retErr
+	}
+	if len(candidates) == 0 {
+		s.hostRegistry.RecordAllocFailure()
+		retErr = fmt.Errorf("no host with sufficient capacity for tier %s (need %d CPU, %d MB memory)", tierName, effectiveCPU, effectiveMemoryMB)
+		return nil, retErr
+	}
+
+	// --- Step B: Score off-lock ---
+	// Scoring touches no shared mutable state; the captured usage values and
+	// host pointers give a consistent-enough view for ranking.
+	// Per-host version overrides ensure scoring matches the version each host
+	// will actually boot (important during canary rollouts).
+	for i := range candidates {
+		targetVersion := scoringVersion
+		if hostVersionOverrides != nil {
+			if override, ok := hostVersionOverrides[candidates[i].host.ID]; ok {
+				targetVersion = override
+			}
+		}
+		candidates[i].score = s.scoreHostForWorkloadKeyWithUsage(
+			candidates[i].host, workloadKey, targetVersion,
+			candidates[i].usedCPU, candidates[i].usedMem,
+		)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].score > candidates[j].score
+	})
+
+	// Apply session stickiness: prefer the original host for cache warmth.
+	// Move the sticky host to the front of the ranked list so the retry loop
+	// tries it first.
+	if sessionHostID != "" {
+		for i, c := range candidates {
+			if c.host.ID == sessionHostID {
+				stickySelected = true
+				if i > 0 {
+					entry := candidates[i]
+					copy(candidates[1:i+1], candidates[:i])
+					candidates[0] = entry
+				}
+				break
+			}
+		}
+		stickyFallback = !stickySelected
+	}
+
+	if stickySelected {
+		s.logger.WithFields(logrus.Fields{
+			"session_id": req.SessionID,
+			"host_id":    sessionHostID,
+		}).Info("Session sticky routing: using original host")
+		if s.sessionResumeRoutingCounter != nil {
+			s.sessionResumeRoutingCounter.Add(ctx, 1, metric.WithAttributes(
+				fcrotel.AttrRouting.String(fcrotel.RoutingSameHost),
+			))
+		}
+	} else if stickyFallback {
+		s.logger.WithFields(logrus.Fields{
+			"session_id":      req.SessionID,
+			"original_host":   sessionHostID,
+			"available_hosts": len(candidates),
+		}).Warn("Session sticky host not available, falling back to best-fit")
+		if s.sessionResumeRoutingCounter != nil {
+			s.sessionResumeRoutingCounter.Add(ctx, 1, metric.WithAttributes(
+				fcrotel.AttrRouting.String(fcrotel.RoutingCrossHost),
+			))
+		}
+	}
+
+	// Pre-build proto request (host-independent parts).
 	effectiveNPPreset := configNetworkPolicyPreset
 	effectiveNPJSON := configNetworkPolicyJSON
 	if !resumeFromSessionConfig {
@@ -400,6 +539,14 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		if req.NetworkPolicyJSON != "" {
 			effectiveNPJSON = req.NetworkPolicyJSON
 		}
+	}
+	protoReq := &pb.AllocateRunnerRequest{
+		RequestId:   req.RequestID,
+		Labels:      req.Labels,
+		WorkloadKey: workloadKey,
+		SessionId:   req.SessionID,
+		TtlSeconds:  int32(runnerTTLSeconds),
+		AutoPause:   autoPause,
 	}
 	if effectiveNPPreset != "" || effectiveNPJSON != "" {
 		if protoReq.Labels == nil {
@@ -412,7 +559,6 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			protoReq.Labels["_network_policy_json"] = effectiveNPJSON
 		}
 	}
-	// Pass auth config via labels so the host agent can start the auth proxy.
 	s.logger.WithFields(logrus.Fields{
 		"workload_key":    workloadKey,
 		"auth_config_len": len(authConfigJSON),
@@ -424,12 +570,10 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		}
 		protoReq.Labels["_auth_config_json"] = authConfigJSON
 	}
-	// Populate resources from tier (overrides request-level values)
 	protoReq.Resources = &pb.Resources{
 		Vcpus:    int32(tier.VCPUs),
 		MemoryMb: int32(tier.MemoryMB),
 	}
-	// Allow explicit request-level overrides if set
 	if req.VCPUs > 0 {
 		protoReq.Resources.Vcpus = int32(req.VCPUs)
 	}
@@ -446,58 +590,162 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		}
 	}
 
-	// Call host agent to allocate runner
-	resp, err := client.AllocateRunner(ctx, protoReq)
-	if err != nil {
-		// Roll back optimistic reservation
-		s.hostRegistry.mu.Lock()
-		host.UsedCPUMillicores -= effectiveCPU
-		host.UsedMemoryMB -= tier.MemoryMB
-		s.hostRegistry.mu.Unlock()
-		s.logger.WithError(err).WithField("host", host.InstanceName).Error("gRPC AllocateRunner failed")
-		return nil, fmt.Errorf("host agent AllocateRunner failed: %w", err)
-	}
+	// --- Step C+D: Reserve under short Lock + gRPC call with host fallback ---
+	// Try up to maxHostAttempts candidates. Each attempt takes a short write
+	// lock to re-validate capacity and reserve resources, then makes the gRPC
+	// call. On retryable failures the reservation is released and the next
+	// candidate is tried.
+	const maxHostAttempts = 3
+	var lastErr error
+	for i := 0; i < len(candidates) && i < maxHostAttempts; i++ {
+		candidate := candidates[i]
+		h := candidate.host
 
-	if resp.Error != "" {
-		// Roll back optimistic reservation
-		s.hostRegistry.mu.Lock()
-		host.UsedCPUMillicores -= effectiveCPU
-		host.UsedMemoryMB -= tier.MemoryMB
-		s.hostRegistry.mu.Unlock()
-		return &AllocateRunnerResponse{
-			HostID:      host.ID,
-			HostAddress: host.HTTPAddress,
-			Error:       resp.Error,
-		}, fmt.Errorf("host agent returned error: %s", resp.Error)
-	}
+		s.logger.WithFields(logrus.Fields{
+			"host_id":       h.ID,
+			"instance_name": h.InstanceName,
+			"grpc_address":  h.GRPCAddress,
+			"attempt":       i + 1,
+		}).Debug("Attempting host allocation")
 
-	// Register runner in our registry
-	if resp.Runner != nil {
-		if err := s.hostRegistry.AddRunner(ctx, &Runner{
-			ID:                  resp.Runner.Id,
-			HostID:              host.ID,
-			InternalIP:          resp.Runner.InternalIp,
-			Status:              "busy",
-			WorkloadKey:         workloadKey,
-			RunnerTTLSeconds:    runnerTTLSeconds,
-			AutoPause:           autoPause,
-			NetworkPolicyPreset: effectiveNPPreset,
-			NetworkPolicyJSON:   effectiveNPJSON,
-			ReservedCPU:         effectiveCPU,
-			ReservedMemoryMB:    tier.MemoryMB,
-		}); err != nil {
-			s.logger.WithError(err).Warn("Failed to register runner in control plane registry")
+		// Reserve under short Lock with re-validation
+		s.hostRegistry.mu.Lock()
+		liveHost := s.hostRegistry.hosts[h.ID]
+		if liveHost == nil || liveHost.Status != "ready" || time.Since(liveHost.LastHeartbeat) >= 60*time.Second {
+			s.hostRegistry.mu.Unlock()
+			s.logger.WithField("host", h.InstanceName).Debug("Host no longer valid, trying next")
+			continue
 		}
+		usedCPU, usedMem := s.hostRegistry.effectiveUsageLocked(liveHost)
+		if !canFitWorkloadWithUsage(liveHost, usedCPU, usedMem, tier) {
+			s.hostRegistry.mu.Unlock()
+			s.logger.WithField("host", h.InstanceName).Debug("Host no longer has capacity, trying next")
+			continue
+		}
+		liveHost.PendingCPUMillicores += effectiveCPU
+		liveHost.PendingMemoryMB += effectiveMemoryMB
+		s.hostRegistry.mu.Unlock()
+
+		// Resolve host-specific snapshot version for the gRPC request
+		var snapshotVersion string
+		if taggedSnapshotVersion != "" {
+			snapshotVersion = taggedSnapshotVersion
+		}
+		if snapshotVersion == "" && workloadKey != "" && s.snapshotManager != nil && s.snapshotManager.db != nil {
+			desired, _ := s.snapshotManager.GetDesiredVersions(ctx, h.ID)
+			if v, ok := desired[workloadKey]; ok {
+				snapshotVersion = v
+			}
+		}
+		if snapshotVersion == "" && workloadKey != "" && s.snapshotManager != nil {
+			snapshotVersion = s.snapshotManager.GetCurrentVersionForKey(workloadKey)
+		}
+		protoReq.SnapshotVersion = snapshotVersion
+
+		// Connect to host agent (pooled connection)
+		conn, err := s.getHostConn(h.GRPCAddress)
+		if err != nil {
+			s.hostRegistry.releasePendingReservation(h.ID, effectiveCPU, effectiveMemoryMB)
+			lastErr = err
+			s.logger.WithError(err).WithField("host", h.InstanceName).Warn("Failed to connect to host, trying next")
+			continue
+		}
+
+		// Call host agent to allocate runner
+		client := pb.NewHostAgentClient(conn)
+		allocStart := time.Now()
+		grpcCtx, grpcCancel := context.WithTimeout(ctx, 30*time.Second)
+		resp, err := client.AllocateRunner(grpcCtx, protoReq)
+		grpcCancel()
+		allocDuration := time.Since(allocStart)
+		if allocDuration > 5*time.Second {
+			s.logger.WithFields(logrus.Fields{
+				"host":        h.InstanceName,
+				"duration_ms": allocDuration.Milliseconds(),
+				"request_id":  req.RequestID,
+			}).Warn("Slow runner allocation on host agent")
+		}
+
+		if err != nil {
+			s.hostRegistry.releasePendingReservation(h.ID, effectiveCPU, effectiveMemoryMB)
+			// Non-retryable: context cancelled/deadline exceeded
+			if ctx.Err() != nil {
+				retErr = ctx.Err()
+				return nil, retErr
+			}
+			// Non-retryable: invalid argument (bad request)
+			st, _ := status.FromError(err)
+			if st.Code() == codes.InvalidArgument {
+				s.logger.WithError(err).WithField("host", h.InstanceName).Error("gRPC AllocateRunner failed (non-retryable)")
+				retErr = fmt.Errorf("host agent AllocateRunner failed: %w", err)
+				return nil, retErr
+			}
+			// Retryable gRPC error (transport, unavailable, timeout, etc.)
+			s.logger.WithError(err).WithField("host", h.InstanceName).Warn("gRPC AllocateRunner failed, trying next host")
+			lastErr = fmt.Errorf("host agent AllocateRunner failed: %w", err)
+			continue
+		}
+
+		if resp.Error != "" {
+			s.hostRegistry.releasePendingReservation(h.ID, effectiveCPU, effectiveMemoryMB)
+			if isRetryableHostError(resp.Error) {
+				s.logger.WithFields(logrus.Fields{
+					"host":  h.InstanceName,
+					"error": resp.Error,
+				}).Warn("Host agent error, trying next host")
+				lastErr = fmt.Errorf("host agent returned error: %s", resp.Error)
+				continue
+			}
+			// Non-retryable host error
+			retErr = fmt.Errorf("host agent returned error: %s", resp.Error)
+			return &AllocateRunnerResponse{
+				HostID:      h.ID,
+				HostAddress: h.HTTPAddress,
+				Error:       resp.Error,
+			}, retErr
+		}
+
+		// Success — register runner and return
+		if resp.Runner != nil {
+			if err := s.hostRegistry.AddRunner(ctx, &Runner{
+				ID:                  resp.Runner.Id,
+				HostID:              h.ID,
+				InternalIP:          resp.Runner.InternalIp,
+				Status:              "busy",
+				WorkloadKey:         workloadKey,
+				RunnerTTLSeconds:    runnerTTLSeconds,
+				AutoPause:           autoPause,
+				NetworkPolicyPreset: effectiveNPPreset,
+				NetworkPolicyJSON:   effectiveNPJSON,
+				ReservedCPU:         effectiveCPU,
+				ReservedMemoryMB:    tier.MemoryMB,
+			}); err != nil {
+				s.logger.WithError(err).Warn("Failed to register runner in control plane registry")
+			}
+		}
+		s.hostRegistry.releasePendingReservation(h.ID, effectiveCPU, effectiveMemoryMB)
+
+		allocatedResp = &AllocateRunnerResponse{
+			RunnerID:    resp.Runner.GetId(),
+			HostID:      h.ID,
+			HostAddress: h.HTTPAddress,
+			InternalIP:  resp.Runner.GetInternalIp(),
+			SessionID:   resp.GetSessionId(),
+			Resumed:     resp.GetResumed(),
+		}
+		return allocatedResp, nil
 	}
 
-	return &AllocateRunnerResponse{
-		RunnerID:    resp.Runner.GetId(),
-		HostID:      host.ID,
-		HostAddress: host.HTTPAddress,
-		InternalIP:  resp.Runner.GetInternalIp(),
-		SessionID:   resp.GetSessionId(),
-		Resumed:     resp.GetResumed(),
-	}, nil
+	// All host attempts exhausted — record the failure so the downscaler's
+	// demand-driven scale-up path sees the signal, not just pre-scan capacity
+	// shortages.
+	s.hostRegistry.RecordAllocFailure()
+	if lastErr != nil {
+		retErr = lastErr
+	} else {
+		retErr = fmt.Errorf("no suitable host found after %d attempts", maxHostAttempts)
+	}
+	return nil, retErr
 }
 
 // selectBestHostForWorkloadKey selects the best host with workload-key cache affinity.
@@ -513,7 +761,13 @@ func (s *Scheduler) selectBestHostForWorkloadKey(hosts []*Host, workloadKey stri
 
 	var scored []scoredHost
 	for _, h := range hosts {
-		score := s.scoreHostForWorkloadKey(h, workloadKey)
+		usedCPU, usedMem := h.UsedCPUMillicores, h.UsedMemoryMB
+		if s.hostRegistry != nil {
+			s.hostRegistry.mu.RLock()
+			usedCPU, usedMem = s.hostRegistry.effectiveUsageLocked(h)
+			s.hostRegistry.mu.RUnlock()
+		}
+		score := s.scoreHostForWorkloadKeyWithUsage(h, workloadKey, "", usedCPU, usedMem)
 		scored = append(scored, scoredHost{host: h, score: score})
 	}
 
@@ -526,47 +780,57 @@ func (s *Scheduler) selectBestHostForWorkloadKey(hosts []*Host, workloadKey stri
 
 // scoreHostForWorkloadKey calculates a score for a host with workload-key cache affinity.
 func (s *Scheduler) scoreHostForWorkloadKey(h *Host, workloadKey string) float64 {
-	score := s.scoreHost(h)
+	return s.scoreHostForWorkloadKeyWithUsage(h, workloadKey, "", h.UsedCPUMillicores, h.UsedMemoryMB)
+}
 
-	// Repo-aware cache affinity scoring:
-	// If we have loaded manifests info (from heartbeat), prefer hosts with warm caches.
+func (s *Scheduler) scoreHostForWorkloadKeyWithUsage(h *Host, workloadKey, targetVersion string, usedCPU, usedMem int) float64 {
+	score := s.scoreHostWithUsage(h, usedCPU, usedMem)
+
+	// Version-aware cache affinity scoring:
+	// Exact version match gets highest bonus, stale version still gets partial
+	// credit for chunk data warmth.
 	if workloadKey != "" && h.LoadedManifests != nil {
 		if version, ok := h.LoadedManifests[workloadKey]; ok {
-			// Host has a manifest loaded for this repo
-			// Check if it's the current version (ideal) or any version (warm-ish)
-			if version != "" {
-				score += 100 // Warm cache: manifest loaded for this repo
+			if targetVersion != "" && version == targetVersion {
+				score += 100 // Exact version match
 			} else {
-				score += 50 // Manifest loaded but version unknown
+				score += 20 // Stale cache, partial warmth from chunk data
 			}
 		}
-		// No manifest for this repo: +0 (cold, but fast in UFFD mode)
 	}
 
 	return score
 }
 
-// canFitWorkload checks whether a host has enough resources to run a workload
-// of the given tier.
-func canFitWorkload(h *Host, t tiers.Tier) bool {
+func canFitWorkloadWithUsage(h *Host, usedCPU, usedMem int, t tiers.Tier) bool {
 	if h.TotalCPUMillicores == 0 {
 		return false
 	}
 	effectiveCPU := tiers.EffectiveCPUMillicores(t)
-	return (h.TotalCPUMillicores-h.UsedCPUMillicores) >= effectiveCPU &&
-		(h.TotalMemoryMB-h.UsedMemoryMB) >= t.MemoryMB
+	return (h.TotalCPUMillicores-usedCPU) >= effectiveCPU &&
+		(h.TotalMemoryMB-usedMem) >= t.MemoryMB
+}
+
+// isRetryableHostError returns true if the host agent error message indicates
+// a transient condition that warrants trying another host.
+func isRetryableHostError(errMsg string) bool {
+	lower := strings.ToLower(errMsg)
+	return strings.Contains(lower, "no slots available") ||
+		strings.Contains(lower, "at capacity") ||
+		strings.Contains(lower, "draining")
 }
 
 // scoreHost calculates a base score for a host using resource-based metrics.
 func (s *Scheduler) scoreHost(h *Host) float64 {
+	return s.scoreHostWithUsage(h, h.UsedCPUMillicores, h.UsedMemoryMB)
+}
+
+func (s *Scheduler) scoreHostWithUsage(h *Host, usedCPU, usedMem int) float64 {
 	var score float64
 
-	// Prefer hosts with idle runners (cache warmth)
-	score += float64(h.IdleRunners) * 10
-
 	if h.TotalCPUMillicores > 0 {
-		cpuFree := float64(h.TotalCPUMillicores-h.UsedCPUMillicores) / float64(h.TotalCPUMillicores)
-		memFree := float64(h.TotalMemoryMB-h.UsedMemoryMB) / float64(h.TotalMemoryMB)
+		cpuFree := float64(h.TotalCPUMillicores-usedCPU) / float64(h.TotalCPUMillicores)
+		memFree := float64(h.TotalMemoryMB-usedMem) / float64(h.TotalMemoryMB)
 		score += cpuFree * 20
 		score += memFree * 15
 	}
@@ -576,25 +840,39 @@ func (s *Scheduler) scoreHost(h *Host) float64 {
 		score += 20
 	}
 
+	// Penalize hosts with many pending (in-flight) allocations to spread
+	// burst load across hosts instead of queueing on one host agent.
+	if h.PendingCPUMillicores > 0 && h.TotalCPUMillicores > 0 {
+		pendingFraction := float64(h.PendingCPUMillicores) / float64(h.TotalCPUMillicores)
+		score -= pendingFraction * 30
+	}
+
 	return score
 }
 
-// ReleaseRunner releases a runner
+// ReleaseRunner releases a runner. The operation is idempotent: releasing a
+// runner that has already been removed returns nil so callers don't see 500s
+// on retries or concurrent release attempts.
 func (s *Scheduler) ReleaseRunner(ctx context.Context, runnerID string, destroy bool) error {
 	s.logger.WithFields(logrus.Fields{
 		"runner_id": runnerID,
 		"destroy":   destroy,
 	}).Info("Releasing runner")
 
-	// Get runner's host from registry
+	// Get runner's host from registry. If the runner is already gone, the
+	// release is a no-op (idempotent).
 	runner, err := s.hostRegistry.GetRunner(runnerID)
 	if err != nil {
-		return err
+		s.logger.WithField("runner_id", runnerID).Debug("Runner already removed from registry, release is no-op")
+		return nil
 	}
 
 	host, err := s.hostRegistry.GetHost(runner.HostID)
 	if err != nil {
-		return err
+		// Host gone — clean up the orphaned runner record and return success.
+		s.logger.WithField("runner_id", runnerID).Debug("Host gone, cleaning up orphaned runner")
+		_ = s.hostRegistry.RemoveRunner(runnerID)
+		return nil
 	}
 
 	// Connect to host and release
@@ -611,32 +889,18 @@ func (s *Scheduler) ReleaseRunner(ctx context.Context, runnerID string, destroy 
 	if err != nil {
 		return fmt.Errorf("host agent ReleaseRunner failed: %w", err)
 	}
+	// If the host agent says the runner is already gone, that's fine —
+	// still clean up our own registry below.
 	if resp.Error != "" {
-		return fmt.Errorf("host agent returned error: %s", resp.Error)
+		s.logger.WithFields(logrus.Fields{
+			"runner_id": runnerID,
+			"error":     resp.Error,
+		}).Warn("Host agent reported error during release, cleaning up registry")
 	}
 
 	// Update registry
 	if err := s.hostRegistry.RemoveRunner(runnerID); err != nil {
 		return err
-	}
-
-	// Roll back optimistic resource reservation made at allocate time.
-	// Without this, UsedCPU/Memory accumulates until the next heartbeat
-	// corrects it, causing spurious "no available hosts" under rapid
-	// allocate/release cycles.
-	if runner.ReservedCPU > 0 || runner.ReservedMemoryMB > 0 {
-		s.hostRegistry.mu.Lock()
-		if host != nil {
-			host.UsedCPUMillicores -= runner.ReservedCPU
-			host.UsedMemoryMB -= runner.ReservedMemoryMB
-			if host.UsedCPUMillicores < 0 {
-				host.UsedCPUMillicores = 0
-			}
-			if host.UsedMemoryMB < 0 {
-				host.UsedMemoryMB = 0
-			}
-		}
-		s.hostRegistry.mu.Unlock()
 	}
 
 	// Clean up session_snapshots row so stale entries don't accumulate.

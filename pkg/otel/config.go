@@ -1,6 +1,9 @@
 package otel
 
-import "os"
+import (
+	"os"
+	"strings"
+)
 
 // Config holds the configuration for OpenTelemetry initialization.
 type Config struct {
@@ -14,9 +17,16 @@ type Config struct {
 
 // ConfigFromEnv creates a Config by reading standard environment variables.
 func ConfigFromEnv(serviceName string) Config {
+	// The gRPC WithEndpoint option expects a bare host:port (e.g.
+	// "10.0.16.17:4317"), not a URL with a scheme. Strip http:// or https://
+	// so the dialer doesn't produce "too many colons in address" errors.
+	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	endpoint = strings.TrimPrefix(endpoint, "http://")
+	endpoint = strings.TrimPrefix(endpoint, "https://")
+
 	cfg := Config{
 		ServiceName: serviceName,
-		Endpoint:    os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+		Endpoint:    endpoint,
 		Environment: os.Getenv("ENVIRONMENT"),
 	}
 

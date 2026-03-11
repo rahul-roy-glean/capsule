@@ -131,7 +131,7 @@ else
   TTL_STATUS_RESP=$(curl -s "$CP/api/v1/runners/status?runner_id=$TTL_RUNNER_ID")
   TTL_STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
     "$CP/api/v1/runners/status?runner_id=$TTL_RUNNER_ID")
-  TTL_STATE=$(echo "$TTL_STATUS_RESP" | jq -r '.state // "unknown"')
+  TTL_STATE=$(echo "$TTL_STATUS_RESP" | jq -r '.status // .state // "unknown"')
   echo "  TTL runner state: $TTL_STATE (HTTP $TTL_STATUS_CODE)"
 
   # Also check the manager's view of the runner
@@ -379,13 +379,17 @@ fi
 echo "  --- 9b. Memory state (2MB file checksum) ---"
 OUT=$(vm_exec_resumed "md5sum /tmp/gcs-bigfile.bin")
 echo "  $OUT"
-RESUMED_MD5=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[a-f0-9]{32}' | head -1)
+RESUMED_MD5=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[a-f0-9]{32}' | head -1 || true)
 echo "  MD5 before: $BIGFILE_MD5"
 echo "  MD5 after:  $RESUMED_MD5"
-if [ "$BIGFILE_MD5" = "$RESUMED_MD5" ] && [ -n "$RESUMED_MD5" ]; then
+if echo "$OUT" | grep -q "EXEC_TIMEOUT"; then
+  fail "2MB tmpfs file checksum timed out after resume"
+  echo "  Raw exec output: $OUT"
+elif [ "$BIGFILE_MD5" = "$RESUMED_MD5" ] && [ -n "$RESUMED_MD5" ]; then
   pass "2MB tmpfs file checksum matches — no corruption"
 else
-  fail "2MB tmpfs file checksum MISMATCH — data corrupted"
+  fail "2MB tmpfs file checksum missing or mismatched"
+  echo "  Raw exec output: $OUT"
 fi
 
 # 9c. Disk: rootfs marker

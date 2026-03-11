@@ -163,22 +163,8 @@ func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
 				c.config.ttlSeconds, c.config.autoPause, c.config.networkPolicyPreset, networkPolicy)
 		}
 
-		// Roll back optimistic resource reservation.
-		runner, err := s.hostRegistry.GetRunner(c.runnerID)
-		if err == nil && (runner.ReservedCPU > 0 || runner.ReservedMemoryMB > 0) {
-			host, hostErr := s.hostRegistry.GetHost(c.hostID)
-			if hostErr == nil {
-				s.hostRegistry.mu.Lock()
-				host.UsedCPUMillicores -= runner.ReservedCPU
-				host.UsedMemoryMB -= runner.ReservedMemoryMB
-				if host.UsedCPUMillicores < 0 {
-					host.UsedCPUMillicores = 0
-				}
-				if host.UsedMemoryMB < 0 {
-					host.UsedMemoryMB = 0
-				}
-				s.hostRegistry.mu.Unlock()
-			}
+		if err := s.hostRegistry.RemoveRunner(c.runnerID); err != nil {
+			s.logger.WithError(err).WithField("runner_id", c.runnerID).Warn("TTL enforcement: failed to remove paused runner from registry")
 		}
 
 		s.logger.WithFields(logrus.Fields{
