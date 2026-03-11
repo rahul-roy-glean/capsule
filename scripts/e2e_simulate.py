@@ -1233,6 +1233,7 @@ def suite_concurrency(
     - duplicate request_id race
     - allocate → simultaneous release race
     - mixed operation storm
+    - exec-dirty-writes → pause → resume cycles (random data across chunks)
 
     Pre-conditions: releases enough idle runners before each scenario to ensure
     at least `width` CPU slots are free, so workers actually execute.
@@ -1781,6 +1782,160 @@ def suite_concurrency(
     storm_results = _run_workers("mixed_storm", _mixed_worker)
     _assert_workers("Mixed operation storm", storm_results)
 
+    # ---------------------------------------------------------------
+    # Scenario 8: Concurrent exec-with-random-writes → pause → resume
+    # Each worker allocates a session runner, then runs multiple
+    # exec→pause→resume cycles. In each exec phase, random data is
+    # written to random offsets on the workspace drive so that
+    # different chunks get dirtied differently per worker and per
+    # cycle. This stresses the chunked snapshot diff/merge path under
+    # concurrent load with realistic, non-uniform dirty patterns.
+    # ---------------------------------------------------------------
+    SCENARIO_8 = "Concurrent exec-dirty-writes → pause → resume cycles"
+    log.info("Starting test", extra={"suite": SUITE, "test": SCENARIO_8})
+    _free_slots(width)
+
+    NUM_PAUSE_CYCLES = 2         # exec→pause→resume rounds per worker
+    WRITES_PER_CYCLE_MIN = 3     # min random writes per cycle
+    WRITES_PER_CYCLE_MAX = 8     # max random writes per cycle
+    WRITE_SIZE_MIN_KB = 64       # min write size
+    WRITE_SIZE_MAX_KB = 4096     # max write size (4 MB = chunk size)
+    MAX_OFFSET_MB = 200          # upper bound for random seek offset
+
+    def _exec_dirty_worker(wid: int, barrier: Barrier) -> tuple[bool, str, bool]:
+        client = BFClient(base_url=base_url, token=token, timeout=180.0)
+        runner_id: str | None = None
+        rng = random.Random(wid + int(time.monotonic() * 1000))
+        try:
+            sess_id = uuid.uuid4().hex
+            barrier.wait()
+            t0 = time.monotonic()
+            resp = _allocate_with_retry(
+                client, leaf_workload_key,
+                request_id=f"e2e-dirty-{wid}-{uuid.uuid4().hex[:8]}",
+                session_id=sess_id,
+            )
+            _alloc_latencies.append(("exec_dirty_cycles", time.monotonic() - t0))
+            runner_id = resp.runner_id
+
+            for cycle in range(NUM_PAUSE_CYCLES):
+                # --- Exec phase: write random data to random offsets ---
+                num_writes = rng.randint(WRITES_PER_CYCLE_MIN, WRITES_PER_CYCLE_MAX)
+                # Build a shell script where all dd writes run in parallel
+                # (backgrounded with &), then wait + sync before returning.
+                bg_cmds: list[str] = []
+                for w in range(num_writes):
+                    offset_mb = rng.randint(0, MAX_OFFSET_MB)
+                    size_kb = rng.randint(WRITE_SIZE_MIN_KB, WRITE_SIZE_MAX_KB)
+                    # Use /dev/urandom so each write produces unique data,
+                    # ensuring the chunk hash actually changes.
+                    bg_cmds.append(
+                        f"dd if=/dev/urandom of=/workspace/.dirty-{wid}-{cycle}-{w} "
+                        f"bs=1K count={size_kb} seek={offset_mb}K "
+                        f"conv=notrunc 2>/dev/null &"
+                    )
+                # Also write to a shared file at random offsets to simulate
+                # contention within a single file across cycles.
+                shared_offset_kb = rng.randint(0, MAX_OFFSET_MB * 1024)
+                shared_size_kb = rng.randint(WRITE_SIZE_MIN_KB, WRITE_SIZE_MAX_KB)
+                bg_cmds.append(
+                    f"dd if=/dev/urandom of=/workspace/.shared-dirty-{wid} "
+                    f"bs=1K count={shared_size_kb} seek={shared_offset_kb} "
+                    f"conv=notrunc 2>/dev/null &"
+                )
+                # Wait for all background writes to finish, then sync to
+                # flush to the block device before pause.
+                script = " ".join(bg_cmds) + " wait && sync"
+                exec_events = list(client.runners.exec(
+                    runner_id,
+                    ["sh", "-c", script],
+                    timeout_seconds=60,
+                ))
+                # Check for non-zero exit.
+                exit_events = [e for e in exec_events if e.type == "exit"]
+                if exit_events and exit_events[0].code != 0:
+                    return False, (
+                        f"Cycle {cycle}: exec exited with code {exit_events[0].code} "
+                        f"(worker {wid}, {num_writes} writes)"
+                    ), True
+
+                log.debug("Exec dirty writes done", extra={
+                    "worker": wid, "cycle": cycle,
+                    "num_writes": num_writes + 1,  # +1 for shared file
+                    "runner_id": runner_id,
+                })
+
+                # --- Pause phase ---
+                pause = client.runners.pause(runner_id)
+                if not pause.success:
+                    return False, (
+                        f"Cycle {cycle}: pause returned success=False "
+                        f"for runner {runner_id}"
+                    ), True
+
+                if pause.session_id and pause.session_id != sess_id:
+                    return False, (
+                        f"Cycle {cycle}: session ID mismatch after pause: "
+                        f"expected {sess_id}, got {pause.session_id}"
+                    ), True
+
+                log.debug("Pause complete", extra={
+                    "worker": wid, "cycle": cycle,
+                    "runner_id": runner_id,
+                    "snapshot_size_bytes": pause.snapshot_size_bytes,
+                })
+
+                # --- Resume phase ---
+                conn = client.runners.connect(runner_id)
+                runner_id = conn.runner_id
+                if conn.status not in {"connected", "resumed", "pending"}:
+                    return False, (
+                        f"Cycle {cycle}: unexpected post-resume status: "
+                        f"{conn.status}"
+                    ), True
+
+                log.debug("Resume complete", extra={
+                    "worker": wid, "cycle": cycle,
+                    "runner_id": runner_id,
+                    "status": conn.status,
+                })
+
+            # --- Final verification: read back a file to confirm data survived ---
+            verify_events = list(client.runners.exec(
+                runner_id,
+                ["sh", "-c",
+                 f"ls -la /workspace/.dirty-{wid}-*  /workspace/.shared-dirty-{wid} 2>/dev/null | wc -l"],
+                timeout_seconds=30,
+            ))
+            stdout_parts = [e.data for e in verify_events if e.type == "stdout" and e.data]
+            file_count_str = "".join(stdout_parts).strip()
+            if not file_count_str or int(file_count_str) == 0:
+                return False, "No dirty files found after pause/resume cycles", True
+
+            client.runners.release(runner_id)
+            runner_id = None
+            return True, (
+                f"{NUM_PAUSE_CYCLES} cycles, files verified={file_count_str}"
+            ), True
+
+        except (BFServiceUnavailable, BFRateLimited) as exc:
+            if _is_capacity_error(str(exc)):
+                return True, f"capacity-limited: {exc}", False
+            return False, str(exc), False
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc), True
+        finally:
+            if runner_id:
+                try:
+                    client.runners.release(runner_id)
+                except Exception:  # noqa: BLE001
+                    pass
+            client.close()
+
+    dirty_results = _run_workers(
+        "exec_dirty_cycles", _exec_dirty_worker, join_timeout=600,
+    )
+    _assert_workers(SCENARIO_8, dirty_results)
 
     # Log allocation latency summary
     if _alloc_latencies:
