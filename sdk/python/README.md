@@ -97,6 +97,51 @@ with BFClient(base_url="http://localhost:8080", token="my-token") as bf:
         print(runner.read_text("/etc/hostname"))
 ```
 
+## Async Quickstart
+
+The SDK also exposes a parallel async API for agent frameworks, servers, and other event-loop-native callers:
+
+```python
+import asyncio
+
+from bf_sdk import AsyncBFClient, RunnerConfig
+
+
+async def main() -> None:
+    cfg = (
+        RunnerConfig("My async sandbox")
+        .with_base_image("ubuntu:22.04")
+        .with_commands(["echo async-ready"])
+        .with_tier("m")
+        .with_ttl(3600)
+        .with_auto_pause(True)
+    )
+
+    async with AsyncBFClient(base_url="http://localhost:8080", token="my-token") as bf:
+        workload = await bf.workloads.onboard(cfg)
+        runner = await bf.workloads.start(workload)
+        async with runner:
+            result = await runner.exec_collect("sh", "-lc", "printf hello")
+            print(result.stdout, result.exit_code)
+
+            await runner.write_text("/workspace/hello.txt", "hello")
+            print(await runner.read_text("/workspace/hello.txt"))
+
+            async for event in runner.exec("pytest", "-q"):
+                if event.type == "stdout":
+                    print(event.data, end="")
+
+            async with runner.shell(cols=120, rows=40) as sh:
+                await sh.send("ls -la\n")
+                print((await sh.recv_stdout()).decode())
+
+            await runner.pause()
+            await runner.resume()
+
+
+asyncio.run(main())
+```
+
 ## Low-level API
 
 For full control, use the lower-level resource APIs directly. `allocate()` now retries transient capacity failures internally using a stable `request_id`, `allocate_ready()` gives you a single "usable runner" step, and the SDK can resolve workload names for you instead of forcing `leaf_workload_key` through your app:
@@ -121,6 +166,21 @@ with BFClient(base_url="http://localhost:8080", token="my-token") as client:
     # Or keep low-level allocation + explicit waiting if you want
     allocation = client.workloads.allocate("My dev sandbox", startup_timeout=45.0)
     client.runners.wait_ready(allocation.runner_id, timeout=45.0)
+```
+
+The async client mirrors the same concepts and models:
+
+```python
+from bf_sdk import AsyncBFClient
+
+
+async def run() -> None:
+    async with AsyncBFClient(base_url="http://localhost:8080", token="my-token") as client:
+        runner = await client.runners.allocate_ready("my-workload-key")
+        async with runner:
+            async for event in runner.exec("echo", "hello"):
+                if event.type == "stdout":
+                    print(event.data, end="")
 ```
 
 ## Configuration
