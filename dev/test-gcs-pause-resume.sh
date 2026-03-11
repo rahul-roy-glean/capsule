@@ -26,6 +26,96 @@ pass() { echo "  ✓ $1"; PASS=$((PASS + 1)); }
 fail() { echo "  ✗ $1"; FAIL=$((FAIL + 1)); }
 header() { echo ""; echo "=== $1 ==="; }
 
+vm_exec_runner() {
+  local runner_id="$1"
+  local cmd="$2"
+  curl -s --no-buffer --max-time 30 -X POST "$MGR/api/v1/runners/$runner_id/exec" \
+    -H 'Content-Type: application/json' \
+    -d "{\"command\":[\"sh\",\"-c\",\"$cmd\"],\"timeout_seconds\":20}" 2>&1 || echo "EXEC_TIMEOUT"
+}
+
+dump_vm_sanity() {
+  local runner_id="$1"
+  local label="$2"
+  echo "  --- ${label}: guest sanity snapshot ---"
+  local out
+  out=$(vm_exec_runner "$runner_id" "echo 'WHOAMI:'; whoami; echo 'HOSTNAME:'; hostname; echo 'UPTIME:'; head -c 20 /proc/uptime; echo; echo 'ETH0:'; ip -brief addr show dev eth0 2>/dev/null || ip addr show dev eth0 2>/dev/null || true; echo 'ROUTES:'; ip route 2>/dev/null || cat /proc/net/route; echo 'RESOLV:'; cat /etc/resolv.conf 2>/dev/null || true; echo 'THAW_PID:'; pgrep thaw-agent | head -1")
+  echo "$out"
+}
+
+extract_stdout() {
+  echo "$1" | jq -rs 'map(select(.type=="stdout") | .data) | join("")'
+}
+
+PROC_STATE_SERVER_PY=$(cat <<'PY'
+import hashlib
+import json
+import os
+import socket
+
+sock_path = "/tmp/proc-state.sock"
+try:
+    os.unlink(sock_path)
+except FileNotFoundError:
+    pass
+
+blob = bytearray((b"bazel-firecracker-proc-state-" * ((64 * 1024 * 1024 // 29) + 1))[: 64 * 1024 * 1024])
+state = {
+    "pid": os.getpid(),
+    "token": "unset",
+    "counter": 0,
+    "blob_sha": hashlib.sha256(blob).hexdigest(),
+    "blob_len": len(blob),
+}
+
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock_path)
+srv.listen(16)
+
+while True:
+    conn, _ = srv.accept()
+    try:
+        data = conn.recv(4096).decode().strip()
+        if data.startswith("SET "):
+            state["token"] = data[4:]
+        elif data == "BUMP":
+            state["counter"] += 1
+        conn.sendall((json.dumps(state) + "\n").encode())
+    finally:
+        conn.close()
+PY
+)
+PROC_STATE_SERVER_B64=$(printf '%s' "$PROC_STATE_SERVER_PY" | base64 -w0 2>/dev/null || printf '%s' "$PROC_STATE_SERVER_PY" | base64 | tr -d '\n')
+
+proc_state_raw_runner() {
+  local runner_id="$1"
+  local payload="$2"
+  vm_exec_runner "$runner_id" "python3 -c 'import socket; s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(\"/tmp/proc-state.sock\"); s.sendall(b\"$payload\\n\"); print(s.recv(65536).decode(), end=\"\")'"
+}
+
+proc_state_get_runner() {
+  extract_stdout "$(proc_state_raw_runner "$1" "STATE")"
+}
+
+proc_state_set_runner() {
+  local runner_id="$1"
+  local token="$2"
+  extract_stdout "$(proc_state_raw_runner "$runner_id" "SET $token")"
+}
+
+proc_state_bump_runner() {
+  extract_stdout "$(proc_state_raw_runner "$1" "BUMP")"
+}
+
+dump_proc_state() {
+  local runner_id="$1"
+  local label="$2"
+  local json
+  json=$(proc_state_get_runner "$runner_id")
+  echo "  --- ${label}: proc-state ---"
+  echo "$json" | jq . 2>/dev/null | sed 's/^/    /' || echo "    $json"
+}
+
 GCS_BUCKET=$(require_gcs_bucket)
 assert_manager_gcs_mode "$GCS_BUCKET"
 
@@ -79,6 +169,8 @@ else
   tail -30 /tmp/fc-dev/logs/firecracker-manager.log
   exit 1
 fi
+
+dump_vm_sanity "$RUNNER_ID" "fresh allocation"
 
 # ---------------------------------------------------------------------------
 header "3b. TTL auto-pause behavioral test"
@@ -156,10 +248,7 @@ header "4. Create state inside VM (memory + disk + process)"
 
 # Helper to run a command inside the VM and capture output
 vm_exec() {
-  local cmd="$1"
-  curl -s --no-buffer --max-time 30 -X POST "$MGR/api/v1/runners/$RUNNER_ID/exec" \
-    -H 'Content-Type: application/json' \
-    -d "{\"command\":[\"sh\",\"-c\",\"$cmd\"],\"timeout_seconds\":20}"
+  vm_exec_runner "$RUNNER_ID" "$1"
 }
 
 # 4a. Memory state: write marker to tmpfs (/tmp is memory-backed)
@@ -210,6 +299,77 @@ echo "  --- 4e. Kernel state ---"
 OUT=$(vm_exec "head -c 20 /proc/uptime")
 PRE_PAUSE_UPTIME=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[0-9]+\.[0-9]+' | head -1)
 echo "  Uptime before pause: ${PRE_PAUSE_UPTIME}s"
+
+# 4f. Tmpfs directory tree: many small files + manifest hash
+echo "  --- 4f. Tmpfs directory tree workload ---"
+OUT=$(vm_exec "rm -rf /tmp/gcs-tree && mkdir -p /tmp/gcs-tree/a /tmp/gcs-tree/b/c && for i in \$(seq 1 48); do printf 'mem-tree-%03d\n' \$i > /tmp/gcs-tree/a/file_\$i.txt; done && for i in \$(seq 49 96); do printf 'mem-nested-%03d\n' \$i > /tmp/gcs-tree/b/c/file_\$i.txt; done && find /tmp/gcs-tree -type f | sort | xargs sha256sum | sha256sum")
+echo "  $OUT"
+TMPFS_TREE_SHA=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[a-f0-9]{64}' | head -1)
+echo "  Tmpfs tree SHA: $TMPFS_TREE_SHA"
+if [ -n "$TMPFS_TREE_SHA" ]; then
+  pass "tmpfs tree created (sha=$TMPFS_TREE_SHA)"
+else
+  fail "tmpfs tree workload failed"
+fi
+
+# 4g. Rootfs directory tree: nested files + manifest hash
+echo "  --- 4g. Rootfs directory tree workload ---"
+OUT=$(vm_exec "rm -rf /var/tmp/gcs-tree && mkdir -p /var/tmp/gcs-tree/x /var/tmp/gcs-tree/y/z && for i in \$(seq 1 24); do printf 'disk-tree-%03d\n' \$i > /var/tmp/gcs-tree/x/file_\$i.txt; done && for i in \$(seq 25 48); do printf 'disk-nested-%03d\n' \$i > /var/tmp/gcs-tree/y/z/file_\$i.txt; done && find /var/tmp/gcs-tree -type f | sort | xargs sha256sum | sha256sum")
+echo "  $OUT"
+ROOTFS_TREE_SHA=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[a-f0-9]{64}' | head -1)
+echo "  Rootfs tree SHA: $ROOTFS_TREE_SHA"
+if [ -n "$ROOTFS_TREE_SHA" ]; then
+  pass "rootfs tree created (sha=$ROOTFS_TREE_SHA)"
+else
+  fail "rootfs tree workload failed"
+fi
+
+# 4h. Larger rootfs file: exercise disk chunking beyond tiny marker files
+echo "  --- 4h. Larger disk data (8MB on rootfs) ---"
+OUT=$(vm_exec "dd if=/dev/urandom of=/var/tmp/gcs-rootfs-big.bin bs=1K count=8192 2>/dev/null && md5sum /var/tmp/gcs-rootfs-big.bin")
+echo "  $OUT"
+ROOTFS_BIG_MD5=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[a-f0-9]{32}' | head -1)
+echo "  Rootfs bigfile MD5: $ROOTFS_BIG_MD5"
+if [ -n "$ROOTFS_BIG_MD5" ]; then
+  pass "8MB rootfs file written (md5=$ROOTFS_BIG_MD5)"
+else
+  fail "8MB rootfs file write failed"
+fi
+
+# 4i. In-memory daemon: heap-resident state over a Unix socket
+echo "  --- 4i. In-memory daemon state ---"
+PROC_TOKEN="session-proof-$SESSION_ID"
+OUT=$(vm_exec "rm -f /tmp/proc-state.sock /tmp/proc_state_server.py /tmp/proc_state.log && printf '%s' '$PROC_STATE_SERVER_B64' | base64 -d >/tmp/proc_state_server.py && nohup python3 /tmp/proc_state_server.py >/tmp/proc_state.log 2>&1 & echo \$!")
+echo "  $OUT"
+PROC_DAEMON_PID=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '\d+' | head -1)
+if [ -n "$PROC_DAEMON_PID" ]; then
+  pass "proc-state daemon started (pid=$PROC_DAEMON_PID)"
+else
+  fail "proc-state daemon failed to start"
+fi
+
+sleep 1
+dump_proc_state "$RUNNER_ID" "fresh allocation"
+PROC_STATE_JSON=$(proc_state_set_runner "$RUNNER_ID" "$PROC_TOKEN")
+for _ in $(seq 1 7); do
+  PROC_STATE_JSON=$(proc_state_bump_runner "$RUNNER_ID")
+done
+echo "  Final pre-pause proc-state: $PROC_STATE_JSON"
+PRE_PROC_PID=$(echo "$PROC_STATE_JSON" | jq -r '.pid // empty')
+PRE_PROC_TOKEN=$(echo "$PROC_STATE_JSON" | jq -r '.token // empty')
+PRE_PROC_COUNTER=$(echo "$PROC_STATE_JSON" | jq -r '.counter // empty')
+PRE_PROC_BLOB_SHA=$(echo "$PROC_STATE_JSON" | jq -r '.blob_sha // empty')
+PRE_PROC_BLOB_LEN=$(echo "$PROC_STATE_JSON" | jq -r '.blob_len // empty')
+echo "  PID:      $PRE_PROC_PID"
+echo "  Token:    $PRE_PROC_TOKEN"
+echo "  Counter:  $PRE_PROC_COUNTER"
+echo "  Blob SHA: $PRE_PROC_BLOB_SHA"
+echo "  Blob Len: $PRE_PROC_BLOB_LEN"
+if [ "$PRE_PROC_TOKEN" = "$PROC_TOKEN" ] && [ "$PRE_PROC_COUNTER" = "7" ] && [ -n "$PRE_PROC_BLOB_SHA" ]; then
+  pass "proc-state daemon initialized with heap state"
+else
+  fail "proc-state daemon state initialization failed"
+fi
 
 # ---------------------------------------------------------------------------
 header "5. Pause runner (should upload to GCS)"
@@ -441,6 +601,71 @@ else
   fail "Exec broken on resumed VM"
 fi
 
+# 9g. Verify tmpfs/rootfs tree hashes and larger rootfs file
+echo "  --- 9g. Tmpfs tree hash ---"
+OUT=$(vm_exec_resumed "find /tmp/gcs-tree -type f | sort | xargs sha256sum | sha256sum")
+echo "  $OUT"
+RESUMED_TMPFS_TREE_SHA=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[a-f0-9]{64}' | head -1 || true)
+echo "  Tmpfs tree SHA before: $TMPFS_TREE_SHA"
+echo "  Tmpfs tree SHA after:  $RESUMED_TMPFS_TREE_SHA"
+if [ "$TMPFS_TREE_SHA" = "$RESUMED_TMPFS_TREE_SHA" ] && [ -n "$RESUMED_TMPFS_TREE_SHA" ]; then
+  pass "tmpfs tree hash preserved"
+else
+  fail "tmpfs tree hash mismatch after resume"
+fi
+
+echo "  --- 9h. Rootfs tree hash ---"
+OUT=$(vm_exec_resumed "find /var/tmp/gcs-tree -type f | sort | xargs sha256sum | sha256sum")
+echo "  $OUT"
+RESUMED_ROOTFS_TREE_SHA=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[a-f0-9]{64}' | head -1 || true)
+echo "  Rootfs tree SHA before: $ROOTFS_TREE_SHA"
+echo "  Rootfs tree SHA after:  $RESUMED_ROOTFS_TREE_SHA"
+if [ "$ROOTFS_TREE_SHA" = "$RESUMED_ROOTFS_TREE_SHA" ] && [ -n "$RESUMED_ROOTFS_TREE_SHA" ]; then
+  pass "rootfs tree hash preserved"
+else
+  fail "rootfs tree hash mismatch after resume"
+fi
+
+echo "  --- 9i. Rootfs bigfile checksum ---"
+OUT=$(vm_exec_resumed "md5sum /var/tmp/gcs-rootfs-big.bin")
+echo "  $OUT"
+RESUMED_ROOTFS_BIG_MD5=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[a-f0-9]{32}' | head -1 || true)
+echo "  Rootfs bigfile MD5 before: $ROOTFS_BIG_MD5"
+echo "  Rootfs bigfile MD5 after:  $RESUMED_ROOTFS_BIG_MD5"
+if [ "$ROOTFS_BIG_MD5" = "$RESUMED_ROOTFS_BIG_MD5" ] && [ -n "$RESUMED_ROOTFS_BIG_MD5" ]; then
+  pass "rootfs bigfile checksum preserved"
+else
+  fail "rootfs bigfile checksum mismatch after resume"
+fi
+
+dump_vm_sanity "$RESUME_RUNNER_ID" "after /connect resume"
+
+echo "  --- 9j. In-memory daemon state after /connect resume ---"
+dump_proc_state "$RESUME_RUNNER_ID" "after /connect resume"
+PROC_STATE_JSON_RESUME1=$(proc_state_get_runner "$RESUME_RUNNER_ID")
+echo "  Resume 1 proc-state: $PROC_STATE_JSON_RESUME1"
+RESUME1_PROC_PID=$(echo "$PROC_STATE_JSON_RESUME1" | jq -r '.pid // empty')
+RESUME1_PROC_TOKEN=$(echo "$PROC_STATE_JSON_RESUME1" | jq -r '.token // empty')
+RESUME1_PROC_COUNTER=$(echo "$PROC_STATE_JSON_RESUME1" | jq -r '.counter // empty')
+RESUME1_PROC_BLOB_SHA=$(echo "$PROC_STATE_JSON_RESUME1" | jq -r '.blob_sha // empty')
+RESUME1_PROC_BLOB_LEN=$(echo "$PROC_STATE_JSON_RESUME1" | jq -r '.blob_len // empty')
+if [ "$RESUME1_PROC_PID" = "$PRE_PROC_PID" ] && \
+   [ "$RESUME1_PROC_TOKEN" = "$PRE_PROC_TOKEN" ] && \
+   [ "$RESUME1_PROC_COUNTER" = "$PRE_PROC_COUNTER" ] && \
+   [ "$RESUME1_PROC_BLOB_SHA" = "$PRE_PROC_BLOB_SHA" ] && \
+   [ "$RESUME1_PROC_BLOB_LEN" = "$PRE_PROC_BLOB_LEN" ]; then
+  pass "proc-state daemon heap survived /connect resume"
+else
+  fail "proc-state daemon state changed after /connect resume"
+fi
+PROC_STATE_JSON_RESUME1_BUMP=$(proc_state_bump_runner "$RESUME_RUNNER_ID")
+RESUME1_BUMP_COUNTER=$(echo "$PROC_STATE_JSON_RESUME1_BUMP" | jq -r '.counter // empty')
+if [ "$RESUME1_BUMP_COUNTER" = "8" ]; then
+  pass "proc-state daemon counter continued after /connect resume"
+else
+  fail "proc-state daemon counter did not continue after /connect resume"
+fi
+
 # ---------------------------------------------------------------------------
 header "10. Multi-pause GCS chain: write more data → pause → verify GCS chaining"
 # ---------------------------------------------------------------------------
@@ -540,6 +765,33 @@ if ! $EXEC_READY2; then
   exit 1
 fi
 pass "Exec reachable on resumed layer 1 VM"
+dump_vm_sanity "$RESUME2_RUNNER_ID" "after layer 1 resume"
+
+echo "  --- In-memory daemon after layer 1 resume ---"
+dump_proc_state "$RESUME2_RUNNER_ID" "after layer 1 resume"
+PROC_STATE_JSON_RESUME2=$(proc_state_get_runner "$RESUME2_RUNNER_ID")
+echo "  Resume 2 proc-state: $PROC_STATE_JSON_RESUME2"
+RESUME2_PROC_PID=$(echo "$PROC_STATE_JSON_RESUME2" | jq -r '.pid // empty')
+RESUME2_PROC_TOKEN=$(echo "$PROC_STATE_JSON_RESUME2" | jq -r '.token // empty')
+RESUME2_PROC_COUNTER=$(echo "$PROC_STATE_JSON_RESUME2" | jq -r '.counter // empty')
+RESUME2_PROC_BLOB_SHA=$(echo "$PROC_STATE_JSON_RESUME2" | jq -r '.blob_sha // empty')
+RESUME2_PROC_BLOB_LEN=$(echo "$PROC_STATE_JSON_RESUME2" | jq -r '.blob_len // empty')
+if [ "$RESUME2_PROC_PID" = "$PRE_PROC_PID" ] && \
+   [ "$RESUME2_PROC_TOKEN" = "$PRE_PROC_TOKEN" ] && \
+   [ "$RESUME2_PROC_COUNTER" = "8" ] && \
+   [ "$RESUME2_PROC_BLOB_SHA" = "$PRE_PROC_BLOB_SHA" ] && \
+   [ "$RESUME2_PROC_BLOB_LEN" = "$PRE_PROC_BLOB_LEN" ]; then
+  pass "proc-state daemon heap survived layer 1 resume"
+else
+  fail "proc-state daemon state changed after layer 1 resume"
+fi
+PROC_STATE_JSON_RESUME2_BUMP=$(proc_state_bump_runner "$RESUME2_RUNNER_ID")
+RESUME2_BUMP_COUNTER=$(echo "$PROC_STATE_JSON_RESUME2_BUMP" | jq -r '.counter // empty')
+if [ "$RESUME2_BUMP_COUNTER" = "9" ]; then
+  pass "proc-state daemon counter continued after layer 1 resume"
+else
+  fail "proc-state daemon counter did not continue after layer 1 resume"
+fi
 
 # Verify ALL data survived 2 GCS pause/resume cycles
 vm_exec_chain() {
@@ -571,6 +823,36 @@ if echo "$OUT" | grep -q 'gcs-chain-test-data'; then
   pass "Layer 1 data preserved through GCS resume"
 else
   fail "Layer 1 data LOST after GCS resume"
+fi
+
+echo "  --- Verify tmpfs tree hash through 2 cycles ---"
+OUT=$(vm_exec_chain "find /tmp/gcs-tree -type f | sort | xargs sha256sum | sha256sum")
+FINAL_TMPFS_TREE_SHA=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[a-f0-9]{64}' | head -1 || true)
+echo "  Tmpfs tree SHA final: $FINAL_TMPFS_TREE_SHA"
+if [ "$TMPFS_TREE_SHA" = "$FINAL_TMPFS_TREE_SHA" ] && [ -n "$FINAL_TMPFS_TREE_SHA" ]; then
+  pass "tmpfs tree preserved through 2 GCS cycles"
+else
+  fail "tmpfs tree mismatch after 2 GCS cycles"
+fi
+
+echo "  --- Verify rootfs tree hash through 2 cycles ---"
+OUT=$(vm_exec_chain "find /var/tmp/gcs-tree -type f | sort | xargs sha256sum | sha256sum")
+FINAL_ROOTFS_TREE_SHA=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[a-f0-9]{64}' | head -1 || true)
+echo "  Rootfs tree SHA final: $FINAL_ROOTFS_TREE_SHA"
+if [ "$ROOTFS_TREE_SHA" = "$FINAL_ROOTFS_TREE_SHA" ] && [ -n "$FINAL_ROOTFS_TREE_SHA" ]; then
+  pass "rootfs tree preserved through 2 GCS cycles"
+else
+  fail "rootfs tree mismatch after 2 GCS cycles"
+fi
+
+echo "  --- Verify rootfs bigfile through 2 cycles ---"
+OUT=$(vm_exec_chain "md5sum /var/tmp/gcs-rootfs-big.bin")
+FINAL_ROOTFS_BIG_MD5=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '[a-f0-9]{32}' | head -1 || true)
+echo "  Rootfs bigfile MD5 final: $FINAL_ROOTFS_BIG_MD5"
+if [ "$ROOTFS_BIG_MD5" = "$FINAL_ROOTFS_BIG_MD5" ] && [ -n "$FINAL_ROOTFS_BIG_MD5" ]; then
+  pass "rootfs bigfile preserved through 2 GCS cycles"
+else
+  fail "rootfs bigfile checksum mismatch after 2 GCS cycles"
 fi
 
 # ---------------------------------------------------------------------------
