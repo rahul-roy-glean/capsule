@@ -90,7 +90,7 @@ PROC_STATE_SERVER_B64=$(printf '%s' "$PROC_STATE_SERVER_PY" | base64 -w0 2>/dev/
 proc_state_raw_runner() {
   local runner_id="$1"
   local payload="$2"
-  vm_exec_runner "$runner_id" "python3 -c 'import socket; s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(\"/tmp/proc-state.sock\"); s.sendall(b\"$payload\\n\"); print(s.recv(65536).decode(), end=\"\")'"
+  vm_exec_runner "$runner_id" "python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(\"/tmp/proc-state.sock\"); s.sendall((sys.argv[1] + \"\\n\").encode()); print(s.recv(65536).decode(), end=\"\")' '$payload'"
 }
 
 proc_state_get_runner() {

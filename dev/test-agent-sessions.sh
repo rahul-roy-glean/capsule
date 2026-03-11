@@ -37,6 +37,10 @@ fail() { echo "  ✗ $1"; FAIL=$((FAIL + 1)); }
 skip() { echo "  ⊘ $1"; SKIP=$((SKIP + 1)); PASS=$((PASS + 1)); }
 header() { echo ""; echo "=== $1 ==="; }
 
+extract_stdout() {
+  echo "$1" | jq -rs 'map(select(.type=="stdout") | .data) | join("")'
+}
+
 # Helper: exec inside a VM, return raw ndjson output
 vm_exec() {
   local rid="$1"; shift
@@ -48,6 +52,84 @@ vm_exec() {
     return 0  # don't blow up set -e; caller checks output
   fi
   echo "$out"
+}
+
+dump_vm_sanity() {
+  local rid="$1"
+  local label="$2"
+  echo "  --- ${label}: guest sanity snapshot ---"
+  local out
+  out=$(vm_exec "$rid" "[\"bash\",\"-lc\",\"echo WHOAMI:; whoami; echo HOSTNAME:; hostname; echo UPTIME:; head -c 20 /proc/uptime; echo; echo ETH0:; ip -brief addr show dev eth0 2>/dev/null || ip addr show dev eth0 2>/dev/null || true; echo ROUTES:; ip route 2>/dev/null || cat /proc/net/route; echo RESOLV:; cat /etc/resolv.conf 2>/dev/null || true; echo THAW_PID:; pgrep thaw-agent | head -1\"]")
+  echo "$out"
+}
+
+PROC_STATE_SERVER_PY=$(cat <<'PY'
+import hashlib
+import json
+import os
+import socket
+
+sock_path = "/tmp/proc-state.sock"
+try:
+    os.unlink(sock_path)
+except FileNotFoundError:
+    pass
+
+blob = bytearray((b"agent-session-proc-state-" * ((64 * 1024 * 1024 // 25) + 1))[: 64 * 1024 * 1024])
+state = {
+    "pid": os.getpid(),
+    "token": "unset",
+    "counter": 0,
+    "blob_sha": hashlib.sha256(blob).hexdigest(),
+    "blob_len": len(blob),
+}
+
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock_path)
+srv.listen(16)
+
+while True:
+    conn, _ = srv.accept()
+    try:
+        data = conn.recv(4096).decode().strip()
+        if data.startswith("SET "):
+            state["token"] = data[4:]
+        elif data == "BUMP":
+            state["counter"] += 1
+        conn.sendall((json.dumps(state) + "\n").encode())
+    finally:
+        conn.close()
+PY
+)
+PROC_STATE_SERVER_B64=$(printf '%s' "$PROC_STATE_SERVER_PY" | base64 -w0 2>/dev/null || printf '%s' "$PROC_STATE_SERVER_PY" | base64 | tr -d '\n')
+
+proc_state_raw_runner() {
+  local runner_id="$1"
+  local payload="$2"
+  vm_exec "$runner_id" "[\"bash\",\"-lc\",\"python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(\\\"/tmp/proc-state.sock\\\"); s.sendall((sys.argv[1] + \\\"\\\\n\\\").encode()); print(s.recv(65536).decode(), end=\\\"\\\")' '$payload'\"]"
+}
+
+proc_state_get_runner() {
+  extract_stdout "$(proc_state_raw_runner "$1" "STATE")"
+}
+
+proc_state_set_runner() {
+  local runner_id="$1"
+  local token="$2"
+  extract_stdout "$(proc_state_raw_runner "$runner_id" "SET $token")"
+}
+
+proc_state_bump_runner() {
+  extract_stdout "$(proc_state_raw_runner "$1" "BUMP")"
+}
+
+dump_proc_state() {
+  local runner_id="$1"
+  local label="$2"
+  local json
+  json=$(proc_state_get_runner "$runner_id")
+  echo "  --- ${label}: proc-state ---"
+  echo "$json" | jq . 2>/dev/null | sed 's/^/    /' || echo "    $json"
 }
 
 # Helper: exec with long timeout for Claude commands
@@ -272,6 +354,7 @@ if ! wait_for_exec "$RUNNER_ID"; then
   fail "Thaw-agent exec unreachable"; exit 1
 fi
 pass "Thaw-agent liveness confirmed"
+dump_vm_sanity "$RUNNER_ID" "fresh allocation"
 
 # ---------------------------------------------------------------------------
 header "4. Verify repos cloned"
@@ -399,6 +482,65 @@ if [ "$CLAUDE_AVAILABLE" = "true" ]; then
 else
   skip "Claude not available, creating file manually"
   vm_exec "$RUNNER_ID" "[\"bash\",\"-c\",\"echo 'Created by Claude agent test' > /workspace/markupsafe/AGENT_TEST.md\"]" > /dev/null
+fi
+
+# ---------------------------------------------------------------------------
+header "10b. Create richer workspace state"
+# ---------------------------------------------------------------------------
+if [ "$CLAUDE_AVAILABLE" = "true" ]; then
+  CLAUDE_STATE=$(run_claude "$RUNNER_ID" "/workspace/markupsafe" \
+    "Create a directory AGENT_STATE with two files: summary.txt containing exactly 'agent-state-summary' and nested/details.txt containing exactly 'agent-state-details'.")
+  CLAUDE_STATE_STATUS=$(check_claude_output "$CLAUDE_STATE")
+  case "$CLAUDE_STATE_STATUS" in
+    ok)   pass "Claude created richer workspace state in markupsafe" ;;
+    skip) skip "Claude auth failed for richer workspace state; creating files manually" ;;
+    fail) fail "Exec transport broken for richer workspace state command" ;;
+  esac
+fi
+vm_exec "$RUNNER_ID" "[\"bash\",\"-c\",\"mkdir -p /workspace/markupsafe/AGENT_STATE/nested && echo 'agent-state-summary' > /workspace/markupsafe/AGENT_STATE/summary.txt && echo 'agent-state-details' > /workspace/markupsafe/AGENT_STATE/nested/details.txt\"]" > /dev/null
+
+WORKSPACE_TREE_OUT=$(vm_exec "$RUNNER_ID" "[\"bash\",\"-lc\",\"find /workspace/markupsafe/AGENT_STATE -type f | sort | xargs sha256sum | sha256sum\"]")
+WORKSPACE_TREE_SHA=$(echo "$WORKSPACE_TREE_OUT" | grep -oE '[a-f0-9]{64}' | head -1)
+if [ -n "$WORKSPACE_TREE_SHA" ]; then
+  pass "Workspace tree hash captured ($WORKSPACE_TREE_SHA)"
+else
+  fail "Workspace tree hash capture failed"
+fi
+
+CAMELCASE_STATE_OUT=$(vm_exec "$RUNNER_ID" "[\"bash\",\"-lc\",\"mkdir -p /workspace/camelcase/tmp_state && dd if=/dev/urandom of=/workspace/camelcase/tmp_state/blob.bin bs=1K count=4096 2>/dev/null && md5sum /workspace/camelcase/tmp_state/blob.bin\"]")
+CAMELCASE_BLOB_MD5=$(echo "$CAMELCASE_STATE_OUT" | grep -oE '[a-f0-9]{32}' | head -1)
+if [ -n "$CAMELCASE_BLOB_MD5" ]; then
+  pass "Camelcase blob checksum captured ($CAMELCASE_BLOB_MD5)"
+else
+  fail "Camelcase blob checksum capture failed"
+fi
+
+# ---------------------------------------------------------------------------
+header "10c. Start in-memory daemon"
+# ---------------------------------------------------------------------------
+PROC_TOKEN="agent-session-proof-$SESSION_ID"
+PROC_START=$(vm_exec "$RUNNER_ID" "[\"bash\",\"-lc\",\"rm -f /tmp/proc-state.sock /tmp/proc_state_server.py /tmp/proc_state.log && printf '%s' '$PROC_STATE_SERVER_B64' | base64 -d >/tmp/proc_state_server.py && nohup python3 /tmp/proc_state_server.py >/tmp/proc_state.log 2>&1 & echo \\$!\"]")
+PROC_DAEMON_PID=$(echo "$PROC_START" | grep -oE '[0-9]+' | head -1)
+if [ -n "$PROC_DAEMON_PID" ]; then
+  pass "proc-state daemon started (pid=$PROC_DAEMON_PID)"
+else
+  fail "proc-state daemon failed to start"
+fi
+sleep 1
+dump_proc_state "$RUNNER_ID" "fresh allocation"
+PROC_STATE_JSON=$(proc_state_set_runner "$RUNNER_ID" "$PROC_TOKEN")
+for _ in $(seq 1 7); do
+  PROC_STATE_JSON=$(proc_state_bump_runner "$RUNNER_ID")
+done
+PRE_PROC_PID=$(echo "$PROC_STATE_JSON" | jq -r '.pid // empty')
+PRE_PROC_TOKEN=$(echo "$PROC_STATE_JSON" | jq -r '.token // empty')
+PRE_PROC_COUNTER=$(echo "$PROC_STATE_JSON" | jq -r '.counter // empty')
+PRE_PROC_BLOB_SHA=$(echo "$PROC_STATE_JSON" | jq -r '.blob_sha // empty')
+PRE_PROC_BLOB_LEN=$(echo "$PROC_STATE_JSON" | jq -r '.blob_len // empty')
+if [ "$PRE_PROC_TOKEN" = "$PROC_TOKEN" ] && [ "$PRE_PROC_COUNTER" = "7" ] && [ -n "$PRE_PROC_BLOB_SHA" ]; then
+  pass "proc-state daemon initialized with heap state"
+else
+  fail "proc-state daemon state initialization failed"
 fi
 
 # ---------------------------------------------------------------------------
@@ -596,6 +738,7 @@ if ! wait_for_exec "$RESUME_RUNNER_ID"; then
   fail "Thaw-agent unreachable after resume"; exit 1
 fi
 pass "Thaw-agent liveness confirmed after resume"
+dump_vm_sanity "$RESUME_RUNNER_ID" "after first resume"
 
 # ---------------------------------------------------------------------------
 header "17. Verify AGENT_TEST.md survived pause/resume"
@@ -640,6 +783,49 @@ if [ "$CLAUDE_AVAILABLE" = "true" ]; then
   esac
 else
   skip "Claude not available, skipping resumed session test"
+fi
+
+# ---------------------------------------------------------------------------
+header "19b. Verify richer workspace + in-memory state after resume"
+# ---------------------------------------------------------------------------
+WORKSPACE_TREE_RESUME=$(vm_exec "$RESUME_RUNNER_ID" "[\"bash\",\"-lc\",\"find /workspace/markupsafe/AGENT_STATE -type f | sort | xargs sha256sum | sha256sum\"]")
+WORKSPACE_TREE_SHA_RESUME=$(echo "$WORKSPACE_TREE_RESUME" | grep -oE '[a-f0-9]{64}' | head -1)
+if [ "$WORKSPACE_TREE_SHA_RESUME" = "$WORKSPACE_TREE_SHA" ] && [ -n "$WORKSPACE_TREE_SHA_RESUME" ]; then
+  pass "Workspace tree preserved after resume"
+else
+  fail "Workspace tree hash mismatch after resume"
+fi
+
+CAMELCASE_STATE_RESUME=$(vm_exec "$RESUME_RUNNER_ID" "[\"bash\",\"-lc\",\"md5sum /workspace/camelcase/tmp_state/blob.bin\"]")
+CAMELCASE_BLOB_MD5_RESUME=$(echo "$CAMELCASE_STATE_RESUME" | grep -oE '[a-f0-9]{32}' | head -1)
+if [ "$CAMELCASE_BLOB_MD5_RESUME" = "$CAMELCASE_BLOB_MD5" ] && [ -n "$CAMELCASE_BLOB_MD5_RESUME" ]; then
+  pass "Camelcase blob preserved after resume"
+else
+  fail "Camelcase blob checksum mismatch after resume"
+fi
+
+dump_proc_state "$RESUME_RUNNER_ID" "after first resume"
+PROC_STATE_JSON_RESUME1=$(proc_state_get_runner "$RESUME_RUNNER_ID")
+RESUME1_PROC_PID=$(echo "$PROC_STATE_JSON_RESUME1" | jq -r '.pid // empty')
+RESUME1_PROC_TOKEN=$(echo "$PROC_STATE_JSON_RESUME1" | jq -r '.token // empty')
+RESUME1_PROC_COUNTER=$(echo "$PROC_STATE_JSON_RESUME1" | jq -r '.counter // empty')
+RESUME1_PROC_BLOB_SHA=$(echo "$PROC_STATE_JSON_RESUME1" | jq -r '.blob_sha // empty')
+RESUME1_PROC_BLOB_LEN=$(echo "$PROC_STATE_JSON_RESUME1" | jq -r '.blob_len // empty')
+if [ "$RESUME1_PROC_PID" = "$PRE_PROC_PID" ] && \
+   [ "$RESUME1_PROC_TOKEN" = "$PRE_PROC_TOKEN" ] && \
+   [ "$RESUME1_PROC_COUNTER" = "$PRE_PROC_COUNTER" ] && \
+   [ "$RESUME1_PROC_BLOB_SHA" = "$PRE_PROC_BLOB_SHA" ] && \
+   [ "$RESUME1_PROC_BLOB_LEN" = "$PRE_PROC_BLOB_LEN" ]; then
+  pass "proc-state daemon heap survived first resume"
+else
+  fail "proc-state daemon state changed after first resume"
+fi
+PROC_STATE_JSON_RESUME1_BUMP=$(proc_state_bump_runner "$RESUME_RUNNER_ID")
+RESUME1_BUMP_COUNTER=$(echo "$PROC_STATE_JSON_RESUME1_BUMP" | jq -r '.counter // empty')
+if [ "$RESUME1_BUMP_COUNTER" = "8" ]; then
+  pass "proc-state daemon counter continued after first resume"
+else
+  fail "proc-state daemon counter did not continue after first resume"
 fi
 
 # =========================================================================
@@ -733,6 +919,7 @@ done
 if ! wait_for_exec "$RESUME2_RUNNER_ID"; then
   fail "Thaw-agent unreachable after multi-layer resume"; exit 1
 fi
+dump_vm_sanity "$RESUME2_RUNNER_ID" "after multi-layer resume"
 
 # ---------------------------------------------------------------------------
 header "22. Verify all state from both layers"
@@ -753,6 +940,46 @@ if echo "$VERIFY_L1" | grep -q "layer1-agent-test"; then
   pass "Layer 1 data preserved after resume"
 else
   fail "Layer 1 data lost after resume"
+fi
+
+WORKSPACE_TREE_RESUME2=$(vm_exec "$RESUME2_RUNNER_ID" "[\"bash\",\"-lc\",\"find /workspace/markupsafe/AGENT_STATE -type f | sort | xargs sha256sum | sha256sum\"]")
+WORKSPACE_TREE_SHA_RESUME2=$(echo "$WORKSPACE_TREE_RESUME2" | grep -oE '[a-f0-9]{64}' | head -1)
+if [ "$WORKSPACE_TREE_SHA_RESUME2" = "$WORKSPACE_TREE_SHA" ] && [ -n "$WORKSPACE_TREE_SHA_RESUME2" ]; then
+  pass "Workspace tree preserved through multi-layer resume"
+else
+  fail "Workspace tree hash mismatch after multi-layer resume"
+fi
+
+CAMELCASE_STATE_RESUME2=$(vm_exec "$RESUME2_RUNNER_ID" "[\"bash\",\"-lc\",\"md5sum /workspace/camelcase/tmp_state/blob.bin\"]")
+CAMELCASE_BLOB_MD5_RESUME2=$(echo "$CAMELCASE_STATE_RESUME2" | grep -oE '[a-f0-9]{32}' | head -1)
+if [ "$CAMELCASE_BLOB_MD5_RESUME2" = "$CAMELCASE_BLOB_MD5" ] && [ -n "$CAMELCASE_BLOB_MD5_RESUME2" ]; then
+  pass "Camelcase blob preserved through multi-layer resume"
+else
+  fail "Camelcase blob checksum mismatch after multi-layer resume"
+fi
+
+dump_proc_state "$RESUME2_RUNNER_ID" "after multi-layer resume"
+PROC_STATE_JSON_RESUME2=$(proc_state_get_runner "$RESUME2_RUNNER_ID")
+RESUME2_PROC_PID=$(echo "$PROC_STATE_JSON_RESUME2" | jq -r '.pid // empty')
+RESUME2_PROC_TOKEN=$(echo "$PROC_STATE_JSON_RESUME2" | jq -r '.token // empty')
+RESUME2_PROC_COUNTER=$(echo "$PROC_STATE_JSON_RESUME2" | jq -r '.counter // empty')
+RESUME2_PROC_BLOB_SHA=$(echo "$PROC_STATE_JSON_RESUME2" | jq -r '.blob_sha // empty')
+RESUME2_PROC_BLOB_LEN=$(echo "$PROC_STATE_JSON_RESUME2" | jq -r '.blob_len // empty')
+if [ "$RESUME2_PROC_PID" = "$PRE_PROC_PID" ] && \
+   [ "$RESUME2_PROC_TOKEN" = "$PRE_PROC_TOKEN" ] && \
+   [ "$RESUME2_PROC_COUNTER" = "8" ] && \
+   [ "$RESUME2_PROC_BLOB_SHA" = "$PRE_PROC_BLOB_SHA" ] && \
+   [ "$RESUME2_PROC_BLOB_LEN" = "$PRE_PROC_BLOB_LEN" ]; then
+  pass "proc-state daemon heap survived multi-layer resume"
+else
+  fail "proc-state daemon state changed after multi-layer resume"
+fi
+PROC_STATE_JSON_RESUME2_BUMP=$(proc_state_bump_runner "$RESUME2_RUNNER_ID")
+RESUME2_BUMP_COUNTER=$(echo "$PROC_STATE_JSON_RESUME2_BUMP" | jq -r '.counter // empty')
+if [ "$RESUME2_BUMP_COUNTER" = "9" ]; then
+  pass "proc-state daemon counter continued after multi-layer resume"
+else
+  fail "proc-state daemon counter did not continue after multi-layer resume"
 fi
 
 # ---------------------------------------------------------------------------
