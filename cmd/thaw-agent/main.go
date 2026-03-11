@@ -855,12 +855,20 @@ func configureNetwork(data *MMDSData) error {
 		iface = "eth0"
 	}
 
+	currentMAC := ""
+	if goIface, err := gonet.InterfaceByName(iface); err == nil && goIface.HardwareAddr != nil {
+		currentMAC = strings.ToLower(goIface.HardwareAddr.String())
+	}
+
 	// Set MAC address if provided. Snapshot-restored VMs all share the same
 	// MAC baked into the snapshot. Each slot gets a unique MAC via MMDS to
 	// avoid bridge forwarding table collisions when multiple VMs run on the
 	// same host.
 	if net.MAC != "" {
-		if err := exec.Command("ip", "link", "set", iface, "address", net.MAC).Run(); err != nil {
+		desiredMAC := strings.ToLower(net.MAC)
+		if currentMAC == desiredMAC {
+			log.WithField("mac", net.MAC).Info("MAC address already configured")
+		} else if err := exec.Command("ip", "link", "set", iface, "address", net.MAC).Run(); err != nil {
 			log.WithError(err).WithField("mac", net.MAC).Warn("Failed to set MAC address")
 		} else {
 			log.WithField("mac", net.MAC).Info("MAC address configured")
@@ -1131,6 +1139,31 @@ func watchForSnapshotRestore() {
 			continue
 		}
 		if !*skipNetwork && newData.Latest.Network.IP != "" {
+			iface := newData.Latest.Network.Interface
+			if iface == "" {
+				iface = "eth0"
+			}
+			currentState, stateErr := readGuestNetworkState(iface)
+			if stateErr == nil {
+				reconfigure, reason := shouldReconfigureNetworkAfterRestore(currentState, newData)
+				log.WithFields(logrus.Fields{
+					"iface":         iface,
+					"current_ip":    currentState.IP,
+					"desired_ip":    strings.Split(newData.Latest.Network.IP, "/")[0],
+					"current_mac":   currentState.MAC,
+					"desired_mac":   strings.ToLower(newData.Latest.Network.MAC),
+					"current_dns":   currentState.DNS,
+					"desired_dns":   newData.Latest.Network.DNS,
+					"has_def_route": currentState.HasDefaultRoute,
+					"reconfigure":   reconfigure,
+					"reason":        reason,
+				}).Info("watchForSnapshotRestore: evaluated network reconfiguration")
+				if !reconfigure {
+					continue
+				}
+			} else {
+				log.WithError(stateErr).Warn("watchForSnapshotRestore: failed to read current network state, forcing reconfiguration")
+			}
 			if err := configureNetwork(newData); err != nil {
 				log.WithError(err).Warn("watchForSnapshotRestore: network reconfiguration failed")
 			} else {
@@ -1138,6 +1171,84 @@ func watchForSnapshotRestore() {
 			}
 		}
 	}
+}
+
+type guestNetworkState struct {
+	IP              string
+	MAC             string
+	DNS             string
+	HasDefaultRoute bool
+}
+
+func readGuestNetworkState(iface string) (*guestNetworkState, error) {
+	state := &guestNetworkState{}
+
+	goIface, err := gonet.InterfaceByName(iface)
+	if err != nil {
+		return nil, err
+	}
+	if goIface.HardwareAddr != nil {
+		state.MAC = strings.ToLower(goIface.HardwareAddr.String())
+	}
+	addrs, err := goIface.Addrs()
+	if err != nil {
+		return nil, err
+	}
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*gonet.IPNet)
+		if !ok || ipNet.IP == nil || ipNet.IP.To4() == nil {
+			continue
+		}
+		state.IP = ipNet.IP.String()
+		break
+	}
+
+	if routeData, routeErr := os.ReadFile("/proc/net/route"); routeErr == nil {
+		for _, line := range strings.Split(string(routeData), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) >= 3 && fields[1] == "00000000" {
+				state.HasDefaultRoute = true
+				break
+			}
+		}
+	}
+
+	if resolvData, resolvErr := os.ReadFile("/etc/resolv.conf"); resolvErr == nil {
+		for _, line := range strings.Split(string(resolvData), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "nameserver ") {
+				state.DNS = strings.TrimSpace(strings.TrimPrefix(line, "nameserver "))
+				break
+			}
+		}
+	}
+
+	return state, nil
+}
+
+func shouldReconfigureNetworkAfterRestore(current *guestNetworkState, data *MMDSData) (bool, string) {
+	if current == nil || data == nil {
+		return true, "missing current or desired network state"
+	}
+	net := data.Latest.Network
+	desiredIP := strings.Split(net.IP, "/")[0]
+	desiredMAC := strings.ToLower(net.MAC)
+	if desiredIP == "" {
+		return false, "desired IP missing"
+	}
+	if current.IP != desiredIP {
+		return true, "guest IP differs from MMDS"
+	}
+	if desiredMAC != "" && current.MAC != "" && current.MAC != desiredMAC {
+		return true, "guest MAC differs from MMDS"
+	}
+	if net.DNS != "" && current.DNS != "" && current.DNS != net.DNS {
+		return true, "guest DNS differs from MMDS"
+	}
+	if net.Gateway != "" && !current.HasDefaultRoute {
+		return true, "guest missing default route"
+	}
+	return false, "guest network already matches MMDS"
 }
 
 func resyncClock(mmdsData *MMDSData) error {
