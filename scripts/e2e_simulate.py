@@ -1910,22 +1910,34 @@ def suite_concurrency(
                         f"{conn.status}"
                     ), True
 
-                # Readiness probe: wait for the workspace FUSE mount to
-                # become available after resume before firing heavy writes.
+                # Readiness probe: wait for /workspace to become usable
+                # after resume. Capture diagnostic output so we can tell
+                # WHY it fails (not mounted, FUSE hang, permission, etc).
                 ready_events = list(client.runners.exec(
                     runner_id,
                     ["sh", "-c",
-                     "for i in 1 2 3 4 5; do "
-                     "  ls /workspace >/dev/null 2>&1 && exit 0; "
-                     "  sleep 1; "
-                     "done; exit 1"],
-                    timeout_seconds=15,
+                     "for i in $(seq 1 15); do "
+                     "  if ls /workspace >/dev/null 2>&1; then exit 0; fi; "
+                     "  sleep 2; "
+                     "done; "
+                     # Probe failed — dump diagnostics before exiting.
+                     "echo '--- diag ---' >&2; "
+                     "mount | grep workspace >&2 || echo 'no workspace mount' >&2; "
+                     "ls -la / >&2; "
+                     "stat /workspace >&2 2>&1; "
+                     "dmesg | tail -5 >&2 2>/dev/null; "
+                     "exit 1"],
+                    timeout_seconds=45,
                 ))
                 ready_exit = [e for e in ready_events if e.type == "exit"]
                 if ready_exit and ready_exit[0].code != 0:
+                    diag = "".join(
+                        e.data for e in ready_events
+                        if e.type == "stderr" and e.data
+                    ).strip()
                     return False, (
                         f"Cycle {cycle}: /workspace not ready after resume "
-                        f"(runner {runner_id})"
+                        f"(runner {runner_id}): {diag[:300]}"
                     ), True
 
                 log.debug("Resume complete", extra={
