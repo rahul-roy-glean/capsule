@@ -15,10 +15,11 @@ func newTestManager(opts ...func(*Manager)) *Manager {
 	logger.SetLevel(logrus.DebugLevel)
 	m := &Manager{
 		config:       HostConfig{MaxRunners: 4, HostID: "test-host", Environment: "test"},
-		runners:      make(map[string]*Runner),
-		slotToRunner: make(map[int]string),
-		runnerToSlot: make(map[string]int),
-		uffdHandlers: make(map[string]uffdStopper),
+		runners:         make(map[string]*Runner),
+		slotToRunner:    make(map[int]string),
+		runnerToSlot:    make(map[string]int),
+		pendingSessions: make(map[string]string),
+		uffdHandlers:    make(map[string]uffdStopper),
 		logger:       logger.WithField("test", true),
 	}
 	for _, opt := range opts {
@@ -464,27 +465,29 @@ func TestIdempotentAllocationWaitsForLeader(t *testing.T) {
 	}
 }
 
-func TestReserveAllocationSlotCountsPendingReservations(t *testing.T) {
+func TestAcquireBringupLeaseCountsPendingReservations(t *testing.T) {
 	m := newTestManager(func(m *Manager) {
 		m.config.MaxRunners = 1
 	})
 
-	if err := m.reserveAllocationSlot(); err != nil {
-		t.Fatalf("first reserveAllocationSlot() error = %v", err)
+	lease, err := m.AcquireBringupLease("runner-1", "")
+	if err != nil {
+		t.Fatalf("first AcquireBringupLease() error = %v", err)
 	}
 	if m.CanAddRunner(0, 0) {
-		t.Fatal("CanAddRunner() should be false while a slot is reserved")
+		t.Fatal("CanAddRunner() should be false while a lease is held")
 	}
-	if err := m.reserveAllocationSlot(); err == nil {
-		t.Fatal("second reserveAllocationSlot() should fail at capacity")
+	if _, err := m.AcquireBringupLease("runner-2", ""); err == nil {
+		t.Fatal("second AcquireBringupLease() should fail at capacity")
 	}
 
-	m.releaseAllocationSlot()
+	lease.Release()
 
-	if err := m.reserveAllocationSlot(); err != nil {
-		t.Fatalf("reserveAllocationSlot() after release error = %v", err)
+	lease2, err := m.AcquireBringupLease("runner-3", "")
+	if err != nil {
+		t.Fatalf("AcquireBringupLease() after release error = %v", err)
 	}
-	m.releaseAllocationSlot()
+	lease2.Release()
 }
 
 func TestDrainBlocksAllocation(t *testing.T) {

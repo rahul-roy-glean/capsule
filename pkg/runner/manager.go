@@ -53,9 +53,9 @@ type Manager struct {
 	slotToRunner map[int]string
 	// runnerToSlot is the reverse mapping for quick lookup during cleanup.
 	runnerToSlot map[string]int
-	draining     bool
-	mu           sync.RWMutex
-	logger       *logrus.Entry
+	draining bool
+	mu       sync.RWMutex
+	logger   *logrus.Entry
 
 	// sessionMemStore and sessionDiskStore are chunk stores for GCS-backed
 	// session pause/resume (nil when SessionChunkBucket is not configured).
@@ -100,6 +100,10 @@ type Manager struct {
 	// pendingAllocations reserves runner slots for allocations that have passed the
 	// initial capacity check but have not yet been added to m.runners.
 	pendingAllocations int
+	// pendingSessions tracks session IDs that are being brought up but not yet
+	// registered in m.runners. Prevents two concurrent ResumeFromSession calls
+	// for the same session from both passing the uniqueness check.
+	pendingSessions map[string]string // sessionID → runnerID
 }
 
 type QuarantineOptions struct {
@@ -146,6 +150,7 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 		snapshotCache:   cache,
 		slotToRunner:    make(map[int]string),
 		runnerToSlot:    make(map[string]int),
+		pendingSessions: make(map[string]string),
 		policyEnforcers: make(map[string]*network.PolicyEnforcer),
 		authProxies:     make(map[string]*authproxy.AuthProxy),
 		logger:          logger.WithField("component", "runner-manager"),
@@ -269,28 +274,140 @@ func (m *Manager) finishIdempotentAllocation(reqID string, alloc *recentAllocati
 	}
 }
 
-func (m *Manager) reserveAllocationSlot() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.draining {
-		return fmt.Errorf("host is draining")
-	}
-	if len(m.runners)+m.pendingAllocations >= m.config.MaxRunners {
-		return fmt.Errorf("host at capacity: %d/%d runners", len(m.runners)+m.pendingAllocations, m.config.MaxRunners)
-	}
-
-	m.pendingAllocations++
-	return nil
+// bringupLease atomically reserves capacity, a TAP slot, and a network
+// namespace for a new runner. Release cleans everything up on error;
+// Commit marks the lease as committed so Release becomes a no-op.
+type bringupLease struct {
+	manager   *Manager
+	runnerID  string
+	sessionID string
+	slot      int
+	NsInfo    *network.VMNamespace
+	Tap       *network.TapDevice
+	committed bool
+	released  bool
 }
 
-func (m *Manager) releaseAllocationSlot() {
+// AcquireBringupLease atomically checks capacity, validates session
+// uniqueness, finds an available slot, and registers the slot mapping
+// under m.mu.Lock. Network namespace creation happens outside the lock
+// to avoid blocking other manager operations during the ~100ms syscall.
+func (m *Manager) AcquireBringupLease(runnerID, sessionID string) (*bringupLease, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
-	if m.pendingAllocations > 0 {
-		m.pendingAllocations--
+	if m.draining {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("host is draining")
 	}
+
+	// Count active runners (exclude suspended — they don't consume VM resources)
+	activeCount := 0
+	for _, r := range m.runners {
+		if r.State != StateSuspended {
+			activeCount++
+		}
+	}
+	if activeCount+m.pendingAllocations >= m.config.MaxRunners {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("host at capacity: %d/%d runners", activeCount+m.pendingAllocations, m.config.MaxRunners)
+	}
+
+	// Validate session uniqueness against both registered and pending runners
+	if sessionID != "" {
+		if pendingRunner, ok := m.pendingSessions[sessionID]; ok {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("session %s already has a pending allocation for runner %s", sessionID, pendingRunner)
+		}
+		for _, r := range m.runners {
+			if r.SessionID == sessionID && r.State != StateSuspended {
+				m.mu.Unlock()
+				return nil, fmt.Errorf("session %s already has an active runner %s in state %s", sessionID, r.ID, r.State)
+			}
+		}
+	}
+
+	slot := m.findAvailableSlot()
+	if slot < 0 {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("no slots available")
+	}
+
+	// Reserve the slot, register pending session, and increment pendingAllocations.
+	m.slotToRunner[slot] = runnerID
+	m.runnerToSlot[runnerID] = slot
+	if sessionID != "" {
+		m.pendingSessions[sessionID] = runnerID
+	}
+	m.pendingAllocations++
+	m.mu.Unlock()
+
+	lease := &bringupLease{
+		manager:   m,
+		runnerID:  runnerID,
+		sessionID: sessionID,
+		slot:      slot,
+	}
+
+	// Create network namespace outside the lock — this involves ip netns add,
+	// veth pair creation, and IP assignment (~100-200ms of syscalls). Holding
+	// m.mu during this would block all concurrent manager operations.
+	if m.netnsNetwork != nil {
+		nsInfo, err := m.netnsNetwork.CreateNamespaceForVM(runnerID, slot)
+		if err != nil {
+			// Undo slot reservation on failure
+			lease.Release()
+			return nil, fmt.Errorf("failed to create network namespace: %w", err)
+		}
+		lease.NsInfo = nsInfo
+		lease.Tap = nsInfo.GetTapDevice(m.netnsNetwork.GetSubnet())
+	}
+
+	return lease, nil
+}
+
+// Release cleans up lease resources (namespace, slot, pendingAllocations).
+// Idempotent; no-op if Commit was already called.
+func (l *bringupLease) Release() {
+	if l.committed || l.released {
+		return
+	}
+	l.released = true
+
+	l.manager.mu.Lock()
+	defer l.manager.mu.Unlock()
+
+	if l.manager.netnsNetwork != nil && l.NsInfo != nil {
+		l.manager.netnsNetwork.ReleaseNamespace(l.runnerID)
+	}
+	if slot, ok := l.manager.runnerToSlot[l.runnerID]; ok {
+		delete(l.manager.slotToRunner, slot)
+		delete(l.manager.runnerToSlot, l.runnerID)
+	}
+	if l.sessionID != "" {
+		delete(l.manager.pendingSessions, l.sessionID)
+	}
+	if l.manager.pendingAllocations > 0 {
+		l.manager.pendingAllocations--
+	}
+	os.Remove(filepath.Join(l.manager.config.SocketDir, l.runnerID+".sock"))
+}
+
+// Commit marks the lease as committed (runner successfully registered)
+// and decrements pendingAllocations. After Commit, Release is a no-op.
+func (l *bringupLease) Commit() {
+	if l.committed {
+		return
+	}
+	l.committed = true
+
+	l.manager.mu.Lock()
+	if l.sessionID != "" {
+		delete(l.manager.pendingSessions, l.sessionID)
+	}
+	if l.manager.pendingAllocations > 0 {
+		l.manager.pendingAllocations--
+	}
+	l.manager.mu.Unlock()
 }
 
 // SetNetNSNetwork configures the manager to use per-VM network namespaces.
@@ -350,69 +467,94 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 
 // ReleaseRunner releases a runner
 func (m *Manager) ReleaseRunner(runnerID string, destroy bool) error {
+	// Phase 1: under lock — extract resources and remove from maps.
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	runner, exists := m.runners[runnerID]
 	if !exists {
+		m.mu.Unlock()
 		return fmt.Errorf("runner not found: %s", runnerID)
 	}
 
+	// Take runner.mu to set StateTerminated, preventing PauseRunner from
+	// racing. Save the previous state first — suspended runners had their
+	// network released during pause and need a different cleanup path.
+	runner.mu.Lock()
 	if runner.State == StateQuarantined {
+		runner.mu.Unlock()
+		m.mu.Unlock()
 		if destroy {
 			return fmt.Errorf("runner %s is quarantined; unquarantine before destroying", runnerID)
 		}
 		return nil
 	}
+	wasSuspended := runner.State == StateSuspended
+	runner.State = StateTerminated
+	runner.mu.Unlock()
 
+	// Extract resources before removing from maps.
+	vm := m.vms[runnerID]
+	handler := m.uffdHandlers[runnerID]
+	enforcer := m.policyEnforcers[runnerID]
+	proxy := m.authProxies[runnerID]
+	overlayPath := runner.RootfsOverlay
+	sessionID := runner.SessionID
+	slot, hasSlot := m.runnerToSlot[runnerID]
+
+	// Remove from ALL maps — no other operation can find this runner.
+	delete(m.runners, runnerID)
+	delete(m.vms, runnerID)
+	delete(m.uffdHandlers, runnerID)
+	delete(m.policyEnforcers, runnerID)
+	delete(m.authProxies, runnerID)
+	if hasSlot {
+		delete(m.slotToRunner, slot)
+		delete(m.runnerToSlot, runnerID)
+	}
+	m.mu.Unlock()
+
+	// Phase 2: blocking cleanup — outside lock.
 	m.logger.WithFields(logrus.Fields{
 		"runner_id": runnerID,
 		"destroy":   destroy,
 	}).Info("Releasing runner")
 
-	vm, exists := m.vms[runnerID]
-	if exists {
+	if vm != nil {
 		vm.Stop()
-		delete(m.vms, runnerID)
 	}
-
-	// Stop UFFD handler if one exists
-	if handler, ok := m.uffdHandlers[runnerID]; ok {
+	if handler != nil {
 		handler.Stop()
-		delete(m.uffdHandlers, runnerID)
 	}
-
-	// Remove policy enforcer if one exists
-	if enforcer, ok := m.policyEnforcers[runnerID]; ok {
+	if enforcer != nil {
 		enforcer.Remove()
-		delete(m.policyEnforcers, runnerID)
 	}
-
-	// Stop auth proxy if one exists
-	if proxy, ok := m.authProxies[runnerID]; ok {
+	if proxy != nil {
 		proxy.Stop()
-		delete(m.authProxies, runnerID)
 	}
 
 	// Suspended runners already had network released during pause; only clean up overlay/files
-	if runner.State == StateSuspended {
-		if runner.RootfsOverlay != "" {
-			os.Remove(runner.RootfsOverlay)
+	if wasSuspended {
+		if overlayPath != "" {
+			os.Remove(overlayPath)
 		}
 		os.Remove(filepath.Join(m.config.SocketDir, runnerID+".sock"))
 	} else {
-		m.cleanupRunner(runnerID, runner.TapDevice, runner.RootfsOverlay)
+		// Release network namespace, slot mappings were already cleaned above.
+		if m.netnsNetwork != nil {
+			m.netnsNetwork.ReleaseNamespace(runnerID)
+		}
+		if overlayPath != "" {
+			os.Remove(overlayPath)
+		}
+		os.Remove(filepath.Join(m.config.SocketDir, runnerID+".sock"))
 	}
 
 	// Clean up session snapshot files if this runner had a session
-	if runner.SessionID != "" {
-		sessionDir := filepath.Join(m.sessionBaseDir(), runner.SessionID)
+	if sessionID != "" {
+		sessionDir := filepath.Join(m.sessionBaseDir(), sessionID)
 		if err := os.RemoveAll(sessionDir); err != nil {
-			m.logger.WithError(err).WithField("session_id", runner.SessionID).Warn("Failed to clean up session dir")
+			m.logger.WithError(err).WithField("session_id", sessionID).Warn("Failed to clean up session dir")
 		}
 	}
-
-	delete(m.runners, runnerID)
 
 	return nil
 }
@@ -858,31 +1000,27 @@ func (m *Manager) buildDrives(extensionDrivePaths map[string]string) []firecrack
 	return drives
 }
 
-// snapshotSymlinkDir is the directory where symlinks are created to match the
-// snapshot-builder's output paths baked into the snapshot state file.
-// Must match snapshot-builder's --output-dir flag (default: /tmp/snapshot).
-const snapshotSymlinkDir = "/tmp/snapshot"
-
-// to the actual host paths. Firecracker validates (opens) drive backing files during
-// LoadSnapshot at the paths recorded in the snapshot state. Since the snapshot was
-// built with drives at /tmp/snapshot/*.img but the host has them at different locations,
-// symlinks bridge the gap.
+// setupSnapshotSymlinks creates a per-runner directory with symlinks that map
+// snapshot-builder output paths to the actual host paths. Firecracker validates
+// (opens) drive backing files during LoadSnapshot at the paths recorded in the
+// snapshot state. Since the snapshot was built with drives at /tmp/snapshot/*.img
+// but the host has them at different locations, symlinks bridge the gap.
 //
-// This function must be called while m.mu is held (the caller holds it),
-// which serializes access to the shared /tmp/snapshot/ directory.
+// Each runner gets its own directory (/tmp/snapshot-{runnerID}/) to avoid
+// contention between concurrent restores. The directory is bind-mounted to
+// /tmp/snapshot inside Firecracker's private mount namespace.
 //
-// Returns a cleanup function that removes the symlinks. The cleanup should be
-// called after LoadSnapshot returns, as Firecracker holds open file descriptors
-// and no longer needs the symlink paths.
-func (m *Manager) setupSnapshotSymlinks(overlayPath string, extensionDrivePaths map[string]string) (func(), error) {
-	if err := os.MkdirAll(snapshotSymlinkDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create snapshot symlink dir: %w", err)
+// Returns the per-runner directory path and a cleanup function that removes it.
+func (m *Manager) setupSnapshotSymlinks(runnerID, overlayPath string, extensionDrivePaths map[string]string) (string, func(), error) {
+	perRunnerDir := fmt.Sprintf("/tmp/snapshot-%s", runnerID)
+	if err := os.MkdirAll(perRunnerDir, 0755); err != nil {
+		return "", nil, fmt.Errorf("failed to create per-runner snapshot dir: %w", err)
 	}
 
 	// Map snapshot filenames to actual host paths.
 	// These filenames must match what snapshot-builder creates in its output dir.
 	symlinks := []struct {
-		name   string // filename in /tmp/snapshot/
+		name   string // filename in per-runner dir
 		target string // actual path on host
 	}{
 		{"rootfs.img", overlayPath},
@@ -899,7 +1037,7 @@ func (m *Manager) setupSnapshotSymlinks(overlayPath string, extensionDrivePaths 
 		if s.target == "" {
 			continue
 		}
-		linkPath := filepath.Join(snapshotSymlinkDir, s.name)
+		linkPath := filepath.Join(perRunnerDir, s.name)
 		// Remove any existing file/symlink at the path
 		os.Remove(linkPath)
 		if err := os.Symlink(s.target, linkPath); err != nil {
@@ -907,7 +1045,8 @@ func (m *Manager) setupSnapshotSymlinks(overlayPath string, extensionDrivePaths 
 			for _, c := range created {
 				os.Remove(c)
 			}
-			return nil, fmt.Errorf("symlink %s -> %s: %w", linkPath, s.target, err)
+			os.RemoveAll(perRunnerDir)
+			return "", nil, fmt.Errorf("symlink %s -> %s: %w", linkPath, s.target, err)
 		}
 		created = append(created, linkPath)
 		m.logger.WithFields(logrus.Fields{
@@ -917,11 +1056,9 @@ func (m *Manager) setupSnapshotSymlinks(overlayPath string, extensionDrivePaths 
 	}
 
 	cleanup := func() {
-		for _, c := range created {
-			os.Remove(c)
-		}
+		os.RemoveAll(perRunnerDir)
 	}
-	return cleanup, nil
+	return perRunnerDir, cleanup, nil
 }
 
 // GetRunner returns a runner by ID

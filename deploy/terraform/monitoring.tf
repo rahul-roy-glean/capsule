@@ -1,8 +1,15 @@
 # GCP Cloud Monitoring configuration for Firecracker runners
 # This creates dashboards and alerting policies
+#
+# Metrics are emitted via OTel and exported to GCP Cloud Monitoring
+# by the googlecloud exporter in the OTel Collector sidecar.
+# They appear under the workload.googleapis.com/ prefix with dot-separated names.
 
 locals {
-  metric_prefix = "custom.googleapis.com/firecracker"
+  metric_prefix = "workload.googleapis.com"
+  # Service names used in metric.label.service_name filters
+  cp_service  = "control-plane"
+  mgr_service = "firecracker-manager"
 }
 
 # Dashboard for Firecracker Runner Overview
@@ -21,14 +28,15 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
           width  = 3
           height = 2
           widget = {
-            title = "Active Hosts"
+            title = "Ready Hosts"
             scorecard = {
               timeSeriesQuery = {
                 timeSeriesFilter = {
-                  filter = "metric.type=\"${local.metric_prefix}/control_plane/hosts_total\" resource.type=\"global\""
+                  filter = "metric.type=\"${local.metric_prefix}/control_plane.hosts.ready\" AND metric.label.service_name=\"${local.cp_service}\""
                   aggregation = {
-                    alignmentPeriod  = "60s"
-                    perSeriesAligner = "ALIGN_MEAN"
+                    alignmentPeriod    = "60s"
+                    perSeriesAligner   = "ALIGN_MAX"
+                    crossSeriesReducer = "REDUCE_SUM"
                   }
                 }
               }
@@ -40,14 +48,15 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
           width  = 3
           height = 2
           widget = {
-            title = "Active Runners"
+            title = "Total Runners"
             scorecard = {
               timeSeriesQuery = {
                 timeSeriesFilter = {
-                  filter = "metric.type=\"${local.metric_prefix}/control_plane/runners_total\" resource.type=\"global\""
+                  filter = "metric.type=\"${local.metric_prefix}/control_plane.runners.total\" AND metric.label.service_name=\"${local.cp_service}\""
                   aggregation = {
-                    alignmentPeriod  = "60s"
-                    perSeriesAligner = "ALIGN_MEAN"
+                    alignmentPeriod    = "60s"
+                    perSeriesAligner   = "ALIGN_MAX"
+                    crossSeriesReducer = "REDUCE_SUM"
                   }
                 }
               }
@@ -63,10 +72,11 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
             scorecard = {
               timeSeriesQuery = {
                 timeSeriesFilter = {
-                  filter = "metric.type=\"${local.metric_prefix}/control_plane/queue_depth\" resource.type=\"global\""
+                  filter = "metric.type=\"${local.metric_prefix}/control_plane.queue.depth\" AND metric.label.service_name=\"${local.cp_service}\""
                   aggregation = {
-                    alignmentPeriod  = "60s"
-                    perSeriesAligner = "ALIGN_MEAN"
+                    alignmentPeriod    = "60s"
+                    perSeriesAligner   = "ALIGN_MAX"
+                    crossSeriesReducer = "REDUCE_SUM"
                   }
                 }
               }
@@ -78,21 +88,22 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
           width  = 3
           height = 2
           widget = {
-            title = "Snapshot Age (hours)"
+            title = "Snapshot Age"
             scorecard = {
               timeSeriesQuery = {
                 timeSeriesFilter = {
-                  filter = "metric.type=\"${local.metric_prefix}/snapshot/age_seconds\" resource.type=\"global\""
+                  filter = "metric.type=\"${local.metric_prefix}/snapshot.age\" AND metric.label.service_name=\"${local.cp_service}\""
                   aggregation = {
-                    alignmentPeriod  = "60s"
-                    perSeriesAligner = "ALIGN_MEAN"
+                    alignmentPeriod    = "300s"
+                    perSeriesAligner   = "ALIGN_MAX"
+                    crossSeriesReducer = "REDUCE_MAX"
                   }
                 }
               }
             }
           }
         },
-        # Row 2: VM Boot Time (from host-side allocation timer)
+        # Row 2: VM Boot Time (host-side histogram, needs ALIGN_DELTA for cumulative distribution)
         {
           yPos   = 2
           width  = 6
@@ -104,8 +115,13 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/vm/boot_duration_seconds\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/vm.boot.duration\" AND metric.label.service_name=\"${local.mgr_service}\""
                       aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                      secondaryAggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_PERCENTILE_50"
                         crossSeriesReducer = "REDUCE_MEAN"
@@ -117,8 +133,13 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/vm/boot_duration_seconds\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/vm.boot.duration\" AND metric.label.service_name=\"${local.mgr_service}\""
                       aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                      secondaryAggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_PERCENTILE_95"
                         crossSeriesReducer = "REDUCE_MEAN"
@@ -130,8 +151,13 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/vm/boot_duration_seconds\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/vm.boot.duration\" AND metric.label.service_name=\"${local.mgr_service}\""
                       aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                      secondaryAggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_PERCENTILE_99"
                         crossSeriesReducer = "REDUCE_MEAN"
@@ -160,7 +186,7 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/vm/allocations_total\" resource.type=\"gce_instance\" metric.label.result=\"success\""
+                      filter = "metric.type=\"${local.metric_prefix}/vm.allocations\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.result=\"success\""
                       aggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_DELTA"
@@ -173,7 +199,7 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/vm/allocations_total\" resource.type=\"gce_instance\" metric.label.result=\"failure\""
+                      filter = "metric.type=\"${local.metric_prefix}/vm.allocations\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.result=\"failure\""
                       aggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_DELTA"
@@ -196,81 +222,99 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
           width  = 6
           height = 4
           widget = {
-            title = "Host Slot Utilization"
+            title = "Runners By State (Fleet)"
             xyChart = {
               dataSets = [
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/host/slots_used\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/control_plane.runners.idle\" AND metric.label.service_name=\"${local.cp_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
-                        perSeriesAligner   = "ALIGN_MEAN"
+                        perSeriesAligner   = "ALIGN_MAX"
                         crossSeriesReducer = "REDUCE_SUM"
                       }
                     }
                   }
-                  legendTemplate = "Used Slots"
+                  legendTemplate = "Idle"
+                  plotType       = "STACKED_AREA"
                 },
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/host/slots_total\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/control_plane.runners.busy\" AND metric.label.service_name=\"${local.cp_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
-                        perSeriesAligner   = "ALIGN_MEAN"
+                        perSeriesAligner   = "ALIGN_MAX"
                         crossSeriesReducer = "REDUCE_SUM"
                       }
                     }
                   }
-                  legendTemplate = "Total Slots"
+                  legendTemplate = "Busy"
+                  plotType       = "STACKED_AREA"
                 }
               ]
               yAxis = {
-                label = "slots"
+                label = "runners"
               }
             }
           }
         },
-        # Runner States
+        # Hosts By Status
         {
           yPos   = 6
           xPos   = 6
           width  = 6
           height = 4
           widget = {
-            title = "Runner States"
+            title = "Hosts By Status"
             xyChart = {
               dataSets = [
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/host/runners_idle\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/control_plane.hosts.ready\" AND metric.label.service_name=\"${local.cp_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
-                        perSeriesAligner   = "ALIGN_MEAN"
+                        perSeriesAligner   = "ALIGN_MAX"
                         crossSeriesReducer = "REDUCE_SUM"
                       }
                     }
                   }
-                  legendTemplate = "Idle"
+                  legendTemplate = "Ready"
+                  plotType       = "STACKED_AREA"
                 },
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/host/runners_busy\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/control_plane.hosts.draining\" AND metric.label.service_name=\"${local.cp_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
-                        perSeriesAligner   = "ALIGN_MEAN"
+                        perSeriesAligner   = "ALIGN_MAX"
                         crossSeriesReducer = "REDUCE_SUM"
                       }
                     }
                   }
-                  legendTemplate = "Busy"
+                  legendTemplate = "Draining"
+                  plotType       = "STACKED_AREA"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/control_plane.hosts.unhealthy\" AND metric.label.service_name=\"${local.cp_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Unhealthy"
+                  plotType       = "STACKED_AREA"
                 }
               ]
               yAxis = {
-                label = "runners"
+                label = "hosts"
               }
             }
           }
@@ -286,7 +330,7 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
               dataSets = [{
                 timeSeriesQuery = {
                   timeSeriesFilter = {
-                    filter = "metric.type=\"${local.metric_prefix}/chunked/cache_hit_ratio\" resource.type=\"gce_instance\""
+                    filter = "metric.type=\"${local.metric_prefix}/chunked.cache_hit_ratio\" AND metric.label.service_name=\"${local.mgr_service}\""
                     aggregation = {
                       alignmentPeriod    = "60s"
                       perSeriesAligner   = "ALIGN_MEAN"
@@ -314,7 +358,7 @@ resource "google_monitoring_dashboard" "firecracker_overview" {
               dataSets = [{
                 timeSeriesQuery = {
                   timeSeriesFilter = {
-                    filter = "metric.type=\"${local.metric_prefix}/pool/hit_ratio\" resource.type=\"gce_instance\""
+                    filter = "metric.type=\"${local.metric_prefix}/pool.hit_ratio\" AND metric.label.service_name=\"${local.mgr_service}\""
                     aggregation = {
                       alignmentPeriod    = "60s"
                       perSeriesAligner   = "ALIGN_MEAN"
@@ -421,10 +465,15 @@ resource "google_monitoring_alert_policy" "vm_boot_slow" {
   conditions {
     display_name = "VM boot p95 above threshold"
     condition_threshold {
-      filter          = "metric.type=\"${local.metric_prefix}/vm/boot_duration_seconds\" resource.type=\"gce_instance\""
+      filter          = "metric.type=\"${local.metric_prefix}/vm.boot.duration\" AND metric.label.service_name=\"${local.mgr_service}\""
       comparison      = "COMPARISON_GT"
       threshold_value = var.alert_vm_boot_threshold_seconds
       duration        = "300s"
+      aggregations {
+        alignment_period     = "60s"
+        per_series_aligner   = "ALIGN_DELTA"
+        cross_series_reducer = "REDUCE_SUM"
+      }
       aggregations {
         alignment_period     = "60s"
         per_series_aligner   = "ALIGN_PERCENTILE_95"
@@ -454,13 +503,13 @@ resource "google_monitoring_alert_policy" "no_idle_runners" {
   conditions {
     display_name = "No idle runners for 5 minutes"
     condition_threshold {
-      filter          = "metric.type=\"${local.metric_prefix}/host/runners_idle\" resource.type=\"gce_instance\""
+      filter          = "metric.type=\"${local.metric_prefix}/control_plane.runners.idle\" AND metric.label.service_name=\"${local.cp_service}\""
       comparison      = "COMPARISON_LT"
       threshold_value = 1
       duration        = "300s"
       aggregations {
         alignment_period     = "60s"
-        per_series_aligner   = "ALIGN_MEAN"
+        per_series_aligner   = "ALIGN_MAX"
         cross_series_reducer = "REDUCE_SUM"
       }
     }
@@ -483,13 +532,14 @@ resource "google_monitoring_alert_policy" "high_queue_depth" {
   conditions {
     display_name = "Queue depth above threshold"
     condition_threshold {
-      filter          = "metric.type=\"${local.metric_prefix}/control_plane/queue_depth\" resource.type=\"global\""
+      filter          = "metric.type=\"${local.metric_prefix}/control_plane.queue.depth\" AND metric.label.service_name=\"${local.cp_service}\""
       comparison      = "COMPARISON_GT"
       threshold_value = var.alert_queue_depth_threshold
       duration        = "300s"
       aggregations {
-        alignment_period   = "60s"
-        per_series_aligner = "ALIGN_MEAN"
+        alignment_period     = "60s"
+        per_series_aligner   = "ALIGN_MAX"
+        cross_series_reducer = "REDUCE_SUM"
       }
     }
   }
@@ -511,13 +561,13 @@ resource "google_monitoring_alert_policy" "snapshot_stale" {
   conditions {
     display_name = "Snapshot age above threshold"
     condition_threshold {
-      filter          = "metric.type=\"${local.metric_prefix}/snapshot/age_seconds\" resource.type=\"global\""
+      filter          = "metric.type=\"${local.metric_prefix}/snapshot.age\" AND metric.label.service_name=\"${local.cp_service}\""
       comparison      = "COMPARISON_GT"
       threshold_value = var.alert_snapshot_age_threshold_hours * 3600
       duration        = "3600s"
       aggregations {
         alignment_period   = "300s"
-        per_series_aligner = "ALIGN_MEAN"
+        per_series_aligner = "ALIGN_MAX"
       }
     }
   }
@@ -539,12 +589,12 @@ resource "google_monitoring_alert_policy" "host_unhealthy" {
   conditions {
     display_name = "Host heartbeat missing"
     condition_absent {
-      filter   = "metric.type=\"${local.metric_prefix}/host/heartbeat_latency_seconds\" resource.type=\"gce_instance\""
+      filter   = "metric.type=\"${local.metric_prefix}/host.heartbeat.latency\" AND metric.label.service_name=\"${local.mgr_service}\""
       duration = "300s"
       aggregations {
         alignment_period   = "60s"
         per_series_aligner = "ALIGN_MEAN"
-        group_by_fields    = ["resource.label.instance_id"]
+        group_by_fields    = ["metric.label.host_id"]
       }
     }
   }
@@ -577,14 +627,15 @@ resource "google_monitoring_dashboard" "firecracker_operations" {
           width  = 6
           height = 4
           widget = {
-            title = "Active Hosts"
+            title = "Ready Hosts"
             scorecard = {
               timeSeriesQuery = {
                 timeSeriesFilter = {
-                  filter = "metric.type=\"${local.metric_prefix}/control_plane/hosts_total\" resource.type=\"global\""
+                  filter = "metric.type=\"${local.metric_prefix}/control_plane.hosts.ready\" AND metric.label.service_name=\"${local.cp_service}\""
                   aggregation = {
-                    alignmentPeriod  = "60s"
-                    perSeriesAligner = "ALIGN_MEAN"
+                    alignmentPeriod    = "60s"
+                    perSeriesAligner   = "ALIGN_MAX"
+                    crossSeriesReducer = "REDUCE_SUM"
                   }
                 }
               }
@@ -600,10 +651,11 @@ resource "google_monitoring_dashboard" "firecracker_operations" {
             scorecard = {
               timeSeriesQuery = {
                 timeSeriesFilter = {
-                  filter = "metric.type=\"${local.metric_prefix}/control_plane/runners_total\" resource.type=\"global\""
+                  filter = "metric.type=\"${local.metric_prefix}/control_plane.runners.total\" AND metric.label.service_name=\"${local.cp_service}\""
                   aggregation = {
-                    alignmentPeriod  = "60s"
-                    perSeriesAligner = "ALIGN_MEAN"
+                    alignmentPeriod    = "60s"
+                    perSeriesAligner   = "ALIGN_MAX"
+                    crossSeriesReducer = "REDUCE_SUM"
                   }
                 }
               }
@@ -622,8 +674,13 @@ resource "google_monitoring_dashboard" "firecracker_operations" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/vm/boot_duration_seconds\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/vm.boot.duration\" AND metric.label.service_name=\"${local.mgr_service}\""
                       aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                      secondaryAggregation = {
                         alignmentPeriod    = "300s"
                         perSeriesAligner   = "ALIGN_PERCENTILE_50"
                         crossSeriesReducer = "REDUCE_MEAN"
@@ -636,8 +693,13 @@ resource "google_monitoring_dashboard" "firecracker_operations" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/vm/boot_duration_seconds\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/vm.boot.duration\" AND metric.label.service_name=\"${local.mgr_service}\""
                       aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                      secondaryAggregation = {
                         alignmentPeriod    = "300s"
                         perSeriesAligner   = "ALIGN_PERCENTILE_95"
                         crossSeriesReducer = "REDUCE_MEAN"
@@ -665,10 +727,10 @@ resource "google_monitoring_dashboard" "firecracker_operations" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/host/runners_idle\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/control_plane.runners.idle\" AND metric.label.service_name=\"${local.cp_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
-                        perSeriesAligner   = "ALIGN_MEAN"
+                        perSeriesAligner   = "ALIGN_MAX"
                         crossSeriesReducer = "REDUCE_SUM"
                       }
                     }
@@ -679,10 +741,10 @@ resource "google_monitoring_dashboard" "firecracker_operations" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/host/runners_busy\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/control_plane.runners.busy\" AND metric.label.service_name=\"${local.cp_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
-                        perSeriesAligner   = "ALIGN_MEAN"
+                        perSeriesAligner   = "ALIGN_MAX"
                         crossSeriesReducer = "REDUCE_SUM"
                       }
                     }
@@ -706,10 +768,11 @@ resource "google_monitoring_dashboard" "firecracker_operations" {
               dataSets = [{
                 timeSeriesQuery = {
                   timeSeriesFilter = {
-                    filter = "metric.type=\"${local.metric_prefix}/snapshot/age_seconds\" resource.type=\"global\""
+                    filter = "metric.type=\"${local.metric_prefix}/snapshot.age\" AND metric.label.service_name=\"${local.cp_service}\""
                     aggregation = {
-                      alignmentPeriod  = "300s"
-                      perSeriesAligner = "ALIGN_MEAN"
+                      alignmentPeriod    = "300s"
+                      perSeriesAligner   = "ALIGN_MAX"
+                      crossSeriesReducer = "REDUCE_MAX"
                     }
                   }
                 }
@@ -733,7 +796,7 @@ resource "google_monitoring_dashboard" "firecracker_operations" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/vm/allocations_total\" resource.type=\"gce_instance\" metric.label.result=\"success\""
+                      filter = "metric.type=\"${local.metric_prefix}/vm.allocations\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.result=\"success\""
                       aggregation = {
                         alignmentPeriod    = "300s"
                         perSeriesAligner   = "ALIGN_DELTA"
@@ -747,7 +810,7 @@ resource "google_monitoring_dashboard" "firecracker_operations" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/vm/allocations_total\" resource.type=\"gce_instance\" metric.label.result=\"failure\""
+                      filter = "metric.type=\"${local.metric_prefix}/vm.allocations\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.result=\"failure\""
                       aggregation = {
                         alignmentPeriod    = "300s"
                         perSeriesAligner   = "ALIGN_DELTA"
@@ -792,10 +855,11 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
             scorecard = {
               timeSeriesQuery = {
                 timeSeriesFilter = {
-                  filter = "metric.type=\"${local.metric_prefix}/chunked/cache_hit_ratio\" resource.type=\"gce_instance\""
+                  filter = "metric.type=\"${local.metric_prefix}/chunked.cache_hit_ratio\" AND metric.label.service_name=\"${local.mgr_service}\""
                   aggregation = {
-                    alignmentPeriod  = "60s"
-                    perSeriesAligner = "ALIGN_MEAN"
+                    alignmentPeriod    = "60s"
+                    perSeriesAligner   = "ALIGN_MEAN"
+                    crossSeriesReducer = "REDUCE_MEAN"
                   }
                 }
               }
@@ -807,14 +871,14 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
           width  = 3
           height = 2
           widget = {
-            title = "Page Faults Total"
+            title = "Disk Cache Used"
             scorecard = {
               timeSeriesQuery = {
                 timeSeriesFilter = {
-                  filter = "metric.type=\"${local.metric_prefix}/chunked/page_faults_total\" resource.type=\"gce_instance\""
+                  filter = "metric.type=\"${local.metric_prefix}/chunked.disk_cache.size\" AND metric.label.service_name=\"${local.mgr_service}\""
                   aggregation = {
                     alignmentPeriod    = "60s"
-                    perSeriesAligner   = "ALIGN_MEAN"
+                    perSeriesAligner   = "ALIGN_MAX"
                     crossSeriesReducer = "REDUCE_SUM"
                   }
                 }
@@ -831,10 +895,11 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
             scorecard = {
               timeSeriesQuery = {
                 timeSeriesFilter = {
-                  filter = "metric.type=\"${local.metric_prefix}/pool/hit_ratio\" resource.type=\"gce_instance\""
+                  filter = "metric.type=\"${local.metric_prefix}/pool.hit_ratio\" AND metric.label.service_name=\"${local.mgr_service}\""
                   aggregation = {
-                    alignmentPeriod  = "60s"
-                    perSeriesAligner = "ALIGN_MEAN"
+                    alignmentPeriod    = "60s"
+                    perSeriesAligner   = "ALIGN_MEAN"
+                    crossSeriesReducer = "REDUCE_MEAN"
                   }
                 }
               }
@@ -846,14 +911,14 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
           width  = 3
           height = 2
           widget = {
-            title = "Pooled Runners"
+            title = "Dirty Chunks"
             scorecard = {
               timeSeriesQuery = {
                 timeSeriesFilter = {
-                  filter = "metric.type=\"${local.metric_prefix}/pool/runners\" resource.type=\"gce_instance\""
+                  filter = "metric.type=\"${local.metric_prefix}/chunked.dirty_chunks\" AND metric.label.service_name=\"${local.mgr_service}\""
                   aggregation = {
                     alignmentPeriod    = "60s"
-                    perSeriesAligner   = "ALIGN_MEAN"
+                    perSeriesAligner   = "ALIGN_MAX"
                     crossSeriesReducer = "REDUCE_SUM"
                   }
                 }
@@ -872,7 +937,7 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
               dataSets = [{
                 timeSeriesQuery = {
                   timeSeriesFilter = {
-                    filter = "metric.type=\"${local.metric_prefix}/chunked/cache_hit_ratio\" resource.type=\"gce_instance\""
+                    filter = "metric.type=\"${local.metric_prefix}/chunked.cache_hit_ratio\" AND metric.label.service_name=\"${local.mgr_service}\""
                     aggregation = {
                       alignmentPeriod    = "60s"
                       perSeriesAligner   = "ALIGN_MEAN"
@@ -899,7 +964,7 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/chunked/page_faults_total\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/chunked.page_faults\" AND metric.label.service_name=\"${local.mgr_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_DELTA"
@@ -912,7 +977,7 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/chunked/chunk_fetches_total\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/chunked.chunk_fetches\" AND metric.label.service_name=\"${local.mgr_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_DELTA"
@@ -925,7 +990,7 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/chunked/cache_hits_total\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/chunked.cache_hits\" AND metric.label.service_name=\"${local.mgr_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_DELTA"
@@ -952,7 +1017,7 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/chunked/disk_reads_total\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/chunked.disk_reads\" AND metric.label.service_name=\"${local.mgr_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_DELTA"
@@ -965,7 +1030,7 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/chunked/disk_writes_total\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/chunked.disk_writes\" AND metric.label.service_name=\"${local.mgr_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_DELTA"
@@ -992,10 +1057,10 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/chunked/cache_size_bytes\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/chunked.disk_cache.size\" AND metric.label.service_name=\"${local.mgr_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
-                        perSeriesAligner   = "ALIGN_MEAN"
+                        perSeriesAligner   = "ALIGN_MAX"
                         crossSeriesReducer = "REDUCE_SUM"
                       }
                     }
@@ -1005,10 +1070,10 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/chunked/cache_max_size_bytes\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/chunked.disk_cache.max\" AND metric.label.service_name=\"${local.mgr_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
-                        perSeriesAligner   = "ALIGN_MEAN"
+                        perSeriesAligner   = "ALIGN_MAX"
                         crossSeriesReducer = "REDUCE_SUM"
                       }
                     }
@@ -1031,7 +1096,7 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
               dataSets = [{
                 timeSeriesQuery = {
                   timeSeriesFilter = {
-                    filter = "metric.type=\"${local.metric_prefix}/pool/hit_ratio\" resource.type=\"gce_instance\""
+                    filter = "metric.type=\"${local.metric_prefix}/pool.hit_ratio\" AND metric.label.service_name=\"${local.mgr_service}\""
                     aggregation = {
                       alignmentPeriod    = "60s"
                       perSeriesAligner   = "ALIGN_MEAN"
@@ -1058,7 +1123,7 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/pool/hits_total\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/pool.hits\" AND metric.label.service_name=\"${local.mgr_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_DELTA"
@@ -1071,7 +1136,7 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/pool/misses_total\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/pool.misses\" AND metric.label.service_name=\"${local.mgr_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_DELTA"
@@ -1084,7 +1149,7 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/pool/evictions_total\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/pool.evictions\" AND metric.label.service_name=\"${local.mgr_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_DELTA"
@@ -1097,7 +1162,7 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/pool/recycle_failures_total\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/pool.recycle_failures\" AND metric.label.service_name=\"${local.mgr_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_DELTA"
@@ -1124,10 +1189,10 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/pool/memory_used_bytes\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/pool.memory.used\" AND metric.label.service_name=\"${local.mgr_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
-                        perSeriesAligner   = "ALIGN_MEAN"
+                        perSeriesAligner   = "ALIGN_MAX"
                         crossSeriesReducer = "REDUCE_SUM"
                       }
                     }
@@ -1137,10 +1202,10 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/pool/memory_max_bytes\" resource.type=\"gce_instance\""
+                      filter = "metric.type=\"${local.metric_prefix}/pool.memory.max\" AND metric.label.service_name=\"${local.mgr_service}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
-                        perSeriesAligner   = "ALIGN_MEAN"
+                        perSeriesAligner   = "ALIGN_MAX"
                         crossSeriesReducer = "REDUCE_SUM"
                       }
                     }
@@ -1163,10 +1228,10 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
               dataSets = [{
                 timeSeriesQuery = {
                   timeSeriesFilter = {
-                    filter = "metric.type=\"${local.metric_prefix}/chunked/dirty_chunks\" resource.type=\"gce_instance\""
+                    filter = "metric.type=\"${local.metric_prefix}/chunked.dirty_chunks\" AND metric.label.service_name=\"${local.mgr_service}\""
                     aggregation = {
                       alignmentPeriod    = "60s"
-                      perSeriesAligner   = "ALIGN_MEAN"
+                      perSeriesAligner   = "ALIGN_MAX"
                       crossSeriesReducer = "REDUCE_SUM"
                     }
                   }
@@ -1192,7 +1257,7 @@ resource "google_monitoring_alert_policy" "chunk_cache_low_hit_ratio" {
   conditions {
     display_name = "Chunk cache hit ratio below 50%"
     condition_threshold {
-      filter          = "metric.type=\"${local.metric_prefix}/chunked/cache_hit_ratio\" resource.type=\"gce_instance\""
+      filter          = "metric.type=\"${local.metric_prefix}/chunked.cache_hit_ratio\" AND metric.label.service_name=\"${local.mgr_service}\""
       comparison      = "COMPARISON_LT"
       threshold_value = 0.5
       duration        = "300s"
@@ -1226,7 +1291,7 @@ resource "google_monitoring_alert_policy" "e2e_canary_failures" {
   conditions {
     display_name = "E2E canary failures > 3 in 1h"
     condition_threshold {
-      filter          = "metric.type=\"${local.metric_prefix}/e2e/canary_failure_total\" AND resource.type=\"global\""
+      filter          = "metric.type=\"${local.metric_prefix}/e2e.canary.failure\" AND metric.label.service_name=\"${local.cp_service}\""
       duration        = "3600s"
       comparison      = "COMPARISON_GT"
       threshold_value = 3
@@ -1330,4 +1395,3 @@ resource "google_logging_metric" "job_complete_from_logs" {
     }
   }
 }
-

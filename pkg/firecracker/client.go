@@ -20,13 +20,16 @@ import (
 
 // Client provides an interface to the Firecracker API
 type Client struct {
-	socketPath string
-	httpClient *http.Client
-	vmID       string
-	netNSPath  string // Network namespace path; if set, Firecracker runs inside this namespace
-	process    *exec.Cmd
-	mu         sync.Mutex
-	logger     *logrus.Entry
+	socketPath  string
+	httpClient  *http.Client
+	vmID        string
+	netNSPath   string // Network namespace path; if set, Firecracker runs inside this namespace
+	snapshotDir string // Per-runner snapshot symlink dir; bind-mounted to /tmp/snapshot in private mount ns
+	process     *exec.Cmd
+	procExited  chan struct{} // closed when process exits; set by StartFirecracker
+	procExitErr error        // set before procExited is closed
+	mu          sync.Mutex
+	logger      *logrus.Entry
 }
 
 // Config for creating a new Firecracker client
@@ -37,6 +40,7 @@ type Config struct {
 	JailerBin      string
 	UseJailer      bool
 	NetNSPath      string // Network namespace path (e.g., /var/run/netns/fc-xxxx)
+	SnapshotDir    string // Per-runner snapshot symlink dir; bind-mounted to /tmp/snapshot
 	Logger         *logrus.Logger
 }
 
@@ -54,10 +58,11 @@ func NewClient(cfg Config) *Client {
 	}
 
 	return &Client{
-		socketPath: cfg.SocketPath,
-		vmID:       cfg.VMID,
-		netNSPath:  cfg.NetNSPath,
-		httpClient: &http.Client{
+		socketPath:  cfg.SocketPath,
+		vmID:        cfg.VMID,
+		netNSPath:   cfg.NetNSPath,
+		snapshotDir: cfg.SnapshotDir,
+		httpClient:  &http.Client{
 			Transport: transport,
 			Timeout:   10 * time.Minute, // Snapshot creation can take minutes for large memory VMs on standard disks
 		},
@@ -324,11 +329,23 @@ func (c *Client) LoadSnapshot(ctx context.Context, params SnapshotLoadParams) er
 
 // WaitForSocket waits for the Firecracker socket to become available
 func (c *Client) WaitForSocket(ctx context.Context, timeout time.Duration) error {
+	return c.waitForSocketOrExit(ctx, timeout, nil)
+}
+
+// waitForSocketOrExit waits for the Firecracker socket to become available.
+// If procExited is non-nil, it also monitors for early process exit and returns
+// immediately if the process dies before the socket appears.
+func (c *Client) waitForSocketOrExit(ctx context.Context, timeout time.Duration, procExited <-chan struct{}) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-procExited:
+			if c.procExitErr != nil {
+				return fmt.Errorf("firecracker process exited early: %w", c.procExitErr)
+			}
+			return fmt.Errorf("firecracker process exited unexpectedly with status 0")
 		default:
 		}
 
@@ -371,7 +388,21 @@ func (c *Client) StartFirecracker(ctx context.Context, firecrackerBin string, co
 	// The Firecracker process should outlive the gRPC request that started it.
 	// Using the request context would kill the VM when the gRPC response is sent.
 	var cmd *exec.Cmd
-	if c.netNSPath != "" {
+	if c.netNSPath != "" && c.snapshotDir != "" {
+		// Launch Firecracker with a private mount namespace so we can
+		// bind-mount the per-runner snapshot dir to /tmp/snapshot without
+		// contention. The `exec` ensures the final PID is Firecracker
+		// itself, so SIGTERM/process management works unchanged.
+		nsName := filepath.Base(c.netNSPath)
+		shellCmd := fmt.Sprintf("mkdir -p /tmp/snapshot && mount --bind %s /tmp/snapshot && exec ip netns exec %s %s --api-sock %s --id %s",
+			c.snapshotDir, nsName, firecrackerBin, c.socketPath, c.vmID)
+		cmd = exec.Command("unshare", "--mount", "--propagation", "private",
+			"sh", "-c", shellCmd)
+		c.logger.WithFields(logrus.Fields{
+			"netns":        nsName,
+			"snapshot_dir": c.snapshotDir,
+		}).Info("Launching Firecracker with private mount namespace")
+	} else if c.netNSPath != "" {
 		// Launch Firecracker inside the VM's network namespace so it can
 		// open the TAP device (tap-slot-0) that exists only in that namespace.
 		nsName := filepath.Base(c.netNSPath)
@@ -410,10 +441,19 @@ func (c *Client) StartFirecracker(ctx context.Context, firecrackerBin string, co
 	}
 
 	c.process = cmd
+	c.procExited = make(chan struct{})
 
-	// Wait for socket to be ready
-	if err := c.WaitForSocket(ctx, 10*time.Second); err != nil {
-		c.StopFirecracker()
+	// Monitor for process exit in a single goroutine. This is the only place
+	// cmd.Wait() is called; StopFirecracker uses this channel instead.
+	go func() {
+		c.procExitErr = cmd.Wait()
+		close(c.procExited)
+	}()
+
+	// Wait for socket to be ready, but also detect early process death
+	// (e.g., mount --bind failure in unshare shell).
+	if err := c.waitForSocketOrExit(ctx, 10*time.Second, c.procExited); err != nil {
+		c.stopFirecrackerLocked()
 		return fmt.Errorf("firecracker socket not ready: %w", err)
 	}
 
@@ -424,7 +464,11 @@ func (c *Client) StartFirecracker(ctx context.Context, firecrackerBin string, co
 func (c *Client) StopFirecracker() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.stopFirecrackerLocked()
+}
 
+// stopFirecrackerLocked stops the Firecracker process. Caller must hold c.mu.
+func (c *Client) stopFirecrackerLocked() error {
 	if c.process == nil {
 		return nil
 	}
@@ -436,20 +480,16 @@ func (c *Client) StopFirecracker() error {
 		c.logger.WithError(err).Warn("Failed to send SIGTERM")
 	}
 
-	// Wait briefly for graceful shutdown
-	done := make(chan error, 1)
-	go func() {
-		done <- c.process.Wait()
-	}()
-
+	// Wait briefly for graceful shutdown. The procExited channel is closed by
+	// the single Wait goroutine started in StartFirecracker.
 	select {
-	case <-done:
+	case <-c.procExited:
 		// Process exited
 	case <-time.After(5 * time.Second):
 		// Force kill
 		c.logger.Warn("Forcing kill of Firecracker process")
 		c.process.Process.Kill()
-		<-done
+		<-c.procExited
 	}
 
 	c.process = nil

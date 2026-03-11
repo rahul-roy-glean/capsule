@@ -1247,7 +1247,11 @@ def suite_concurrency(
     # We release up to `slots_needed` idle runners whose workload matches.
     # ------------------------------------------------------------------
     def _free_slots(slots_needed: int) -> list[str]:
-        """Release up to `slots_needed` idle runners and return their IDs."""
+        """Release up to `slots_needed` runners with our workload key.
+
+        Releases runners in any state (not just idle) to reclaim slots
+        leaked by prior scenarios where threads outlived join_timeout.
+        """
         _c = _make_client(base_url, token)
         try:
             runners = _c.runners.list()
@@ -1256,10 +1260,11 @@ def suite_concurrency(
         finally:
             _c.close()
 
-        idle = [r["runner_id"] for r in runners
-                if r.get("status") == "idle"
-                and r.get("workload_key") == leaf_workload_key]
-        to_free = idle[:slots_needed]
+        # Release any runner with our workload key, regardless of status,
+        # to clean up leaks from prior scenarios.
+        ours = [r["runner_id"] for r in runners
+                if r.get("workload_key") == leaf_workload_key]
+        to_free = ours[:slots_needed]
         freed: list[str] = []
         for rid in to_free:
             try:
@@ -1270,7 +1275,7 @@ def suite_concurrency(
             except Exception:  # noqa: BLE001
                 pass
         if freed:
-            log.info("Released idle runners to free CPU slots",
+            log.info("Released runners to free CPU slots",
                      extra={"freed": len(freed), "runner_ids": freed})
         return freed
 
@@ -1287,6 +1292,10 @@ def suite_concurrency(
         """
         Returns list of (passed, detail, did_real_work) per worker.
         worker_fn must return (passed: bool, detail: str, real: bool).
+
+        Workers MUST release any allocated runners in their own finally
+        block rather than relying on post-hoc cleanup loops. This avoids
+        leaking runners when a thread finishes after join_timeout expires.
         """
         barrier = Barrier(n)
         results: list[tuple[bool, str, bool]] = []
@@ -1298,11 +1307,27 @@ def suite_concurrency(
                 ok, detail, real = False, f"{type(exc).__name__}: {exc}", False
             results.append((ok, detail, real))
 
-        threads = [Thread(target=_wrap, args=(i,), name=f"{name}-{i}") for i in range(n)]
+        threads = [Thread(target=_wrap, args=(i,), name=f"{name}-{i}",
+                          daemon=True) for i in range(n)]
         for t in threads:
             t.start()
         for t in threads:
             t.join(timeout=join_timeout)
+
+        # Give straggler threads a short grace period to finish their
+        # cleanup (e.g. releasing allocated runners in their finally
+        # blocks) before we pad the results with timeout entries.
+        still_alive = [t for t in threads if t.is_alive()]
+        if still_alive:
+            log.warning("Waiting for straggler threads to finish cleanup",
+                        extra={"name": name, "alive": len(still_alive)})
+            grace = min(30, join_timeout // 4)
+            for t in still_alive:
+                t.join(timeout=grace)
+            final_alive = sum(1 for t in threads if t.is_alive())
+            if final_alive:
+                log.warning("Straggler threads still alive after grace period",
+                            extra={"name": name, "alive": final_alive})
 
         while len(results) < n:
             results.append((False, f"worker timed out after {join_timeout}s", False))
@@ -1407,10 +1432,10 @@ def suite_concurrency(
     log.info("Starting test", extra={"suite": SUITE, "test": "Parallel allocate burst"})
     _free_slots(width)
     allocated_ids: list[str] = []
-    to_release_after: list[str] = []
 
     def _alloc_worker(wid: int, barrier: Barrier) -> tuple[bool, str, bool]:
         client = _make_client(base_url, token)
+        runner_id: str | None = None
         try:
             barrier.wait()
             t0 = time.monotonic()
@@ -1419,8 +1444,8 @@ def suite_concurrency(
                 request_id=f"e2e-burst-{uuid.uuid4().hex[:12]}",
             )
             _alloc_latencies.append(("allocate_burst", time.monotonic() - t0))
+            runner_id = resp.runner_id
             allocated_ids.append(resp.runner_id)
-            to_release_after.append(resp.runner_id)
             return True, resp.runner_id, True
         except (BFServiceUnavailable, BFRateLimited) as exc:
             if _is_capacity_error(str(exc)):
@@ -1429,6 +1454,11 @@ def suite_concurrency(
         except Exception as exc:  # noqa: BLE001
             return False, str(exc), False
         finally:
+            if runner_id:
+                try:
+                    client.runners.release(runner_id)
+                except Exception:  # noqa: BLE001
+                    pass
             client.close()
 
     burst_results = _run_workers("alloc_burst", _alloc_worker)
@@ -1438,14 +1468,6 @@ def suite_concurrency(
         burst_results.append((False, f"Duplicate runner_ids returned: {dupes}", True))
     log.info("Burst allocate runner IDs", extra={"runner_ids": allocated_ids})
     _assert_workers("Parallel allocate burst — no 500s, unique runner_ids", burst_results)
-
-    for rid in to_release_after:
-        try:
-            _cr = _make_client(base_url, token)
-            _cr.runners.release(rid)
-            _cr.close()
-        except Exception:  # noqa: BLE001
-            pass
 
     # ---------------------------------------------------------------
     # Scenario 2: Concurrent full lifecycle (allocate → status → release)
@@ -1627,9 +1649,11 @@ def suite_concurrency(
 
     def _dedup_worker(wid: int, barrier: Barrier) -> tuple[bool, str, bool]:
         client = _make_client(base_url, token)
+        runner_id: str | None = None
         try:
             barrier.wait()
             resp = client.runners.allocate(leaf_workload_key, request_id=dedup_request_id)
+            runner_id = resp.runner_id
             dedup_runner_ids.append(resp.runner_id)
             return True, resp.runner_id, True
         except (BFServiceUnavailable, BFRateLimited) as exc:
@@ -1644,6 +1668,11 @@ def suite_concurrency(
         except Exception as exc:  # noqa: BLE001
             return False, str(exc), True
         finally:
+            if runner_id:
+                try:
+                    client.runners.release(runner_id)
+                except Exception:  # noqa: BLE001
+                    pass
             client.close()
 
     dedup_results = _run_workers("dedup_race", _dedup_worker, n=2)
@@ -1654,13 +1683,6 @@ def suite_concurrency(
     log.info("Dedup race runner IDs", extra={"runner_ids": dedup_runner_ids})
     _assert_workers("Duplicate request_id deduplication under concurrency", dedup_results,
                     min_real=1)
-    for rid in set(real_ids):
-        try:
-            _cd = _make_client(base_url, token)
-            _cd.runners.release(rid)
-            _cd.close()
-        except Exception:  # noqa: BLE001
-            pass
 
     # ---------------------------------------------------------------
     # Scenario 6: Simultaneous release race
@@ -1828,9 +1850,11 @@ def suite_concurrency(
                 # Build a shell script where all dd writes run in parallel
                 # (backgrounded with &), then wait + sync before returning.
                 bg_cmds: list[str] = []
+                cycle_data_kb = 0
                 for w in range(num_writes):
                     offset_mb = rng.randint(0, MAX_OFFSET_MB)
                     size_kb = rng.randint(WRITE_SIZE_MIN_KB, WRITE_SIZE_MAX_KB)
+                    cycle_data_kb += size_kb
                     # Use /dev/urandom so each write produces unique data,
                     # ensuring the chunk hash actually changes.
                     bg_cmds.append(
@@ -1842,6 +1866,7 @@ def suite_concurrency(
                 # contention within a single file across cycles.
                 shared_offset_kb = rng.randint(0, MAX_OFFSET_MB * 1024)
                 shared_size_kb = rng.randint(WRITE_SIZE_MIN_KB, WRITE_SIZE_MAX_KB)
+                cycle_data_kb += shared_size_kb
                 bg_cmds.append(
                     f"dd if=/dev/urandom of=/workspace/.shared-dirty-{wid} "
                     f"bs=1K count={shared_size_kb} seek={shared_offset_kb} "
@@ -1870,6 +1895,7 @@ def suite_concurrency(
                 log.debug("Exec dirty writes done", extra={
                     "worker": wid, "cycle": cycle,
                     "num_writes": num_writes + 1,  # +1 for shared file
+                    "data_written_kb": cycle_data_kb,
                     "runner_id": runner_id,
                     "exec_ms": round(exec_dur * 1000),
                 })
@@ -1949,6 +1975,8 @@ def suite_concurrency(
 
                 cycle_timings.append({
                     "cycle": cycle,
+                    "writes": num_writes + 1,
+                    "data_kb": cycle_data_kb,
                     "exec_ms": round(exec_dur * 1000),
                     "pause_ms": round(pause_dur * 1000),
                     "resume_ms": round(resume_dur * 1000),
@@ -1995,7 +2023,8 @@ def suite_concurrency(
             client.close()
 
     dirty_results = _run_workers(
-        "exec_dirty_cycles", _exec_dirty_worker, join_timeout=600,
+        "exec_dirty_cycles", _exec_dirty_worker,
+        join_timeout=600,
     )
     _assert_workers(SCENARIO_8, dirty_results)
 

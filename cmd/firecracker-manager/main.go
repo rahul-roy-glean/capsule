@@ -1129,8 +1129,11 @@ func handleExecCommand(w http.ResponseWriter, r *http.Request, mgr *runner.Manag
 	}).Debug("Proxying exec request to thaw-agent")
 
 	// Track active execs for TTL enforcement
-	mgr.IncrementActiveExecs(runnerID)
-	defer mgr.DecrementActiveExecs(runnerID)
+	if err := mgr.TryAcquireExec(runnerID); err != nil {
+		http.Error(w, "runner unavailable: "+err.Error(), http.StatusConflict)
+		return
+	}
+	defer mgr.ReleaseExec(runnerID)
 
 	// Forward the request to thaw-agent
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, r.Body)
@@ -1202,8 +1205,11 @@ func handlePTYProxy(w http.ResponseWriter, r *http.Request, mgr *runner.Manager,
 	}
 
 	// Track active execs for TTL enforcement
-	mgr.IncrementActiveExecs(runnerID)
-	defer mgr.DecrementActiveExecs(runnerID)
+	if err := mgr.TryAcquireExec(runnerID); err != nil {
+		http.Error(w, "runner unavailable: "+err.Error(), http.StatusConflict)
+		return
+	}
+	defer mgr.ReleaseExec(runnerID)
 
 	// Build backend WebSocket URL (thaw-agent debug port)
 	backendURL := fmt.Sprintf("ws://%s:%d/pty?%s", rn.InternalIP.String(), snapshot.ThawAgentDebugPort, r.URL.RawQuery)
@@ -1325,8 +1331,11 @@ func handleFileOp(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, l
 		"target":    targetURL,
 	}).Debug("Proxying file op request to thaw-agent")
 
-	mgr.IncrementActiveExecs(runnerID)
-	defer mgr.DecrementActiveExecs(runnerID)
+	if err := mgr.TryAcquireExec(runnerID); err != nil {
+		http.Error(w, "runner unavailable: "+err.Error(), http.StatusConflict)
+		return
+	}
+	defer mgr.ReleaseExec(runnerID)
 
 	method := r.Method
 	var body io.Reader

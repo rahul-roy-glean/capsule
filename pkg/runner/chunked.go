@@ -11,11 +11,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
@@ -58,15 +58,13 @@ type ChunkedManager struct {
 	// readyTimeout is the max wait time for thaw-agent health check
 	readyTimeout time.Duration
 
-	// snapshotRestoreMu serializes access to the shared /tmp/snapshot symlink
-	// namespace during Firecracker restore.
-	snapshotRestoreMu sync.Mutex
-	// cachePopulateMu serializes population of shared local cache files such as
-	// kernel.bin and per-workload snapshot.mem files.
-	cachePopulateMu sync.Mutex
+	// cachePopulateGroup deduplicates concurrent downloads of the same local
+	// cache file (e.g. kernel.bin, per-workload snapshot.mem). Keyed by local
+	// file path so unrelated downloads proceed in parallel.
+	cachePopulateGroup singleflight.Group
 
 	newVMFn                func(cfg firecracker.VMConfig, logger *logrus.Logger) (chunkedVM, error)
-	setupChunkedSymlinksFn func(rootfsPath string, extensionDrivePaths map[string]string) (func(), error)
+	setupChunkedSymlinksFn func(runnerID, rootfsPath string, extensionDrivePaths map[string]string) (string, func(), error)
 	waitForReadyFn         func(ctx context.Context, ip string, timeout time.Duration) error
 	forwardPortFn          func(runnerID string, port int) error
 
@@ -266,29 +264,6 @@ func (cm *ChunkedManager) getOrLoadManifest(ctx context.Context, workloadKey, ve
 	return meta, nil
 }
 
-func (cm *ChunkedManager) reserveRunnerSlot(runnerID string) (int, error) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	slot := cm.findAvailableSlot()
-	if slot < 0 {
-		return -1, fmt.Errorf("no slots available")
-	}
-	cm.slotToRunner[slot] = runnerID
-	cm.runnerToSlot[runnerID] = slot
-	return slot, nil
-}
-
-func (cm *ChunkedManager) releaseRunnerSlot(runnerID string) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	if slot, ok := cm.runnerToSlot[runnerID]; ok {
-		delete(cm.slotToRunner, slot)
-		delete(cm.runnerToSlot, runnerID)
-	}
-}
-
 func (cm *ChunkedManager) ensureLocalMemFile(ctx context.Context, runnerID, workloadKey string, meta *snapshot.ChunkedSnapshotMetadata) (string, error) {
 	localMemPath := filepath.Join(cm.config.SnapshotCachePath, workloadKey, "snapshot.mem")
 	if _, err := os.Stat(localMemPath); err == nil {
@@ -297,28 +272,31 @@ func (cm *ChunkedManager) ensureLocalMemFile(ctx context.Context, runnerID, work
 		return "", fmt.Errorf("raw memory file not found at %s and no MemFilePath in metadata: %w", localMemPath, err)
 	}
 
-	cm.cachePopulateMu.Lock()
-	defer cm.cachePopulateMu.Unlock()
+	result, err, _ := cm.cachePopulateGroup.Do(localMemPath, func() (interface{}, error) {
+		if _, err := os.Stat(localMemPath); err == nil {
+			return localMemPath, nil
+		}
 
-	if _, err := os.Stat(localMemPath); err == nil {
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"runner_id":  runnerID,
+			"gcs_path":   meta.MemFilePath,
+			"local_path": localMemPath,
+		}).Info("Downloading snapshot.mem on demand for repo")
+		if dlErr := cm.chunkStore.DownloadRawFile(ctx, meta.MemFilePath, localMemPath); dlErr != nil {
+			return "", fmt.Errorf("failed to download snapshot.mem from %s: %w", meta.MemFilePath, dlErr)
+		}
+		fi, _ := os.Stat(localMemPath)
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"runner_id":  runnerID,
+			"local_path": localMemPath,
+			"size_bytes": fi.Size(),
+		}).Info("snapshot.mem downloaded on demand")
 		return localMemPath, nil
+	})
+	if err != nil {
+		return "", err
 	}
-
-	cm.chunkedLogger.WithFields(logrus.Fields{
-		"runner_id":  runnerID,
-		"gcs_path":   meta.MemFilePath,
-		"local_path": localMemPath,
-	}).Info("Downloading snapshot.mem on demand for repo")
-	if dlErr := cm.chunkStore.DownloadRawFile(ctx, meta.MemFilePath, localMemPath); dlErr != nil {
-		return "", fmt.Errorf("failed to download snapshot.mem from %s: %w", meta.MemFilePath, dlErr)
-	}
-	fi, _ := os.Stat(localMemPath)
-	cm.chunkedLogger.WithFields(logrus.Fields{
-		"runner_id":  runnerID,
-		"local_path": localMemPath,
-		"size_bytes": fi.Size(),
-	}).Info("snapshot.mem downloaded on demand")
-	return localMemPath, nil
+	return result.(string), nil
 }
 
 func (cm *ChunkedManager) ensureKernelPath(ctx context.Context, meta *snapshot.ChunkedSnapshotMetadata) (string, error) {
@@ -329,26 +307,29 @@ func (cm *ChunkedManager) ensureKernelPath(ctx context.Context, meta *snapshot.C
 		return "", fmt.Errorf("kernel not found at %s and no KernelHash in metadata to fetch it: %w", kernelPath, err)
 	}
 
-	cm.cachePopulateMu.Lock()
-	defer cm.cachePopulateMu.Unlock()
+	result, err, _ := cm.cachePopulateGroup.Do(kernelPath, func() (interface{}, error) {
+		if _, err := os.Stat(kernelPath); err == nil {
+			return kernelPath, nil
+		}
 
-	if _, err := os.Stat(kernelPath); err == nil {
+		cm.chunkedLogger.WithField("kernel_hash", meta.KernelHash).Info("Fetching kernel on demand during allocation")
+		kernelData, fetchErr := cm.chunkStore.GetChunk(ctx, meta.KernelHash)
+		if fetchErr != nil {
+			return "", fmt.Errorf("failed to fetch kernel chunk on demand: %w", fetchErr)
+		}
+		if writeErr := os.WriteFile(kernelPath, kernelData, 0644); writeErr != nil {
+			return "", fmt.Errorf("failed to write kernel to %s: %w", kernelPath, writeErr)
+		}
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"kernel_size": len(kernelData),
+			"path":        kernelPath,
+		}).Info("Kernel fetched on demand during allocation")
 		return kernelPath, nil
+	})
+	if err != nil {
+		return "", err
 	}
-
-	cm.chunkedLogger.WithField("kernel_hash", meta.KernelHash).Info("Fetching kernel on demand during allocation")
-	kernelData, fetchErr := cm.chunkStore.GetChunk(ctx, meta.KernelHash)
-	if fetchErr != nil {
-		return "", fmt.Errorf("failed to fetch kernel chunk on demand: %w", fetchErr)
-	}
-	if writeErr := os.WriteFile(kernelPath, kernelData, 0644); writeErr != nil {
-		return "", fmt.Errorf("failed to write kernel to %s: %w", kernelPath, writeErr)
-	}
-	cm.chunkedLogger.WithFields(logrus.Fields{
-		"kernel_size": len(kernelData),
-		"path":        kernelPath,
-	}).Info("Kernel fetched on demand during allocation")
-	return kernelPath, nil
+	return result.(string), nil
 }
 
 func (cm *ChunkedManager) registerAllocatedRunner(
@@ -373,6 +354,9 @@ func (cm *ChunkedManager) registerAllocatedRunner(
 	}
 	if uffdHandler != nil {
 		cm.uffdHandlers[runnerID] = uffdHandler
+		// Also store in Manager.uffdHandlers so PauseRunner (which runs on
+		// *Manager via embedding) can find and stop the handler.
+		cm.Manager.uffdHandlers[runnerID] = uffdHandler
 	}
 	if proxy != nil {
 		cm.authProxies[runnerID] = proxy
@@ -389,11 +373,11 @@ func (cm *ChunkedManager) newVM(cfg firecracker.VMConfig) (chunkedVM, error) {
 	return firecracker.NewVM(cfg, cm.logger.Logger)
 }
 
-func (cm *ChunkedManager) setupRestoreSymlinks(rootfsPath string, extensionDrivePaths map[string]string) (func(), error) {
+func (cm *ChunkedManager) setupRestoreSymlinks(runnerID, rootfsPath string, extensionDrivePaths map[string]string) (string, func(), error) {
 	if cm.setupChunkedSymlinksFn != nil {
-		return cm.setupChunkedSymlinksFn(rootfsPath, extensionDrivePaths)
+		return cm.setupChunkedSymlinksFn(runnerID, rootfsPath, extensionDrivePaths)
 	}
-	return cm.setupChunkedSymlinks(rootfsPath, extensionDrivePaths)
+	return cm.setupChunkedSymlinks(runnerID, rootfsPath, extensionDrivePaths)
 }
 
 func (cm *ChunkedManager) waitForRunnerReady(ctx context.Context, ip string, timeout time.Duration) error {
@@ -424,45 +408,40 @@ func (cm *ChunkedManager) restoreAndActivateRunner(
 	useFileBackedMem bool,
 	extensionDrivePaths map[string]string,
 ) (chunkedVM, *authproxy.AuthProxy, error) {
+	// Set up per-runner snapshot symlinks before creating the VM so the
+	// SnapshotDir is available for the private mount namespace.
+	snapshotDir, symlinkCleanup, setupErr := cm.setupRestoreSymlinks(
+		runnerID,
+		vmCfg.RootfsPath,
+		extensionDrivePaths,
+	)
+	if setupErr != nil {
+		return nil, nil, fmt.Errorf("failed to setup snapshot symlinks: %w", setupErr)
+	}
+	defer symlinkCleanup()
+
+	vmCfg.SnapshotDir = snapshotDir
+
 	vm, err := cm.newVM(vmCfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
 	var restoreErr error
-	cm.snapshotRestoreMu.Lock()
-	func() {
-		defer cm.snapshotRestoreMu.Unlock()
-
-		symlinkCleanup, setupErr := cm.setupRestoreSymlinks(
-			vmCfg.RootfsPath,
-			extensionDrivePaths,
-		)
-		if setupErr != nil {
-			err = fmt.Errorf("failed to setup snapshot symlinks: %w", setupErr)
-			return
-		}
-		defer symlinkCleanup()
-
-		if useFileBackedMem {
-			cm.chunkedLogger.WithFields(logrus.Fields{
-				"runner_id": runnerID,
-				"snapshot":  restoreStatePath,
-				"mem_path":  localMemPath,
-			}).Info("Restoring VM with file-backed memory")
-			restoreErr = vm.RestoreFromSnapshot(ctx, restoreStatePath, localMemPath, false)
-			return
-		}
-
+	if useFileBackedMem {
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"runner_id": runnerID,
+			"snapshot":  restoreStatePath,
+			"mem_path":  localMemPath,
+		}).Info("Restoring VM with file-backed memory")
+		restoreErr = vm.RestoreFromSnapshot(ctx, restoreStatePath, localMemPath, false)
+	} else {
 		cm.chunkedLogger.WithFields(logrus.Fields{
 			"runner_id":   runnerID,
 			"snapshot":    restoreStatePath,
 			"uffd_socket": uffdSocketPath,
 		}).Info("Restoring VM with UFFD memory backend")
 		restoreErr = vm.RestoreFromSnapshotWithUFFD(ctx, restoreStatePath, uffdSocketPath, false)
-	}()
-	if err != nil {
-		return nil, nil, err
 	}
 
 	if restoreErr != nil {
@@ -558,19 +537,24 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		}()
 	}
 
-	if err := cm.reserveAllocationSlot(); err != nil {
+	// Derive workload key — the request must always carry one (resolved upstream).
+	workloadKey := req.WorkloadKey
+
+	runnerID := uuid.New().String()
+	cm.chunkedLogger.WithField("runner_id", runnerID).Info("Allocating runner with chunked snapshot")
+
+	// Acquire lease: atomically checks capacity, reserves slot, and creates
+	// network namespace. The deferred Release cleans up on any error.
+	lease, err := cm.AcquireBringupLease(runnerID, req.SessionID)
+	if err != nil {
 		retErr = err
 		return nil, retErr
 	}
-	defer cm.releaseAllocationSlot()
-
-	// Derive workload key — the request must always carry one (resolved upstream).
-	workloadKey := req.WorkloadKey
+	defer lease.Release()
 
 	// Get the appropriate manifest for this workload key
 	var meta *snapshot.ChunkedSnapshotMetadata
 	if cm.chunkStore != nil {
-		var err error
 		meta, err = cm.getOrLoadManifest(ctx, workloadKey, req.SnapshotVersion)
 		if err != nil {
 			retErr = fmt.Errorf("failed to load manifest for workload key %q: %w", workloadKey, err)
@@ -584,15 +568,10 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		return nil, retErr
 	}
 
-	runnerID := uuid.New().String()
-	cm.chunkedLogger.WithField("runner_id", runnerID).Info("Allocating runner with chunked snapshot")
-
 	startTime := time.Now()
 
-	// Setup network namespace
-	var tap *network.TapDevice
-	var netns *network.VMNamespace
-	var err error
+	tap := lease.Tap
+	netns := lease.NsInfo
 	var fuseDisk *fuse.ChunkedDisk
 	extensionFUSEDisks := make(map[string]*fuse.ChunkedDisk)
 	var uffdHandler *uffd.Handler
@@ -600,7 +579,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	var proxy *authproxy.AuthProxy
 
 	cleanup := func() {
-		cm.cleanupChunkedRunner(runnerID, tap, netns, fuseDisk, extensionFUSEDisks, uffdHandler, proxy)
+		cm.cleanupChunkedRunner(runnerID, fuseDisk, extensionFUSEDisks, uffdHandler, proxy)
 	}
 	cleanupOnError := true
 	defer func() {
@@ -608,17 +587,6 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 			cleanup()
 		}
 	}()
-
-	slot, err := cm.reserveRunnerSlot(runnerID)
-	if err != nil {
-		retErr = err
-		return nil, retErr
-	}
-	netns, err = cm.netnsNetwork.CreateNamespaceForVM(runnerID, slot)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create network namespace: %w", err)
-	}
-	tap = netns.GetTapDevice(cm.netnsNetwork.GetSubnet())
 
 	// Setup FUSE disk for lazy rootfs loading with CoW
 	fuseMountDir := filepath.Join(cm.config.WorkspaceDir, runnerID, "fuse")
@@ -906,6 +874,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		retErr = err
 		return nil, retErr
 	}
+	lease.Commit()
 
 	restoreTime := time.Since(startTime)
 	cm.chunkedLogger.WithFields(logrus.Fields{
@@ -919,111 +888,113 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	return runner, nil
 }
 
-// ReleaseRunnerChunked releases a runner and optionally saves dirty chunks
+// ReleaseRunnerChunked releases a runner and optionally saves dirty chunks.
+// Blocking cleanup (vm.Stop, UFFD/FUSE/proxy teardown, network release) runs
+// outside cm.mu so concurrent allocations and other releases are not blocked.
 func (cm *ChunkedManager) ReleaseRunnerChunked(ctx context.Context, runnerID string, saveIncremental bool) error {
+	// Phase 1: under lock — extract resources, remove from all maps.
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	_, exists := cm.runners[runnerID]
+	runner, exists := cm.runners[runnerID]
 	if !exists {
+		cm.mu.Unlock()
 		return fmt.Errorf("runner not found: %s", runnerID)
 	}
 
+	// Prevent PauseRunner from racing: it drops m.mu before taking runner.mu.
+	runner.mu.Lock()
+	runner.State = StateTerminated
+	runner.mu.Unlock()
+
+	vm := cm.vms[runnerID]
+	handler := cm.uffdHandlers[runnerID]
+	proxy := cm.authProxies[runnerID]
+	fuseDisk := cm.fuseDisks[runnerID]
+	extDisks := cm.fuseExtensionDisks[runnerID]
+	slot, hasSlot := cm.runnerToSlot[runnerID]
+
+	// Snapshot metadata needed for incremental save (read under lock).
+	var defaultMeta *snapshot.ChunkedSnapshotMetadata
+	if saveIncremental && cm.chunkStore != nil && fuseDisk != nil {
+		defaultMeta = cm.chunkedMetas[""]
+	}
+
+	// Remove from ALL maps — no other operation can find this runner after unlock.
+	delete(cm.runners, runnerID)
+	delete(cm.vms, runnerID)
+	delete(cm.uffdHandlers, runnerID)
+	delete(cm.Manager.uffdHandlers, runnerID)
+	delete(cm.authProxies, runnerID)
+	delete(cm.fuseDisks, runnerID)
+	delete(cm.fuseExtensionDisks, runnerID)
+	if hasSlot {
+		delete(cm.slotToRunner, slot)
+		delete(cm.runnerToSlot, runnerID)
+	}
+	cm.mu.Unlock()
+
+	// Phase 2: blocking cleanup — outside lock.
 	cm.chunkedLogger.WithFields(logrus.Fields{
 		"runner_id":        runnerID,
 		"save_incremental": saveIncremental,
 	}).Info("Releasing chunked runner")
 
 	// Save incremental snapshot if requested
-	if saveIncremental && cm.chunkStore != nil {
-		if fuseDisk, ok := cm.fuseDisks[runnerID]; ok {
-			dirtyCount := fuseDisk.DirtyChunkCount()
-			if dirtyCount > 0 {
+	if defaultMeta != nil {
+		dirtyCount := fuseDisk.DirtyChunkCount()
+		if dirtyCount > 0 {
+			cm.chunkedLogger.WithFields(logrus.Fields{
+				"runner_id":    runnerID,
+				"dirty_chunks": dirtyCount,
+			}).Info("Saving dirty chunks for incremental snapshot")
+
+			dirtyChunks := fuseDisk.GetDirtyChunks()
+			uploader := snapshot.NewIncrementalUploader(cm.chunkStore, cm.logger.Logger)
+
+			newVersion := fmt.Sprintf("%s-%s", defaultMeta.Version, runnerID[:8])
+			newMeta, err := uploader.UploadIncrementalSnapshot(ctx, defaultMeta, dirtyChunks, nil, newVersion)
+			if err != nil {
+				cm.chunkedLogger.WithError(err).Warn("Failed to save incremental snapshot")
+			} else {
 				cm.chunkedLogger.WithFields(logrus.Fields{
-					"runner_id":    runnerID,
+					"new_version":  newMeta.Version,
 					"dirty_chunks": dirtyCount,
-				}).Info("Saving dirty chunks for incremental snapshot")
-
-				dirtyChunks := fuseDisk.GetDirtyChunks()
-				uploader := snapshot.NewIncrementalUploader(cm.chunkStore, cm.logger.Logger)
-
-				defaultMeta := cm.chunkedMetas[""]
-				newVersion := fmt.Sprintf("%s-%s", defaultMeta.Version, runnerID[:8])
-				newMeta, err := uploader.UploadIncrementalSnapshot(ctx, defaultMeta, dirtyChunks, nil, newVersion)
-				if err != nil {
-					cm.chunkedLogger.WithError(err).Warn("Failed to save incremental snapshot")
-				} else {
-					cm.chunkedLogger.WithFields(logrus.Fields{
-						"new_version":  newMeta.Version,
-						"dirty_chunks": dirtyCount,
-					}).Info("Incremental snapshot saved")
-				}
+				}).Info("Incremental snapshot saved")
 			}
 		}
 	}
 
-	// Stop auth proxy
-	if proxy, exists := cm.authProxies[runnerID]; exists {
+	if proxy != nil {
 		proxy.Stop()
-		delete(cm.authProxies, runnerID)
 	}
-
-	// Stop VM
-	if vm, exists := cm.vms[runnerID]; exists {
+	if vm != nil {
 		vm.Stop()
-		delete(cm.vms, runnerID)
 	}
-
-	// Cleanup UFFD handler
-	if handler, exists := cm.uffdHandlers[runnerID]; exists {
+	if handler != nil {
 		handler.Stop()
-		delete(cm.uffdHandlers, runnerID)
 	}
-
-	// Stop auth proxy if one exists
-	if proxy, ok := cm.authProxies[runnerID]; ok {
-		proxy.Stop()
-		delete(cm.authProxies, runnerID)
+	if fuseDisk != nil {
+		fuseDisk.Unmount()
 	}
-
-	// Cleanup rootfs FUSE disk
-	if disk, exists := cm.fuseDisks[runnerID]; exists {
+	for _, disk := range extDisks {
 		disk.Unmount()
-		delete(cm.fuseDisks, runnerID)
-	}
-	// Cleanup extension drive FUSE disks
-	if extDisks, exists := cm.fuseExtensionDisks[runnerID]; exists {
-		for _, disk := range extDisks {
-			disk.Unmount()
-		}
-		delete(cm.fuseExtensionDisks, runnerID)
 	}
 
 	// Cleanup network
 	cm.netnsNetwork.ReleaseNamespace(runnerID)
-	if slot, ok := cm.runnerToSlot[runnerID]; ok {
-		delete(cm.slotToRunner, slot)
-		delete(cm.runnerToSlot, runnerID)
-	}
 
-	// Cleanup workspace
-	workspaceDir := filepath.Join(cm.config.WorkspaceDir, runnerID)
-	os.RemoveAll(workspaceDir)
-
-	// Cleanup socket
+	// Cleanup workspace and sockets
+	os.RemoveAll(filepath.Join(cm.config.WorkspaceDir, runnerID))
 	os.Remove(filepath.Join(cm.config.SocketDir, runnerID+".sock"))
 	os.Remove(filepath.Join(cm.config.SocketDir, runnerID+".uffd.sock"))
-
-	delete(cm.runners, runnerID)
 
 	return nil
 }
 
-// cleanupChunkedRunner cleans up resources on allocation failure
+// cleanupChunkedRunner cleans up resources on allocation failure.
+// Network namespace and slot cleanup is handled by the bringupLease, so this
+// function only cleans up FUSE disks, UFFD handler, auth proxy, and local files.
 func (cm *ChunkedManager) cleanupChunkedRunner(
 	runnerID string,
-	tap *network.TapDevice,
-	netns *network.VMNamespace,
 	fuseDisk *fuse.ChunkedDisk,
 	extensionDisks map[string]*fuse.ChunkedDisk,
 	uffdHandler *uffd.Handler,
@@ -1042,24 +1013,21 @@ func (cm *ChunkedManager) cleanupChunkedRunner(
 	for _, disk := range extensionDisks {
 		disk.Unmount()
 	}
-	if netns != nil {
-		cm.netnsNetwork.ReleaseNamespace(runnerID)
-	}
-	cm.releaseRunnerSlot(runnerID)
 	workspaceDir := filepath.Join(cm.config.WorkspaceDir, runnerID)
 	os.RemoveAll(workspaceDir)
 	os.Remove(filepath.Join(cm.config.SocketDir, runnerID+".sock"))
 	os.Remove(filepath.Join(cm.config.SocketDir, runnerID+".uffd.sock"))
 }
 
-// setupChunkedSymlinks creates symlinks from the snapshot's baked-in drive paths
-// (/tmp/snapshot/*.img) to the actual FUSE-backed or local paths on this host.
-// Firecracker opens drive backing files during LoadSnapshot at the paths recorded
-// in the snapshot state file. Returns a cleanup function to remove the symlinks
-// after restore (Firecracker holds open fds, so symlinks can be removed).
-func (cm *ChunkedManager) setupChunkedSymlinks(rootfsPath string, extensionDrivePaths map[string]string) (func(), error) {
-	if err := os.MkdirAll(snapshotSymlinkDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create snapshot symlink dir: %w", err)
+// setupChunkedSymlinks creates a per-runner directory with symlinks from the
+// snapshot's baked-in drive paths to the actual FUSE-backed or local paths on
+// this host. Firecracker opens drive backing files during LoadSnapshot at the
+// paths recorded in the snapshot state file.
+// Returns the per-runner directory path and a cleanup function.
+func (cm *ChunkedManager) setupChunkedSymlinks(runnerID, rootfsPath string, extensionDrivePaths map[string]string) (string, func(), error) {
+	perRunnerDir := fmt.Sprintf("/tmp/snapshot-%s", runnerID)
+	if err := os.MkdirAll(perRunnerDir, 0755); err != nil {
+		return "", nil, fmt.Errorf("failed to create per-runner snapshot dir: %w", err)
 	}
 
 	symlinks := []struct {
@@ -1080,13 +1048,14 @@ func (cm *ChunkedManager) setupChunkedSymlinks(rootfsPath string, extensionDrive
 		if s.target == "" {
 			continue
 		}
-		linkPath := filepath.Join(snapshotSymlinkDir, s.name)
+		linkPath := filepath.Join(perRunnerDir, s.name)
 		os.Remove(linkPath)
 		if err := os.Symlink(s.target, linkPath); err != nil {
 			for _, c := range created {
 				os.Remove(c)
 			}
-			return nil, fmt.Errorf("symlink %s -> %s: %w", linkPath, s.target, err)
+			os.RemoveAll(perRunnerDir)
+			return "", nil, fmt.Errorf("symlink %s -> %s: %w", linkPath, s.target, err)
 		}
 		created = append(created, linkPath)
 		cm.chunkedLogger.WithFields(logrus.Fields{
@@ -1095,10 +1064,8 @@ func (cm *ChunkedManager) setupChunkedSymlinks(rootfsPath string, extensionDrive
 		}).Debug("Created snapshot symlink")
 	}
 
-	return func() {
-		for _, c := range created {
-			os.Remove(c)
-		}
+	return perRunnerDir, func() {
+		os.RemoveAll(perRunnerDir)
 	}, nil
 }
 
@@ -1432,20 +1399,22 @@ func (cm *ChunkedManager) getDirtyRootfsDiskChunksCallback(runnerID string) map[
 // Called during pause/checkpoint after VM stop so the next resume can create
 // fresh mounts without collisions.
 func (cm *ChunkedManager) cleanupFUSEDisksForRunner(runnerID string) {
+	// Phase 1: extract disks under lock, delete from maps.
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
+	rootfsDisk := cm.fuseDisks[runnerID]
+	delete(cm.fuseDisks, runnerID)
+	extDisks := cm.fuseExtensionDisks[runnerID]
+	delete(cm.fuseExtensionDisks, runnerID)
+	cm.mu.Unlock()
 
-	if disk, ok := cm.fuseDisks[runnerID]; ok {
-		disk.Unmount()
-		delete(cm.fuseDisks, runnerID)
+	// Phase 2: unmount outside lock (blocking I/O).
+	if rootfsDisk != nil {
+		rootfsDisk.Unmount()
 		cm.chunkedLogger.WithField("runner_id", runnerID).Debug("Cleaned up rootfs FUSE disk during pause")
 	}
-	if extDisks, ok := cm.fuseExtensionDisks[runnerID]; ok {
-		for driveID, disk := range extDisks {
-			disk.Unmount()
-			cm.chunkedLogger.WithFields(logrus.Fields{"runner_id": runnerID, "drive_id": driveID}).Debug("Cleaned up extension FUSE disk during pause")
-		}
-		delete(cm.fuseExtensionDisks, runnerID)
+	for driveID, disk := range extDisks {
+		disk.Unmount()
+		cm.chunkedLogger.WithFields(logrus.Fields{"runner_id": runnerID, "drive_id": driveID}).Debug("Cleaned up extension FUSE disk during pause")
 	}
 }
 

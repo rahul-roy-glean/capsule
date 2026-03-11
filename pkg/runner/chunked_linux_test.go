@@ -74,7 +74,7 @@ func (f *fakeChunkedVM) SetMMDSData(ctx context.Context, data interface{}) error
 	return f.mmdsErr
 }
 
-func TestReserveRunnerSlotConcurrentUniqueSlots(t *testing.T) {
+func TestAcquireBringupLeaseConcurrentUniqueSlots(t *testing.T) {
 	cm := newTestChunkedManager()
 	cm.config.MaxRunners = 2
 
@@ -92,8 +92,13 @@ func TestReserveRunnerSlotConcurrentUniqueSlots(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			<-start
-			slot, err := cm.reserveRunnerSlot("runner-" + string(rune('a'+id)))
-			results <- result{slot: slot, err: err}
+			runnerID := "runner-" + string(rune('a'+id))
+			lease, err := cm.AcquireBringupLease(runnerID, "")
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			results <- result{slot: lease.slot}
 		}(i)
 	}
 
@@ -120,35 +125,37 @@ func TestReserveRunnerSlotConcurrentUniqueSlots(t *testing.T) {
 	}
 }
 
-func TestReleaseRunnerSlotAllowsReuse(t *testing.T) {
+func TestBringupLeaseReleaseAllowsReuse(t *testing.T) {
 	cm := newTestChunkedManager()
 	cm.config.MaxRunners = 2
 
-	slot0, err := cm.reserveRunnerSlot("runner-1")
+	lease1, err := cm.AcquireBringupLease("runner-1", "")
 	if err != nil {
-		t.Fatalf("reserveRunnerSlot(runner-1) error = %v", err)
+		t.Fatalf("AcquireBringupLease(runner-1) error = %v", err)
 	}
-	if slot0 != 0 {
-		t.Fatalf("reserveRunnerSlot(runner-1) = %d, want 0", slot0)
+	if lease1.slot != 0 {
+		t.Fatalf("lease1.slot = %d, want 0", lease1.slot)
 	}
 
-	slot1, err := cm.reserveRunnerSlot("runner-2")
+	lease2, err := cm.AcquireBringupLease("runner-2", "")
 	if err != nil {
-		t.Fatalf("reserveRunnerSlot(runner-2) error = %v", err)
+		t.Fatalf("AcquireBringupLease(runner-2) error = %v", err)
 	}
-	if slot1 != 1 {
-		t.Fatalf("reserveRunnerSlot(runner-2) = %d, want 1", slot1)
+	if lease2.slot != 1 {
+		t.Fatalf("lease2.slot = %d, want 1", lease2.slot)
 	}
 
-	cm.releaseRunnerSlot("runner-1")
+	lease1.Release()
 
-	reused, err := cm.reserveRunnerSlot("runner-3")
+	lease3, err := cm.AcquireBringupLease("runner-3", "")
 	if err != nil {
-		t.Fatalf("reserveRunnerSlot(runner-3) after release error = %v", err)
+		t.Fatalf("AcquireBringupLease(runner-3) after release error = %v", err)
 	}
-	if reused != 0 {
-		t.Fatalf("reserveRunnerSlot(runner-3) = %d, want reused slot 0", reused)
+	if lease3.slot != 0 {
+		t.Fatalf("lease3.slot = %d, want reused slot 0", lease3.slot)
 	}
+	lease2.Release()
+	lease3.Release()
 }
 
 func TestRegisterAllocatedRunnerPublishesResources(t *testing.T) {
@@ -200,18 +207,10 @@ func TestRegisterAllocatedRunnerRejectsDrainingHost(t *testing.T) {
 	}
 }
 
-func TestCleanupChunkedRunnerRemovesArtifactsAndReleasesSlot(t *testing.T) {
+func TestCleanupChunkedRunnerRemovesArtifacts(t *testing.T) {
 	cm := newTestChunkedManager()
 	cm.config.WorkspaceDir = t.TempDir()
 	cm.config.SocketDir = t.TempDir()
-
-	slot, err := cm.reserveRunnerSlot("runner-1")
-	if err != nil {
-		t.Fatalf("reserveRunnerSlot() error = %v", err)
-	}
-	if slot != 0 {
-		t.Fatalf("reserveRunnerSlot() = %d, want 0", slot)
-	}
 
 	workspaceDir := filepath.Join(cm.config.WorkspaceDir, "runner-1")
 	if err := os.MkdirAll(workspaceDir, 0755); err != nil {
@@ -225,14 +224,8 @@ func TestCleanupChunkedRunnerRemovesArtifactsAndReleasesSlot(t *testing.T) {
 		}
 	}
 
-	cm.cleanupChunkedRunner("runner-1", nil, nil, nil, nil, nil, nil)
+	cm.cleanupChunkedRunner("runner-1", nil, nil, nil, nil)
 
-	if _, ok := cm.runnerToSlot["runner-1"]; ok {
-		t.Fatal("cleanupChunkedRunner() should release runnerToSlot entry")
-	}
-	if _, ok := cm.slotToRunner[slot]; ok {
-		t.Fatal("cleanupChunkedRunner() should release slotToRunner entry")
-	}
 	if _, err := os.Stat(workspaceDir); !os.IsNotExist(err) {
 		t.Fatalf("workspaceDir should be removed, stat err = %v", err)
 	}
@@ -240,6 +233,32 @@ func TestCleanupChunkedRunnerRemovesArtifactsAndReleasesSlot(t *testing.T) {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("%s should be removed, stat err = %v", path, err)
 		}
+	}
+}
+
+func TestBringupLeaseReleaseCleansUpSlot(t *testing.T) {
+	cm := newTestChunkedManager()
+	cm.config.MaxRunners = 4
+
+	lease, err := cm.AcquireBringupLease("runner-1", "")
+	if err != nil {
+		t.Fatalf("AcquireBringupLease() error = %v", err)
+	}
+
+	if _, ok := cm.runnerToSlot["runner-1"]; !ok {
+		t.Fatal("AcquireBringupLease() should register runnerToSlot entry")
+	}
+	if _, ok := cm.slotToRunner[lease.slot]; !ok {
+		t.Fatal("AcquireBringupLease() should register slotToRunner entry")
+	}
+
+	lease.Release()
+
+	if _, ok := cm.runnerToSlot["runner-1"]; ok {
+		t.Fatal("Release() should clear runnerToSlot entry")
+	}
+	if _, ok := cm.slotToRunner[lease.slot]; ok {
+		t.Fatal("Release() should clear slotToRunner entry")
 	}
 }
 
@@ -290,9 +309,9 @@ func TestRestoreAndActivateRunnerSequencesRestoreResumeAndReady(t *testing.T) {
 	cm.newVMFn = func(cfg firecracker.VMConfig, logger *logrus.Logger) (chunkedVM, error) {
 		return vm, nil
 	}
-	cm.setupChunkedSymlinksFn = func(rootfsPath string, extensionDrivePaths map[string]string) (func(), error) {
+	cm.setupChunkedSymlinksFn = func(runnerID, rootfsPath string, extensionDrivePaths map[string]string) (string, func(), error) {
 		actions = append(actions, "setup-symlinks")
-		return func() { actions = append(actions, "cleanup-symlinks") }, nil
+		return "/tmp/snapshot-test", func() { actions = append(actions, "cleanup-symlinks") }, nil
 	}
 	cm.forwardPortFn = func(runnerID string, port int) error {
 		actions = append(actions, fmt.Sprintf("forward:%d", port))
@@ -382,8 +401,8 @@ func TestRestoreAndActivateRunnerFallsBackToColdBoot(t *testing.T) {
 		}
 		return secondVM, nil
 	}
-	cm.setupChunkedSymlinksFn = func(rootfsPath string, extensionDrivePaths map[string]string) (func(), error) {
-		return func() {}, nil
+	cm.setupChunkedSymlinksFn = func(runnerID, rootfsPath string, extensionDrivePaths map[string]string) (string, func(), error) {
+		return "/tmp/snapshot-test", func() {}, nil
 	}
 	cm.forwardPortFn = func(runnerID string, port int) error { return nil }
 	cm.waitForReadyFn = func(ctx context.Context, ip string, timeout time.Duration) error {

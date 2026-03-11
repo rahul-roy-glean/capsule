@@ -30,6 +30,11 @@ type VMConfig struct {
 	// NetNSPath is the path to a network namespace file (e.g., /var/run/netns/fc-xxxx).
 	// When set, Firecracker is launched inside this namespace via "ip netns exec".
 	NetNSPath string
+	// SnapshotDir is the per-runner directory containing symlinks to snapshot files.
+	// When set (together with NetNSPath), Firecracker is launched with a private
+	// mount namespace that bind-mounts this directory to /tmp/snapshot, isolating
+	// concurrent restores.
+	SnapshotDir string
 }
 
 // VM represents a running Firecracker microVM
@@ -75,10 +80,11 @@ func NewVM(cfg VMConfig, logger *logrus.Logger) (*VM, error) {
 	socketPath := filepath.Join(cfg.SocketDir, cfg.VMID+".sock")
 
 	client := NewClient(Config{
-		SocketPath: socketPath,
-		VMID:       cfg.VMID,
-		NetNSPath:  cfg.NetNSPath,
-		Logger:     logger,
+		SocketPath:  socketPath,
+		VMID:        cfg.VMID,
+		NetNSPath:   cfg.NetNSPath,
+		SnapshotDir: cfg.SnapshotDir,
+		Logger:      logger,
 	})
 
 	return &VM{

@@ -496,6 +496,20 @@ data:
                     },
                     "legendTemplate": "connect/resume",
                     "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/release\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "release",
+                    "plotType": "LINE"
                   }
                 ],
                 "yAxis": {
@@ -595,6 +609,34 @@ data:
                       }
                     },
                     "legendTemplate": "connect/resume 5xx",
+                    "plotType": "STACKED_BAR"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/release\" AND metric.label.status_class=\"4xx\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "release 4xx",
+                    "plotType": "STACKED_BAR"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/control_plane.endpoint.requests\" AND metric.label.service_name=\"control-plane\" AND metric.label.route=\"/api/v1/runners/release\" AND metric.label.status_class=\"5xx\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "release 5xx",
                     "plotType": "STACKED_BAR"
                   }
                 ],
