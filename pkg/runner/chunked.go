@@ -1095,7 +1095,15 @@ func (cm *ChunkedManager) GetChunkedStats() ChunkedStats {
 		hs := handler.Stats()
 		stats.TotalPageFaults += hs.PageFaults
 		stats.TotalCacheHits += hs.CacheHits
-		stats.TotalChunkFetches += hs.ChunkFetches
+	}
+
+	// Remote fetches (GCS only) come from the ChunkStore, not the UFFD
+	// handler, so they correctly exclude LRU and disk cache hits.
+	if cm.memChunkStore != nil {
+		stats.TotalChunkFetches += cm.memChunkStore.RemoteFetches()
+	}
+	if cm.chunkStore != nil {
+		stats.TotalChunkFetches += cm.chunkStore.RemoteFetches()
 	}
 
 	for _, disk := range cm.fuseDisks {

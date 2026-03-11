@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -166,6 +167,9 @@ type ChunkStore struct {
 	eagerFetchCancel  context.CancelFunc
 	eagerFetchWg      sync.WaitGroup
 	eagerFetchStarted bool
+
+	// Counters for observability (atomic, safe for concurrent access)
+	remoteFetches atomic.Uint64 // GCS fetches only (excludes LRU and disk cache hits)
 
 	// OTel instruments (nil-safe: callers that don't provide a Meter get no-ops)
 	chunkFetchHist    metric.Float64Histogram
@@ -404,6 +408,7 @@ func (cs *ChunkStore) GetChunk(ctx context.Context, hash string) ([]byte, error)
 		if fetchErr != nil {
 			return nil, fetchErr
 		}
+		cs.remoteFetches.Add(1)
 
 		data, decErr := cs.decoder.DecodeAll(compressed, nil)
 		if decErr != nil {
@@ -1057,6 +1062,12 @@ func (cs *ChunkStore) Close() error {
 // CacheStats returns statistics for the in-memory LRU chunk cache.
 func (cs *ChunkStore) CacheStats() CacheStats {
 	return cs.chunkCache.Stats()
+}
+
+// RemoteFetches returns the total number of chunks fetched from GCS (not served
+// from LRU or disk cache). This count only includes successful fetches.
+func (cs *ChunkStore) RemoteFetches() uint64 {
+	return cs.remoteFetches.Load()
 }
 
 // StartEagerFetcher starts background goroutines for eager chunk prefetching.

@@ -520,7 +520,7 @@ func (h *Handler) handlePageFaults(uffdFd int) {
 				h.logger.WithFields(logrus.Fields{
 					"total_faults":  currentFaults,
 					"delta":         currentFaults - lastFaultCount,
-					"chunk_fetches": atomic.LoadUint64(&h.chunkFetches),
+					"remote_fetches": h.chunkStore.RemoteFetches(),
 					"lru_hits":      cacheStats.Hits,
 					"lru_misses":    cacheStats.Misses,
 					"lru_evictions": cacheStats.Evictions,
@@ -734,7 +734,6 @@ func (h *Handler) getPageData(ctx context.Context, offset uint64) ([]byte, error
 	}
 
 	// Fetch the chunk (hits ChunkStore's in-memory LRU on repeat access)
-	atomic.AddUint64(&h.chunkFetches, 1)
 	chunkData, err := h.chunkStore.GetChunk(ctx, chunk.Hash)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch chunk %s: %w", chunk.Hash[:12], err)
@@ -795,11 +794,11 @@ func (h *Handler) SetPrefetcher(p *Prefetcher) {
 // Stats returns handler statistics
 func (h *Handler) Stats() HandlerStats {
 	return HandlerStats{
-		PageFaults:   atomic.LoadUint64(&h.pageFaults),
-		ChunkFetches: atomic.LoadUint64(&h.chunkFetches),
+		PageFaults: atomic.LoadUint64(&h.pageFaults),
 		// CacheHits is always 0 for the chunked Handler: page-level caching
 		// was removed in favor of the ChunkStore's chunk-level LRU, which
 		// tracks its own hit rate via ChunkStore.CacheStats().
+		// ChunkFetches (remote GCS) is now tracked by ChunkStore.RemoteFetches().
 	}
 }
 
