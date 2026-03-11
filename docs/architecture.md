@@ -42,7 +42,6 @@ flowchart TD
 - runner allocation at `/api/v1/runners/allocate`
 - session-aware reconnect/pause/resume APIs
 - workload version convergence via `/api/v1/versions/*`
-- optional GitHub webhook intake at `/webhook/github`
 - optional MCP server exposure for sandbox orchestration
 
 Its durable state lives in PostgreSQL. Important tables are:
@@ -55,7 +54,6 @@ Its durable state lives in PostgreSQL. Important tables are:
 - `hosts`
 - `runners`
 - `session_snapshots`
-- `repo_workload_mappings`
 
 ### Host Agent
 
@@ -186,7 +184,6 @@ and resume work happens on host agents.
 
 The runtime is generic, but the repository still contains workload-specific adapters:
 
-- GitHub webhook routing populates `jobs` and `repo_workload_mappings`
 - the Python SDK wraps layered config registration and runner lifecycle calls
 - the MCP server exposes sandbox tools on top of the same allocate/pause/resume/exec
   primitives

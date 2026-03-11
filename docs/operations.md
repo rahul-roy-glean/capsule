@@ -144,7 +144,6 @@ On resume:
 The control plane is stateless apart from PostgreSQL:
 
 - host and runner state is rebuilt from DB plus fresh heartbeats
-- queued jobs remain in `jobs`
 - build queue state remains in `snapshot_builds`
 
 ### Host Restart

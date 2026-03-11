@@ -130,31 +130,8 @@ variable "alert_vm_boot_threshold_seconds" {
   default     = 10
 }
 
-variable "alert_queue_depth_threshold" {
-  description = "Alert when job queue depth exceeds this threshold"
-  type        = number
-  default     = 50
-}
-
 variable "alert_snapshot_age_threshold_hours" {
   description = "Alert when active snapshot is older than this many hours"
   type        = number
   default     = 48
-}
-
-variable "ci_system" {
-  description = "CI system integration (github-actions, none). Controls runner registration and webhook handling."
-  type        = string
-  default     = "github-actions"
-
-  validation {
-    condition     = contains(["github-actions", "none"], var.ci_system)
-    error_message = "ci_system must be one of: github-actions, none"
-  }
-}
-
-variable "github_org" {
-  description = "GitHub organization for org-level runner registration. If set, uses org-level API instead of repo-level."
-  type        = string
-  default     = ""
 }
