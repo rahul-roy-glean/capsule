@@ -195,26 +195,6 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 		return "", "", err
 	}
 
-	// Best-effort: populate repo_workload_mappings for CI webhook routing.
-	// This is outside the transaction — a failed upsert doesn't break registration.
-	// Scan init_commands for any argument that looks like a repo URL (e.g.
-	// "https://github.com/org/repo" or "org/repo") and extract a simple
-	// "owner/repo" string. No CI-specific adapter required.
-	for _, layer := range cfg.Layers {
-		repo := repoFromCommandArgs(layer.InitCommands)
-		if repo != "" {
-			r.db.ExecContext(ctx, `
-				INSERT INTO repo_workload_mappings (repo, workload_key) VALUES ($1, $2)
-				ON CONFLICT (repo) DO UPDATE SET workload_key = EXCLUDED.workload_key
-			`, repo, leafWorkloadKey)
-			// Update in-memory cache
-			if r.configCache != nil {
-				r.configCache.PutRepoMapping(repo, leafWorkloadKey)
-			}
-			break
-		}
-	}
-
 	// Update in-memory workload config cache
 	if r.configCache != nil {
 		npJSON := ""
@@ -446,12 +426,6 @@ func (r *LayeredConfigRegistry) DeleteLayeredConfig(ctx context.Context, configI
 	}
 
 	return nil
-}
-
-// LookupWorkloadKeyForRepo finds the leaf_workload_key matching the given repo name.
-// Delegates to the shared lookupWorkloadKeyForRepo which uses indexed repo columns.
-func (r *LayeredConfigRegistry) LookupWorkloadKeyForRepo(repoFullName string) string {
-	return lookupWorkloadKeyForRepo(r.db, repoFullName)
 }
 
 // HTTP Handlers
@@ -745,68 +719,3 @@ func networkPolicyVal(policy json.RawMessage) *string {
 	return &s
 }
 
-// repoFromCommandArgs scans snapshot init commands for any argument that looks
-// like a repository URL (e.g. "https://github.com/org/repo.git") and extracts
-// a normalized "owner/repo" string. This is a simple heuristic that avoids
-// depending on any CI-specific adapter.
-func repoFromCommandArgs(commands []snapshot.SnapshotCommand) string {
-	for _, cmd := range commands {
-		for _, arg := range cmd.Args {
-			repo := parseRepoURL(arg)
-			if repo != "" {
-				return repo
-			}
-		}
-	}
-	return ""
-}
-
-// parseRepoURL tries to extract "owner/repo" from a URL-like string.
-// Supports:
-//
-//	https://github.com/org/repo.git
-//	https://gitlab.com/org/repo
-//	git@github.com:org/repo.git
-//	org/repo  (bare owner/repo with no slashes beyond the first)
-func parseRepoURL(s string) string {
-	s = strings.TrimSuffix(s, ".git")
-
-	// Handle git@host:owner/repo
-	if strings.HasPrefix(s, "git@") {
-		s = strings.TrimPrefix(s, "git@")
-		if idx := strings.Index(s, ":"); idx >= 0 {
-			s = s[idx+1:]
-		}
-		return extractOwnerRepo(s)
-	}
-
-	// Handle https:// or http://
-	for _, scheme := range []string{"https://", "http://"} {
-		if strings.HasPrefix(s, scheme) {
-			s = strings.TrimPrefix(s, scheme)
-			// Strip hostname (first segment before /)
-			if idx := strings.Index(s, "/"); idx >= 0 {
-				s = s[idx+1:]
-			} else {
-				return ""
-			}
-			return extractOwnerRepo(s)
-		}
-	}
-
-	// Bare "owner/repo" — must have exactly one slash and no spaces
-	if !strings.Contains(s, " ") && strings.Count(s, "/") == 1 && len(s) > 2 {
-		return extractOwnerRepo(s)
-	}
-
-	return ""
-}
-
-// extractOwnerRepo returns "owner/repo" from a path like "owner/repo/extra/stuff".
-func extractOwnerRepo(path string) string {
-	parts := strings.SplitN(path, "/", 3)
-	if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
-		return parts[0] + "/" + parts[1]
-	}
-	return ""
-}

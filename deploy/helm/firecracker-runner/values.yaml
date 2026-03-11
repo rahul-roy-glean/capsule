@@ -71,10 +71,6 @@ env:
     name: firecracker_runner
     sslMode: require
 
-  github:
-    secretName: github-credentials
-    webhookSecretKey: webhook_secret
-
 auth:
   apiToken:
     secretName: ""
@@ -139,8 +135,6 @@ ingress:
   hosts:
     - host: runners.example.com
       paths:
-        - path: /webhook
-          pathType: Prefix
         - path: /api
           pathType: Prefix
   tls: []

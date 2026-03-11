@@ -50,7 +50,6 @@ type PlatformConfig struct {
 	TerraformStateBucket string   `yaml:"terraform_state_bucket"`
 	TerraformStatePrefix string   `yaml:"terraform_state_prefix"`
 	DBPassword           string   `yaml:"db_password"`
-	GitHubWebhookSecret  string   `yaml:"github_webhook_secret"`
 	AdminCIDRs           []string `yaml:"admin_cidrs"`
 }
 

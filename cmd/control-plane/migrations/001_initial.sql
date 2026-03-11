@@ -62,22 +62,6 @@ CREATE TABLE IF NOT EXISTS version_assignments (
     UNIQUE(workload_key, host_id)
 );
 
--- Jobs table: tracks CI job requests (webhook-driven allocation queue)
-CREATE TABLE IF NOT EXISTS jobs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    ci_run_id BIGINT,
-    ci_job_id BIGINT,
-    repo VARCHAR(512) NOT NULL,
-    branch VARCHAR(255),
-    commit_sha VARCHAR(64),
-    status VARCHAR(32) DEFAULT 'queued' CHECK (status IN ('queued', 'assigned', 'in_progress', 'running', 'completed', 'failed', 'cancelled')),
-    runner_id UUID REFERENCES runners(id) ON DELETE SET NULL,
-    labels JSONB DEFAULT '[]'::jsonb,
-    queued_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    started_at TIMESTAMP WITH TIME ZONE,
-    completed_at TIMESTAMP WITH TIME ZONE
-);
-
 -- Session snapshots: tracks session pause/resume state
 CREATE TABLE IF NOT EXISTS session_snapshots (
     session_id VARCHAR(255) PRIMARY KEY,
@@ -151,14 +135,6 @@ CREATE TABLE IF NOT EXISTS layered_configs (
     updated_at             TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- repo_workload_mappings: maps CI repo names to workload keys for webhook routing
-CREATE TABLE IF NOT EXISTS repo_workload_mappings (
-    repo          VARCHAR(512) PRIMARY KEY,
-    workload_key  VARCHAR(16) NOT NULL,
-    source        VARCHAR(32) DEFAULT 'auto',
-    created_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
 -- snapshot_tags: named aliases for snapshot versions
 CREATE TABLE IF NOT EXISTS snapshot_tags (
     tag           VARCHAR(64) NOT NULL,
@@ -185,11 +161,6 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_workload_key ON snapshots(workload_key)
 
 CREATE INDEX IF NOT EXISTS idx_version_assignments_workload ON version_assignments(workload_key);
 CREATE INDEX IF NOT EXISTS idx_version_assignments_host ON version_assignments(host_id);
-
-CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-CREATE INDEX IF NOT EXISTS idx_jobs_queued ON jobs(queued_at) WHERE status = 'queued';
-CREATE INDEX IF NOT EXISTS idx_jobs_runner ON jobs(runner_id);
-CREATE INDEX IF NOT EXISTS idx_jobs_ci_job_id ON jobs(ci_job_id);
 
 CREATE INDEX IF NOT EXISTS idx_layers_parent ON snapshot_layers(parent_layer_hash);
 CREATE INDEX IF NOT EXISTS idx_layers_status ON snapshot_layers(status);
@@ -256,10 +227,8 @@ LIMIT 10;
 COMMENT ON TABLE hosts IS 'GCE VMs running Firecracker and hosting microVMs';
 COMMENT ON TABLE runners IS 'Individual sandbox microVMs';
 COMMENT ON TABLE snapshots IS 'Firecracker snapshot versions for fast VM boot';
-COMMENT ON TABLE jobs IS 'CI job queue for webhook-driven runner allocation';
 COMMENT ON TABLE session_snapshots IS 'Session pause/resume state tracking';
 COMMENT ON TABLE snapshot_layers IS 'Layered snapshot DAG - each layer is a set of init commands';
 COMMENT ON TABLE snapshot_builds IS 'Build queue for layered snapshot pipeline';
 COMMENT ON TABLE layered_configs IS 'Top-level workload configurations';
-COMMENT ON TABLE repo_workload_mappings IS 'Maps CI repo names to workload keys for webhook routing';
 COMMENT ON TABLE snapshot_tags IS 'Named aliases for snapshot versions (e.g., stable, canary)';

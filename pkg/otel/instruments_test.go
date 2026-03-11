@@ -33,7 +33,6 @@ func TestAllCountersHaveDescriptions(t *testing.T) {
 		CPWebhookRequests, CPAllocations, CPEndpointRequests, CPDownscalerActions,
 		SnapshotRollouts,
 		CacheArtifactHits, CacheArtifactMisses, CacheGitClones,
-		CITokenRequests, CIJobs,
 		ChunkedPageFaults, ChunkedCacheHits, ChunkedChunkFetches,
 		ChunkedDiskReads, ChunkedDiskWrites,
 		PoolHits, PoolMisses, PoolEvictions, PoolRecycleFailures,
@@ -53,7 +52,7 @@ func TestAllGaugesHaveDescriptions(t *testing.T) {
 	gauges := []GaugeName{
 		HostCPUTotal, HostCPUUsed, HostMemTotal, HostMemUsed,
 		CPHostsTotal, CPHostsReady, CPHostsDraining, CPHostsTerminating, CPHostsUnhealthy, CPHostsTerminated,
-		CPRunnersTotal, CPRunnersTotalCurrent, CPRunnersIdleCurrent, CPRunnersBusyCurrent, CPQueueDepth,
+		CPRunnersTotal, CPRunnersTotalCurrent, CPRunnersIdleCurrent, CPRunnersBusyCurrent,
 		CPFleetCPUTotal, CPFleetCPUUsed, CPFleetCPUFree,
 		CPFleetMemTotal, CPFleetMemUsed, CPFleetMemFree,
 		ChunkedDiskCacheSize, ChunkedDiskCacheMax, ChunkedDiskCacheItems,

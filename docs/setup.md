@@ -29,7 +29,6 @@ Optional advanced fields:
 - `platform.terraform_state_bucket`
 - `platform.terraform_state_prefix`
 - `platform.db_password`
-- `platform.github_webhook_secret`
 
 3. Preview the full deployment:
 

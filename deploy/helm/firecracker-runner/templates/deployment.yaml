@@ -59,11 +59,6 @@ spec:
                 configMapKeyRef:
                   name: {{ include "firecracker-runner.fullname" . }}-config
                   key: gcs_bucket
-            - name: GITHUB_WEBHOOK_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.env.github.secretName }}
-                  key: {{ .Values.env.github.webhookSecretKey }}
 {{- if .Values.auth.apiToken.secretName }}
             - name: API_AUTH_TOKEN
               valueFrom:

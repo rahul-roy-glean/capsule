@@ -203,13 +203,3 @@ curl http://HOST_IP:8080/health
 curl http://HOST_IP:8080/metrics
 ```
 
-## Enable GitHub Webhooks Later
-
-GitHub integration is optional. If you need it later:
-
-1. create a GitHub App and store the private key in Secret Manager
-2. update the host metadata inputs in Terraform (`github_app_id`, `github_app_secret`, `github_repo`, `github_org`)
-3. create a real `github-credentials` Kubernetes secret with the webhook secret
-4. configure the GitHub webhook to hit `${CONTROL_PLANE_BASE}/webhook/github`
-
-The runtime itself remains workload-key based either way.

@@ -28,7 +28,6 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
-	cigithub "github.com/rahul-roy-glean/bazel-firecracker/pkg/ci/github"
 	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/tiers"
 )
@@ -262,7 +261,6 @@ func main() {
 	cpRunnersTotalCurrentGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPRunnersTotalCurrent)
 	cpRunnersIdleCurrentGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPRunnersIdleCurrent)
 	cpRunnersBusyCurrentGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPRunnersBusyCurrent)
-	cpQueueDepthGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPQueueDepth)
 	cpFleetCPUTotalGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetCPUTotal)
 	cpFleetCPUUsedGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetCPUUsed)
 	cpFleetCPUFreeGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetCPUFree)
@@ -293,27 +291,11 @@ func main() {
 	scheduler := NewScheduler(hostRegistry, db, snapshotManager, tagRegistry, logger)
 	scheduler.SetConfigCache(configCache)
 	scheduler.SetOTel(otelClient, sessionResumeRoutingCounter)
-	jobQueue := NewJobQueue(db, scheduler, hostRegistry, logger)
-	jobQueue.SetConfigCache(configCache)
 	layeredConfigRegistry := NewLayeredConfigRegistry(db, snapshotManager, logger)
 	layeredConfigRegistry.SetConfigCache(configCache)
 	layeredConfigRegistry.tagRegistry = tagRegistry
 	layerBuildScheduler := NewLayerBuildScheduler(db, snapshotManager, logger, 4)
 	layeredConfigRegistry.SetLayerBuilder(layerBuildScheduler)
-
-	// Wire CI webhook adapter for GitHub Actions webhook routing.
-	// The webhook-only adapter does not require GitHub App credentials.
-	var webhookAdapter *cigithub.Adapter
-	ciSystemEnv := os.Getenv("CI_SYSTEM")
-	if ciSystemEnv == "" || ciSystemEnv == "github-actions" {
-		webhookAdapter = cigithub.NewWebhookAdapter(logger)
-		webhookAdapter.SetWebhookDeps(cigithub.WebhookDeps{
-			JobQueue:       jobQueue,
-			RunnerReleaser: scheduler,
-			RunnerLookup:   &jobQueueRunnerLookup{hr: hostRegistry},
-			Logger:         logger,
-		})
-	}
 
 	// Load existing state from DB (best-effort)
 	if err := hostRegistry.LoadFromDB(ctx); err != nil {
@@ -329,7 +311,7 @@ func main() {
 	)
 
 	// Register services
-	controlPlaneServer := NewControlPlaneServer(scheduler, hostRegistry, snapshotManager, jobQueue, canarySuccessCounter, canaryFailureCounter, logger)
+	controlPlaneServer := NewControlPlaneServer(scheduler, hostRegistry, snapshotManager, canarySuccessCounter, canaryFailureCounter, logger)
 	pb.RegisterControlPlaneServer(grpcServer, controlPlaneServer)
 
 	// Register health service
@@ -388,12 +370,6 @@ func main() {
 	// Canary report endpoint (Phase 6)
 	httpMux.Handle("/api/v1/canary/report", instrumentAuthenticatedHandler("/api/v1/canary/report", "control_plane.canary_report", http.HandlerFunc(controlPlaneServer.HandleCanaryReport)))
 	httpMux.Handle("/api/v1/", instrumentAuthenticatedHandler("/api/v1/", "control_plane.api_not_found", http.NotFoundHandler()))
-	// Register webhook handler via CI adapter (replaces hardcoded CI_SYSTEM check)
-	if webhookAdapter != nil {
-		if h := webhookAdapter.WebhookHandler(); h != nil {
-			httpMux.Handle(webhookAdapter.WebhookPath(), instrumentHTTPHandler(webhookAdapter.WebhookPath(), "control_plane.webhook", h))
-		}
-	}
 
 	httpHandler := apiLoggingMiddleware(logger, httpMux)
 	httpServer := &http.Server{
@@ -441,12 +417,11 @@ func main() {
 	// Start background workers
 	go hostRegistry.HealthCheckLoop(ctx)
 	go startDownscaler(ctx, db, hostRegistry, logger)
-	go jobQueue.jobRetryLoop(ctx)
 	go controlPlaneServer.startTTLEnforcement(ctx)
 	go layerBuildScheduler.Run(ctx)
 	go controlPlaneMetricsLoop(ctx, hostRegistry, scheduler, snapshotManager,
 		cpHostsGauge, cpHostsReadyGauge, cpHostsDrainingGauge, cpHostsTerminatingGauge, cpHostsUnhealthyGauge, cpHostsTerminatedGauge,
-		cpRunnersGauge, cpRunnersTotalCurrentGauge, cpRunnersIdleCurrentGauge, cpRunnersBusyCurrentGauge, cpQueueDepthGauge,
+		cpRunnersGauge, cpRunnersTotalCurrentGauge, cpRunnersIdleCurrentGauge, cpRunnersBusyCurrentGauge,
 		cpFleetCPUTotalGauge, cpFleetCPUUsedGauge, cpFleetCPUFreeGauge,
 		cpFleetMemTotalGauge, cpFleetMemUsedGauge, cpFleetMemFreeGauge,
 		cpFleetUtilGauge, snapshotAgeGauge, logger)
@@ -641,18 +616,16 @@ type ControlPlaneServer struct {
 	scheduler            *Scheduler
 	hostRegistry         *HostRegistry
 	snapshotManager      *SnapshotManager
-	jobQueue             *JobQueue
 	canarySuccessCounter metric.Int64Counter
 	canaryFailureCounter metric.Int64Counter
 	logger               *logrus.Entry
 }
 
-func NewControlPlaneServer(s *Scheduler, h *HostRegistry, sm *SnapshotManager, jq *JobQueue, canarySuccess, canaryFailure metric.Int64Counter, l *logrus.Logger) *ControlPlaneServer {
+func NewControlPlaneServer(s *Scheduler, h *HostRegistry, sm *SnapshotManager, canarySuccess, canaryFailure metric.Int64Counter, l *logrus.Logger) *ControlPlaneServer {
 	return &ControlPlaneServer{
 		scheduler:            s,
 		hostRegistry:         h,
 		snapshotManager:      sm,
-		jobQueue:             jq,
 		canarySuccessCounter: canarySuccess,
 		canaryFailureCounter: canaryFailure,
 		logger:               l.WithField("service", "control-plane"),
@@ -1327,7 +1300,7 @@ func (s *ControlPlaneServer) HandleCanaryReport(w http.ResponseWriter, r *http.R
 // controlPlaneMetricsLoop periodically records control plane metrics via OpenTelemetry
 func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Scheduler, sm *SnapshotManager,
 	cpHostsGauge, cpHostsReadyGauge, cpHostsDrainingGauge, cpHostsTerminatingGauge, cpHostsUnhealthyGauge, cpHostsTerminatedGauge metric.Int64Gauge,
-	cpRunnersGauge, cpRunnersTotalCurrentGauge, cpRunnersIdleCurrentGauge, cpRunnersBusyCurrentGauge, cpQueueDepthGauge metric.Int64Gauge,
+	cpRunnersGauge, cpRunnersTotalCurrentGauge, cpRunnersIdleCurrentGauge, cpRunnersBusyCurrentGauge metric.Int64Gauge,
 	cpFleetCPUTotalGauge, cpFleetCPUUsedGauge, cpFleetCPUFreeGauge metric.Int64Gauge,
 	cpFleetMemTotalGauge, cpFleetMemUsedGauge, cpFleetMemFreeGauge metric.Int64Gauge,
 	cpFleetUtilGauge metric.Float64Gauge, snapshotAgeGauge metric.Int64Gauge,
@@ -1428,17 +1401,11 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 				usedSlots += hostTotal - hostFree
 			}
 
-			queueDepth := sched.GetQueueDepth()
 			var utilization float64
 			if totalSlots > 0 {
-				utilization = float64(usedSlots+queueDepth) / float64(totalSlots)
-			} else if queueDepth > 0 {
-				utilization = 10.0 // no capacity but demand exists — force scale-up
+				utilization = float64(usedSlots) / float64(totalSlots)
 			}
 			cpFleetUtilGauge.Record(ctx, utilization)
-
-			// Record queue depth
-			cpQueueDepthGauge.Record(ctx, int64(queueDepth))
 
 			// Record snapshot age
 			currentVersion := sm.GetCurrentVersion()

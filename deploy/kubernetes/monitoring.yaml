@@ -719,27 +719,6 @@ data:
             }
           },
           {
-            "xPos": 9,
-            "yPos": 0,
-            "width": 3,
-            "height": 2,
-            "widget": {
-              "title": "Queue Depth",
-              "scorecard": {
-                "timeSeriesQuery": {
-                  "timeSeriesFilter": {
-                    "filter": "metric.type=\"workload.googleapis.com/control_plane.queue.depth\" AND metric.label.service_name=\"control-plane\"",
-                    "aggregation": {
-                      "alignmentPeriod": "60s",
-                      "perSeriesAligner": "ALIGN_MAX",
-                      "crossSeriesReducer": "REDUCE_SUM"
-                    }
-                  }
-                }
-              }
-            }
-          },
-          {
             "xPos": 0,
             "yPos": 2,
             "width": 6,
