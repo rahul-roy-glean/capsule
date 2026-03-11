@@ -48,6 +48,7 @@ type SnapshotManager struct {
 	gcpZone               string
 	builderImage          string // GCE image for snapshot builder VM
 	builderNetwork        string // VPC network for builder VM
+	builderSubnet         string // VPC subnet for builder VM (required for custom-mode VPCs)
 	builderServiceAccount string // GCE service account email for builder VMs
 	logger                *logrus.Entry
 	mu                    sync.RWMutex

@@ -55,7 +55,8 @@ type Runner struct {
 	PreQuarantineState      State
 	QuarantineEgressBlocked bool
 	QuarantinePaused        bool
-	ServicePort             int // Port of the user's service inside the VM (from StartCommand)
+	ServicePort int                   // Port of the user's service inside the VM (from StartCommand)
+	AuthConfig  *authproxy.AuthConfig // Auth proxy config, preserved for pause/resume
 
 	// Network policy fields
 	NetworkPolicy          *network.NetworkPolicy `json:"network_policy,omitempty"`

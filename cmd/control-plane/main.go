@@ -282,6 +282,9 @@ func main() {
 	if v := os.Getenv("BUILDER_NETWORK"); v != "" {
 		snapshotManager.builderNetwork = v
 	}
+	if v := os.Getenv("BUILDER_SUBNET"); v != "" {
+		snapshotManager.builderSubnet = v
+	}
 	if v := os.Getenv("BUILDER_IMAGE"); v != "" {
 		snapshotManager.builderImage = v
 	}
