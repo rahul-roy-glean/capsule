@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
 	"github.com/sirupsen/logrus"
 )
 
@@ -16,10 +18,12 @@ func newTestManager(opts ...func(*Manager)) *Manager {
 	m := &Manager{
 		config:          HostConfig{MaxRunners: 4, HostID: "test-host", Environment: "test"},
 		runners:         make(map[string]*Runner),
+		vms:             make(map[string]*firecracker.VM),
 		slotToRunner:    make(map[int]string),
 		runnerToSlot:    make(map[string]int),
 		pendingSessions: make(map[string]string),
 		uffdHandlers:    make(map[string]uffdStopper),
+		authProxies:     make(map[string]*authproxy.AuthProxy),
 		logger:          logger.WithField("test", true),
 	}
 	for _, opt := range opts {
