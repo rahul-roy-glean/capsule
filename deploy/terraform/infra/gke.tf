@@ -150,14 +150,3 @@ resource "google_service_account_iam_member" "control_plane_workload_identity" {
   role               = "roles/iam.workloadIdentityUser"
   member             = "serviceAccount:${var.project_id}.svc.id.goog[firecracker-runner/control-plane]"
 }
-
-# Kubernetes namespace (created via kubectl, referenced here for documentation)
-# kubectl create namespace firecracker-runner
-
-# Output cluster credentials command
-output "gke_get_credentials" {
-  value       = "gcloud container clusters get-credentials ${google_container_cluster.control_plane.name} --region ${var.region} --project ${var.project_id}"
-  description = "Command to get GKE credentials"
-}
-
-

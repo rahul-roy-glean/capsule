@@ -5,14 +5,8 @@ region      = "us-central1"
 zone        = "us-central1-a"
 environment = "dev"
 
-# Host VM configuration
-host_machine_type = "n2-standard-64"
-host_disk_size_gb = 200
-min_hosts         = 2
-max_hosts         = 20
-
 # GKE configuration
-gke_node_machine_type = "e2-standard-4"
+gke_node_machine_type = "n2-standard-4"
 gke_min_nodes         = 1
 gke_max_nodes         = 3
 
@@ -24,13 +18,7 @@ db_password = "your-secure-password-here"
 vpc_cidr          = "10.0.0.0/16"
 gke_pods_cidr     = "10.1.0.0/16"
 gke_services_cidr = "10.2.0.0/16"
-microvm_subnet    = "172.16.0.0/24"
 
 # Container Registry (Artifact Registry)
 container_registry_location  = "us-central1"
 container_registry_repo_name = "firecracker"
-
-# Telemetry
-otel_collector_addr = ""  # Internal LB IP of OTel collector (e.g. "10.0.16.17:4317")
-
-

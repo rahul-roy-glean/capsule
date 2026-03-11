@@ -15,7 +15,7 @@ terraform {
   backend "gcs" {
     # Configure via backend config file or CLI flags
     # bucket = "your-terraform-state-bucket"
-    # prefix = "firecracker-bazel-runner"
+    # prefix = "firecracker/infra"
   }
 }
 
@@ -197,5 +197,3 @@ resource "google_project_iam_member" "host_secrets" {
   role    = "roles/secretmanager.secretAccessor"
   member  = "serviceAccount:${google_service_account.host_agent.email}"
 }
-
-

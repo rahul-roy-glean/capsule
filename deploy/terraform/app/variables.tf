@@ -1,0 +1,160 @@
+variable "infra_state_bucket" {
+  description = "GCS bucket containing the infra stage Terraform state"
+  type        = string
+}
+
+variable "infra_state_prefix" {
+  description = "GCS prefix for the infra stage Terraform state"
+  type        = string
+}
+
+variable "db_password" {
+  description = "Password for Cloud SQL postgres user (used for K8s secret)"
+  type        = string
+  sensitive   = true
+}
+
+variable "github_webhook_secret" {
+  description = "GitHub webhook secret for control plane"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "host_bootstrap_token" {
+  description = "Shared bearer token used by host VMs when sending authenticated heartbeats to the control plane"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "control_plane_image_tag" {
+  description = "Docker image tag for the control plane"
+  type        = string
+  default     = "latest"
+}
+
+variable "host_machine_type" {
+  description = "Machine type for Firecracker host VMs"
+  type        = string
+  default     = "n2-standard-64"
+}
+
+variable "host_disk_size_gb" {
+  description = "Boot disk size for host VMs in GB (OS + binaries only)"
+  type        = number
+  default     = 50
+}
+
+variable "host_data_disk_size_gb" {
+  description = "Data disk size for snapshots/workspaces in GB (pd-ssd)"
+  type        = number
+  default     = 500
+}
+
+variable "min_hosts" {
+  description = "Minimum number of host VMs in MIG"
+  type        = number
+  default     = 1
+}
+
+variable "max_hosts" {
+  description = "Maximum number of host VMs in MIG"
+  type        = number
+  default     = 20
+}
+
+variable "use_custom_host_image" {
+  description = "Whether to use the custom Packer-built host image. Set to false for initial deployment, then true after building with Packer."
+  type        = bool
+  default     = false
+}
+
+variable "microvm_subnet" {
+  description = "Subnet CIDR for microVM NAT networking"
+  type        = string
+  default     = "172.16.0.0/24"
+}
+
+variable "max_runners_per_host" {
+  description = "Maximum number of microVMs (runners) per host"
+  type        = number
+  default     = 4
+}
+
+variable "idle_runners_target" {
+  description = "Target number of idle runners to maintain per host"
+  type        = number
+  default     = 2
+}
+
+variable "chunk_cache_size_gb" {
+  description = "Size in GB of the on-disk LRU chunk cache for FUSE-backed disks"
+  type        = number
+  default     = 2
+}
+
+variable "mem_cache_size_gb" {
+  description = "Size in GB of the in-memory LRU chunk cache for UFFD page fault handling"
+  type        = number
+  default     = 2
+}
+
+variable "otel_collector_addr" {
+  description = "OpenTelemetry Collector OTLP gRPC endpoint reachable from host VMs (e.g. internal LB IP:4317). Leave empty to disable OTel on hosts."
+  type        = string
+  default     = ""
+}
+
+variable "enable_monitoring" {
+  description = "Enable GCP Cloud Monitoring dashboards and log-based metrics"
+  type        = bool
+  default     = true
+}
+
+variable "enable_monitoring_alerts" {
+  description = "Enable GCP Cloud Monitoring alert policies (requires enable_monitoring=true)"
+  type        = bool
+  default     = false
+}
+
+variable "monitoring_notification_channels" {
+  description = "List of notification channel IDs for alerts (e.g., Slack, PagerDuty)"
+  type        = list(string)
+  default     = []
+}
+
+variable "alert_vm_boot_threshold_seconds" {
+  description = "Alert when VM boot p95 exceeds this threshold in seconds"
+  type        = number
+  default     = 10
+}
+
+variable "alert_queue_depth_threshold" {
+  description = "Alert when job queue depth exceeds this threshold"
+  type        = number
+  default     = 50
+}
+
+variable "alert_snapshot_age_threshold_hours" {
+  description = "Alert when active snapshot is older than this many hours"
+  type        = number
+  default     = 48
+}
+
+variable "ci_system" {
+  description = "CI system integration (github-actions, none). Controls runner registration and webhook handling."
+  type        = string
+  default     = "github-actions"
+
+  validation {
+    condition     = contains(["github-actions", "none"], var.ci_system)
+    error_message = "ci_system must be one of: github-actions, none"
+  }
+}
+
+variable "github_org" {
+  description = "GitHub organization for org-level runner registration. If set, uses org-level API instead of repo-level."
+  type        = string
+  default     = ""
+}
