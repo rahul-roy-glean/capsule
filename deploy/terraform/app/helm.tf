@@ -112,6 +112,11 @@ resource "helm_release" "control_plane" {
   }
 
   set {
+    name  = "gcp.builderSubnet"
+    value = local.infra.host_subnet_name
+  }
+
+  set {
     name  = "gcp.builderServiceAccount"
     value = local.infra.snapshot_builder_service_account
   }
@@ -140,4 +145,167 @@ data "kubernetes_service" "control_plane" {
 locals {
   control_plane_ip   = data.kubernetes_service.control_plane.status[0].load_balancer[0].ingress[0].ip
   control_plane_addr = "${local.control_plane_ip}:8080"
+
+  otel_collector_ip   = var.enable_otel_collector ? data.kubernetes_service.otel_collector[0].status[0].load_balancer[0].ingress[0].ip : ""
+  otel_collector_addr = var.enable_otel_collector ? "http://${local.otel_collector_ip}:4317" : ""
+}
+
+# --- OTel Collector (standalone, for host VMs) ---
+
+resource "kubernetes_config_map" "otel_collector" {
+  count = var.enable_otel_collector ? 1 : 0
+
+  metadata {
+    name      = "otel-collector-config"
+    namespace = kubernetes_namespace.firecracker_runner.metadata[0].name
+  }
+
+  data = {
+    "config.yaml" = yamlencode({
+      receivers = {
+        otlp = {
+          protocols = {
+            grpc = {
+              endpoint = "0.0.0.0:4317"
+            }
+          }
+        }
+      }
+      processors = {
+        batch = {
+          timeout         = "5s"
+          send_batch_size = 1024
+        }
+      }
+      exporters = {
+        googlecloud = {
+          project = local.infra.project_id
+        }
+      }
+      service = {
+        pipelines = {
+          traces = {
+            receivers  = ["otlp"]
+            processors = ["batch"]
+            exporters  = ["googlecloud"]
+          }
+          metrics = {
+            receivers  = ["otlp"]
+            processors = ["batch"]
+            exporters  = ["googlecloud"]
+          }
+        }
+      }
+    })
+  }
+}
+
+resource "kubernetes_deployment" "otel_collector" {
+  count = var.enable_otel_collector ? 1 : 0
+
+  metadata {
+    name      = "otel-collector"
+    namespace = kubernetes_namespace.firecracker_runner.metadata[0].name
+    labels = {
+      app = "otel-collector"
+    }
+  }
+
+  spec {
+    replicas = 1
+
+    selector {
+      match_labels = {
+        app = "otel-collector"
+      }
+    }
+
+    template {
+      metadata {
+        labels = {
+          app = "otel-collector"
+        }
+      }
+
+      spec {
+        service_account_name = "control-plane"
+
+        container {
+          name  = "collector"
+          image = "otel/opentelemetry-collector-contrib:latest"
+          args  = ["--config=/etc/otelcol/config.yaml"]
+
+          port {
+            container_port = 4317
+            name           = "otlp-grpc"
+          }
+
+          resources {
+            requests = {
+              cpu    = "100m"
+              memory = "128Mi"
+            }
+            limits = {
+              cpu    = "500m"
+              memory = "512Mi"
+            }
+          }
+
+          volume_mount {
+            name       = "config"
+            mount_path = "/etc/otelcol"
+          }
+        }
+
+        volume {
+          name = "config"
+          config_map {
+            name = kubernetes_config_map.otel_collector[0].metadata[0].name
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [helm_release.control_plane]
+}
+
+resource "kubernetes_service" "otel_collector" {
+  count = var.enable_otel_collector ? 1 : 0
+
+  metadata {
+    name      = "otel-collector"
+    namespace = kubernetes_namespace.firecracker_runner.metadata[0].name
+    labels = {
+      app = "otel-collector"
+    }
+    annotations = {
+      "networking.gke.io/load-balancer-type" = "Internal"
+    }
+  }
+
+  spec {
+    type = "LoadBalancer"
+
+    port {
+      port        = 4317
+      name        = "otlp-grpc"
+      target_port = "otlp-grpc"
+    }
+
+    selector = {
+      app = "otel-collector"
+    }
+  }
+}
+
+data "kubernetes_service" "otel_collector" {
+  count = var.enable_otel_collector ? 1 : 0
+
+  metadata {
+    name      = "otel-collector"
+    namespace = kubernetes_namespace.firecracker_runner.metadata[0].name
+  }
+
+  depends_on = [kubernetes_service.otel_collector]
 }

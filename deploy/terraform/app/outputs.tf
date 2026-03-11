@@ -18,6 +18,11 @@ output "host_instance_group_manager_name" {
   description = "Instance group manager name for Firecracker hosts"
 }
 
+output "otel_collector_addr" {
+  value       = local.otel_collector_addr
+  description = "OTel Collector OTLP endpoint (http://IP:4317) passed to host VMs, empty if disabled"
+}
+
 output "gke_get_credentials" {
   value       = "gcloud container clusters get-credentials ${local.infra.gke_cluster_name} --region ${local.infra.region} --project ${local.infra.project_id}"
   description = "Command to get GKE credentials"

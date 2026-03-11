@@ -74,7 +74,7 @@ resource "google_compute_instance_template" "firecracker_host" {
     idle-target             = var.idle_runners_target
     chunk-cache-size-gb     = var.chunk_cache_size_gb
     mem-cache-size-gb       = var.mem_cache_size_gb
-    otel-collector-endpoint = var.otel_collector_addr
+    otel-collector-endpoint = local.otel_collector_addr
   }
 
   metadata_startup_script = <<-EOF

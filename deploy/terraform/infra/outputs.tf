@@ -50,6 +50,11 @@ output "host_subnet_id" {
   description = "Host subnet ID for instance templates"
 }
 
+output "host_subnet_name" {
+  value       = google_compute_subnetwork.hosts.name
+  description = "Host subnet name for builder VMs"
+}
+
 output "host_agent_email" {
   value       = google_service_account.host_agent.email
   description = "Service account email for host VMs"

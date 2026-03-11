@@ -3,14 +3,7 @@ resource "google_container_cluster" "control_plane" {
   provider = google-beta
 
   name     = "${local.name_prefix}-control-plane"
-  location = var.region
-
-  # Use regional cluster for HA
-  node_locations = [
-    "${var.region}-a",
-    "${var.region}-b",
-    "${var.region}-c",
-  ]
+  location = var.zone
 
   network    = google_compute_network.main.name
   subnetwork = google_compute_subnetwork.gke.name
@@ -37,18 +30,11 @@ resource "google_container_cluster" "control_plane" {
   remove_default_node_pool = true
   initial_node_count       = 1
 
-  # Master authorized networks
+  # Allow all IPs to reach the API server (auth is via IAM)
   master_authorized_networks_config {
     cidr_blocks {
-      cidr_block   = var.vpc_cidr
-      display_name = "VPC"
-    }
-    dynamic "cidr_blocks" {
-      for_each = var.admin_cidrs
-      content {
-        cidr_block   = cidr_blocks.value
-        display_name = "admin"
-      }
+      cidr_block   = "0.0.0.0/0"
+      display_name = "all"
     }
   }
 
@@ -98,7 +84,7 @@ resource "google_container_cluster" "control_plane" {
 # Node pool for control plane services
 resource "google_container_node_pool" "control_plane" {
   name       = "${local.name_prefix}-control-plane-pool"
-  location   = var.region
+  location   = var.zone
   cluster    = google_container_cluster.control_plane.name
   node_count = var.gke_min_nodes
 

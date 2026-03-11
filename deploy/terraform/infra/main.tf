@@ -13,9 +13,7 @@ terraform {
   }
 
   backend "gcs" {
-    # Configure via backend config file or CLI flags
-    # bucket = "your-terraform-state-bucket"
-    # prefix = "firecracker/infra"
+
   }
 }
 
@@ -116,7 +114,7 @@ resource "google_service_account" "control_plane" {
 # IAM bindings for GCS
 resource "google_storage_bucket_iam_member" "host_read" {
   bucket = google_storage_bucket.snapshots.name
-  role   = "roles/storage.objectViewer"
+  role   = "roles/storage.objectAdmin"
   member = "serviceAccount:${google_service_account.host_agent.email}"
 }
 
@@ -126,9 +124,9 @@ resource "google_storage_bucket_iam_member" "builder_write" {
   member = "serviceAccount:${google_service_account.snapshot_builder.email}"
 }
 
-resource "google_storage_bucket_iam_member" "control_plane_read" {
+resource "google_storage_bucket_iam_member" "control_plane_storage" {
   bucket = google_storage_bucket.snapshots.name
-  role   = "roles/storage.objectViewer"
+  role   = "roles/storage.objectAdmin"
   member = "serviceAccount:${google_service_account.control_plane.email}"
 }
 
@@ -139,10 +137,16 @@ resource "google_project_iam_member" "host_metrics" {
   member  = "serviceAccount:${google_service_account.host_agent.email}"
 }
 
-# IAM for control plane to write metrics
+# IAM for control plane to write metrics and traces
 resource "google_project_iam_member" "control_plane_metrics" {
   project = var.project_id
   role    = "roles/monitoring.metricWriter"
+  member  = "serviceAccount:${google_service_account.control_plane.email}"
+}
+
+resource "google_project_iam_member" "control_plane_traces" {
+  project = var.project_id
+  role    = "roles/cloudtrace.agent"
   member  = "serviceAccount:${google_service_account.control_plane.email}"
 }
 
@@ -189,6 +193,13 @@ resource "google_project_iam_member" "control_plane_sql" {
   project = var.project_id
   role    = "roles/cloudsql.client"
   member  = "serviceAccount:${google_service_account.control_plane.email}"
+}
+
+# Allow control plane to launch VMs as the snapshot builder SA
+resource "google_service_account_iam_member" "control_plane_use_builder_sa" {
+  service_account_id = google_service_account.snapshot_builder.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.control_plane.email}"
 }
 
 # IAM for host agent to read secrets (GitHub App key)

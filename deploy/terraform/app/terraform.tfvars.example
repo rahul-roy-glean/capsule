@@ -32,4 +32,4 @@ chunk_cache_size_gb  = 2
 mem_cache_size_gb    = 2
 
 # Telemetry
-otel_collector_addr = ""  # Internal LB IP of OTel collector (e.g. "10.0.16.17:4317")
+enable_otel_collector = true  # Deploy OTel Collector in GKE; ILB IP auto-wired to hosts

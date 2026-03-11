@@ -12,7 +12,7 @@ variable "region" {
 variable "zone" {
   description = "GCP zone for zonal resources"
   type        = string
-  default     = "us-central1-a"
+  default     = "us-central1-c"
 }
 
 variable "environment" {
@@ -25,12 +25,6 @@ variable "vpc_cidr" {
   description = "CIDR range for the VPC"
   type        = string
   default     = "10.0.0.0/16"
-}
-
-variable "admin_cidrs" {
-  description = "Additional CIDR blocks allowed to reach the GKE control plane API."
-  type        = list(string)
-  default     = []
 }
 
 variable "gke_pods_cidr" {

@@ -100,10 +100,10 @@ variable "mem_cache_size_gb" {
   default     = 2
 }
 
-variable "otel_collector_addr" {
-  description = "OpenTelemetry Collector OTLP gRPC endpoint reachable from host VMs (e.g. internal LB IP:4317). Leave empty to disable OTel on hosts."
-  type        = string
-  default     = ""
+variable "enable_otel_collector" {
+  description = "Deploy a standalone OTel Collector in GKE with an internal LB. Its IP is automatically passed to host VMs."
+  type        = bool
+  default     = true
 }
 
 variable "enable_monitoring" {

@@ -21,9 +21,7 @@ terraform {
   }
 
   backend "gcs" {
-    # Configure via backend config file or CLI flags
-    # bucket = "your-terraform-state-bucket"
-    # prefix = "firecracker/app"
+
   }
 }
 
