@@ -37,11 +37,10 @@ class LayeredConfigs:
         raw_configs_value = data.get("configs")
         raw_configs: list[dict[str, Any]]
         if isinstance(raw_configs_value, list):
-            raw_configs = [
-                item
-                for item in raw_configs_value
-                if isinstance(item, dict)
-            ]
+            raw_configs = []
+            for item in cast(list[Any], raw_configs_value):
+                if isinstance(item, dict):
+                    raw_configs.append(cast(dict[str, Any], item))
         else:
             raw_configs = []
         return [StoredLayeredConfig.model_validate(c) for c in raw_configs]
