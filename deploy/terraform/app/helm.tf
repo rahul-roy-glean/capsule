@@ -180,6 +180,9 @@ resource "kubernetes_config_map" "otel_collector" {
       exporters = {
         googlecloud = {
           project = local.infra.project_id
+          metric = {
+            service_resource_labels = true
+          }
         }
       }
       service = {

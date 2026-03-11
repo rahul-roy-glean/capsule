@@ -20,6 +20,8 @@ data:
     exporters:
       googlecloud:
         project: ${GCP_PROJECT_ID}
+        metric:
+          service_resource_labels: true
 
     service:
       pipelines:
