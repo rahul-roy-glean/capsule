@@ -517,17 +517,29 @@ done
 
 # Wait for exec
 echo -n "  Waiting for exec..."
+EXEC_READY2=false
 for i in $(seq 1 30); do
   PRECHECK2=$(curl -s --no-buffer --max-time 5 -X POST "$MGR/api/v1/runners/$RESUME2_RUNNER_ID/exec" \
     -H 'Content-Type: application/json' \
     -d '{"command":["echo","alive2"],"timeout_seconds":3}' 2>&1 || echo "TIMEOUT")
   if echo "$PRECHECK2" | grep -q 'alive2'; then
     echo " responsive (${i}s)"
+    EXEC_READY2=true
     break
   fi
   echo -n "."
   sleep 1
 done
+echo ""
+
+if ! $EXEC_READY2; then
+  fail "Exec NOT reachable on resumed layer 1 VM after 30s"
+  echo "  Last response: $PRECHECK2"
+  echo "  Manager log (last 20 lines):"
+  tail -20 /tmp/fc-dev/logs/firecracker-manager.log
+  exit 1
+fi
+pass "Exec reachable on resumed layer 1 VM"
 
 # Verify ALL data survived 2 GCS pause/resume cycles
 vm_exec_chain() {

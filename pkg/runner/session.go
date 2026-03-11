@@ -1246,6 +1246,13 @@ func (m *Manager) resumeFromSessionMetadata(ctx context.Context, sessionID, work
 		"resume_vm_ms": time.Since(vmResumeStart).Milliseconds(),
 	}).Info("Resume stage complete: microVM resume")
 
+	if err := m.persistResumedSessionMetadata(sessionDir, metadata, runner, overlayPath); err != nil {
+		m.logger.WithError(err).WithFields(logrus.Fields{
+			"runner_id":  runnerID,
+			"session_id": sessionID,
+		}).Warn("Failed to persist session metadata after resume")
+	}
+
 	m.logger.WithFields(logrus.Fields{
 		"runner_id":  runnerID,
 		"session_id": sessionID,
@@ -1253,6 +1260,36 @@ func (m *Manager) resumeFromSessionMetadata(ctx context.Context, sessionID, work
 	}).Info("Runner resumed from session snapshot successfully")
 
 	return runner, nil
+}
+
+func (m *Manager) persistResumedSessionMetadata(sessionDir string, metadata *SessionMetadata, runner *Runner, overlayPath string) error {
+	if metadata == nil || runner == nil {
+		return fmt.Errorf("metadata and runner are required")
+	}
+	if err := os.MkdirAll(sessionDir, 0755); err != nil {
+		return fmt.Errorf("failed to create session dir: %w", err)
+	}
+
+	restored := *metadata
+	restored.SessionID = runner.SessionID
+	restored.WorkloadKey = runner.WorkloadKey
+	restored.RunnerID = runner.ID
+	restored.HostID = m.config.HostID
+	restored.RootfsPath = overlayPath
+	restored.CreatedAt = runner.CreatedAt
+	restored.VCPUs = runner.Resources.VCPUs
+	restored.MemoryMB = runner.Resources.MemoryMB
+	restored.TTLSeconds = runner.TTLSeconds
+	restored.AutoPause = runner.AutoPause
+
+	metadataBytes, err := json.MarshalIndent(restored, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal resumed session metadata: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionDir, "metadata.json"), metadataBytes, 0644); err != nil {
+		return fmt.Errorf("failed to write resumed session metadata: %w", err)
+	}
+	return nil
 }
 
 // cleanupNetworkOnly releases network resources without touching overlay or extension drives.

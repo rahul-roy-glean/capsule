@@ -396,6 +396,77 @@ func TestGetSessionMetadata_NotFound(t *testing.T) {
 	}
 }
 
+func TestPersistResumedSessionMetadata(t *testing.T) {
+	tmpDir := t.TempDir()
+	m := newTestManager(func(m *Manager) {
+		m.config.SessionDir = tmpDir
+		m.config.HostID = "host-after-resume"
+	})
+
+	meta := &SessionMetadata{
+		SessionID:           "sess-1",
+		WorkloadKey:         "wk-1",
+		RunnerID:            "runner-old",
+		HostID:              "host-before-resume",
+		Layers:              2,
+		CreatedAt:           time.Unix(123, 0).UTC(),
+		RootfsPath:          "/old/rootfs",
+		VCPUs:               2,
+		MemoryMB:            4096,
+		TTLSeconds:          300,
+		AutoPause:           true,
+		GCSManifestPath:     "v1/wk-1/runner_state/runner-old/snapshot_manifest.json",
+		GCSMemIndexObject:   "v1/wk-1/runner_state/runner-old/chunked-metadata.json",
+		GCSDiskIndexObjects: map[string]string{"__rootfs__": "v1/wk-1/runner_state/runner-old/__rootfs__-disk.json"},
+	}
+	r := &Runner{
+		ID:          "runner-new",
+		SessionID:   "sess-1",
+		WorkloadKey: "wk-1",
+		CreatedAt:   time.Unix(123, 0).UTC(),
+		Resources: Resources{
+			VCPUs:    4,
+			MemoryMB: 8192,
+		},
+		TTLSeconds: 600,
+		AutoPause:  false,
+	}
+
+	sessionDir := filepath.Join(tmpDir, "sess-1")
+	if err := m.persistResumedSessionMetadata(sessionDir, meta, r, "/new/rootfs"); err != nil {
+		t.Fatalf("persistResumedSessionMetadata failed: %v", err)
+	}
+
+	got, err := m.GetSessionMetadata("sess-1")
+	if err != nil {
+		t.Fatalf("GetSessionMetadata failed: %v", err)
+	}
+	if got.RunnerID != "runner-new" {
+		t.Fatalf("RunnerID = %q, want %q", got.RunnerID, "runner-new")
+	}
+	if got.HostID != "host-after-resume" {
+		t.Fatalf("HostID = %q, want %q", got.HostID, "host-after-resume")
+	}
+	if got.RootfsPath != "/new/rootfs" {
+		t.Fatalf("RootfsPath = %q, want %q", got.RootfsPath, "/new/rootfs")
+	}
+	if got.GCSManifestPath != meta.GCSManifestPath {
+		t.Fatalf("GCSManifestPath = %q, want %q", got.GCSManifestPath, meta.GCSManifestPath)
+	}
+	if got.GCSMemIndexObject != meta.GCSMemIndexObject {
+		t.Fatalf("GCSMemIndexObject = %q, want %q", got.GCSMemIndexObject, meta.GCSMemIndexObject)
+	}
+	if got.GCSDiskIndexObjects["__rootfs__"] != meta.GCSDiskIndexObjects["__rootfs__"] {
+		t.Fatalf("GCSDiskIndexObjects[__rootfs__] = %q, want %q", got.GCSDiskIndexObjects["__rootfs__"], meta.GCSDiskIndexObjects["__rootfs__"])
+	}
+	if got.TTLSeconds != 600 {
+		t.Fatalf("TTLSeconds = %d, want %d", got.TTLSeconds, 600)
+	}
+	if got.AutoPause {
+		t.Fatalf("AutoPause = true, want false")
+	}
+}
+
 func TestCleanupSession(t *testing.T) {
 	tmpDir := t.TempDir()
 	m := newTestManager(func(m *Manager) {
