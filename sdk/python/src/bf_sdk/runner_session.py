@@ -2,9 +2,19 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Iterator
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 from bf_sdk._shell import ShellSession
+from bf_sdk.models.file import (
+    FileListResult,
+    FileMkdirResult,
+    FileReadResult,
+    FileRemoveResult,
+    FileStatResult,
+    FileUploadResult,
+    FileWriteResult,
+)
 from bf_sdk.models.runner import ConnectResult, ExecEvent, ExecResult, PauseResult
 
 if TYPE_CHECKING:
@@ -34,10 +44,13 @@ class RunnerSession:
         *,
         host_address: str | None = None,
         session_id: str | None = None,
+        request_id: str | None = None,
     ) -> None:
         self._runners = runners
         self._runner_id = runner_id
         self._session_id = session_id
+        self._request_id = request_id
+        self._released = False
         if host_address:
             self._runners.set_host_cache(runner_id, host_address)
 
@@ -49,17 +62,25 @@ class RunnerSession:
     def session_id(self) -> str | None:
         return self._session_id
 
+    @property
+    def request_id(self) -> str | None:
+        return self._request_id
+
     # -- Context manager -------------------------------------------------------
 
     def __enter__(self) -> RunnerSession:
         return self
 
-    def __exit__(self, *_: object) -> None:
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if exc_type is not None:
+            with suppress(Exception):
+                self.release()
+            return
         self.release()
 
     # -- Lifecycle -------------------------------------------------------------
 
-    def wait_ready(self, *, timeout: float = 120.0, poll_interval: float = 2.0) -> None:
+    def wait_ready(self, *, timeout: float | None = None, poll_interval: float = 2.0) -> None:
         """Block until the runner is ready."""
         self._runners.wait_ready(self._runner_id, timeout=timeout, poll_interval=poll_interval)
 
@@ -80,7 +101,12 @@ class RunnerSession:
 
     def release(self) -> bool:
         """Release (destroy) the runner."""
-        return self._runners.release(self._runner_id)
+        if self._released:
+            return True
+        ok = self._runners.release(self._runner_id)
+        if ok:
+            self._released = True
+        return ok
 
     # -- Exec & Shell ----------------------------------------------------------
 
@@ -164,33 +190,40 @@ class RunnerSession:
         *,
         mode: str = "overwrite",
         perm: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> FileUploadResult:
         """Upload data to a file in the runner. Strings are encoded to UTF-8."""
         if isinstance(data, str):
             data = data.encode("utf-8")
         return self._runners.file_upload(self._runner_id, path, data, mode=mode, perm=perm)
 
-    def read_file(self, path: str, *, offset: int = 0, limit: int | None = None) -> dict[str, Any]:
+    def read_file(self, path: str, *, offset: int = 0, limit: int | None = None) -> FileReadResult:
         """Read a file's content (JSON-based, supports offset/limit)."""
         return self._runners.file_read(self._runner_id, path, offset=offset, limit=limit)
 
-    def write_file(self, path: str, content: str, *, mode: str = "overwrite") -> dict[str, Any]:
+    def read_text(self, path: str, *, offset: int = 0, limit: int | None = None) -> str:
+        result = self.read_file(path, offset=offset, limit=limit)
+        return result.content or ""
+
+    def write_file(self, path: str, content: str, *, mode: str = "overwrite") -> FileWriteResult:
         """Write string content to a file in the runner."""
         return self._runners.file_write(self._runner_id, path, content, mode=mode)
 
-    def list_files(self, path: str, *, recursive: bool = False) -> dict[str, Any]:
+    def write_text(self, path: str, content: str, *, mode: str = "overwrite") -> FileWriteResult:
+        return self.write_file(path, content, mode=mode)
+
+    def list_files(self, path: str, *, recursive: bool = False) -> FileListResult:
         """List files in a directory in the runner."""
         return self._runners.file_list(self._runner_id, path, recursive=recursive)
 
-    def stat_file(self, path: str) -> dict[str, Any]:
+    def stat_file(self, path: str) -> FileStatResult:
         """Stat a file in the runner."""
         return self._runners.file_stat(self._runner_id, path)
 
-    def remove(self, path: str, *, recursive: bool = False) -> dict[str, Any]:
+    def remove(self, path: str, *, recursive: bool = False) -> FileRemoveResult:
         """Remove a file or directory in the runner."""
         return self._runners.file_remove(self._runner_id, path, recursive=recursive)
 
-    def mkdir(self, path: str) -> dict[str, Any]:
+    def mkdir(self, path: str) -> FileMkdirResult:
         """Create a directory in the runner."""
         return self._runners.file_mkdir(self._runner_id, path)
 

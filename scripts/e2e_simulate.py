@@ -364,14 +364,14 @@ def suite_configs(
     created: dict[str, Any] = {}
 
     with test_case(run, SUITE, "List configs returns a list", log):
-        configs = client.layered_configs.list()
+        configs = client._layered_configs.list()
         assert isinstance(configs, list), f"Expected list, got {type(configs)}"
         log.info("Existing configs", extra={"count": len(configs)})
 
     # --- Create ---
     with test_case(run, SUITE, "Create config returns config_id and leaf_workload_key", log):
         body = _make_test_config_body("e2ecreate")
-        resp = client.layered_configs.create(body)
+        resp = client._layered_configs.create(body)
         assert resp.config_id, "config_id must be non-empty"
         assert resp.leaf_workload_key, "leaf_workload_key must be non-empty"
         created["config_id"] = resp.config_id
@@ -389,7 +389,7 @@ def suite_configs(
     # --- Idempotent re-create ---
     with test_case(run, SUITE, "Re-creating identical config is idempotent (same config_id)", log):
         body = _make_test_config_body("e2ecreate")
-        resp2 = client.layered_configs.create(body)
+        resp2 = client._layered_configs.create(body)
         assert resp2.config_id == created["config_id"], (
             f"Expected same config_id on re-create, "
             f"got {resp2.config_id} vs {created['config_id']}"
@@ -397,7 +397,7 @@ def suite_configs(
 
     # --- Get by ID ---
     with test_case(run, SUITE, "Get config by config_id returns full detail", log):
-        detail = client.layered_configs.get(created["config_id"])
+        detail = client._layered_configs.get(created["config_id"])
         assert detail.config.config_id == created["config_id"]
         assert detail.layers is not None and len(detail.layers) > 0
         log.info("Config detail", extra={
@@ -417,7 +417,7 @@ def suite_configs(
 
     # --- List contains created config ---
     with test_case(run, SUITE, "List includes newly created config", log):
-        configs = client.layered_configs.list()
+        configs = client._layered_configs.list()
         ids = [c.config_id for c in configs]
         assert created["config_id"] in ids, (
             f"Created config {created['config_id']} not found in list: {ids[:5]}"
@@ -425,7 +425,7 @@ def suite_configs(
 
     # --- Config fields are correct ---
     with test_case(run, SUITE, "Config fields match what was submitted", log):
-        detail = client.layered_configs.get(created["config_id"])
+        detail = client._layered_configs.get(created["config_id"])
         assert detail.config.runner_ttl_seconds == 300, (
             f"Expected ttl=300, got {detail.config.runner_ttl_seconds}"
         )
@@ -454,7 +454,7 @@ def suite_configs(
             ],
             "config": {"ttl": 600, "tier": "m"},
         }
-        resp3 = client.layered_configs.create(body2)
+        resp3 = client._layered_configs.create(body2)
         assert resp3.config_id, "multi-layer config_id must be set"
         assert resp3.leaf_workload_key, "multi-layer leaf_workload_key must be set"
         created["multi_config_id"] = resp3.config_id
@@ -480,25 +480,25 @@ def suite_builds(
     if not config_id:
         log.info("No config_id supplied for builds suite, creating a fresh one")
         try:
-            resp = client.layered_configs.create(_make_test_config_body("buildsuite"))
+            resp = client._layered_configs.create(_make_test_config_body("buildsuite"))
             config_id = resp.config_id
         except Exception as exc:  # noqa: BLE001
             log.warning("Could not create config for builds suite", extra={"error": str(exc)})
             return
 
     with test_case(run, SUITE, "Trigger build returns config_id and status", log):
-        resp = client.layered_configs.build(config_id)
+        resp = client._layered_configs.build(config_id)
         assert resp.config_id == config_id
         assert resp.status is not None
         log.info("Build triggered", extra={"config_id": config_id, "status": resp.status})
 
     with test_case(run, SUITE, "Trigger build with force=True is accepted", log):
-        resp = client.layered_configs.build(config_id, force=True)
+        resp = client._layered_configs.build(config_id, force=True)
         assert resp.config_id == config_id
         log.info("Force build response", extra={"status": resp.status})
 
     with test_case(run, SUITE, "Get config shows layer statuses after build trigger", log):
-        detail = client.layered_configs.get(config_id)
+        detail = client._layered_configs.get(config_id)
         assert detail.layers is not None
         for layer in detail.layers:
             log.info("Layer post-build-trigger", extra={
@@ -517,7 +517,7 @@ def suite_builds(
             "queued", "waiting_parent", "running", "ready",
             "failed", "cancelled", None,
         }
-        detail = client.layered_configs.get(config_id)
+        detail = client._layered_configs.get(config_id)
         for layer in (detail.layers or []):
             assert layer.status in VALID_LAYER_STATUS, (
                 f"Layer '{layer.name}' has unexpected status '{layer.status}'"
@@ -530,7 +530,7 @@ def suite_builds(
     with test_case(run, SUITE, "Build status stabilises within 60s", log):
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
-            detail = client.layered_configs.get(config_id)
+            detail = client._layered_configs.get(config_id)
             build_statuses = [l.build_status for l in (detail.layers or [])]
             active = [bs for bs in build_statuses if bs in {"queued", "running", "waiting_parent"}]
             log.debug("Build poll", extra={
@@ -545,10 +545,10 @@ def suite_builds(
 
     # Refresh layer test
     with test_case(run, SUITE, "Refresh layer endpoint returns response", log):
-        detail = client.layered_configs.get(config_id)
+        detail = client._layered_configs.get(config_id)
         if detail.layers:
             layer_name = detail.layers[-1].name  # use leaf layer
-            resp = client.layered_configs.refresh_layer(config_id, layer_name)
+            resp = client._layered_configs.refresh_layer(config_id, layer_name)
             assert resp.config_id == config_id
             assert resp.layer_name == layer_name
             log.info("Refresh layer response", extra={
@@ -574,7 +574,7 @@ def suite_runners(
 
     if not leaf_workload_key:
         try:
-            configs = client.layered_configs.list()
+            configs = client._layered_configs.list()
             if configs and configs[0].leaf_workload_key:
                 leaf_workload_key = configs[0].leaf_workload_key
                 log.info("Discovered workload_key from first config", extra={
@@ -712,7 +712,7 @@ def suite_session(
         log.info("No active runner for session suite — allocating fresh runner")
         if not leaf_workload_key:
             try:
-                configs = client.layered_configs.list()
+                configs = client._layered_configs.list()
                 if configs and configs[0].leaf_workload_key:
                     leaf_workload_key = configs[0].leaf_workload_key
             except Exception:  # noqa: BLE001
@@ -804,7 +804,7 @@ def suite_quarantine(
 
     if not leaf_workload_key:
         try:
-            configs = client.layered_configs.list()
+            configs = client._layered_configs.list()
             if configs and configs[0].leaf_workload_key:
                 leaf_workload_key = configs[0].leaf_workload_key
         except Exception:  # noqa: BLE001
@@ -892,7 +892,7 @@ def suite_fleet(
     wk = leaf_workload_key
     if not wk:
         try:
-            configs = client.layered_configs.list()
+            configs = client._layered_configs.list()
             if configs and configs[0].leaf_workload_key:
                 wk = configs[0].leaf_workload_key
         except Exception:  # noqa: BLE001
@@ -1172,7 +1172,7 @@ def suite_edge(client: BFClient, run: SimulationRun, log: logging.Logger) -> Non
     # --- Duplicate request_id (idempotency smoke test) ---
     with test_case(run, SUITE, "Duplicate allocate request_id is handled without 500", log):
         try:
-            configs = client.layered_configs.list()
+            configs = client._layered_configs.list()
             wk = configs[0].leaf_workload_key if configs else None
         except Exception:  # noqa: BLE001
             wk = None
@@ -1827,6 +1827,7 @@ def suite_concurrency(
     def _exec_dirty_worker(wid: int, barrier: Barrier) -> tuple[bool, str, bool]:
         client = BFClient(base_url=base_url, token=token, timeout=180.0)
         runner_id: str | None = None
+        allocated_runner_id: str | None = None  # preserved for logging after release
         rng = random.Random(wid + int(time.monotonic() * 1000))
         # Per-cycle timings: list of (exec_s, pause_s, resume_s) per cycle.
         cycle_timings: list[dict[str, float]] = []
@@ -1843,6 +1844,7 @@ def suite_concurrency(
             alloc_dur = time.monotonic() - t0
             _alloc_latencies.append(("exec_dirty_cycles", alloc_dur))
             runner_id = resp.runner_id
+            allocated_runner_id = runner_id
 
             for cycle in range(NUM_PAUSE_CYCLES):
                 # --- Exec phase: write random data to random offsets ---
@@ -1876,13 +1878,32 @@ def suite_concurrency(
                 # flush to the block device before pause.
                 script = " ".join(bg_cmds) + " wait && sync"
 
+                # Exec with retry: the thaw agent exec endpoint can
+                # transiently 502/503 right after resume even though the
+                # readiness probe passed moments earlier.
                 t_exec = time.monotonic()
-                exec_events = list(client.runners.exec(
-                    runner_id,
-                    ["sh", "-c", script],
-                    timeout_seconds=60,
-                ))
+                exec_events = None
+                last_exec_err = None
+                for attempt in range(3):
+                    try:
+                        exec_events = list(client.runners.exec(
+                            runner_id,
+                            ["sh", "-c", script],
+                            timeout_seconds=60,
+                        ))
+                        last_exec_err = None
+                        break
+                    except (BFServiceUnavailable, BFRateLimited) as exc:
+                        last_exec_err = exc
+                        if attempt < 2:
+                            time.sleep(2 * (attempt + 1))
                 exec_dur = time.monotonic() - t_exec
+
+                if last_exec_err is not None or exec_events is None:
+                    return False, (
+                        f"Cycle {cycle}: exec failed after 3 retries: "
+                        f"{last_exec_err} (worker {wid})"
+                    ), True
 
                 # Check for non-zero exit.
                 exit_events = [e for e in exec_events if e.type == "exit"]
@@ -2011,7 +2032,7 @@ def suite_concurrency(
             # Always log timings, even on failure, so we capture partial data.
             if cycle_timings:
                 log.info("Worker cycle timings", extra={
-                    "worker": wid, "runner_id": runner_id,
+                    "worker": wid, "runner_id": allocated_runner_id,
                     "alloc_ms": round(alloc_dur * 1000),
                     "cycles": cycle_timings,
                 })
@@ -2396,11 +2417,11 @@ def suite_cleanup(
     SUITE = "cleanup"
     for cid in config_ids:
         with test_case(run, SUITE, f"Delete config {cid[:12]}", log):
-            client.layered_configs.delete(cid)
+            client._layered_configs.delete(cid)
             log.info("Config deleted", extra={"config_id": cid})
 
         with test_case(run, SUITE, f"Deleted config {cid[:12]} not in list", log):
-            configs = client.layered_configs.list()
+            configs = client._layered_configs.list()
             ids = [c.config_id for c in configs]
             assert cid not in ids, f"Config {cid} still listed after delete"
 

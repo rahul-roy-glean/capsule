@@ -13,8 +13,56 @@ env:
   GO_VERSION: '1.24'
 
 jobs:
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.filter.outputs.go }}
+      migrations: ${{ steps.filter.outputs.migrations }}
+      python_sdk: ${{ steps.filter.outputs.python_sdk }}
+      workflows: ${{ steps.filter.outputs.workflows }}
+      helm: ${{ steps.filter.outputs.helm }}
+      examples: ${{ steps.filter.outputs.examples }}
+      contract: ${{ steps.filter.outputs.contract }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            go:
+              - '**/*.go'
+              - 'go.mod'
+              - 'go.sum'
+              - 'Makefile'
+            migrations:
+              - 'cmd/control-plane/migrations/**'
+              - 'cmd/control-plane/schema.sql'
+              - '.github/scripts/check-migrations.sh'
+            python_sdk:
+              - 'sdk/python/**'
+            workflows:
+              - '.github/workflows/**'
+              - '.github/scripts/**'
+            helm:
+              - 'deploy/helm/**'
+            examples:
+              - 'examples/**'
+              - 'cmd/onboard/**'
+            contract:
+              - 'sdk/python/**'
+              - 'cmd/control-plane/**'
+              - 'cmd/firecracker-manager/**'
+              - 'pkg/**'
+              - 'go.mod'
+              - 'go.sum'
+
   fmt:
     name: Format
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -44,6 +92,8 @@ jobs:
 
   migration-guard:
     name: Migration Guard
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.migrations == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -54,6 +104,8 @@ jobs:
 
   vet:
     name: Vet
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -64,6 +116,8 @@ jobs:
 
   lint:
     name: Lint
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -77,6 +131,8 @@ jobs:
 
   test:
     name: Test
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -100,6 +156,8 @@ jobs:
 
   build:
     name: Build
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -124,6 +182,8 @@ jobs:
 
   sdk-python:
     name: Python SDK
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.python_sdk == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -144,6 +204,8 @@ jobs:
 
   workflow-lint:
     name: Workflow Lint
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -151,6 +213,8 @@ jobs:
 
   helm-lint:
     name: Helm Lint
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.helm == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -159,6 +223,8 @@ jobs:
 
   example-validation:
     name: Validate Examples
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.examples == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -169,6 +235,8 @@ jobs:
 
   contract-tests:
     name: SDK Contract Tests
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.contract == 'true'
     runs-on: ubuntu-latest
     services:
       postgres:

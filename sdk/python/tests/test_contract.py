@@ -65,31 +65,32 @@ class TestContract:
 
     def test_layered_config_crud(self, client: BFClient) -> None:
         name = f"contract-{uuid.uuid4().hex[:8]}"
-        created = client.layered_configs.create(_layered_config_body(name))
+        created = client.workloads.onboard(_layered_config_body(name), build=False)
 
         config_id = created.config_id
         assert config_id
-        assert created.leaf_workload_key
+        assert created.workload_key
 
         try:
-            listed_ids = {cfg.config_id for cfg in client.layered_configs.list()}
+            listed_ids = {cfg.config_id for cfg in client.workloads.list() if cfg.config_id}
             assert config_id in listed_ids
 
-            detail = client.layered_configs.get(config_id)
-            assert detail.config.config_id == config_id
-            assert detail.config.display_name == name
-            assert detail.layers
-            assert detail.layers[0].name
+            detail = client.workloads.get(name)
+            assert detail.config_id == config_id
+            assert detail.display_name == name
         finally:
             with suppress(Exception):
-                client.layered_configs.delete(config_id)
+                client.workloads.delete(name)
 
         with pytest.raises(BFNotFound):
-            client.layered_configs.get(config_id)
+            client.workloads.get(name)
 
     def test_invalid_layered_config_returns_http_400(self, client: BFClient) -> None:
         with pytest.raises(BFHTTPError) as exc:
-            client.layered_configs.create({"display_name": "invalid", "layers": []})
+            client.workloads.onboard(
+                {"display_name": "invalid", "layers": [{"name": "", "init_commands": []}]},
+                build=False,
+            )
 
         assert exc.value.status_code == 400
-        assert "at least one layer is required" in exc.value.message
+        assert "layer name must not be empty" in exc.value.message

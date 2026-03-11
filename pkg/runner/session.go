@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -12,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
+	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
 	"github.com/rahul-roy-glean/bazel-firecracker/pkg/uffd"
@@ -66,6 +68,15 @@ type SessionMetadata struct {
 	// TTL config preserved across pause/resume
 	TTLSeconds int  `json:"ttl_seconds,omitempty"`
 	AutoPause  bool `json:"auto_pause,omitempty"`
+
+	// ServicePort is the port of the user's service inside the VM (from StartCommand).
+	// Preserved so that resume can re-forward it into the network namespace.
+	ServicePort int `json:"service_port,omitempty"`
+	// SnapshotVersion is the snapshot version used to boot this runner.
+	SnapshotVersion string `json:"snapshot_version,omitempty"`
+	// AuthConfig preserves the auth proxy configuration so it can be
+	// recreated on resume.
+	AuthConfig *authproxy.AuthConfig `json:"auth_config,omitempty"`
 
 	// GCS-backed session fields (populated when SessionChunkBucket is configured).
 	// When GCSManifestPath is non-empty, ResumeFromSession uses UFFD-backed
@@ -215,18 +226,21 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 	}
 
 	metadata := SessionMetadata{
-		SessionID:   sessionID,
-		WorkloadKey: runner.WorkloadKey,
-		RunnerID:    runnerID,
-		HostID:      m.config.HostID,
-		Layers:      layerN + 1,
-		CreatedAt:   runner.CreatedAt,
-		PausedAt:    time.Now(),
-		RootfsPath:  runner.RootfsOverlay,
-		VCPUs:       runner.Resources.VCPUs,
-		MemoryMB:    runner.Resources.MemoryMB,
-		TTLSeconds:  runner.TTLSeconds,
-		AutoPause:   runner.AutoPause,
+		SessionID:       sessionID,
+		WorkloadKey:     runner.WorkloadKey,
+		RunnerID:        runnerID,
+		HostID:          m.config.HostID,
+		Layers:          layerN + 1,
+		CreatedAt:       runner.CreatedAt,
+		PausedAt:        time.Now(),
+		RootfsPath:      runner.RootfsOverlay,
+		VCPUs:           runner.Resources.VCPUs,
+		MemoryMB:        runner.Resources.MemoryMB,
+		TTLSeconds:      runner.TTLSeconds,
+		AutoPause:       runner.AutoPause,
+		ServicePort:     runner.ServicePort,
+		SnapshotVersion: runner.SnapshotVersion,
+		AuthConfig:      runner.AuthConfig,
 	}
 
 	// GCS-backed upload: when sessionMemStore is configured, upload dirty mem
@@ -611,18 +625,21 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 	}
 
 	metadata := SessionMetadata{
-		SessionID:   sessionID,
-		WorkloadKey: runner.WorkloadKey,
-		RunnerID:    runnerID,
-		HostID:      m.config.HostID,
-		Layers:      layerN + 1,
-		CreatedAt:   runner.CreatedAt,
-		PausedAt:    time.Now(),
-		RootfsPath:  runner.RootfsOverlay,
-		VCPUs:       runner.Resources.VCPUs,
-		MemoryMB:    runner.Resources.MemoryMB,
-		TTLSeconds:  runner.TTLSeconds,
-		AutoPause:   runner.AutoPause,
+		SessionID:       sessionID,
+		WorkloadKey:     runner.WorkloadKey,
+		RunnerID:        runnerID,
+		HostID:          m.config.HostID,
+		Layers:          layerN + 1,
+		CreatedAt:       runner.CreatedAt,
+		PausedAt:        time.Now(),
+		RootfsPath:      runner.RootfsOverlay,
+		VCPUs:           runner.Resources.VCPUs,
+		MemoryMB:        runner.Resources.MemoryMB,
+		TTLSeconds:      runner.TTLSeconds,
+		AutoPause:       runner.AutoPause,
+		ServicePort:     runner.ServicePort,
+		SnapshotVersion: runner.SnapshotVersion,
+		AuthConfig:      runner.AuthConfig,
 	}
 
 	// GCS-backed upload (same logic as PauseRunner)
@@ -1121,6 +1138,11 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentDebugPort); err != nil {
 			m.logger.WithError(err).Warn("Failed to forward thaw-agent debug port")
 		}
+		if metadata.ServicePort > 0 {
+			if err := m.netnsNetwork.ForwardPort(runnerID, metadata.ServicePort); err != nil {
+				m.logger.WithField("port", metadata.ServicePort).WithError(err).Warn("Failed to forward service port on resume")
+			}
+		}
 	}
 
 	// Build runner record
@@ -1131,7 +1153,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		InternalIP:      internalIP,
 		TapDevice:       tap.Name,
 		MAC:             tap.MAC,
-		SnapshotVersion: "", // populated by chunked manager when applicable
+		SnapshotVersion: metadata.SnapshotVersion,
 		WorkloadKey:     metadata.WorkloadKey,
 		Resources: Resources{
 			VCPUs:    metadata.VCPUs,
@@ -1141,13 +1163,42 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		StartedAt:     time.Now(),
 		SocketPath:    filepath.Join(m.config.SocketDir, runnerID+".sock"),
 		LogPath:       filepath.Join(m.config.LogDir, runnerID+".log"),
+		MetricsPath:   filepath.Join(m.config.LogDir, runnerID+".metrics"),
 		RootfsOverlay: overlayPath,
 		SessionID:     sessionID,
 		SessionDir:    sessionDir,
 		SessionLayers: metadata.Layers,
 		TTLSeconds:    metadata.TTLSeconds,
 		AutoPause:     metadata.AutoPause,
+		ServicePort:   metadata.ServicePort,
+		AuthConfig:    metadata.AuthConfig,
 		LastExecAt:    time.Now(),
+	}
+
+	// Recreate auth proxy if the paused runner had one
+	var proxy *authproxy.AuthProxy
+	if metadata.AuthConfig != nil && m.netnsNetwork != nil {
+		ns, nsErr := m.netnsNetwork.GetNamespace(runnerID)
+		if nsErr != nil {
+			m.logger.WithError(nsErr).Warn("Failed to get namespace for auth proxy on resume")
+		} else {
+			hostVethIP := net.IPv4(10, 200, byte(ns.Slot), 1).String()
+			proxy, err = authproxy.NewAuthProxy(
+				runnerID,
+				*metadata.AuthConfig,
+				ns.Path,
+				ns.Gateway.String(),
+				hostVethIP,
+				m.logger,
+			)
+			if err != nil {
+				m.logger.WithError(err).Warn("Failed to create auth proxy on resume (non-fatal)")
+			} else if startErr := proxy.Start(context.Background()); startErr != nil {
+				proxy.Stop()
+				proxy = nil
+				m.logger.WithError(startErr).Warn("Failed to start auth proxy on resume (non-fatal)")
+			}
+		}
 	}
 
 	m.mu.Lock()
@@ -1156,13 +1207,22 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	m.runners[runnerID] = runner
 	m.vms[runnerID] = vm
 	m.uffdHandlers[runnerID] = uffdHandler
+	if proxy != nil {
+		m.authProxies[runnerID] = proxy
+	}
 	m.mu.Unlock()
 	lease.Commit()
 
 	// Inject MMDS data BEFORE resuming so the thaw-agent sees fresh config
-	mmdsData := m.buildMMDSData(ctx, runner, tap, AllocateRequest{
+	allocReq := AllocateRequest{
 		WorkloadKey: metadata.WorkloadKey,
-	})
+	}
+	mmdsData := m.buildMMDSData(ctx, runner, tap, allocReq)
+	if proxy != nil {
+		mmdsData.Latest.Proxy.Address = proxy.ProxyAddress()
+		mmdsData.Latest.Proxy.CACertPEM = string(proxy.CACertPEM)
+		mmdsData.Latest.Proxy.MetadataHost = proxy.GatewayIP()
+	}
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		m.logger.WithError(err).Warn("Failed to set MMDS data on resumed runner")
 	}

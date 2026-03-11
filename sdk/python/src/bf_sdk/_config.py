@@ -12,8 +12,15 @@ class ConnectionConfig:
 
     base_url: str
     token: str | None
-    timeout: float
+    request_timeout: float
+    startup_timeout: float
+    operation_timeout: float
     user_agent: str
+
+    @property
+    def timeout(self) -> float:
+        """Backward-compatible alias for the request timeout."""
+        return self.request_timeout
 
     @classmethod
     def resolve(
@@ -22,6 +29,9 @@ class ConnectionConfig:
         base_url: str | None = None,
         token: str | None = None,
         timeout: float = 30.0,
+        request_timeout: float | None = None,
+        startup_timeout: float | None = None,
+        operation_timeout: float | None = None,
     ) -> ConnectionConfig:
         resolved_base_url = (
             base_url
@@ -30,10 +40,27 @@ class ConnectionConfig:
         ).rstrip("/")
 
         resolved_token = token if token is not None else os.environ.get("BF_TOKEN")
+        resolved_request_timeout = (
+            request_timeout
+            if request_timeout is not None
+            else float(os.environ.get("BF_REQUEST_TIMEOUT", timeout))
+        )
+        resolved_startup_timeout = (
+            startup_timeout
+            if startup_timeout is not None
+            else float(os.environ.get("BF_STARTUP_TIMEOUT", 45.0))
+        )
+        resolved_operation_timeout = (
+            operation_timeout
+            if operation_timeout is not None
+            else float(os.environ.get("BF_OPERATION_TIMEOUT", 120.0))
+        )
 
         return cls(
             base_url=resolved_base_url,
             token=resolved_token,
-            timeout=timeout,
+            request_timeout=resolved_request_timeout,
+            startup_timeout=resolved_startup_timeout,
+            operation_timeout=resolved_operation_timeout,
             user_agent=f"bf-sdk-python/{__version__}",
         )

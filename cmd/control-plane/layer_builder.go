@@ -53,12 +53,57 @@ func (s *LayerBuildScheduler) Run(ctx context.Context) {
 			return
 		case <-gcTicker.C:
 			s.snapshotManager.GCTerminatedBuilderVMs(ctx)
+			s.reconcileCompletedBuilds(ctx)
 		case <-ticker.C:
 			s.processWaitingBuilds(ctx)
 			s.processQueuedBuilds(ctx)
 			s.checkRefreshSchedules(ctx)
 			s.checkRunningBuilds(ctx)
 		}
+	}
+}
+
+// reconcileCompletedBuilds fixes layers stuck in 'pending' status when their
+// builds completed successfully. This can happen if the process was interrupted
+// (e.g., pod restart) between marking a build as 'completed' and updating the
+// layer status to 'active'. Runs periodically as a safety net.
+func (s *LayerBuildScheduler) reconcileCompletedBuilds(ctx context.Context) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT sb.build_id, sb.layer_hash, sb.version
+		FROM snapshot_builds sb
+		JOIN snapshot_layers sl ON sb.layer_hash = sl.layer_hash
+		WHERE sb.status = 'completed'
+		  AND sl.status = 'pending'
+		  AND (sl.current_version IS NULL OR sl.current_version = '')
+		ORDER BY sb.completed_at DESC
+	`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	// Track which layer_hashes we've already fixed (take the latest completed build)
+	fixed := make(map[string]bool)
+	for rows.Next() {
+		var buildID, layerHash, version string
+		if err := rows.Scan(&buildID, &layerHash, &version); err != nil {
+			continue
+		}
+		if fixed[layerHash] {
+			continue
+		}
+		fixed[layerHash] = true
+
+		artifactHash := s.snapshotManager.ThawAgentHash(ctx)
+		if _, err := s.db.ExecContext(ctx, `UPDATE snapshot_layers SET current_version=$1, build_artifact_hash=$3, status='active', updated_at=NOW() WHERE layer_hash=$2 AND status='pending'`, version, layerHash, artifactHash); err != nil {
+			s.logger.WithError(err).WithField("layer_hash", layerHash[:16]).Error("Reconcile: failed to activate layer")
+			continue
+		}
+		s.logger.WithFields(logrus.Fields{
+			"build_id":   buildID,
+			"layer_hash": layerHash[:16],
+			"version":    version,
+		}).Warn("Reconcile: activated layer from completed build (was stuck pending)")
 	}
 }
 
@@ -595,10 +640,23 @@ func (s *LayerBuildScheduler) onBuildComplete(ctx context.Context, buildID, laye
 		}
 	}
 
+	// Atomically mark the build as completed AND update the layer status
+	// in a single transaction. Previously these were two separate operations
+	// and a context cancellation (e.g. pod restart) between them could leave
+	// the build as 'completed' but the layer stuck at 'pending'.
+	artifactHash := s.snapshotManager.ThawAgentHash(ctx)
+
+	tx, txErr := s.db.BeginTx(ctx, nil)
+	if txErr != nil {
+		s.logger.WithError(txErr).WithField("build_id", buildID).Error("Failed to begin completion transaction")
+		return
+	}
+	defer tx.Rollback()
+
 	// Only complete the build if it's still in 'running' state.
 	// A concurrent force-cancel may have set it to 'cancelled'; in that case
 	// we must NOT update the layer's current_version (the clean path cleared it).
-	result, err2 := s.db.ExecContext(ctx, `UPDATE snapshot_builds SET status='completed', completed_at=NOW() WHERE build_id=$1 AND status='running'`, buildID)
+	result, err2 := tx.ExecContext(ctx, `UPDATE snapshot_builds SET status='completed', completed_at=NOW() WHERE build_id=$1 AND status='running'`, buildID)
 	if err2 != nil {
 		s.logger.WithError(err2).WithField("build_id", buildID).Error("Failed to mark build completed")
 		return
@@ -612,8 +670,24 @@ func (s *LayerBuildScheduler) onBuildComplete(ctx context.Context, buildID, laye
 	}
 
 	// Update layer status and record the current thaw-agent hash for staleness detection.
-	artifactHash := s.snapshotManager.ThawAgentHash(ctx)
-	s.db.ExecContext(ctx, `UPDATE snapshot_layers SET current_version=$1, build_artifact_hash=$3, status='active', updated_at=NOW() WHERE layer_hash=$2`, version, layerHash, artifactHash)
+	if _, err := tx.ExecContext(ctx, `UPDATE snapshot_layers SET current_version=$1, build_artifact_hash=$3, status='active', updated_at=NOW() WHERE layer_hash=$2`, version, layerHash, artifactHash); err != nil {
+		s.logger.WithError(err).WithFields(logrus.Fields{
+			"build_id":   buildID,
+			"layer_hash": layerHash[:16],
+		}).Error("Failed to update layer status to active")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		s.logger.WithError(err).WithField("build_id", buildID).Error("Failed to commit build completion transaction")
+		return
+	}
+
+	s.logger.WithFields(logrus.Fields{
+		"build_id":   buildID,
+		"layer_hash": layerHash[:16],
+		"version":    version,
+	}).Info("Build completed and layer activated")
 
 	// Unblock waiting children (leaf layers have no children, skip the query)
 	if !isLeaf {
@@ -1143,6 +1217,20 @@ shutdown -h now
 	}
 	networkURL := fmt.Sprintf("projects/%s/global/networks/%s", sm.gcpProject, network)
 
+	netIface := &computepb.NetworkInterface{
+		Network: proto.String(networkURL),
+		AccessConfigs: []*computepb.AccessConfig{
+			{
+				Type: proto.String("ONE_TO_ONE_NAT"),
+				Name: proto.String("External NAT"),
+			},
+		},
+	}
+	if sm.builderSubnet != "" {
+		region := sm.gcpZone[:len(sm.gcpZone)-2] // strip zone suffix (e.g. "us-central1-c" -> "us-central1")
+		netIface.Subnetwork = proto.String(fmt.Sprintf("projects/%s/regions/%s/subnetworks/%s", sm.gcpProject, region, sm.builderSubnet))
+	}
+
 	req := &computepb.InsertInstanceRequest{
 		Project: sm.gcpProject,
 		Zone:    sm.gcpZone,
@@ -1162,15 +1250,7 @@ shutdown -h now
 				},
 			},
 			NetworkInterfaces: []*computepb.NetworkInterface{
-				{
-					Network: proto.String(networkURL),
-					AccessConfigs: []*computepb.AccessConfig{
-						{
-							Type: proto.String("ONE_TO_ONE_NAT"),
-							Name: proto.String("External NAT"),
-						},
-					},
-				},
+				netIface,
 			},
 			Metadata: &computepb.Metadata{
 				Items: []*computepb.Items{

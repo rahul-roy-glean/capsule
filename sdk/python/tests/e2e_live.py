@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from bf_sdk import BFClient, BFServiceUnavailable, RunnerConfig, RunnerSession
+from bf_sdk import BFClient, RunnerConfig, RunnerSession
 
 
 def _preflight_local_stack(base_url: str) -> None:
@@ -73,37 +73,6 @@ def _normalized_stdout(text: str) -> str:
     return text.rstrip("\r\n")
 
 
-def _allocate_with_retry(
-    client: BFClient,
-    workload_key: str,
-    *,
-    session_id: str,
-    network_policy_preset: str,
-    timeout: float = 45.0,
-    poll_interval: float = 2.0,
-) -> Any:
-    deadline = time.monotonic() + timeout
-    last_error: BFServiceUnavailable | None = None
-
-    while time.monotonic() < deadline:
-        try:
-            return client.runners.allocate(
-                workload_key,
-                session_id=session_id,
-                network_policy_preset=network_policy_preset,
-            )
-        except BFServiceUnavailable as exc:
-            last_error = exc
-            time.sleep(poll_interval)
-
-    raise RuntimeError(
-        "The control plane is reachable, but there are no allocatable hosts yet. "
-        "If you just started the stack, wait a few seconds for firecracker-manager "
-        "to heartbeat and retry. Otherwise inspect `/tmp/fc-dev/logs/control-plane.log` "
-        "and `/tmp/fc-dev/logs/firecracker-manager.log`."
-    ) from last_error
-
-
 def test_sdk_live_e2e() -> None:
     base_url = os.getenv("BF_BASE_URL", "http://localhost:8080").rstrip("/")
     _preflight_local_stack(base_url)
@@ -113,6 +82,7 @@ def test_sdk_live_e2e() -> None:
     text_path = f"/workspace/{unique}.txt"
     binary_path = f"/workspace/{unique}.bin"
     config_id: str | None = None
+    workload = None
     released = False
 
     with BFClient(base_url=base_url) as client:
@@ -124,26 +94,22 @@ def test_sdk_live_e2e() -> None:
         )
 
         try:
-            created = client.runner_configs.apply(config)
-            config_id = created.config_id
-            assert created.leaf_workload_key
+            workload = client.workloads.onboard(config)
+            config_id = workload.config_id
+            assert config_id
 
-            build = client.runner_configs.build(config_id)
-            assert build.config_id == config_id
-            assert build.status == "build_enqueued"
-
-            listed_ids = {cfg.config_id for cfg in client.layered_configs.list()}
+            listed_ids = {cfg.config_id for cfg in client.workloads.list() if cfg.config_id}
             assert config_id in listed_ids
 
-            detail = client.layered_configs.get(config_id)
-            assert detail.config.config_id == config_id
-            assert detail.config.leaf_workload_key == created.leaf_workload_key
+            detail = client.workloads.get(unique)
+            assert detail.config_id == config_id
+            assert detail.display_name == unique
 
-            allocation = _allocate_with_retry(
-                client,
-                created.leaf_workload_key,
+            allocation = client.workloads.allocate(
+                workload,
                 session_id=session_id,
                 network_policy_preset="restricted-egress",
+                startup_timeout=45.0,
             )
 
             runner = RunnerSession(
@@ -161,19 +127,18 @@ def test_sdk_live_e2e() -> None:
                 assert exec_result.exit_code == 0
                 assert _normalized_stdout(exec_result.stdout) == unique
 
-                write_result = runner.write_file(text_path, unique)
+                write_result = runner.write_text(text_path, unique)
                 assert write_result["bytes_written"] == len(unique)
 
                 read_result = runner.read_file(text_path)
-                assert read_result["content"] == unique
+                assert read_result.content == unique
+                assert runner.read_text(text_path) == unique
 
                 stat_result = runner.stat_file(text_path)
                 assert stat_result["exists"] is True
 
                 list_result = runner.list_files("/workspace")
-                entries = list_result.get("entries", [])
-                assert isinstance(entries, list)
-                assert f"{unique}.txt" in _entry_names(entries)
+                assert f"{unique}.txt" in _entry_names([entry.model_dump() for entry in list_result.entries])
 
                 payload = b"\x00\x01sdk-e2e"
                 upload_result = runner.upload(binary_path, payload)
@@ -218,4 +183,4 @@ def test_sdk_live_e2e() -> None:
         finally:
             if config_id is not None:
                 with suppress(Exception):
-                    client.layered_configs.delete(config_id)
+                    client.workloads.delete(workload or config_id)

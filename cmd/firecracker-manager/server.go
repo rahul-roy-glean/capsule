@@ -165,6 +165,9 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 	// Freeze TTL config on the runner for both fresh allocations and resumes.
 	r.TTLSeconds = allocReq.TTLSeconds
 	r.AutoPause = allocReq.AutoPause
+	if allocReq.AuthConfig != nil {
+		r.AuthConfig = allocReq.AuthConfig
+	}
 	if r.SessionID != "" && r.LastExecAt.IsZero() {
 		r.LastExecAt = r.StartedAt
 	}
