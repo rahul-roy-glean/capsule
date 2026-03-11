@@ -926,34 +926,8 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
             }
           }
         },
-        # Row 2: Cache hit ratio over time + page faults rate
+        # Row 2: UFFD page faults + memory cache hits vs misses
         {
-          yPos   = 2
-          width  = 6
-          height = 4
-          widget = {
-            title = "Chunk Cache Hit Ratio Over Time"
-            xyChart = {
-              dataSets = [{
-                timeSeriesQuery = {
-                  timeSeriesFilter = {
-                    filter = "metric.type=\"${local.metric_prefix}/chunked.cache_hit_ratio\" AND metric.label.service_name=\"${local.mgr_service}\""
-                    aggregation = {
-                      alignmentPeriod    = "60s"
-                      perSeriesAligner   = "ALIGN_MEAN"
-                      crossSeriesReducer = "REDUCE_MEAN"
-                    }
-                  }
-                }
-                legendTemplate = "Hit Ratio"
-                plotType       = "LINE"
-              }]
-              yAxis = { label = "ratio (0-1)" }
-            }
-          }
-        },
-        {
-          xPos   = 6
           yPos   = 2
           width  = 6
           height = 4
@@ -986,7 +960,21 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
                     }
                   }
                   legendTemplate = "Chunk Fetches (GCS)"
-                },
+                }
+              ]
+              yAxis = { label = "count/min" }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 2
+          width  = 6
+          height = 4
+          widget = {
+            title = "Memory Cache Hits vs Misses"
+            xyChart = {
+              dataSets = [
                 {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
@@ -998,7 +986,20 @@ resource "google_monitoring_dashboard" "chunked_snapshot" {
                       }
                     }
                   }
-                  legendTemplate = "Cache Hits"
+                  legendTemplate = "Hits"
+                },
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/chunked.cache_misses\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = "Misses"
                 }
               ]
               yAxis = { label = "count/min" }

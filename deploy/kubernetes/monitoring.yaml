@@ -1232,7 +1232,7 @@ data:
             "width": 6,
             "height": 4,
             "widget": {
-              "title": "Chunk Activity Totals",
+              "title": "UFFD Page Faults & Chunk Fetches",
               "xyChart": {
                 "dataSets": [
                   {
@@ -1252,20 +1252,6 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.cache_hits\" AND metric.label.service_name=\"firecracker-manager\"",
-                        "aggregation": {
-                          "alignmentPeriod": "60s",
-                          "perSeriesAligner": "ALIGN_MAX",
-                          "crossSeriesReducer": "REDUCE_SUM"
-                        }
-                      }
-                    },
-                    "legendTemplate": "cache hits",
-                    "plotType": "LINE"
-                  },
-                  {
-                    "timeSeriesQuery": {
-                      "timeSeriesFilter": {
                         "filter": "metric.type=\"workload.googleapis.com/chunked.chunk_fetches\" AND metric.label.service_name=\"firecracker-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
@@ -1274,7 +1260,7 @@ data:
                         }
                       }
                     },
-                    "legendTemplate": "chunk fetches",
+                    "legendTemplate": "chunk fetches (GCS)",
                     "plotType": "LINE"
                   }
                 ],
@@ -1290,7 +1276,51 @@ data:
             "width": 6,
             "height": 4,
             "widget": {
-              "title": "Chunked Disk IO Totals",
+              "title": "Memory Cache Hits vs Misses",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.cache_hits\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "hits",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.cache_misses\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "misses",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "latest total"
+                }
+              }
+            }
+          },
+          {
+            "xPos": 0,
+            "yPos": 6,
+            "width": 6,
+            "height": 4,
+            "widget": {
+              "title": "FUSE Disk IO Totals",
               "xyChart": {
                 "dataSets": [
                   {
@@ -1329,7 +1359,7 @@ data:
             }
           },
           {
-            "xPos": 0,
+            "xPos": 6,
             "yPos": 6,
             "width": 6,
             "height": 4,
@@ -1373,8 +1403,8 @@ data:
             }
           },
           {
-            "xPos": 6,
-            "yPos": 6,
+            "xPos": 0,
+            "yPos": 10,
             "width": 6,
             "height": 4,
             "widget": {
@@ -1417,7 +1447,7 @@ data:
             }
           },
           {
-            "xPos": 0,
+            "xPos": 6,
             "yPos": 10,
             "width": 6,
             "height": 4,
@@ -1461,8 +1491,8 @@ data:
             }
           },
           {
-            "xPos": 6,
-            "yPos": 10,
+            "xPos": 0,
+            "yPos": 14,
             "width": 6,
             "height": 4,
             "widget": {

@@ -230,6 +230,7 @@ func main() {
 	// Cumulative counters reported as absolute values from GetChunkedStats - use gauges
 	pageFaultsGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedPageFaults))
 	cacheHitsGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedCacheHits))
+	cacheMissesGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedCacheMisses))
 	chunkFetchesGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedChunkFetches))
 	diskReadsGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedDiskReads))
 	diskWritesGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedDiskWrites))
@@ -327,6 +328,7 @@ func main() {
 		memCacheItems:   memCacheItemsGauge,
 		pageFaults:      pageFaultsGauge,
 		cacheHits:       cacheHitsGauge,
+		cacheMisses:     cacheMissesGauge,
 		chunkFetches:    chunkFetchesGauge,
 		diskReads:       diskReadsGauge,
 		diskWrites:      diskWritesGauge,
@@ -427,6 +429,7 @@ type autoscaleInstruments struct {
 	memCacheItems   metric.Int64Gauge
 	pageFaults      metric.Int64Gauge
 	cacheHits       metric.Int64Gauge
+	cacheMisses     metric.Int64Gauge
 	chunkFetches    metric.Int64Gauge
 	diskReads       metric.Int64Gauge
 	diskWrites      metric.Int64Gauge
@@ -476,7 +479,8 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			instruments.memCacheMax.Record(ctx, cs.MemCacheMaxSize)
 			instruments.memCacheItems.Record(ctx, int64(cs.MemCacheItems))
 			instruments.pageFaults.Record(ctx, int64(cs.TotalPageFaults))
-			instruments.cacheHits.Record(ctx, int64(cs.TotalCacheHits))
+			instruments.cacheHits.Record(ctx, int64(cs.MemCacheHits))
+			instruments.cacheMisses.Record(ctx, int64(cs.MemCacheMisses))
 			instruments.chunkFetches.Record(ctx, int64(cs.TotalChunkFetches))
 			instruments.diskReads.Record(ctx, int64(cs.TotalDiskReads))
 			instruments.diskWrites.Record(ctx, int64(cs.TotalDiskWrites))

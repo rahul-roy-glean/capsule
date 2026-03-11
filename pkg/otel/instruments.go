@@ -54,6 +54,7 @@ const (
 	CIJobs                 CounterName = "ci.jobs"
 	ChunkedPageFaults      CounterName = "chunked.page_faults"
 	ChunkedCacheHits       CounterName = "chunked.cache_hits"
+	ChunkedCacheMisses     CounterName = "chunked.cache_misses"
 	ChunkedChunkFetches    CounterName = "chunked.chunk_fetches"
 	ChunkedDiskReads       CounterName = "chunked.disk_reads"
 	ChunkedDiskWrites      CounterName = "chunked.disk_writes"
@@ -144,6 +145,7 @@ var counterDescriptions = map[CounterName]string{
 	CIJobs:                 "Total CI jobs processed",
 	ChunkedPageFaults:      "Total page faults handled by chunked loader",
 	ChunkedCacheHits:       "Chunk cache hits",
+	ChunkedCacheMisses:     "Chunk cache misses",
 	ChunkedChunkFetches:    "Total chunk fetches from remote storage",
 	ChunkedDiskReads:       "Total disk read operations for chunked storage",
 	ChunkedDiskWrites:      "Total disk write operations for chunked storage",
