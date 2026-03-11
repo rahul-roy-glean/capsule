@@ -718,4 +718,3 @@ func networkPolicyVal(policy json.RawMessage) *string {
 	s := string(policy)
 	return &s
 }
-
