@@ -5,7 +5,7 @@ from pydantic import Field
 from bf_sdk.models.common import BFModel
 
 
-def _empty_entries() -> list["FileEntry"]:
+def _empty_entries() -> list[FileEntry]:
     return []
 
 

@@ -63,6 +63,12 @@ class TestLayeredConfigs:
         assert len(result) == 2
         assert all(isinstance(c, StoredLayeredConfig) for c in result)
 
+    def test_list_handles_null_configs(self, lc: LayeredConfigs, http_client: HttpClient) -> None:
+        mock_resp = httpx.Response(200, json={"configs": None, "count": 0})
+        with patch.object(http_client._client, "request", return_value=mock_resp):
+            result = lc.list()
+        assert result == []
+
     def test_get(self, lc: LayeredConfigs, http_client: HttpClient) -> None:
         resp_data = {
             "config": {"config_id": "c1", "display_name": "My Config"},

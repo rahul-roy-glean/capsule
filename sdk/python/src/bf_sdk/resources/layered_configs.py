@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
-from typing import cast
+from typing import TYPE_CHECKING, Any, cast
 
 from bf_sdk._errors import BFConflict, BFNotFound
 from bf_sdk._http import HttpClient
@@ -35,7 +34,8 @@ class LayeredConfigs:
 
     def list(self) -> list[StoredLayeredConfig]:
         data = self._http.get("/api/v1/layered-configs")
-        return [StoredLayeredConfig.model_validate(c) for c in data.get("configs", [])]
+        raw_configs = data.get("configs") or []
+        return [StoredLayeredConfig.model_validate(c) for c in raw_configs]
 
     def get(self, config_id: str) -> LayeredConfigDetail:
         data = self._http.get(f"/api/v1/layered-configs/{config_id}")
