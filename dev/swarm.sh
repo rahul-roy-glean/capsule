@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
-CP_BASE="${CONTROL_PLANE:-http://localhost:8080}"
+CP_BASE="${CONTROL_PLANE:-http://10.0.16.16:8080}"
 CONFIG_FILE="${CONFIG_FILE:-bin/claude-sandbox-config.json}"
 NUM_CREATORS=2
 NUM_FIXERS=3
