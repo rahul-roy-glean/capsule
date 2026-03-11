@@ -59,6 +59,7 @@ class AllocateRunnerResponse(BFModel):
     internal_ip: str | None = None
     session_id: str | None = None
     resumed: bool = False
+    request_id: str | None = None
 
 
 class RunnerStatus(BFModel):

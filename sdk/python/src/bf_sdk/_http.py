@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import random
 import time
 import uuid
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 import httpx
@@ -16,14 +18,31 @@ from bf_sdk._errors import (
     BFConnectionError,
     BFHTTPError,
     BFNotFound,
+    BFRequestTimeoutError,
     BFRateLimited,
     BFServiceUnavailable,
-    BFTimeoutError,
 )
 
 _RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
 _MAX_RETRIES = 3
 _BASE_BACKOFF = 0.5
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    max_retries: int = 0
+    retry_status_codes: frozenset[int] = field(default_factory=frozenset)
+    retry_transport_errors: bool = False
+    retry_timeouts: bool = False
+
+
+_GET_RETRY_POLICY = RetryPolicy(
+    max_retries=_MAX_RETRIES,
+    retry_status_codes=frozenset(_RETRYABLE_STATUS_CODES),
+    retry_transport_errors=True,
+    retry_timeouts=True,
+)
 
 
 class HttpClient:
@@ -41,7 +60,7 @@ class HttpClient:
         self._client = httpx.Client(
             base_url=config.base_url,
             headers=headers,
-            timeout=httpx.Timeout(config.timeout),
+            timeout=httpx.Timeout(config.request_timeout),
         )
 
     def close(self) -> None:
@@ -49,14 +68,56 @@ class HttpClient:
 
     # -- Public request methods ------------------------------------------------
 
-    def get(self, url: str, *, params: dict[str, str] | None = None) -> dict[str, Any]:
-        return self._request("GET", url, params=params)
+    def get(
+        self,
+        url: str,
+        *,
+        params: dict[str, str] | None = None,
+        request_id: str | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            url,
+            params=params,
+            request_id=request_id,
+            timeout=timeout,
+            retry_policy=_GET_RETRY_POLICY,
+        )
 
-    def post(self, url: str, *, json_body: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self._request("POST", url, json_body=json_body)
+    def post(
+        self,
+        url: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        request_id: str | None = None,
+        timeout: float | None = None,
+        retry_policy: RetryPolicy | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            url,
+            json_body=json_body,
+            request_id=request_id,
+            timeout=timeout,
+            retry_policy=retry_policy or RetryPolicy(),
+        )
 
-    def delete(self, url: str) -> dict[str, Any]:
-        return self._request("DELETE", url)
+    def delete(
+        self,
+        url: str,
+        *,
+        request_id: str | None = None,
+        timeout: float | None = None,
+        retry_policy: RetryPolicy | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "DELETE",
+            url,
+            request_id=request_id,
+            timeout=timeout,
+            retry_policy=retry_policy or RetryPolicy(),
+        )
 
     def get_bytes(
         self,
@@ -64,17 +125,20 @@ class HttpClient:
         *,
         base_url: str | None = None,
         params: dict[str, str] | None = None,
+        request_id: str | None = None,
+        timeout: float | None = None,
     ) -> bytes:
         """Streaming GET that returns raw bytes (for file download)."""
-        request_id = str(uuid.uuid4())
+        request_id = request_id or str(uuid.uuid4())
         headers = {"X-Request-Id": request_id}
+        timeout_value = self._resolve_timeout(timeout, self._config.operation_timeout)
 
         client = self._client
         if base_url:
             client = httpx.Client(
                 base_url=base_url,
                 headers=dict(self._client.headers),
-                timeout=httpx.Timeout(None),
+                timeout=self._timeout_config(timeout_value),
             )
 
         try:
@@ -86,7 +150,12 @@ class HttpClient:
         except httpx.ConnectError as exc:
             raise BFConnectionError(str(exc)) from exc
         except httpx.TimeoutException as exc:
-            raise BFTimeoutError(str(exc)) from exc
+            raise BFRequestTimeoutError(
+                f"Timed out downloading bytes from {url}",
+                request_id=request_id,
+                timeout=timeout_value,
+                operation="download",
+            ) from exc
         finally:
             if base_url:
                 client.close()
@@ -98,31 +167,36 @@ class HttpClient:
         data: bytes,
         base_url: str | None = None,
         params: dict[str, str] | None = None,
+        request_id: str | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         """POST with raw binary body, returns JSON response (for file upload)."""
-        request_id = str(uuid.uuid4())
+        request_id = request_id or str(uuid.uuid4())
         headers = {"X-Request-Id": request_id, "Content-Type": "application/octet-stream"}
+        timeout_value = self._resolve_timeout(timeout, self._config.operation_timeout)
 
         client = self._client
         if base_url:
             client = httpx.Client(
                 base_url=base_url,
                 headers=dict(self._client.headers),
-                timeout=httpx.Timeout(None),
+                timeout=self._timeout_config(timeout_value),
             )
 
         try:
             resp = client.post(url, content=data, params=params, headers=headers)
             if resp.status_code >= 400:
                 self._raise_for_status(resp, request_id)
-            try:
-                return resp.json()  # type: ignore[no-any-return]
-            except (json.JSONDecodeError, ValueError):
-                return {"_raw": resp.text}
+            return self._decode_response_body(resp, request_id)
         except httpx.ConnectError as exc:
             raise BFConnectionError(str(exc)) from exc
         except httpx.TimeoutException as exc:
-            raise BFTimeoutError(str(exc)) from exc
+            raise BFRequestTimeoutError(
+                f"Timed out uploading bytes to {url}",
+                request_id=request_id,
+                timeout=timeout_value,
+                operation="upload",
+            ) from exc
         finally:
             if base_url:
                 client.close()
@@ -133,31 +207,36 @@ class HttpClient:
         *,
         json_body: dict[str, Any] | None = None,
         base_url: str | None = None,
+        request_id: str | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
-        """POST to host agent with no timeout. Returns JSON response."""
-        request_id = str(uuid.uuid4())
+        """POST to a host agent with a bounded operation timeout."""
+        request_id = request_id or str(uuid.uuid4())
         headers = {"X-Request-Id": request_id}
+        timeout_value = self._resolve_timeout(timeout, self._config.operation_timeout)
 
         client = self._client
         if base_url:
             client = httpx.Client(
                 base_url=base_url,
                 headers=dict(self._client.headers),
-                timeout=httpx.Timeout(None),
+                timeout=self._timeout_config(timeout_value),
             )
 
         try:
             resp = client.post(url, json=json_body, headers=headers)
             if resp.status_code >= 400:
                 self._raise_for_status(resp, request_id)
-            try:
-                return resp.json()  # type: ignore[no-any-return]
-            except (json.JSONDecodeError, ValueError):
-                return {"_raw": resp.text}
+            return self._decode_response_body(resp, request_id)
         except httpx.ConnectError as exc:
             raise BFConnectionError(str(exc)) from exc
         except httpx.TimeoutException as exc:
-            raise BFTimeoutError(str(exc)) from exc
+            raise BFRequestTimeoutError(
+                f"Timed out calling host operation {url}",
+                request_id=request_id,
+                timeout=timeout_value,
+                operation="host_request",
+            ) from exc
         finally:
             if base_url:
                 client.close()
@@ -168,17 +247,20 @@ class HttpClient:
         *,
         json_body: dict[str, Any] | None = None,
         base_url: str | None = None,
+        request_id: str | None = None,
+        timeout: float | None = None,
     ) -> Iterator[dict[str, Any]]:
         """POST and stream back ndjson lines. Yields dicts."""
-        request_id = str(uuid.uuid4())
+        request_id = request_id or str(uuid.uuid4())
         headers = {"X-Request-Id": request_id, "Accept": "application/x-ndjson"}
+        timeout_value = self._resolve_timeout(timeout, self._config.operation_timeout)
 
         client = self._client
         if base_url:
             client = httpx.Client(
                 base_url=base_url,
                 headers=dict(self._client.headers),
-                timeout=httpx.Timeout(None),  # no timeout for streaming
+                timeout=self._timeout_config(timeout_value),
             )
 
         try:
@@ -202,7 +284,12 @@ class HttpClient:
         except httpx.ConnectError as exc:
             raise BFConnectionError(str(exc)) from exc
         except httpx.TimeoutException as exc:
-            raise BFTimeoutError(str(exc)) from exc
+            raise BFRequestTimeoutError(
+                f"Timed out streaming {url}",
+                request_id=request_id,
+                timeout=timeout_value,
+                operation="stream",
+            ) from exc
         finally:
             if base_url:
                 client.close()
@@ -216,11 +303,16 @@ class HttpClient:
         *,
         params: dict[str, str] | None = None,
         json_body: dict[str, Any] | None = None,
+        request_id: str | None = None,
+        timeout: float | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> dict[str, Any]:
-        request_id = str(uuid.uuid4())
+        request_id = request_id or str(uuid.uuid4())
         last_exc: Exception | None = None
+        policy = retry_policy or RetryPolicy()
+        timeout_value = self._resolve_timeout(timeout, self._config.request_timeout)
 
-        for attempt in range(_MAX_RETRIES):
+        for attempt in range(policy.max_retries + 1):
             try:
                 resp = self._client.request(
                     method,
@@ -228,16 +320,27 @@ class HttpClient:
                     params=params,
                     json=json_body,
                     headers={"X-Request-Id": request_id},
+                    timeout=self._timeout_config(timeout_value),
                 )
 
                 if resp.status_code < 400:
-                    try:
-                        return resp.json()  # type: ignore[no-any-return]
-                    except (json.JSONDecodeError, ValueError):
-                        return {"_raw": resp.text}
+                    return self._decode_response_body(resp, request_id)
 
-                if resp.status_code in _RETRYABLE_STATUS_CODES and attempt < _MAX_RETRIES - 1:
+                if (
+                    resp.status_code in policy.retry_status_codes
+                    and attempt < policy.max_retries
+                ):
                     retry_after = _parse_retry_after(resp)
+                    logger.debug(
+                        "Retrying %s %s after HTTP %s (attempt %s/%s, request_id=%s, retry_after=%s)",
+                        method,
+                        url,
+                        resp.status_code,
+                        attempt + 1,
+                        policy.max_retries,
+                        request_id,
+                        retry_after,
+                    )
                     self._backoff(attempt, retry_after)
                     continue
 
@@ -245,21 +348,40 @@ class HttpClient:
 
             except (httpx.ConnectError, httpx.ReadError, httpx.WriteError) as exc:
                 last_exc = exc
-                if attempt < _MAX_RETRIES - 1:
+                if policy.retry_transport_errors and attempt < policy.max_retries:
+                    logger.debug(
+                        "Retrying %s %s after transport error %r (attempt %s/%s, request_id=%s)",
+                        method,
+                        url,
+                        exc,
+                        attempt + 1,
+                        policy.max_retries,
+                        request_id,
+                    )
                     self._backoff(attempt)
                     continue
                 raise BFConnectionError(str(exc)) from exc
 
             except httpx.TimeoutException as exc:
                 last_exc = exc
-                # Only retry timeouts for idempotent methods. Retrying a
-                # POST/DELETE timeout is dangerous: the server may have
-                # received the request and started processing it, so a
-                # retry would create a duplicate operation.
-                if method == "GET" and attempt < _MAX_RETRIES - 1:
+                if policy.retry_timeouts and attempt < policy.max_retries:
+                    logger.debug(
+                        "Retrying %s %s after timeout %r (attempt %s/%s, request_id=%s)",
+                        method,
+                        url,
+                        exc,
+                        attempt + 1,
+                        policy.max_retries,
+                        request_id,
+                    )
                     self._backoff(attempt)
                     continue
-                raise BFTimeoutError(str(exc)) from exc
+                raise BFRequestTimeoutError(
+                    f"{method} {url} timed out",
+                    request_id=request_id,
+                    timeout=timeout_value,
+                    operation="request",
+                ) from exc
 
         # Should not reach here, but satisfy type checker
         if last_exc:
@@ -298,6 +420,25 @@ class HttpClient:
         else:
             delay = _BASE_BACKOFF * (2**attempt) + random.uniform(0, 0.5)
             time.sleep(delay)
+
+    @staticmethod
+    def _timeout_config(timeout: float | None) -> httpx.Timeout:
+        return httpx.Timeout(timeout)
+
+    @staticmethod
+    def _resolve_timeout(timeout: float | None, default: float) -> float:
+        return default if timeout is None else timeout
+
+    @staticmethod
+    def _decode_response_body(resp: httpx.Response, request_id: str) -> dict[str, Any]:
+        try:
+            raw = resp.json()
+            if isinstance(raw, dict):
+                raw.setdefault("request_id", request_id)
+                return cast(dict[str, Any], raw)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return {"_raw": resp.text, "request_id": request_id}
 
 
 def _parse_retry_after(resp: httpx.Response) -> float | None:

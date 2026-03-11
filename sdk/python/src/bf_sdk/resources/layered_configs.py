@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from bf_sdk._errors import BFConflict, BFNotFound
 from bf_sdk._http import HttpClient
 from bf_sdk.models.layered_config import (
     BuildResponse,
@@ -11,9 +12,17 @@ from bf_sdk.models.layered_config import (
     StoredLayeredConfig,
 )
 
+if TYPE_CHECKING:
+    from bf_sdk.runner_config import RunnerConfig
+
 
 class LayeredConfigs:
-    """Layered configuration management."""
+    """Advanced low-level layered config management.
+
+    This is kept as a compatibility escape hatch. Most users should prefer
+    `BFClient.workloads`, which wraps these control-plane details in a more
+    ergonomic workload-first API.
+    """
 
     def __init__(self, http: HttpClient) -> None:
         self._http = http
@@ -50,3 +59,84 @@ class LayeredConfigs:
             f"/api/v1/layered-configs/{config_id}/layers/{layer_name}/refresh",
         )
         return RefreshResponse.model_validate(data)
+
+    def resolve_workload_key(
+        self,
+        config_ref: str | CreateConfigResponse | StoredLayeredConfig | LayeredConfigDetail | "RunnerConfig",
+    ) -> str:
+        """Resolve a user-facing config reference into a control-plane workload key."""
+        direct = self._extract_direct_workload_key(config_ref)
+        if direct:
+            return direct
+
+        if isinstance(config_ref, LayeredConfigDetail):
+            return self._resolve_from_stored_config(config_ref.config)
+
+        if isinstance(config_ref, StoredLayeredConfig):
+            return self._resolve_from_stored_config(config_ref)
+
+        ref_value = self._extract_reference_value(config_ref)
+        configs = self.list()
+
+        workload_matches = [cfg for cfg in configs if cfg.leaf_workload_key == ref_value]
+        if workload_matches:
+            return workload_matches[0].leaf_workload_key  # type: ignore[return-value]
+
+        config_id_matches = [cfg for cfg in configs if cfg.config_id == ref_value]
+        if config_id_matches:
+            return self._resolve_from_stored_config(config_id_matches[0])
+
+        display_name_matches = [cfg for cfg in configs if cfg.display_name == ref_value]
+        if len(display_name_matches) > 1:
+            raise BFConflict(
+                f"Multiple layered configs share the display name {ref_value!r}. "
+                "Use a config_id or workload key to disambiguate."
+            )
+        if len(display_name_matches) == 1:
+            return self._resolve_from_stored_config(display_name_matches[0])
+
+        raise BFNotFound(
+            f"Could not resolve workload {ref_value!r}. "
+            "Pass a display name, config_id, create response, or workload key."
+        )
+
+    @staticmethod
+    def _extract_reference_value(
+        config_ref: str | CreateConfigResponse | StoredLayeredConfig | LayeredConfigDetail | "RunnerConfig",
+    ) -> str:
+        if isinstance(config_ref, str):
+            return config_ref
+
+        if hasattr(config_ref, "display_name"):
+            value = getattr(config_ref, "display_name")
+            if isinstance(value, str) and value:
+                return value
+
+        if hasattr(config_ref, "config_id"):
+            value = getattr(config_ref, "config_id")
+            if isinstance(value, str) and value:
+                return value
+
+        raise BFNotFound("Could not determine how to resolve the requested workload reference.")
+
+    @staticmethod
+    def _extract_direct_workload_key(
+        config_ref: str | CreateConfigResponse | StoredLayeredConfig | LayeredConfigDetail | "RunnerConfig",
+    ) -> str | None:
+        if hasattr(config_ref, "workload_key"):
+            value = getattr(config_ref, "workload_key")
+            if isinstance(value, str) and value:
+                return value
+        if hasattr(config_ref, "leaf_workload_key"):
+            value = getattr(config_ref, "leaf_workload_key")
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    def _resolve_from_stored_config(self, cfg: StoredLayeredConfig) -> str:
+        if cfg.leaf_workload_key:
+            return cfg.leaf_workload_key
+        detail = self.get(cfg.config_id)
+        if detail.config.leaf_workload_key:
+            return detail.config.leaf_workload_key
+        raise BFNotFound(f"Layered config {cfg.config_id!r} does not expose a workload key yet.")

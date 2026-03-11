@@ -37,7 +37,7 @@ telling you to spin it up first with `bash dev/run-stack.sh`.
 
 ## Quickstart
 
-The fastest way to get started is the declarative **RunnerConfig** API — declare your runner shape once, build it, then spawn runners:
+The fastest way to get started is the high-level `workloads` API: onboard a workload, then start it by name.
 
 ```python
 from bf_sdk import BFClient, RunnerConfig
@@ -54,15 +54,18 @@ cfg = (
 )
 
 with BFClient(base_url="http://localhost:8080", token="my-token") as bf:
-    # 2. Register the config and build
-    result = bf.runner_configs.apply(cfg)
-    bf.runner_configs.build(result.config_id)
+    # 2. Onboard the workload and build it
+    workload = bf.workloads.onboard(cfg)
 
-    # 3. Spawn a runner from the config (auto-released on exit)
-    with bf.runners.from_config(result.leaf_workload_key) as r:
+    # 3. Spawn a ready runner by workload name (auto-released on exit)
+    with bf.workloads.start(workload) as r:
         # Run a command and collect output
         output, code = r.exec_collect("python", "-c", "print('hello')")
         print(output, code)
+
+        # Ergonomic file helpers
+        r.write_text("/workspace/hello.txt", "hello")
+        print(r.read_text("/workspace/hello.txt"))
 
         # Or stream events
         for event in r.exec("pytest", "-q"):
@@ -79,69 +82,45 @@ with BFClient(base_url="http://localhost:8080", token="my-token") as bf:
         r.resume()
 ```
 
+You can also onboard from YAML directly:
+
+```python
+from bf_sdk import BFClient
+
+with BFClient(base_url="http://localhost:8080", token="my-token") as bf:
+    workload = bf.workloads.onboard_yaml(
+        "examples/afs/onboard.yaml",
+        name="afs-sandbox",
+    )
+
+    with bf.workloads.start("afs-sandbox") as runner:
+        print(runner.read_text("/etc/hostname"))
+```
+
 ## Low-level API
 
-For full control, use the resource APIs directly:
+For full control, use the lower-level resource APIs directly. `allocate()` now retries transient capacity failures internally using a stable `request_id`, `allocate_ready()` gives you a single "usable runner" step, and the SDK can resolve workload names for you instead of forcing `leaf_workload_key` through your app:
 
 ```python
 from bf_sdk import BFClient
 
 with BFClient(base_url="http://localhost:8080", token="my-token") as client:
-    # Allocate a runner
-    runner = client.runners.allocate("my-workload-key")
-    client.runners.wait_ready(runner.runner_id)
+    # Allocate and wait for a usable runner
+    with client.runners.allocate_ready("my-workload-key") as runner:
+        # Execute a command (streaming ndjson)
+        for event in runner.exec("echo", "hello"):
+            if event.type == "stdout":
+                print(event.data, end="")
+            elif event.type == "exit":
+                print(f"Exit code: {event.code}")
 
-    # Execute a command (streaming ndjson)
-    for event in client.runners.exec(runner.runner_id, ["echo", "hello"]):
-        if event.type == "stdout":
-            print(event.data, end="")
-        elif event.type == "exit":
-            print(f"Exit code: {event.code}")
+        # Typed file results still support dict-style access
+        write_result = runner.write_text("/workspace/out.txt", "hello")
+        print(write_result.bytes_written)
 
-    # PTY shell
-    with client.runners.shell(runner.runner_id) as shell:
-        shell.send("ls -la\n")
-        data = shell.recv_stdout(timeout=5.0)
-        print(data.decode())
-
-    # Pause and resume
-    pause = client.runners.pause(runner.runner_id)
-    conn = client.runners.connect(runner.runner_id)
-
-    # Release
-    client.runners.release(runner.runner_id)
-```
-
-## Layered Config Management
-
-```python
-from bf_sdk import BFClient
-
-with BFClient() as client:
-    # List configs
-    configs = client.layered_configs.list()
-
-    # Create a layered config
-    result = client.layered_configs.create({
-        "display_name": "My Workload",
-        "base_image": "ubuntu:22.04",
-        "layers": [
-            {"name": "deps", "init_commands": [{"type": "shell", "args": ["bash", "-lc", "apt-get install -y python3"]}]},
-            {"name": "app", "init_commands": [{"type": "shell", "args": ["bash", "-lc", "pip install ."]}]},
-        ],
-        "config": {"tier": "m", "auto_rollout": True},
-    })
-
-    # Trigger a build
-    build = client.layered_configs.build(result.config_id)
-
-    # Get config details with layer statuses
-    detail = client.layered_configs.get(result.config_id)
-    for layer in detail.layers or []:
-        print(f"{layer.name}: {layer.status}")
-
-    # Refresh a specific layer
-    client.layered_configs.refresh_layer(result.config_id, "deps")
+    # Or keep low-level allocation + explicit waiting if you want
+    allocation = client.workloads.allocate("My dev sandbox", startup_timeout=45.0)
+    client.runners.wait_ready(allocation.runner_id, timeout=45.0)
 ```
 
 ## Configuration
@@ -150,21 +129,35 @@ with BFClient() as client:
 |---|---|---|
 | `base_url` | `BF_BASE_URL` | `http://localhost:8080` |
 | `token` | `BF_TOKEN` | `None` |
-| `timeout` | - | `30.0` |
+| `request_timeout` | `BF_REQUEST_TIMEOUT` | `30.0` |
+| `startup_timeout` | `BF_STARTUP_TIMEOUT` | `45.0` |
+| `operation_timeout` | `BF_OPERATION_TIMEOUT` | `120.0` |
+
+`BFClient(timeout=...)` is still supported as a backwards-compatible alias for `request_timeout`.
 
 ## Key Concepts
 
 | SDK concept | Server primitive | Description |
 |---|---|---|
 | `RunnerConfig` | LayeredConfig | Declarative runner shape (layers, tier, TTL, etc.) |
-| `runner_configs.build()` | `/layered-configs/{id}/build` | Build all layers in a config |
-| `layered_configs.refresh_layer()` | `/layered-configs/{id}/layers/{name}/refresh` | Refresh a specific layer |
+| `workloads.onboard()` | LayeredConfig create + build | Register a workload from Python or YAML |
+| `runner_configs.build()` | `/layered-configs/{id}/build` | Advanced build control for an already-registered config |
 | `runners.from_config()` | `/runners/allocate` | Spawn a runner from a config |
 | `RunnerSession` | Runner ID + host cache | High-level handle with exec/shell/pause/resume |
 
 ## Host Reconnection
 
-The SDK caches host addresses from `allocate()` and `connect()` responses. If a host agent returns 503 during `exec()`, the SDK automatically calls `connect()` to get a new host and retries (only if no output has been received yet).
+The SDK caches host addresses from `allocate()` and `connect()` responses. If a host agent returns 503 during `exec()`, the SDK automatically calls `connect()` to get a new host and retries (only if no output has been received yet). Safe read-only host operations also refresh the cached host and retry once, and PTY attach will reconnect once with a refreshed host before surfacing an error.
+
+## Retry And Timeout Model
+
+- `allocate()` retries transient capacity and control-plane availability failures until `startup_timeout` expires.
+- `workloads.onboard_yaml()` accepts either YAML text or a YAML file path. If the YAML does not include `display_name`, pass `name=...`.
+- `workloads.start()` is the preferred high-level path for named workloads.
+- `from_config()` waits for a ready runner by default; pass `wait_ready=False` if you want lower-level control.
+- `from_config()` and `allocate()` accept a workload display name, config response, config id, or raw workload key. Most callers should stick to a display name and let the SDK resolve the control-plane key.
+- `request_timeout` covers one HTTP request, `startup_timeout` covers "get me a usable runner", and `operation_timeout` covers host-side file/PTY/stream operations.
+- Successful responses include a `request_id` so you can correlate SDK behavior with control-plane logs.
 
 Layer commands use the control-plane `SnapshotCommand` shape under the hood:
 `{"type": "shell", "args": ["bash", "-lc", "echo hi"]}`. The shorthand

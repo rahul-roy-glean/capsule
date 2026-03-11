@@ -78,3 +78,65 @@ class BFConnectionError(BFError):
 
 class BFTimeoutError(BFError):
     """Request timeout."""
+
+    def __init__(
+        self,
+        message: str = "Timed out",
+        *,
+        request_id: str | None = None,
+        runner_id: str | None = None,
+        timeout: float | None = None,
+        operation: str | None = None,
+    ) -> None:
+        self.message = message
+        self.request_id = request_id
+        self.runner_id = runner_id
+        self.timeout = timeout
+        self.operation = operation
+        super().__init__(message)
+
+
+class BFRequestTimeoutError(BFTimeoutError):
+    """Single request exceeded the configured request timeout."""
+
+
+class BFOperationTimeoutError(BFTimeoutError):
+    """A longer-running runner operation exceeded its timeout."""
+
+
+class BFAllocationTimeoutError(BFTimeoutError):
+    """Allocation did not produce a usable runner before the startup timeout."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        workload_key: str,
+        request_id: str | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        self.workload_key = workload_key
+        super().__init__(
+            message,
+            request_id=request_id,
+            timeout=timeout,
+            operation="allocate",
+        )
+
+
+class BFRunnerUnavailableError(BFError):
+    """Runner cannot become ready because it is in a terminal or unavailable state."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        runner_id: str,
+        status: str | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        self.message = message
+        self.runner_id = runner_id
+        self.status = status
+        self.retry_after = retry_after
+        super().__init__(message)

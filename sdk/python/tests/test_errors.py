@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from bf_sdk._errors import (
+    BFAllocationTimeoutError,
     BFAuthError,
     BFConflict,
     BFConnectionError,
     BFError,
     BFHTTPError,
     BFNotFound,
+    BFOperationTimeoutError,
+    BFRequestTimeoutError,
     BFRateLimited,
+    BFRunnerUnavailableError,
     BFServiceUnavailable,
     BFTimeoutError,
 )
@@ -56,3 +60,24 @@ class TestErrorHierarchy:
     def test_timeout_error(self) -> None:
         err = BFTimeoutError("timed out")
         assert isinstance(err, BFError)
+
+    def test_request_timeout_error(self) -> None:
+        err = BFRequestTimeoutError("request timed out", request_id="req-1", timeout=30.0)
+        assert err.request_id == "req-1"
+        assert err.timeout == 30.0
+
+    def test_operation_timeout_error(self) -> None:
+        err = BFOperationTimeoutError("wait_ready timed out", runner_id="r-1", operation="wait_ready")
+        assert err.runner_id == "r-1"
+        assert err.operation == "wait_ready"
+
+    def test_allocation_timeout_error(self) -> None:
+        err = BFAllocationTimeoutError("allocate timed out", workload_key="wk-1", request_id="req-2", timeout=45.0)
+        assert err.workload_key == "wk-1"
+        assert err.request_id == "req-2"
+        assert err.operation == "allocate"
+
+    def test_runner_unavailable_error(self) -> None:
+        err = BFRunnerUnavailableError("runner unavailable", runner_id="r-1", status="terminated")
+        assert err.runner_id == "r-1"
+        assert err.status == "terminated"

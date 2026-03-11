@@ -7,10 +7,19 @@ from bf_sdk._config import ConnectionConfig
 
 class TestConnectionConfig:
     def test_explicit_values(self) -> None:
-        cfg = ConnectionConfig.resolve(base_url="http://example.com", token="token123", timeout=10.0)
+        cfg = ConnectionConfig.resolve(
+            base_url="http://example.com",
+            token="token123",
+            request_timeout=10.0,
+            startup_timeout=50.0,
+            operation_timeout=90.0,
+        )
         assert cfg.base_url == "http://example.com"
         assert cfg.token == "token123"
         assert cfg.timeout == 10.0
+        assert cfg.request_timeout == 10.0
+        assert cfg.startup_timeout == 50.0
+        assert cfg.operation_timeout == 90.0
         assert "bf-sdk-python" in cfg.user_agent
 
     def test_env_fallback(self, monkeypatch: object) -> None:
@@ -37,6 +46,8 @@ class TestConnectionConfig:
             assert cfg.base_url == "http://localhost:8080"
             assert cfg.token is None
             assert cfg.timeout == 30.0
+            assert cfg.startup_timeout == 45.0
+            assert cfg.operation_timeout == 120.0
         finally:
             os.environ.update(env_backup)
 

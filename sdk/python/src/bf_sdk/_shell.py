@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import struct
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import websockets.sync.client
+from websockets.exceptions import WebSocketException
 
 if TYPE_CHECKING:
     from websockets.sync.client import ClientConnection
@@ -19,13 +21,27 @@ MSG_SIGNAL = 0x04
 class ShellSession:
     """WebSocket PTY session using the binary frame protocol."""
 
-    def __init__(self, ws_url: str) -> None:
+    def __init__(
+        self,
+        ws_url: str,
+        *,
+        reconnect_url_factory: Callable[[], str] | None = None,
+        connect_timeout: float | None = None,
+    ) -> None:
         self._url = ws_url
+        self._reconnect_url_factory = reconnect_url_factory
+        self._connect_timeout = connect_timeout
         self._conn: ClientConnection | None = None
         self._exit_code: int | None = None
 
     def connect(self) -> None:
-        self._conn = websockets.sync.client.connect(self._url)
+        try:
+            self._conn = self._connect(self._url)
+        except (OSError, WebSocketException):
+            if self._reconnect_url_factory is None:
+                raise
+            self._url = self._reconnect_url_factory()
+            self._conn = self._connect(self._url)
 
     def close(self) -> None:
         if self._conn:
@@ -97,3 +113,6 @@ class ShellSession:
         if self._conn is None:
             raise RuntimeError("ShellSession is not connected. Call connect() or use as context manager.")
         return self._conn
+
+    def _connect(self, url: str) -> ClientConnection:
+        return websockets.sync.client.connect(url, open_timeout=self._connect_timeout)

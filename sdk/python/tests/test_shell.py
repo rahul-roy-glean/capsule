@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -28,6 +29,20 @@ class TestShellProtocol:
         session = ShellSession("ws://localhost/pty")
         # Just test the __exit__ path doesn't error when not connected
         session.close()
+
+    def test_connect_retries_with_refreshed_url(self) -> None:
+        conn = Mock()
+        session = ShellSession(
+            "ws://stale/pty",
+            reconnect_url_factory=lambda: "ws://fresh/pty",
+            connect_timeout=5.0,
+        )
+        with patch.object(session, "_connect", side_effect=[OSError("stale"), conn]) as connect:
+            session.connect()
+        assert session._conn is conn
+        assert session._url == "ws://fresh/pty"
+        assert connect.call_args_list[0].args[0] == "ws://stale/pty"
+        assert connect.call_args_list[1].args[0] == "ws://fresh/pty"
 
     def test_send_builds_stdin_frame(self) -> None:
         """Verify that send() constructs the correct binary frame."""

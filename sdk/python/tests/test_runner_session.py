@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from bf_sdk._config import ConnectionConfig
+from bf_sdk._errors import BFHTTPError
 from bf_sdk._http import HttpClient
 from bf_sdk.models.runner import ExecEvent, ExecResult
 from bf_sdk.resources.runners import Runners
@@ -25,9 +26,10 @@ def runners(http_client: HttpClient) -> Runners:
 
 class TestRunnerSession:
     def test_properties(self, runners: Runners) -> None:
-        session = RunnerSession(runners, "r-1", host_address="10.0.0.1:8080", session_id="s-1")
+        session = RunnerSession(runners, "r-1", host_address="10.0.0.1:8080", session_id="s-1", request_id="req-1")
         assert session.runner_id == "r-1"
         assert session.session_id == "s-1"
+        assert session.request_id == "req-1"
         # Host should be cached
         assert runners._host_cache["r-1"] == "10.0.0.1:8080"
 
@@ -40,12 +42,26 @@ class TestRunnerSession:
         # release should have been called
         assert "r-1" not in runners._host_cache
 
+    def test_context_manager_preserves_original_exception(self, runners: Runners) -> None:
+        session = RunnerSession(runners, "r-1")
+        with patch.object(runners, "release", side_effect=BFHTTPError(500, "boom")):
+            with pytest.raises(ValueError):
+                with session:
+                    raise ValueError("user failure")
+
     def test_release(self, runners: Runners, http_client: HttpClient) -> None:
         mock_resp = httpx.Response(200, json={"success": True})
         session = RunnerSession(runners, "r-1", host_address="h:8080")
         with patch.object(http_client._client, "request", return_value=mock_resp):
             ok = session.release()
         assert ok is True
+
+    def test_release_is_idempotent(self, runners: Runners) -> None:
+        session = RunnerSession(runners, "r-1")
+        with patch.object(runners, "release", return_value=True) as release:
+            assert session.release() is True
+            assert session.release() is True
+        release.assert_called_once_with("r-1")
 
     def test_pause(self, runners: Runners, http_client: HttpClient) -> None:
         resp_data = {"success": True, "session_id": "s-new", "snapshot_size_bytes": 2048, "layer": 3}
@@ -203,26 +219,17 @@ class TestExecResult:
 
 class TestFromConfig:
     def test_from_config(self, runners: Runners, http_client: HttpClient) -> None:
-        alloc_data = {
-            "runner_id": "r-42",
-            "host_id": "h-1",
-            "host_address": "10.0.0.1:8080",
-            "session_id": "s-1",
-            "resumed": False,
-        }
-        mock_resp = httpx.Response(200, json=alloc_data)
-        with patch.object(http_client._client, "request", return_value=mock_resp):
+        ready_session = RunnerSession(runners, "r-42", host_address="10.0.0.1:8080", session_id="s-1", request_id="req-1")
+        with patch.object(runners, "allocate_ready", return_value=ready_session):
             session = runners.from_config("my-workload", tag="stable")
         assert isinstance(session, RunnerSession)
         assert session.runner_id == "r-42"
         assert session.session_id == "s-1"
+        assert session.request_id == "req-1"
         assert runners._host_cache["r-42"] == "10.0.0.1:8080"
 
     def test_from_config_with_labels(self, runners: Runners, http_client: HttpClient) -> None:
-        alloc_data = {"runner_id": "r-99", "host_address": "h:8080", "resumed": False}
-        mock_resp = httpx.Response(200, json=alloc_data)
-        with patch.object(http_client._client, "request", return_value=mock_resp) as mock_req:
+        ready_session = RunnerSession(runners, "r-99", host_address="h:8080")
+        with patch.object(runners, "allocate_ready", return_value=ready_session) as allocate_ready:
             runners.from_config("wk-1", tag="dev", labels={"env": "ci"})
-        # Verify the allocate call included the label
-        call_kwargs = mock_req.call_args
-        assert call_kwargs is not None
+        assert allocate_ready.call_args.kwargs["labels"] == {"env": "ci"}
