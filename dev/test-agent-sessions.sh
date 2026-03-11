@@ -535,15 +535,15 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-header "14c. Delete local layers (cross-host simulation, GCS mode only)"
+header "14c. Delete local session directory (portable cross-host simulation, GCS mode only)"
 # ---------------------------------------------------------------------------
 if [ -n "$GCS_BUCKET" ]; then
-  echo "  Deleting: $SESSION_DIR/layer_*"
-  rm -rf "$SESSION_DIR/layer_"*
-  if [ ! -d "$SESSION_DIR/layer_0" ]; then
-    pass "Local layer files deleted — resume will use GCS"
+  echo "  Deleting: $SESSION_DIR"
+  rm -rf "$SESSION_DIR"
+  if [ ! -e "$SESSION_DIR" ]; then
+    pass "Local session directory deleted — resume must use portable GCS metadata"
   else
-    fail "Failed to delete local layer files"
+    fail "Failed to delete local session directory"
   fi
 else
   echo "  Skipping (local-only mode — layers needed for resume)"
@@ -672,7 +672,7 @@ else
   fail "Expected layer 1, got $PAUSE2_LAYER"
 fi
 
-# GCS: verify chaining metadata + delete local layers for cross-host
+# GCS: verify chaining metadata + delete local session directory for portable resume
 if [ -n "$GCS_BUCKET" ]; then
   if [ -f "$SESSION_DIR/metadata.json" ]; then
     META2_GCS_DISK=$(jq -c '.gcs_disk_index_objects // {}' "$SESSION_DIR/metadata.json")
@@ -682,12 +682,12 @@ if [ -n "$GCS_BUCKET" ]; then
     pass "GCS session metadata updated for layer 1"
   fi
 
-  echo "  Deleting local layers for cross-host resume..."
-  rm -rf "$SESSION_DIR/layer_"*
-  if [ ! -d "$SESSION_DIR/layer_0" ] && [ ! -d "$SESSION_DIR/layer_1" ]; then
-    pass "Local layer files deleted for cross-host resume (layer 1)"
+  echo "  Deleting local session directory for portable resume..."
+  rm -rf "$SESSION_DIR"
+  if [ ! -e "$SESSION_DIR" ]; then
+    pass "Local session directory deleted for portable resume (layer 1)"
   else
-    fail "Failed to delete local layer files"
+    fail "Failed to delete local session directory"
   fi
 fi
 

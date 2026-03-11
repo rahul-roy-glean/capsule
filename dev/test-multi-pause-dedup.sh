@@ -274,6 +274,17 @@ if [ -n "$P1_EXT_DISKS" ]; then
   done
 fi
 
+# 5e. Delete the local session directory so resume 1 must use portable control-plane
+# metadata plus GCS artifacts, not a host-local metadata.json fallback.
+info "Deleting local session directory before resume 1..."
+rm -rf "$SESSION_DIR"
+if [ ! -e "$SESSION_DIR" ]; then
+  pass "Local session directory deleted before resume 1"
+else
+  fail "Failed to delete local session directory before resume 1"
+  exit 1
+fi
+
 # =====================================================================
 header "6. RESUME from pause 1"
 # =====================================================================
@@ -455,6 +466,17 @@ if [ -n "$P2_EXT_DISKS" ]; then
       inspect "Pause 2 disk '$DRIVE_ID': $P2_DISK_EXTENTS extents"
     fi
   done
+fi
+
+# 9d. Delete the local session directory so resume 2 also proves portability
+# without any local metadata.json or local layer files.
+info "Deleting local session directory before resume 2..."
+rm -rf "$SESSION_DIR"
+if [ ! -e "$SESSION_DIR" ]; then
+  pass "Local session directory deleted before resume 2"
+else
+  fail "Failed to delete local session directory before resume 2"
+  exit 1
 fi
 
 # =====================================================================

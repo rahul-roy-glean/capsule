@@ -129,17 +129,39 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 			}
 		}
 
-		// Try to resume from session snapshot
-		if s.manager.SessionExists(allocReq.SessionID) {
+		// Try to resume from session snapshot. Prefer portable metadata supplied
+		// by the control plane so cross-host resume does not depend on a local
+		// metadata.json file on this host.
+		var portableMeta *runner.SessionMetadata
+		if v, ok := req.Labels["_session_metadata_json"]; ok && v != "" {
+			var meta runner.SessionMetadata
+			if err := json.Unmarshal([]byte(v), &meta); err != nil {
+				s.logger.WithError(err).Warn("Invalid _session_metadata_json, falling back to local session metadata")
+			} else {
+				if meta.SessionID == "" {
+					meta.SessionID = allocReq.SessionID
+				}
+				portableMeta = &meta
+			}
+		}
+
+		if portableMeta != nil || s.manager.SessionExists(allocReq.SessionID) {
 			resumeStart := time.Now()
-			r, err = s.manager.ResumeFromSession(ctx, allocReq.SessionID, allocReq.WorkloadKey)
+			if portableMeta != nil {
+				r, err = s.manager.ResumeFromSessionMetadata(ctx, portableMeta, allocReq.WorkloadKey)
+			} else {
+				r, err = s.manager.ResumeFromSession(ctx, allocReq.SessionID, allocReq.WorkloadKey)
+			}
 			resumeDuration := time.Since(resumeStart)
 
 			if err == nil {
 				resumed = true
 
 				// Determine routing type: GCS-backed or local
-				meta, _ := s.manager.GetSessionMetadata(allocReq.SessionID)
+				meta := portableMeta
+				if meta == nil {
+					meta, _ = s.manager.GetSessionMetadata(allocReq.SessionID)
+				}
 				routing := fcrotel.RoutingLocal
 				if meta != nil && meta.GCSManifestPath != "" {
 					routing = fcrotel.RoutingGCS
@@ -364,10 +386,11 @@ func (s *HostAgentServer) PauseRunner(ctx context.Context, req *pb.PauseRunnerRe
 	}
 
 	return &pb.PauseRunnerResponse{
-		Success:           true,
-		SessionId:         result.SessionID,
-		SnapshotSizeBytes: result.SnapshotSizeBytes,
-		Layer:             int32(result.Layer),
+		Success:             true,
+		SessionId:           result.SessionID,
+		SnapshotSizeBytes:   result.SnapshotSizeBytes,
+		Layer:               int32(result.Layer),
+		SessionMetadataJson: result.SessionMetadataJSON,
 	}, nil
 }
 
@@ -378,7 +401,22 @@ func (s *HostAgentServer) ResumeRunner(ctx context.Context, req *pb.ResumeRunner
 		"workload_key": req.WorkloadKey,
 	}).Info("ResumeRunner request")
 
-	r, err := s.manager.ResumeFromSession(ctx, req.SessionId, req.WorkloadKey)
+	var (
+		r   *runner.Runner
+		err error
+	)
+	if req.SessionMetadataJson != "" {
+		var metadata runner.SessionMetadata
+		if err := json.Unmarshal([]byte(req.SessionMetadataJson), &metadata); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid session_metadata_json: %v", err)
+		}
+		if metadata.SessionID == "" {
+			metadata.SessionID = req.SessionId
+		}
+		r, err = s.manager.ResumeFromSessionMetadata(ctx, &metadata, req.WorkloadKey)
+	} else {
+		r, err = s.manager.ResumeFromSession(ctx, req.SessionId, req.WorkloadKey)
+	}
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to resume runner")
 		return &pb.ResumeRunnerResponse{

@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS session_snapshots (
     auto_pause BOOLEAN DEFAULT false,
     network_policy_preset VARCHAR(64),
     network_policy JSONB,
+    restore_metadata JSONB,
     paused_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );

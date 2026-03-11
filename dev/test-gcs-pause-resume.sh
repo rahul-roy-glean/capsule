@@ -268,37 +268,36 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-header "7. Delete local session files (simulate cross-host resume)"
+header "7. Delete local session directory (simulate true cross-host resume)"
 # ---------------------------------------------------------------------------
 echo "  Deleting: $SESSION_DIR"
-# Keep metadata.json (the resume path reads it), but delete the actual layer files
-# so the UFFD handler is forced to use GCS instead of local files.
-rm -rf "$SESSION_DIR/layer_"*
-if [ ! -d "$SESSION_DIR/layer_0" ]; then
-  pass "Local layer files deleted"
+# Delete the ENTIRE session directory, including metadata.json. A successful
+# resume now proves the control plane persisted portable restore metadata and
+# the host is not relying on local session files at all.
+rm -rf "$SESSION_DIR"
+if [ ! -e "$SESSION_DIR" ]; then
+  pass "Local session directory deleted"
 else
-  fail "Failed to delete local layer files"
+  fail "Failed to delete local session directory"
 fi
 
 # ---------------------------------------------------------------------------
-header "8. Resume: allocate with same session_id (should use GCS)"
+header "8. Resume via /connect on suspended runner (should use portable GCS metadata)"
 # ---------------------------------------------------------------------------
-RESUME_RESP=$(curl -s -X POST "$CP/api/v1/runners/allocate" \
+RESUME_RESP=$(curl -s -X POST "$CP/api/v1/runners/connect" \
   -H 'Content-Type: application/json' \
-  -d "{\"ci_system\":\"none\", \"workload_key\":\"$WORKLOAD_KEY\", \"session_id\":\"$SESSION_ID\"}")
+  -d "{\"runner_id\":\"$RUNNER_ID\"}")
 echo "  Response: $RESUME_RESP"
 
 RESUME_RUNNER_ID=$(echo "$RESUME_RESP" | jq -r '.runner_id')
-RESUMED=$(echo "$RESUME_RESP" | jq -r '.resumed // false')
-RESUME_IP=$(echo "$RESUME_RESP" | jq -r '.internal_ip // empty')
+RESUME_STATUS=$(echo "$RESUME_RESP" | jq -r '.status // empty')
 echo "  Runner ID: $RESUME_RUNNER_ID"
-echo "  Resumed: $RESUMED"
-echo "  Internal IP: $RESUME_IP"
+echo "  Status: $RESUME_STATUS"
 
-if [ "$RESUMED" = "true" ]; then
-  pass "Session resumed"
+if [ "$RESUME_STATUS" = "resumed" ]; then
+  pass "Session resumed through /connect"
 else
-  fail "Expected resumed=true, got $RESUMED"
+  fail "Expected status=resumed, got $RESUME_STATUS"
   echo "  Manager log (last 30 lines):"
   tail -30 /tmp/fc-dev/logs/firecracker-manager.log
   exit 1
@@ -479,15 +478,16 @@ if [ -f "$SESSION_DIR/metadata.json" ]; then
   pass "GCS session metadata updated for layer 1"
 fi
 
-# Delete local layers again (simulate cross-host)
-rm -rf "$SESSION_DIR/layer_"*
-if [ ! -d "$SESSION_DIR/layer_0" ] && [ ! -d "$SESSION_DIR/layer_1" ]; then
-  pass "Local layer files deleted for cross-host resume"
+# Delete the full session directory again so allocate(session_id) also proves it
+# can resume from portable metadata without any local metadata.json.
+rm -rf "$SESSION_DIR"
+if [ ! -e "$SESSION_DIR" ]; then
+  pass "Local session directory deleted for portable resume (layer 1)"
 else
-  fail "Failed to delete local layer files"
+  fail "Failed to delete local session directory"
 fi
 
-# Resume from layer 1
+# Resume from layer 1 using allocate(session_id)
 RESUME2_RESP=$(curl -s -X POST "$CP/api/v1/runners/allocate" \
   -H 'Content-Type: application/json' \
   -d "{\"ci_system\":\"none\", \"workload_key\":\"$WORKLOAD_KEY\", \"session_id\":\"$SESSION_ID\"}")

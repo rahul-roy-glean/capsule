@@ -37,9 +37,10 @@ func (m *Manager) sessionBaseDir() string {
 
 // PauseResult contains the result of a PauseRunner operation.
 type PauseResult struct {
-	SessionID         string `json:"session_id"`
-	Layer             int    `json:"layer"`
-	SnapshotSizeBytes int64  `json:"snapshot_size_bytes"`
+	SessionID           string `json:"session_id"`
+	Layer               int    `json:"layer"`
+	SnapshotSizeBytes   int64  `json:"snapshot_size_bytes"`
+	SessionMetadataJSON string `json:"session_metadata_json,omitempty"`
 }
 
 // CheckpointResult contains the result of a CheckpointRunner operation.
@@ -477,9 +478,10 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 	}).Info("Runner paused successfully")
 
 	return &PauseResult{
-		SessionID:         sessionID,
-		Layer:             layerN,
-		SnapshotSizeBytes: snapshotSize,
+		SessionID:           sessionID,
+		Layer:               layerN,
+		SnapshotSizeBytes:   snapshotSize,
+		SessionMetadataJSON: string(metadataBytes),
 	}, nil
 }
 
@@ -795,18 +797,27 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 
 // ResumeFromSession restores a runner from a session snapshot using layered UFFD.
 func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey string) (*Runner, error) {
-	sessionDir := filepath.Join(m.sessionBaseDir(), sessionID)
-
-	// Read metadata
-	metadataBytes, err := os.ReadFile(filepath.Join(sessionDir, "metadata.json"))
+	metadata, err := m.GetSessionMetadata(sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("session %s not found: %w", sessionID, err)
 	}
+	return m.resumeFromSessionMetadata(ctx, sessionID, workloadKey, metadata)
+}
 
-	var metadata SessionMetadata
-	if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
-		return nil, fmt.Errorf("invalid session metadata: %w", err)
+// ResumeFromSessionMetadata restores a runner using portable metadata supplied
+// by the control plane, enabling cross-host resume without a local metadata.json.
+func (m *Manager) ResumeFromSessionMetadata(ctx context.Context, metadata *SessionMetadata, workloadKey string) (*Runner, error) {
+	if metadata == nil {
+		return nil, fmt.Errorf("session metadata is required")
 	}
+	if metadata.SessionID == "" {
+		return nil, fmt.Errorf("session metadata missing session_id")
+	}
+	return m.resumeFromSessionMetadata(ctx, metadata.SessionID, workloadKey, metadata)
+}
+
+func (m *Manager) resumeFromSessionMetadata(ctx context.Context, sessionID, workloadKey string, metadata *SessionMetadata) (*Runner, error) {
+	sessionDir := filepath.Join(m.sessionBaseDir(), sessionID)
 
 	if workloadKey != "" && metadata.WorkloadKey != workloadKey {
 		return nil, fmt.Errorf("workload_key mismatch: session has %s, requested %s", metadata.WorkloadKey, workloadKey)
@@ -1188,12 +1199,37 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	mmdsData := m.buildMMDSData(ctx, runner, tap, AllocateRequest{
 		WorkloadKey: metadata.WorkloadKey,
 	})
+	mmdsStart := time.Now()
+	m.logger.WithFields(logrus.Fields{
+		"runner_id":  runnerID,
+		"session_id": sessionID,
+	}).Info("Resume stage: injecting MMDS data")
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
-		m.logger.WithError(err).Warn("Failed to set MMDS data on resumed runner")
+		m.logger.WithError(err).WithFields(logrus.Fields{
+			"runner_id":  runnerID,
+			"session_id": sessionID,
+			"mmds_ms":    time.Since(mmdsStart).Milliseconds(),
+		}).Warn("Resume stage failed: MMDS injection")
+	} else {
+		m.logger.WithFields(logrus.Fields{
+			"runner_id":  runnerID,
+			"session_id": sessionID,
+			"mmds_ms":    time.Since(mmdsStart).Milliseconds(),
+		}).Info("Resume stage complete: MMDS injection")
 	}
 
 	// Now resume the VM — thaw-agent will read the fresh MMDS data
+	vmResumeStart := time.Now()
+	m.logger.WithFields(logrus.Fields{
+		"runner_id":  runnerID,
+		"session_id": sessionID,
+	}).Info("Resume stage: resuming microVM")
 	if err := vm.Resume(ctx); err != nil {
+		m.logger.WithError(err).WithFields(logrus.Fields{
+			"runner_id":    runnerID,
+			"session_id":   sessionID,
+			"resume_vm_ms": time.Since(vmResumeStart).Milliseconds(),
+		}).Warn("Resume stage failed: microVM resume")
 		vm.Stop()
 		uffdHandler.Stop()
 		m.mu.Lock()
@@ -1204,6 +1240,11 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		m.mu.Unlock()
 		return nil, fmt.Errorf("failed to resume VM after MMDS injection: %w", err)
 	}
+	m.logger.WithFields(logrus.Fields{
+		"runner_id":    runnerID,
+		"session_id":   sessionID,
+		"resume_vm_ms": time.Since(vmResumeStart).Milliseconds(),
+	}).Info("Resume stage complete: microVM resume")
 
 	m.logger.WithFields(logrus.Fields{
 		"runner_id":  runnerID,

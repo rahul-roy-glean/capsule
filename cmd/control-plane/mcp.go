@@ -232,12 +232,16 @@ func (m *mcpDeps) handlePause(ctx context.Context, _ *mcp.CallToolRequest, in Pa
 		if runner.NetworkPolicyJSON != "" {
 			networkPolicy = runner.NetworkPolicyJSON
 		}
+		var restoreMetadata any
+		if resp.SessionMetadataJson != "" {
+			restoreMetadata = resp.SessionMetadataJson
+		}
 		_, _ = m.db.ExecContext(ctx, `
 			INSERT INTO session_snapshots (
 				session_id, runner_id, workload_key, host_id, status, layer_count, paused_at,
-				runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
+				runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, restore_metadata
 			)
-			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9)
+			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9, $10)
 			ON CONFLICT (session_id) DO UPDATE SET
 				status = 'suspended',
 				layer_count = EXCLUDED.layer_count,
@@ -245,9 +249,10 @@ func (m *mcpDeps) handlePause(ctx context.Context, _ *mcp.CallToolRequest, in Pa
 				runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
 				auto_pause = EXCLUDED.auto_pause,
 				network_policy_preset = EXCLUDED.network_policy_preset,
-				network_policy = EXCLUDED.network_policy
+				network_policy = EXCLUDED.network_policy,
+				restore_metadata = EXCLUDED.restore_metadata
 		`, resp.SessionId, in.SandboxID, runner.WorkloadKey, host.ID, resp.Layer+1,
-			runner.RunnerTTLSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy)
+			runner.RunnerTTLSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy, restoreMetadata)
 	}
 
 	_ = m.hostRegistry.RemoveRunner(in.SandboxID)
@@ -272,27 +277,52 @@ func (m *mcpDeps) handleResume(ctx context.Context, _ *mcp.CallToolRequest, in R
 	var sessionAutoPause sql.NullBool
 	var sessionNPPreset sql.NullString
 	var sessionNPJSON sql.NullString
+	var sessionRestoreMeta sql.NullString
 	if m.db == nil {
 		return nil, ResumeSandboxOutput{}, fmt.Errorf("no database configured")
 	}
 	err := m.db.QueryRowContext(ctx,
-		`SELECT session_id, host_id, workload_key, status, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
+		`SELECT session_id, host_id, workload_key, status, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, restore_metadata
 		 FROM session_snapshots WHERE runner_id = $1`,
-		in.SandboxID).Scan(&sessionID, &hostID, &workloadKey, &status, &sessionTTL, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON)
+		in.SandboxID).Scan(&sessionID, &hostID, &workloadKey, &status, &sessionTTL, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON, &sessionRestoreMeta)
 	if err != nil || status != "suspended" {
 		return nil, ResumeSandboxOutput{}, fmt.Errorf("no suspended session found for sandbox %s", in.SandboxID)
 	}
 
-	// Pick host to resume on
-	var resumeHost *Host
-	origHost, origErr := m.hostRegistry.GetHost(hostID)
-	if origErr == nil && origHost.Status != "draining" && origHost.Status != "terminating" {
-		resumeHost = origHost
-	} else {
-		resumeHost = m.scheduler.selectBestHostForWorkloadKey(m.hostRegistry.GetAvailableHosts(), workloadKey)
-	}
+	crossHostEligible := sessionRestoreMeta.Valid && sessionRestoreMetadataSupportsCrossHost(sessionRestoreMeta.String)
+	resumeHost, unavailableReason := selectOriginalSessionResumeHost(m.hostRegistry, hostID, time.Now())
 	if resumeHost == nil {
-		return nil, ResumeSandboxOutput{}, fmt.Errorf("no available host for session resume")
+		if crossHostEligible {
+			resumeHost = m.scheduler.selectBestHostForWorkloadKey(m.hostRegistry.GetAvailableHosts(), workloadKey)
+			if resumeHost != nil {
+				m.logger.WithFields(logrus.Fields{
+					"sandbox_id":    in.SandboxID,
+					"session_id":    sessionID,
+					"original_host": hostID,
+					"resume_host":   resumeHost.ID,
+					"workload_key":  workloadKey,
+					"unavailable":   unavailableReason,
+				}).Warn("Original session host unavailable; falling back to cross-host portable resume")
+			}
+		}
+		if resumeHost == nil {
+			m.logger.WithFields(logrus.Fields{
+				"sandbox_id":    in.SandboxID,
+				"session_id":    sessionID,
+				"original_host": hostID,
+				"workload_key":  workloadKey,
+				"unavailable":   unavailableReason,
+			}).Warn("Original session host unavailable and no portable resume host available")
+			errMsg := "original session host unavailable; retry later"
+			if !crossHostEligible {
+				errMsg = "original session host unavailable and session is not cross-host resumable yet"
+			}
+			return nil, ResumeSandboxOutput{}, fmt.Errorf(
+				"%s (%s)",
+				errMsg,
+				unavailableReason,
+			)
+		}
 	}
 
 	conn, err := grpc.NewClient(resumeHost.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -311,6 +341,9 @@ func (m *mcpDeps) handleResume(ctx context.Context, _ *mcp.CallToolRequest, in R
 	}
 	if sessionNPJSON.Valid {
 		resumeReq.NetworkPolicyJson = sessionNPJSON.String
+	}
+	if sessionRestoreMeta.Valid {
+		resumeReq.SessionMetadataJson = sessionRestoreMeta.String
 	}
 	resp, err := client.ResumeRunner(ctx, resumeReq)
 	if err != nil {

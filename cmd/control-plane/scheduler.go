@@ -364,6 +364,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// mutable layered-config defaults by workload key.
 	var host *Host
 	var sessionHostID string
+	var sessionRestoreMeta sql.NullString
 	if req.SessionID != "" && s.db != nil {
 		var status string
 		var sessionTTL sql.NullInt64
@@ -371,9 +372,9 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		var sessionNPPreset sql.NullString
 		var sessionNPJSON sql.NullString
 		err := s.db.QueryRowContext(ctx,
-			`SELECT host_id, status, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
+			`SELECT host_id, status, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, restore_metadata
 			 FROM session_snapshots WHERE session_id = $1`,
-			req.SessionID).Scan(&sessionHostID, &status, &sessionTTL, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON)
+			req.SessionID).Scan(&sessionHostID, &status, &sessionTTL, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON, &sessionRestoreMeta)
 		if err == nil && status == "suspended" && sessionHostID != "" {
 			resumeFromSessionConfig = true
 			if sessionTTL.Valid {
@@ -441,6 +442,11 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			}
 		}
 		stickyFallback = host == nil
+		if stickyFallback && !sessionRestoreMetadataSupportsCrossHost(sessionRestoreMeta.String) {
+			s.hostRegistry.mu.Unlock()
+			retErr = fmt.Errorf("original session host unavailable and session is not cross-host resumable yet")
+			return nil, retErr
+		}
 	}
 
 	if host == nil {
@@ -567,6 +573,12 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			protoReq.Labels = make(map[string]string)
 		}
 		protoReq.Labels["_auth_config_json"] = authConfigJSON
+	}
+	if sessionRestoreMeta.Valid && sessionRestoreMeta.String != "" {
+		if protoReq.Labels == nil {
+			protoReq.Labels = make(map[string]string)
+		}
+		protoReq.Labels["_session_metadata_json"] = sessionRestoreMeta.String
 	}
 	// Populate resources from tier (overrides request-level values)
 	protoReq.Resources = &pb.Resources{

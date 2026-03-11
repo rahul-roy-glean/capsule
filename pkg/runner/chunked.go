@@ -506,16 +506,40 @@ func (cm *ChunkedManager) restoreAndActivateRunner(
 		mmdsData.Latest.Proxy.CACertPEM = string(proxy.CACertPEM)
 		mmdsData.Latest.Proxy.MetadataHost = proxy.GatewayIP()
 	}
+	mmdsStart := time.Now()
+	cm.chunkedLogger.WithFields(logrus.Fields{
+		"runner_id": runnerID,
+	}).Info("Allocate stage: injecting MMDS data")
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
+		cm.chunkedLogger.WithError(err).WithFields(logrus.Fields{
+			"runner_id": runnerID,
+			"mmds_ms":   time.Since(mmdsStart).Milliseconds(),
+		}).Warn("Allocate stage failed: MMDS injection")
 		vm.Stop()
 		return nil, proxy, fmt.Errorf("failed to set MMDS data: %w", err)
 	}
+	cm.chunkedLogger.WithFields(logrus.Fields{
+		"runner_id": runnerID,
+		"mmds_ms":   time.Since(mmdsStart).Milliseconds(),
+	}).Info("Allocate stage complete: MMDS injection")
 
 	if restoreErr == nil {
+		vmResumeStart := time.Now()
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"runner_id": runnerID,
+		}).Info("Allocate stage: resuming microVM")
 		if err := vm.Resume(ctx); err != nil {
+			cm.chunkedLogger.WithError(err).WithFields(logrus.Fields{
+				"runner_id":    runnerID,
+				"resume_vm_ms": time.Since(vmResumeStart).Milliseconds(),
+			}).Warn("Allocate stage failed: microVM resume")
 			vm.Stop()
 			return nil, proxy, fmt.Errorf("failed to resume VM after MMDS injection: %w", err)
 		}
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"runner_id":    runnerID,
+			"resume_vm_ms": time.Since(vmResumeStart).Milliseconds(),
+		}).Info("Allocate stage complete: microVM resume")
 	}
 
 	for _, port := range []int{snapshot.ThawAgentHealthPort, snapshot.ThawAgentDebugPort} {

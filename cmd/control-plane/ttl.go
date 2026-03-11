@@ -145,12 +145,16 @@ func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
 			if c.config.networkPolicyJSON != "" {
 				networkPolicy = c.config.networkPolicyJSON
 			}
+			var restoreMetadata any
+			if resp.SessionMetadataJson != "" {
+				restoreMetadata = resp.SessionMetadataJson
+			}
 			_, _ = s.scheduler.db.ExecContext(ctx, `
 				INSERT INTO session_snapshots (
 					session_id, runner_id, workload_key, host_id, status, layer_count, paused_at,
-					runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
+					runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, restore_metadata
 				)
-				VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9)
+				VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9, $10)
 				ON CONFLICT (session_id) DO UPDATE SET
 					status = 'suspended',
 					layer_count = EXCLUDED.layer_count,
@@ -158,9 +162,10 @@ func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
 					runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
 					auto_pause = EXCLUDED.auto_pause,
 					network_policy_preset = EXCLUDED.network_policy_preset,
-					network_policy = EXCLUDED.network_policy
+					network_policy = EXCLUDED.network_policy,
+					restore_metadata = EXCLUDED.restore_metadata
 			`, resp.SessionId, c.runnerID, c.config.workloadKey, c.hostID, resp.Layer+1,
-				c.config.ttlSeconds, c.config.autoPause, c.config.networkPolicyPreset, networkPolicy)
+				c.config.ttlSeconds, c.config.autoPause, c.config.networkPolicyPreset, networkPolicy, restoreMetadata)
 		}
 
 		if err := s.hostRegistry.RemoveRunner(c.runnerID); err != nil {

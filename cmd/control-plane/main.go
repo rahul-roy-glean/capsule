@@ -981,12 +981,16 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 		if runner.NetworkPolicyJSON != "" {
 			networkPolicy = runner.NetworkPolicyJSON
 		}
+		var restoreMetadata any
+		if resp.SessionMetadataJson != "" {
+			restoreMetadata = resp.SessionMetadataJson
+		}
 		if _, dbErr := s.scheduler.db.ExecContext(r.Context(), `
 			INSERT INTO session_snapshots (
 				session_id, runner_id, workload_key, host_id, status, layer_count, paused_at,
-				runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
+				runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, restore_metadata
 			)
-			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9)
+			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9, $10)
 			ON CONFLICT (session_id) DO UPDATE SET
 				status = 'suspended',
 				layer_count = EXCLUDED.layer_count,
@@ -994,9 +998,10 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 				runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
 				auto_pause = EXCLUDED.auto_pause,
 				network_policy_preset = EXCLUDED.network_policy_preset,
-				network_policy = EXCLUDED.network_policy
+				network_policy = EXCLUDED.network_policy,
+				restore_metadata = EXCLUDED.restore_metadata
 		`, resp.SessionId, req.RunnerID, runner.WorkloadKey, host.ID, resp.Layer+1,
-			runner.RunnerTTLSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy); dbErr != nil {
+			runner.RunnerTTLSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy, restoreMetadata); dbErr != nil {
 			s.logger.WithError(dbErr).WithField("session_id", resp.SessionId).Error("Failed to update session_snapshots table")
 		}
 	}
@@ -1048,32 +1053,50 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 		var sessionAutoPause sql.NullBool
 		var sessionNPPreset sql.NullString
 		var sessionNPJSON sql.NullString
+		var sessionRestoreMeta sql.NullString
 		scanErr := s.scheduler.db.QueryRowContext(r.Context(),
-			`SELECT session_id, host_id, workload_key, status, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
+			`SELECT session_id, host_id, workload_key, status, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, restore_metadata
 			 FROM session_snapshots WHERE runner_id = $1`,
-			req.RunnerID).Scan(&sessionID, &hostID, &workloadKey, &status, &sessionTTL, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON)
+			req.RunnerID).Scan(&sessionID, &hostID, &workloadKey, &status, &sessionTTL, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON, &sessionRestoreMeta)
 		if scanErr != nil || status != "suspended" {
 			http.Error(w, "runner not found", http.StatusNotFound)
 			return
 		}
 
-		// Pick the host to resume on. Prefer the original host unless it's
-		// draining/terminating or unreachable — in that case, fall back to
-		// another available host using cache-affinity scheduling.
-		var resumeHost *Host
-		origHost, origErr := s.hostRegistry.GetHost(hostID)
-		if origErr == nil && origHost.Status != "draining" && origHost.Status != "terminating" {
-			resumeHost = origHost
-		} else {
-			// Look up workload_key for affinity scheduling
-			resumeHost = s.scheduler.selectBestHostForWorkloadKey(s.hostRegistry.GetAvailableHosts(), workloadKey)
-		}
+		crossHostEligible := sessionRestoreMeta.Valid && sessionRestoreMetadataSupportsCrossHost(sessionRestoreMeta.String)
+		resumeHost, unavailableReason := selectOriginalSessionResumeHost(s.hostRegistry, hostID, time.Now())
 		if resumeHost == nil {
-			w.Header().Set("Retry-After", "5")
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			json.NewEncoder(w).Encode(map[string]string{"error": "no available host for session resume"})
-			return
+			if crossHostEligible {
+				resumeHost = s.scheduler.selectBestHostForWorkloadKey(s.hostRegistry.GetAvailableHosts(), workloadKey)
+				if resumeHost != nil {
+					s.logger.WithFields(logrus.Fields{
+						"runner_id":     req.RunnerID,
+						"session_id":    sessionID,
+						"original_host": hostID,
+						"resume_host":   resumeHost.ID,
+						"workload_key":  workloadKey,
+						"unavailable":   unavailableReason,
+					}).Warn("Original session host unavailable; falling back to cross-host portable resume")
+				}
+			}
+			if resumeHost == nil {
+				s.logger.WithFields(logrus.Fields{
+					"runner_id":     req.RunnerID,
+					"session_id":    sessionID,
+					"original_host": hostID,
+					"workload_key":  workloadKey,
+					"unavailable":   unavailableReason,
+				}).Warn("Original session host unavailable and no portable resume host available")
+				w.Header().Set("Retry-After", "5")
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				errMsg := "original session host unavailable; retry shortly"
+				if !crossHostEligible {
+					errMsg = "original session host unavailable and session is not cross-host resumable yet; retry shortly"
+				}
+				json.NewEncoder(w).Encode(map[string]string{"error": errMsg})
+				return
+			}
 		}
 
 		conn, err := grpc.NewClient(resumeHost.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -1093,6 +1116,9 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 		}
 		if sessionNPJSON.Valid {
 			resumeReq.NetworkPolicyJson = sessionNPJSON.String
+		}
+		if sessionRestoreMeta.Valid {
+			resumeReq.SessionMetadataJson = sessionRestoreMeta.String
 		}
 		resp, err := client.ResumeRunner(r.Context(), resumeReq)
 		if err != nil || resp.Error != "" {

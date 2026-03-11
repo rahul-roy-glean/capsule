@@ -318,6 +318,7 @@ message PauseRunnerResponse {
   string session_id = 3;
   int64 snapshot_size_bytes = 4;
   int32 layer = 5;
+  string session_metadata_json = 6; // portable restore metadata captured at pause time
 }
 
 message ResumeRunnerRequest {
@@ -327,6 +328,7 @@ message ResumeRunnerRequest {
   bool auto_pause = 4;
   string network_policy_preset = 5;
   string network_policy_json = 6;
+  string session_metadata_json = 7; // portable restore metadata, when available
 }
 
 message ResumeRunnerResponse {
