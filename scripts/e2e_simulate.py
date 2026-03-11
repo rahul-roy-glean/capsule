@@ -1808,6 +1808,7 @@ def suite_concurrency(
         rng = random.Random(wid + int(time.monotonic() * 1000))
         # Per-cycle timings: list of (exec_s, pause_s, resume_s) per cycle.
         cycle_timings: list[dict[str, float]] = []
+        alloc_dur: float = -1.0
         try:
             sess_id = uuid.uuid4().hex
             barrier.wait()
@@ -1909,6 +1910,24 @@ def suite_concurrency(
                         f"{conn.status}"
                     ), True
 
+                # Readiness probe: wait for the workspace FUSE mount to
+                # become available after resume before firing heavy writes.
+                ready_events = list(client.runners.exec(
+                    runner_id,
+                    ["sh", "-c",
+                     "for i in 1 2 3 4 5; do "
+                     "  ls /workspace >/dev/null 2>&1 && exit 0; "
+                     "  sleep 1; "
+                     "done; exit 1"],
+                    timeout_seconds=15,
+                ))
+                ready_exit = [e for e in ready_events if e.type == "exit"]
+                if ready_exit and ready_exit[0].code != 0:
+                    return False, (
+                        f"Cycle {cycle}: /workspace not ready after resume "
+                        f"(runner {runner_id})"
+                    ), True
+
                 log.debug("Resume complete", extra={
                     "worker": wid, "cycle": cycle,
                     "runner_id": runner_id,
@@ -1935,12 +1954,6 @@ def suite_concurrency(
             if not file_count_str or int(file_count_str) == 0:
                 return False, "No dirty files found after pause/resume cycles", True
 
-            log.info("Worker cycle timings", extra={
-                "worker": wid, "runner_id": runner_id,
-                "alloc_ms": round(alloc_dur * 1000),
-                "cycles": cycle_timings,
-            })
-
             client.runners.release(runner_id)
             runner_id = None
             return True, (
@@ -1955,6 +1968,13 @@ def suite_concurrency(
         except Exception as exc:  # noqa: BLE001
             return False, str(exc), True
         finally:
+            # Always log timings, even on failure, so we capture partial data.
+            if cycle_timings:
+                log.info("Worker cycle timings", extra={
+                    "worker": wid, "runner_id": runner_id,
+                    "alloc_ms": round(alloc_dur * 1000),
+                    "cycles": cycle_timings,
+                })
             if runner_id:
                 try:
                     client.runners.release(runner_id)
