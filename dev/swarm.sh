@@ -29,14 +29,10 @@ CLAUDE_ENV='{
   "CLAUDE_CODE_USE_VERTEX": "1",
   "CLOUD_ML_REGION": "us-east5",
   "ANTHROPIC_VERTEX_PROJECT_ID": "dev-sandbox-334901",
-  "ANTHROPIC_MODEL": "claude-3-5-haiku@20241022",
+  "ANTHROPIC_MODEL": "claude-opus-4-6",
   "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4318",
   "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
-  "OTEL_TRACES_EXPORTER": "otlp",
-  "HTTPS_PROXY": "http://localhost:3128",
-  "HTTP_PROXY": "http://localhost:3128",
-  "GIT_SSL_NO_VERIFY": "1",
-  "NODE_TLS_REJECT_UNAUTHORIZED": "0"
+  "OTEL_TRACES_EXPORTER": "otlp"
 }'
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
@@ -88,7 +84,7 @@ build_and_wait() {
   while true; do
     local status
     status=$(curl -sS "$CP_BASE/api/v1/layered-configs/$CONFIG_ID" \
-      | jq -r '[.layers[].status] | if all(. == "ready") then "ready" elif any(. == "failed") then "failed" else "building" end')
+      | jq -r '[.layers[].status] | if all(. == "ready" or . == "active") then "ready" elif any(. == "failed") then "failed" else "building" end')
 
     if [[ "$status" == "ready" ]]; then
       echo "  Snapshot ready!"
