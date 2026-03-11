@@ -370,12 +370,12 @@ func TestRestoreAndActivateRunnerSequencesRestoreResumeAndReady(t *testing.T) {
 	want := []string{
 		"setup-symlinks",
 		"restore-uffd:/tmp/state:/tmp/uffd.sock",
-		"cleanup-symlinks",
 		"set-mmds",
 		"resume",
 		fmt.Sprintf("forward:%d", snapshot.ThawAgentHealthPort),
 		fmt.Sprintf("forward:%d", snapshot.ThawAgentDebugPort),
 		"ready",
+		"cleanup-symlinks", // deferred — runs last
 	}
 	if len(actions) != len(want) {
 		t.Fatalf("unexpected action count: got %v want %v", actions, want)
