@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -22,13 +21,10 @@ import (
 // HostAgentServer implements the HostAgent gRPC service
 type HostAgentServer struct {
 	pb.UnimplementedHostAgentServer
-	manager              *runner.Manager
-	chunkedMgr           *runner.ChunkedManager
-	sessionPauseHist     metric.Float64Histogram
-	sessionPauseCounter  metric.Int64Counter
-	sessionResumeHist    metric.Float64Histogram
-	sessionResumeCounter metric.Int64Counter
-	logger               *logrus.Entry
+	manager          *runner.Manager
+	chunkedMgr       *runner.ChunkedManager
+	lifecycleMetrics managerLifecycleMetrics
+	logger           *logrus.Entry
 }
 
 // NewHostAgentServer creates a HostAgentServer with chunked snapshot support
@@ -40,16 +36,14 @@ func NewHostAgentServer(mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, 
 	}
 }
 
-// SetOTelInstruments attaches OTel instruments for session pause/resume metrics.
-func (s *HostAgentServer) SetOTelInstruments(pauseHist metric.Float64Histogram, pauseCounter metric.Int64Counter, resumeHist metric.Float64Histogram, resumeCounter metric.Int64Counter) {
-	s.sessionPauseHist = pauseHist
-	s.sessionPauseCounter = pauseCounter
-	s.sessionResumeHist = resumeHist
-	s.sessionResumeCounter = resumeCounter
+// SetOTelInstruments attaches OTel instruments for lifecycle telemetry.
+func (s *HostAgentServer) SetOTelInstruments(metrics managerLifecycleMetrics) {
+	s.lifecycleMetrics = metrics
 }
 
 // AllocateRunner allocates a new runner
 func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRunnerRequest) (*pb.AllocateRunnerResponse, error) {
+	allocStart := time.Now()
 	s.logger.WithFields(logrus.Fields{
 		"request_id": req.RequestId,
 	}).Info("AllocateRunner request")
@@ -122,6 +116,7 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		// Check if there's already a running runner for this session
 		if existing := s.manager.FindRunnerBySessionID(allocReq.SessionID); existing != nil {
 			if existing.State != runner.StateSuspended {
+				recordAllocationMetrics(ctx, s.lifecycleMetrics, time.Since(allocStart), fcrotel.ResultSuccess, "existing_session")
 				return &pb.AllocateRunnerResponse{
 					Runner:    runnerToProto(existing),
 					SessionId: allocReq.SessionID,
@@ -137,32 +132,11 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 
 			if err == nil {
 				resumed = true
-
-				// Determine routing type: GCS-backed or local
-				meta, _ := s.manager.GetSessionMetadata(allocReq.SessionID)
-				routing := fcrotel.RoutingLocal
-				if meta != nil && meta.GCSManifestPath != "" {
-					routing = fcrotel.RoutingGCS
-				}
-
-				if s.sessionResumeHist != nil {
-					s.sessionResumeHist.Record(ctx, resumeDuration.Seconds(), metric.WithAttributes(
-						fcrotel.AttrRouting.String(routing),
-					))
-				}
-				if s.sessionResumeCounter != nil {
-					s.sessionResumeCounter.Add(ctx, 1, metric.WithAttributes(
-						fcrotel.AttrResult.String(fcrotel.ResultSuccess),
-						fcrotel.AttrRouting.String(routing),
-					))
-				}
+				recordSessionResumeMetrics(ctx, s.manager, s.lifecycleMetrics, allocReq.SessionID, resumeDuration, fcrotel.ResultSuccess, "allocate")
+				recordAllocationMetrics(ctx, s.lifecycleMetrics, resumeDuration, fcrotel.ResultSuccess, "session_resume")
 			} else {
 				s.logger.WithError(err).Warn("Failed to resume from session, falling back to fresh allocation")
-				if s.sessionResumeCounter != nil {
-					s.sessionResumeCounter.Add(ctx, 1, metric.WithAttributes(
-						fcrotel.AttrResult.String(fcrotel.ResultFailure),
-					))
-				}
+				recordSessionResumeMetrics(ctx, s.manager, s.lifecycleMetrics, allocReq.SessionID, resumeDuration, fcrotel.ResultFailure, "allocate")
 				err = nil // Reset error for fresh allocation
 			}
 		}
@@ -170,7 +144,9 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 
 	// Fresh allocation if not resumed from session
 	if r == nil {
+		freshStart := time.Now()
 		r, err = s.chunkedMgr.AllocateRunnerChunked(ctx, allocReq)
+		recordAllocationMetrics(ctx, s.lifecycleMetrics, time.Since(freshStart), map[bool]string{true: fcrotel.ResultSuccess, false: fcrotel.ResultFailure}[err == nil], "fresh")
 
 		// Bind session_id to the new runner
 		if err == nil && allocReq.SessionID != "" {
@@ -343,25 +319,14 @@ func (s *HostAgentServer) PauseRunner(ctx context.Context, req *pb.PauseRunnerRe
 
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to pause runner")
-		if s.sessionPauseCounter != nil {
-			s.sessionPauseCounter.Add(ctx, 1, metric.WithAttributes(
-				fcrotel.AttrResult.String(fcrotel.ResultFailure),
-			))
-		}
+		recordSessionPauseMetrics(ctx, s.lifecycleMetrics, duration, fcrotel.ResultFailure, "grpc")
 		return &pb.PauseRunnerResponse{
 			Success: false,
 			Error:   err.Error(),
 		}, nil
 	}
 
-	if s.sessionPauseHist != nil {
-		s.sessionPauseHist.Record(ctx, duration.Seconds())
-	}
-	if s.sessionPauseCounter != nil {
-		s.sessionPauseCounter.Add(ctx, 1, metric.WithAttributes(
-			fcrotel.AttrResult.String(fcrotel.ResultSuccess),
-		))
-	}
+	recordSessionPauseMetrics(ctx, s.lifecycleMetrics, duration, fcrotel.ResultSuccess, "grpc")
 
 	return &pb.PauseRunnerResponse{
 		Success:           true,
@@ -373,6 +338,7 @@ func (s *HostAgentServer) PauseRunner(ctx context.Context, req *pb.PauseRunnerRe
 
 // ResumeRunner resumes a runner from a session snapshot
 func (s *HostAgentServer) ResumeRunner(ctx context.Context, req *pb.ResumeRunnerRequest) (*pb.ResumeRunnerResponse, error) {
+	start := time.Now()
 	s.logger.WithFields(logrus.Fields{
 		"session_id":   req.SessionId,
 		"workload_key": req.WorkloadKey,
@@ -381,6 +347,7 @@ func (s *HostAgentServer) ResumeRunner(ctx context.Context, req *pb.ResumeRunner
 	r, err := s.manager.ResumeFromSession(ctx, req.SessionId, req.WorkloadKey)
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to resume runner")
+		recordSessionResumeMetrics(ctx, s.manager, s.lifecycleMetrics, req.SessionId, time.Since(start), fcrotel.ResultFailure, "resume_rpc")
 		return &pb.ResumeRunnerResponse{
 			Error: err.Error(),
 		}, nil
@@ -410,6 +377,7 @@ func (s *HostAgentServer) ResumeRunner(ctx context.Context, req *pb.ResumeRunner
 			s.logger.WithError(policyErr).WithField("runner_id", r.ID).Warn("Failed to reapply network policy on resume (non-fatal)")
 		}
 	}
+	recordSessionResumeMetrics(ctx, s.manager, s.lifecycleMetrics, req.SessionId, time.Since(start), fcrotel.ResultSuccess, "resume_rpc")
 
 	return &pb.ResumeRunnerResponse{
 		Runner:             runnerToProto(r),

@@ -10,6 +10,7 @@ func TestAllHistogramsHaveDescriptions(t *testing.T) {
 	histograms := []HistogramName{
 		VMBootDuration, VMReadyDuration, VMLifetime, VMJobDuration,
 		HostBootDuration, HostGCSSyncDuration, HostHeartbeatLatency,
+		ManagerEndpointRequestDuration, ManagerEndpointRequestSize, ManagerEndpointResponseSize,
 		CPWebhookLatency, CPAllocationLatency, CPQueueWait,
 		CPEndpointRequestDuration, CPEndpointRequestSize, CPEndpointResponseSize,
 		SnapshotBuildDuration, SnapshotUploadDuration,
@@ -29,8 +30,8 @@ func TestAllHistogramsHaveDescriptions(t *testing.T) {
 
 func TestAllCountersHaveDescriptions(t *testing.T) {
 	counters := []CounterName{
-		VMAllocations, VMTerminations,
-		CPWebhookRequests, CPAllocations, CPEndpointRequests, CPDownscalerActions,
+		VMAllocations, VMTerminations, HostHeartbeatTotal, ManagerEndpointRequests,
+		CPWebhookRequests, CPAllocations, CPPlacementSelections, CPEndpointRequests, CPDownscalerActions,
 		SnapshotRollouts,
 		CacheArtifactHits, CacheArtifactMisses, CacheGitClones,
 		ChunkedPageFaults, ChunkedCacheHits, ChunkedChunkFetches,
@@ -53,6 +54,7 @@ func TestAllGaugesHaveDescriptions(t *testing.T) {
 		HostCPUTotal, HostCPUUsed, HostMemTotal, HostMemUsed,
 		CPHostsTotal, CPHostsReady, CPHostsDraining, CPHostsTerminating, CPHostsUnhealthy, CPHostsTerminated,
 		CPRunnersTotal, CPRunnersTotalCurrent, CPRunnersIdleCurrent, CPRunnersBusyCurrent,
+		CPWorkloadRunnersTotal, CPWorkloadRunnersIdle, CPWorkloadRunnersBusy, CPWorkloadHostsActive,
 		CPFleetCPUTotal, CPFleetCPUUsed, CPFleetCPUFree,
 		CPFleetMemTotal, CPFleetMemUsed, CPFleetMemFree,
 		ChunkedDiskCacheSize, ChunkedDiskCacheMax, ChunkedDiskCacheItems,
@@ -104,7 +106,7 @@ func TestNewGaugeCreatesInstrument(t *testing.T) {
 
 func TestAllUpDownCountersHaveDescriptions(t *testing.T) {
 	upDownCounters := []UpDownCounterName{
-		CPEndpointRequestsInFlight, HostRunnersIdle, HostRunnersBusy,
+		CPEndpointRequestsInFlight, ManagerEndpointRequestsInFlight, HostRunnersIdle, HostRunnersBusy,
 	}
 	for _, name := range upDownCounters {
 		if _, ok := upDownCounterDescriptions[name]; !ok {
