@@ -9,7 +9,7 @@ from bf_sdk._config import ConnectionConfig
 from bf_sdk._http import HttpClient
 from bf_sdk.models.layered_config import BuildResponse, CreateConfigResponse, StoredLayeredConfig
 from bf_sdk.models.runner import AllocateRunnerResponse
-from bf_sdk.models.workload import WorkloadSummary
+from bf_sdk.models.workload import ResolvedWorkloadRef, WorkloadSummary
 from bf_sdk.resources.layered_configs import LayeredConfigs
 from bf_sdk.resources.runners import Runners
 from bf_sdk.resources.workloads import Workloads
@@ -129,14 +129,18 @@ workload:
 
     def test_start_delegates_to_runners(self, workloads: Workloads, runners: Runners) -> None:
         session = RunnerSession(runners, "r-1")
-        with patch.object(runners, "from_config", return_value=session) as start:
-            result = workloads.start("My Sandbox", poll_interval=1.0)
+        resolved = ResolvedWorkloadRef(display_name="My Sandbox", workload_key="wk-leaf")
+        with patch.object(workloads, "_resolve_ref", return_value=resolved):
+            with patch.object(runners, "from_config", return_value=session) as start:
+                result = workloads.start("My Sandbox", poll_interval=1.0)
         assert result is session
-        start.assert_called_once_with("My Sandbox", poll_interval=1.0)
+        start.assert_called_once_with(resolved, poll_interval=1.0)
 
     def test_allocate_delegates_to_runners(self, workloads: Workloads, runners: Runners) -> None:
         allocation = AllocateRunnerResponse(runner_id="r-1", request_id="req-1")
-        with patch.object(runners, "allocate", return_value=allocation) as allocate:
-            result = workloads.allocate("My Sandbox", startup_timeout=10.0)
+        resolved = ResolvedWorkloadRef(display_name="My Sandbox", workload_key="wk-leaf")
+        with patch.object(workloads, "_resolve_ref", return_value=resolved):
+            with patch.object(runners, "allocate", return_value=allocation) as allocate:
+                result = workloads.allocate("My Sandbox", startup_timeout=10.0)
         assert result is allocation
-        allocate.assert_called_once_with("My Sandbox", startup_timeout=10.0)
+        allocate.assert_called_once_with(resolved, startup_timeout=10.0)

@@ -706,6 +706,7 @@ func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Req
 		}
 	}
 
+	allRunners = nonNilSlice(allRunners)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"runners": allRunners,
 		"count":   len(allRunners),
@@ -1189,6 +1190,7 @@ func (s *ControlPlaneServer) HandleGetHosts(w http.ResponseWriter, r *http.Reque
 		})
 	}
 
+	hostList = nonNilSlice(hostList)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"hosts": hostList,
 		"count": len(hostList),
@@ -1204,6 +1206,7 @@ func (s *ControlPlaneServer) HandleGetSnapshots(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	snapshots = nonNilSlice(snapshots)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"snapshots":       snapshots,
 		"count":           len(snapshots),

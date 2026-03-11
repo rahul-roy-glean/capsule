@@ -34,9 +34,11 @@ from bf_sdk.models.runner import (
     ConnectResult,
     ExecEvent,
     PauseResult,
+    Runner,
+    RunnerListResponse,
     RunnerStatus,
 )
-from bf_sdk.models.workload import WorkloadSummary
+from bf_sdk.models.workload import ResolvedWorkloadRef, WorkloadSummary
 from bf_sdk.runner_session import RunnerSession
 
 if TYPE_CHECKING:
@@ -78,6 +80,7 @@ class Runners:
             | LayeredConfigDetail
             | RunnerConfig
             | WorkloadSummary
+            | ResolvedWorkloadRef
         ),
         *,
         request_id: str | None = None,
@@ -89,7 +92,10 @@ class Runners:
         startup_timeout: float | None = None,
         retry_poll_interval: float = 1.0,
     ) -> AllocateRunnerResponse:
-        workload_key = self._resolve_workload_key(workload)
+        workload_ref = self._resolve_workload_ref(workload)
+        workload_key = workload_ref.workload_key
+        if not workload_key:
+            raise BFNotFound("Could not resolve workload key for runner allocation.")
         stable_request_id = request_id or str(uuid.uuid4())
         body: dict[str, Any] = {
             "workload_key": workload_key,
@@ -155,9 +161,9 @@ class Runners:
             self._host_cache[result.runner_id] = result.host_address
         return result
 
-    def list(self) -> list[dict[str, Any]]:
+    def list(self) -> list[Runner]:
         data = self._http.get("/api/v1/runners")
-        return data.get("runners", [])  # type: ignore[no-any-return]
+        return RunnerListResponse.model_validate(data).runners
 
     def release(self, runner_id: str) -> bool:
         data = self._http.post("/api/v1/runners/release", json_body={"runner_id": runner_id})
@@ -269,6 +275,7 @@ class Runners:
             | LayeredConfigDetail
             | RunnerConfig
             | WorkloadSummary
+            | ResolvedWorkloadRef
         ),
         *,
         request_id: str | None = None,
@@ -280,7 +287,10 @@ class Runners:
         startup_timeout: float | None = None,
         poll_interval: float = 2.0,
     ) -> RunnerSession:
-        workload_key = self._resolve_workload_key(workload)
+        workload_ref = self._resolve_workload_ref(workload)
+        workload_key = workload_ref.workload_key
+        if not workload_key:
+            raise BFNotFound("Could not resolve workload key for runner allocation.")
         budget = self._resolve_startup_timeout(startup_timeout)
         deadline = time.monotonic() + budget
         alloc = self.allocate(
@@ -329,6 +339,7 @@ class Runners:
             | LayeredConfigDetail
             | RunnerConfig
             | WorkloadSummary
+            | ResolvedWorkloadRef
         ),
         *,
         tag: str = "stable",
@@ -594,25 +605,49 @@ class Runners:
             | WorkloadSummary
         ),
     ) -> str:
+        resolved = self._resolve_workload_ref(workload)
+        if not resolved.workload_key:
+            raise BFNotFound("Resolved workload reference is missing a workload key.")
+        return resolved.workload_key
+
+    def _resolve_workload_ref(
+        self,
+        workload: (
+            str
+            | CreateConfigResponse
+            | StoredLayeredConfig
+            | LayeredConfigDetail
+            | RunnerConfig
+            | WorkloadSummary
+            | ResolvedWorkloadRef
+        ),
+    ) -> ResolvedWorkloadRef:
+        if isinstance(workload, ResolvedWorkloadRef):
+            return workload
+
         if hasattr(workload, "leaf_workload_key"):
             value = cast(Any, workload).leaf_workload_key
             if isinstance(value, str) and value:
-                return value
+                return ResolvedWorkloadRef(
+                    display_name=cast(Any, workload).display_name if hasattr(workload, "display_name") else None,
+                    config_id=cast(Any, workload).config_id if hasattr(workload, "config_id") else None,
+                    workload_key=value,
+                )
 
         if self._layered_configs is None:
             if isinstance(workload, str):
-                return workload
+                return ResolvedWorkloadRef(display_name=workload, workload_key=workload)
             raise BFNotFound(
                 "This runner client cannot resolve workload references without layered config support."
             )
 
         try:
-            return self._layered_configs.resolve_workload_key(workload)
+            return self._layered_configs.resolve_workload_ref(workload)
         except BFNotFound:
             if isinstance(workload, str):
                 # Preserve backwards compatibility for callers that already know
                 # the raw control-plane workload key.
-                return workload
+                return ResolvedWorkloadRef(display_name=workload, workload_key=workload)
             raise
 
     def _with_host_read_retry(self, runner_id: str, op: Callable[[str], Any]) -> Any:
@@ -626,7 +661,7 @@ class Runners:
 
     def _retry_delay(self, exc: Exception, attempt: int, poll_interval: float) -> float:
         retry_after = getattr(exc, "retry_after", None)
-        if isinstance(retry_after, (int, float)) and retry_after > 0:
+        if isinstance(retry_after, int | float) and retry_after > 0:
             return float(retry_after)
         return max(poll_interval, min(5.0, poll_interval * (2**attempt)))
 

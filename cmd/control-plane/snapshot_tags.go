@@ -206,6 +206,7 @@ func (r *SnapshotTagRegistry) handleListTags(w http.ResponseWriter, req *http.Re
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	tags = nonNilSlice(tags)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"tags": tags, "count": len(tags)})
 }

@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 
 from bf_sdk._snapshot_commands import normalize_snapshot_commands
 from bf_sdk.models.common import BFModel
+
+
+def _empty_configs() -> list[StoredLayeredConfig]:
+    return []
 
 
 class DriveSpec(BFModel):
@@ -117,3 +121,10 @@ class RefreshResponse(BFModel):
     config_id: str
     layer_name: str | None = None
     status: str | None = None
+
+
+class LayeredConfigListResponse(BFModel):
+    """Response from listing layered configs."""
+
+    configs: list[StoredLayeredConfig] = Field(default_factory=_empty_configs)
+    count: int | None = None
