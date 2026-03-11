@@ -53,9 +53,9 @@ type Manager struct {
 	slotToRunner map[int]string
 	// runnerToSlot is the reverse mapping for quick lookup during cleanup.
 	runnerToSlot map[string]int
-	draining bool
-	mu       sync.RWMutex
-	logger   *logrus.Entry
+	draining     bool
+	mu           sync.RWMutex
+	logger       *logrus.Entry
 
 	// sessionMemStore and sessionDiskStore are chunk stores for GCS-backed
 	// session pause/resume (nil when SessionChunkBucket is not configured).

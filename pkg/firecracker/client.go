@@ -27,7 +27,7 @@ type Client struct {
 	snapshotDir string // Per-runner snapshot symlink dir; bind-mounted to /tmp/snapshot in private mount ns
 	process     *exec.Cmd
 	procExited  chan struct{} // closed when process exits; set by StartFirecracker
-	procExitErr error        // set before procExited is closed
+	procExitErr error         // set before procExited is closed
 	mu          sync.Mutex
 	logger      *logrus.Entry
 }
@@ -62,7 +62,7 @@ func NewClient(cfg Config) *Client {
 		vmID:        cfg.VMID,
 		netNSPath:   cfg.NetNSPath,
 		snapshotDir: cfg.SnapshotDir,
-		httpClient:  &http.Client{
+		httpClient: &http.Client{
 			Transport: transport,
 			Timeout:   10 * time.Minute, // Snapshot creation can take minutes for large memory VMs on standard disks
 		},
