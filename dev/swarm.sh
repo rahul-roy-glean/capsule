@@ -32,7 +32,9 @@ CLAUDE_ENV='{
   "ANTHROPIC_MODEL": "claude-opus-4-6",
   "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4318",
   "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
-  "OTEL_TRACES_EXPORTER": "otlp"
+  "OTEL_TRACES_EXPORTER": "otlp",
+  "GCE_METADATA_HOST": "169.254.169.254",
+  "METADATA_SERVER_DETECTION": "assume-present"
 }'
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
@@ -107,21 +109,33 @@ build_and_wait() {
 
 allocate_runner() {
   local session_id=$1
-  local resp
-  resp=$(curl -sS -X POST "$CP_BASE/api/v1/runners/allocate" \
-    -H "Content-Type: application/json" \
-    -d "{\"workload_key\":\"$WORKLOAD_KEY\", \"session_id\":\"$session_id\"}")
+  local max_retries=5
+  local retry_delay=15
 
-  local runner_id host_addr error
-  runner_id=$(echo "$resp" | jq -r '.runner_id')
-  host_addr=$(echo "$resp" | jq -r '.host_address')
-  error=$(echo "$resp" | jq -r '.error // empty')
+  for attempt in $(seq 1 "$max_retries"); do
+    local resp
+    resp=$(curl -sS -X POST "$CP_BASE/api/v1/runners/allocate" \
+      -H "Content-Type: application/json" \
+      -d "{\"workload_key\":\"$WORKLOAD_KEY\", \"session_id\":\"$session_id\"}")
 
-  if [[ -n "$error" ]]; then
-    echo "  ERROR allocating $session_id: $error" >&2
-    return 1
-  fi
-  echo "$runner_id|$host_addr"
+    local runner_id host_addr error
+    runner_id=$(echo "$resp" | jq -r '.runner_id')
+    host_addr=$(echo "$resp" | jq -r '.host_address')
+    error=$(echo "$resp" | jq -r '.error // empty')
+
+    if [[ -z "$error" && -n "$runner_id" && "$runner_id" != "null" ]]; then
+      echo "$runner_id|$host_addr"
+      return 0
+    fi
+
+    if (( attempt < max_retries )); then
+      echo "  Allocation attempt $attempt/$max_retries failed for $session_id: $error — retrying in ${retry_delay}s ..." >&2
+      sleep "$retry_delay"
+    else
+      echo "  ERROR allocating $session_id after $max_retries attempts: $error" >&2
+      return 1
+    fi
+  done
 }
 
 wait_ready() {
