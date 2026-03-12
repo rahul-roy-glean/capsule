@@ -3,15 +3,15 @@
 # Used by: dev/build-agent-rootfs.sh
 # Size: ~1GB (vs 512MB for the minimal dev rootfs)
 
-# --- Stage 1: build thaw-agent ---
+# --- Stage 1: build capsule-thaw-agent ---
 FROM golang:1.24 AS builder
 
 WORKDIR /build
 COPY go.mod go.sum ./
-COPY cmd/thaw-agent/ ./cmd/thaw-agent/
+COPY cmd/capsule-thaw-agent/ ./cmd/capsule-thaw-agent/
 COPY pkg/ ./pkg/
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o /thaw-agent ./cmd/thaw-agent
+RUN CGO_ENABLED=0 GOOS=linux go build -o /capsule-thaw-agent ./cmd/capsule-thaw-agent
 
 # --- Stage 2: agent rootfs ---
 FROM debian:bookworm-slim
@@ -48,7 +48,7 @@ RUN useradd -m -s /bin/bash -G sudo runner \
 # The install script uses $HOME to determine the install location.
 RUN su - runner -c "curl -fsSL https://claude.ai/install.sh | bash"
 
-# Ensure claude is on PATH for all users (thaw-agent execs as runner)
+# Ensure claude is on PATH for all users (capsule-thaw-agent execs as runner)
 RUN echo 'export PATH="/home/runner/.claude/bin:/home/runner/.local/bin:$PATH"' >> /home/runner/.bashrc \
     && echo 'PATH="/home/runner/.claude/bin:/home/runner/.local/bin:$PATH"' >> /etc/environment
 
@@ -59,7 +59,7 @@ COPY dev/claude-settings.json /home/runner/.claude/settings.json
 RUN chown runner:runner /home/runner/.claude/settings.json
 
 # Create workspace directory
-RUN mkdir -p /workspace /var/run/thaw-agent /var/log/thaw-agent \
+RUN mkdir -p /workspace /var/run/capsule-thaw-agent /var/log/capsule-thaw-agent \
     && chown -R runner:runner /workspace
 
 # Configure systemd
@@ -72,12 +72,12 @@ RUN systemctl set-default multi-user.target \
         sys-kernel-debug.mount \
         sys-kernel-tracing.mount
 
-# Configure network (static IP set by thaw-agent via MMDS)
+# Configure network (static IP set by capsule-thaw-agent via MMDS)
 COPY images/microvm/rootfs/etc/systemd/network/10-eth0.network /etc/systemd/network/
 RUN systemctl enable systemd-networkd
 
-# Install thaw-agent binary
-COPY --from=builder /thaw-agent /usr/local/bin/thaw-agent
+# Install capsule-thaw-agent binary
+COPY --from=builder /capsule-thaw-agent /usr/local/bin/capsule-thaw-agent
 
 # Thaw-agent systemd service — use runner user, skip features not needed for dev
 RUN printf '[Unit]\n\
@@ -87,7 +87,7 @@ Wants=network.target\n\
 \n\
 [Service]\n\
 Type=simple\n\
-ExecStart=/usr/local/bin/thaw-agent\n\
+ExecStart=/usr/local/bin/capsule-thaw-agent\n\
 Restart=on-failure\n\
 RestartSec=2\n\
 StandardOutput=journal\n\
@@ -96,8 +96,8 @@ Environment=LOG_LEVEL=debug\n\
 Environment=HOME=/root\n\
 \n\
 [Install]\n\
-WantedBy=multi-user.target\n' > /etc/systemd/system/thaw-agent.service \
-    && systemctl enable thaw-agent.service
+WantedBy=multi-user.target\n' > /etc/systemd/system/capsule-thaw-agent.service \
+    && systemctl enable capsule-thaw-agent.service
 
 # Serial console
 RUN echo "ttyS0" >> /etc/securetty \

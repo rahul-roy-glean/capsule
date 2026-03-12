@@ -1,86 +1,74 @@
-# Example: Dev Environments
+# Example: Dev Environment
 
-This example configures the platform as persistent, session-bound cloud development environments. A developer gets a VS Code Server (code-server) instance backed by a snapshot of their repo with the toolchain, LSP servers, and workspace pre-warmed.
+Use this example when you want a persistent, session-bound development
+environment that can resume quickly with its workspace, editor state, terminal
+history, and tooling already warm.
 
-## What the snapshot contains
+## What This Example Does
 
-The golden snapshot is built by:
-1. Cloning the repository
-2. Installing the toolchain (compiler, language servers, formatters)
-3. Running a warm-up script that starts the LSP server and indexes the codebase
-4. Freezing the VM — the LSP index, open editor state, and running processes are preserved
+This pattern is designed for browser-based or remotely accessed dev
+environments. A typical flow is:
 
-Each developer resumes their environment in ~300ms instead of waiting for LSP indexing.
+1. clone the repository during snapshot build
+2. install the toolchain and editor dependencies
+3. warm the language server and workspace indexes
+4. restore a dev VM on demand and expose the IDE through the host proxy
 
-## Workflow
+## What You Need To Edit
 
-```
-Developer opens browser tab
-  → AllocateRunner{session_id: "<user-id>"}
-  → If session exists in GCS: resume (~300ms, any host)
-  → If no session: restore from golden snapshot (~300ms)
-  → thaw-agent starts code-server, waits for /healthz 200
-  → Host proxies traffic to port 8443
-  → Developer works in browser IDE
+Before running this example, update:
 
-Developer closes browser tab (or idle timeout fires)
-  → AutoPause: VM paused to GCS (~50ms diff snapshot)
-  → Session ID preserved; next open resumes exact state
-```
+- `platform.gcp_project`
+- `platform.region`
+- `platform.zone`
+- `workload.base_image`
+- the repo URL in `workload.layers`
+- your toolchain setup script
+- your LSP warmup script
 
-## Session persistence
+## Session Model
 
-The `session` block is required for this use case:
+This example is intentionally session-heavy:
 
 ```yaml
 session:
   enabled: true
-  ttl_seconds: 3600   # Pause after 1h idle
-  auto_pause: true    # Pause to GCS (preserves open files, terminal history, LSP state)
+  ttl_seconds: 3600
+  auto_pause: true
 ```
 
-**Cross-host mobility:** The session is stored in GCS. When the developer reconnects, the scheduler picks any host with available capacity — not necessarily the same host as before. The VM resumes with identical state regardless of which host runs it.
+When the user disconnects or the session idles out, Capsule pauses the VM to
+GCS. On reconnect, the scheduler can resume it on any compatible host.
 
-## Snapshot commands
+## Access Pattern
 
-Customize the `workload.layers` section for your stack:
+After restore, the guest agent launches `code-server` and the host proxy
+exposes it through:
 
-```yaml
-workload:
-  layers:
-    - name: "workspace"
-      init_commands:
-        - type: "shell"
-          args: ["bash", "-c", "git clone --depth=1 -b main https://github.com/myorg/myrepo /workspace"]
-        - type: "shell"
-          args: ["bash", "/setup/install-toolchain.sh"]
-          run_as_root: true
-        - type: "shell"
-          args: ["bash", "/setup/warm-lsp.sh"]
+```text
+http://<host-http-address>/api/v1/runners/<runner-id>/proxy/
 ```
-
-The `install-toolchain.sh` script should install your language toolchain, extensions, and any IDE dependencies. The `warm-lsp.sh` script should start the language server and trigger an initial index so it's warm at restore time.
 
 ## Onboard
 
 ```bash
 cp examples/dev-environment/onboard.yaml my-devenv.yaml
-# Edit my-devenv.yaml: set platform.gcp_project and workload values
+# Edit the fields described above
 make onboard CONFIG=my-devenv.yaml
 ```
 
-## Accessing the environment
+## Security Note
 
-After onboarding, allocate a session via the API:
+The example uses `code-server --auth=none` because it assumes authentication is
+handled outside the guest, for example by the control plane, a host proxy, or an
+upstream ingress layer. Do not copy that setting directly into an
+internet-exposed deployment without adding an outer auth layer.
 
-```bash
-curl -X POST http://<control-plane>:8080/api/v1/runners/allocate \
-  -H "Content-Type: application/json" \
-  -d '{"session_id": "user-alice", "workload_key": "<your-workload-key>"}'
-```
+## Good Fit
 
-The response includes the host HTTP address. Connect to the proxied IDE via:
+This pattern works well for:
 
-```bash
-http://<host-http-address>/api/v1/runners/<runner-id>/proxy/
-```
+- browser IDE environments
+- persistent remote coding sessions
+- tooling-heavy repos with expensive initial indexing
+- session-bound developer sandboxes

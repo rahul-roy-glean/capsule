@@ -6,15 +6,15 @@ bin/
 *.dylib
 
 # Go build output (matches cmd/ directory names)
-/control-plane
+/capsule-control-plane
 /data-snapshot-builder
-/firecracker-manager
+/capsule-manager
 /git-cache-builder
 /git-cache-freshness
 /onboard
 /snapshot-builder
 /snapshot-converter
-/thaw-agent
+/capsule-thaw-agent
 /derive-snapshot
 
 # Build outputs (use `make build-rootfs`)

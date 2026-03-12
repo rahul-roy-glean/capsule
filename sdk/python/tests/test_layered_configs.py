@@ -5,19 +5,19 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from bf_sdk._config import ConnectionConfig
-from bf_sdk._errors import BFConflict, BFNotFound
-from bf_sdk._http import HttpClient
-from bf_sdk.models.layered_config import (
+from capsule_sdk._config import ConnectionConfig
+from capsule_sdk._errors import CapsuleConflict, CapsuleNotFound
+from capsule_sdk._http import HttpClient
+from capsule_sdk.models.layered_config import (
     BuildResponse,
     CreateConfigResponse,
     LayeredConfigDetail,
     RefreshResponse,
     StoredLayeredConfig,
 )
-from bf_sdk.models.workload import WorkloadSummary
-from bf_sdk.resources.layered_configs import LayeredConfigs
-from bf_sdk.runner_config import RunnerConfig
+from capsule_sdk.models.workload import WorkloadSummary
+from capsule_sdk.resources.layered_configs import LayeredConfigs
+from capsule_sdk.runner_config import RunnerConfig
 
 
 @pytest.fixture
@@ -138,10 +138,10 @@ class TestLayeredConfigs:
             StoredLayeredConfig(config_id="c2", display_name="My Sandbox", leaf_workload_key="wk-2"),
         ]
         with patch.object(lc, "list", return_value=configs):
-            with pytest.raises(BFConflict):
+            with pytest.raises(CapsuleConflict):
                 lc.resolve_workload_key("My Sandbox")
 
     def test_resolve_workload_key_raises_on_missing_name(self, lc: LayeredConfigs) -> None:
         with patch.object(lc, "list", return_value=[]):
-            with pytest.raises(BFNotFound):
+            with pytest.raises(CapsuleNotFound):
                 lc.resolve_workload_key("Missing Sandbox")

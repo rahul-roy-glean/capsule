@@ -59,7 +59,7 @@ resource "google_sql_database_instance" "main" {
 
 # Database
 resource "google_sql_database" "firecracker" {
-  name     = "firecracker_runner"
+  name     = "capsule"
   instance = google_sql_database_instance.main.name
 }
 

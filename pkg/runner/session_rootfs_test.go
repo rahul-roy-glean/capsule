@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
 )
 
 func TestBuildRootfsDriveBaseIndex_NilMeta(t *testing.T) {

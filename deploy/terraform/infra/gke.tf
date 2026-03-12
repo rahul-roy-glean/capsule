@@ -134,5 +134,5 @@ resource "google_container_node_pool" "control_plane" {
 resource "google_service_account_iam_member" "control_plane_workload_identity" {
   service_account_id = google_service_account.control_plane.name
   role               = "roles/iam.workloadIdentityUser"
-  member             = "serviceAccount:${var.project_id}.svc.id.goog[firecracker-runner/control-plane]"
+  member             = "serviceAccount:${var.project_id}.svc.id.goog[capsule/control-plane]"
 }

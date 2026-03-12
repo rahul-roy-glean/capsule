@@ -42,7 +42,7 @@ fi
 
 if [[ "${write_python}" == "true" ]]; then
   repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-  cat > "${repo_root}/sdk/python/src/bf_sdk/_version.py" <<EOF
+  cat > "${repo_root}/sdk/python/src/capsule_sdk/_version.py" <<EOF
 __version__ = "${pypi_version}"
 EOF
 fi

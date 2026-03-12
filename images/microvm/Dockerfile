@@ -1,16 +1,16 @@
 # MicroVM Rootfs Builder
 # This Dockerfile builds a minimal rootfs for Firecracker microVMs
-# containing Bazel, GitHub Actions runner, and the thaw-agent
+# containing Bazel, GitHub Actions runner, and the capsule-thaw-agent
 
-# Build thaw-agent first (must be defined before it's used)
-FROM --platform=linux/amd64 golang:1.24 AS thaw-agent-builder
+# Build capsule-thaw-agent first (must be defined before it's used)
+FROM --platform=linux/amd64 golang:1.24 AS capsule-thaw-agent-builder
 
 WORKDIR /build
-COPY cmd/thaw-agent/ ./cmd/thaw-agent/
+COPY cmd/capsule-thaw-agent/ ./cmd/capsule-thaw-agent/
 COPY pkg/ ./pkg/
 COPY go.mod go.sum ./
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o /thaw-agent ./cmd/thaw-agent
+RUN CGO_ENABLED=0 GOOS=linux go build -o /capsule-thaw-agent ./cmd/capsule-thaw-agent
 
 # Main rootfs image
 FROM --platform=linux/amd64 debian:bookworm-slim AS base
@@ -77,7 +77,7 @@ RUN curl -fsSL "https://github.com/actions/runner/releases/download/v${RUNNER_VE
     && chown -R runner:runner /home/runner
 
 # Create directories
-RUN mkdir -p /workspace /var/run/thaw-agent /var/log/thaw-agent \
+RUN mkdir -p /workspace /var/run/capsule-thaw-agent /var/log/capsule-thaw-agent \
     /mnt/ephemeral/caches/repository \
     /mnt/ephemeral/bazel \
     /mnt/ephemeral/output \
@@ -101,12 +101,12 @@ RUN systemctl set-default multi-user.target \
 COPY images/microvm/rootfs/etc/systemd/network/10-eth0.network /etc/systemd/network/
 RUN systemctl enable systemd-networkd
 
-# Copy thaw-agent systemd service
-COPY images/microvm/rootfs/etc/systemd/system/thaw-agent.service /etc/systemd/system/
-RUN systemctl enable thaw-agent.service
+# Copy capsule-thaw-agent systemd service
+COPY images/microvm/rootfs/etc/systemd/system/capsule-thaw-agent.service /etc/systemd/system/
+RUN systemctl enable capsule-thaw-agent.service
 
-# Copy thaw-agent binary (built separately)
-COPY --from=thaw-agent-builder /thaw-agent /usr/local/bin/thaw-agent
+# Copy capsule-thaw-agent binary (built separately)
+COPY --from=capsule-thaw-agent-builder /capsule-thaw-agent /usr/local/bin/capsule-thaw-agent
 
 # Configure serial console
 RUN echo "ttyS0" >> /etc/securetty \

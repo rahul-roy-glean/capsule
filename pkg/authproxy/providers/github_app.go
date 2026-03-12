@@ -11,8 +11,8 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/github"
+	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
+	"github.com/rahul-roy-glean/capsule/pkg/github"
 )
 
 func init() {

@@ -6,15 +6,20 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 import pytest
 
-from bf_sdk._config import ConnectionConfig
-from bf_sdk._errors import BFAllocationTimeoutError, BFNotFound, BFOperationTimeoutError, BFRunnerUnavailableError
-from bf_sdk._http import HttpClient
-from bf_sdk.models.layered_config import CreateConfigResponse
-from bf_sdk.models.runner import AllocateRunnerResponse, ConnectResult, PauseResult, RunnerStatus
-from bf_sdk.models.workload import ResolvedWorkloadRef
-from bf_sdk.resources.layered_configs import LayeredConfigs
-from bf_sdk.resources.runners import Runners
-from bf_sdk.runner_session import RunnerSession
+from capsule_sdk._config import ConnectionConfig
+from capsule_sdk._errors import (
+    CapsuleAllocationTimeoutError,
+    CapsuleNotFound,
+    CapsuleOperationTimeoutError,
+    CapsuleRunnerUnavailableError,
+)
+from capsule_sdk._http import HttpClient
+from capsule_sdk.models.layered_config import CreateConfigResponse
+from capsule_sdk.models.runner import AllocateRunnerResponse, ConnectResult, PauseResult, RunnerStatus
+from capsule_sdk.models.workload import ResolvedWorkloadRef
+from capsule_sdk.resources.layered_configs import LayeredConfigs
+from capsule_sdk.resources.runners import Runners
+from capsule_sdk.runner_session import RunnerSession
 
 
 @pytest.fixture
@@ -82,7 +87,7 @@ class TestRunners:
     ) -> None:
         runners = Runners(http_client, layered_configs=layered_configs)
         mock_resp = httpx.Response(200, json={"runner_id": "r-123", "host_address": "10.0.0.1:8080"})
-        with patch.object(layered_configs, "resolve_workload_ref", side_effect=BFNotFound("missing")):
+        with patch.object(layered_configs, "resolve_workload_ref", side_effect=CapsuleNotFound("missing")):
             with patch.object(http_client._client, "request", return_value=mock_resp) as request:
                 runners.allocate("wk-raw")
         assert request.call_args.kwargs["json"]["workload_key"] == "wk-raw"
@@ -146,19 +151,19 @@ class TestRunners:
             RunnerStatus(runner_id="r-1", status="ready"),
         ]
         with patch.object(runners, "status", side_effect=statuses):
-            with patch("bf_sdk.resources.runners.time.sleep"):
+            with patch("capsule_sdk.resources.runners.time.sleep"):
                 result = runners.wait_ready("r-1", timeout=5.0, poll_interval=0.1)
         assert result.status == "ready"
 
     def test_wait_ready_raises_on_terminal_status(self, runners: Runners) -> None:
         with patch.object(runners, "status", return_value=RunnerStatus(runner_id="r-1", status="terminated")):
-            with pytest.raises(BFRunnerUnavailableError):
+            with pytest.raises(CapsuleRunnerUnavailableError):
                 runners.wait_ready("r-1", timeout=1.0, poll_interval=0.1)
 
     def test_wait_ready_raises_structured_timeout(self, runners: Runners) -> None:
         with patch.object(runners, "status", return_value=RunnerStatus(runner_id="r-1", status="pending")):
-            with patch("bf_sdk.resources.runners.time.sleep"):
-                with pytest.raises(BFOperationTimeoutError):
+            with patch("capsule_sdk.resources.runners.time.sleep"):
+                with pytest.raises(CapsuleOperationTimeoutError):
                     runners.wait_ready("r-1", timeout=0.0, poll_interval=0.1)
 
     def test_shell_returns_session(self, runners: Runners) -> None:
@@ -210,8 +215,8 @@ class TestRunners:
     def test_allocate_ready_converts_wait_timeout(self, runners: Runners) -> None:
         alloc = AllocateRunnerResponse(runner_id="r-42", host_address="10.0.0.1:8080", request_id="req-1")
         with patch.object(runners, "allocate", return_value=alloc):
-            with patch.object(RunnerSession, "wait_ready", side_effect=BFOperationTimeoutError("too slow")):
-                with pytest.raises(BFAllocationTimeoutError):
+            with patch.object(RunnerSession, "wait_ready", side_effect=CapsuleOperationTimeoutError("too slow")):
+                with pytest.raises(CapsuleAllocationTimeoutError):
                     runners.allocate_ready("wk-1", startup_timeout=1.0)
 
     def test_from_config_uses_allocate_ready_by_default(self, runners: Runners) -> None:

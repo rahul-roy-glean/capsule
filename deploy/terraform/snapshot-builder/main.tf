@@ -22,12 +22,12 @@ provider "google" {
 }
 
 locals {
-  name_prefix = "fc-runner-${var.environment}"
+  name_prefix = "capsule-${var.environment}"
 
   labels = {
     environment = var.environment
     managed_by  = "terraform"
-    project     = "firecracker-bazel-runner"
+    project     = "capsule"
     component   = "snapshot-builder"
   }
 }

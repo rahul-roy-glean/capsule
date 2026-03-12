@@ -1,6 +1,6 @@
 package main
 
-import "github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+import "github.com/rahul-roy-glean/capsule/pkg/snapshot"
 
 func (c *Config) ToLayeredConfig() *snapshot.LayeredConfig {
 	cfg := &snapshot.LayeredConfig{

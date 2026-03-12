@@ -20,12 +20,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
-	_ "github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy/providers" // register auth providers
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/fuse"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/uffd"
+	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
+	_ "github.com/rahul-roy-glean/capsule/pkg/authproxy/providers" // register auth providers
+	"github.com/rahul-roy-glean/capsule/pkg/firecracker"
+	"github.com/rahul-roy-glean/capsule/pkg/fuse"
+	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
+	"github.com/rahul-roy-glean/capsule/pkg/uffd"
 )
 
 var errBaseImageNotPinned = errors.New("base image is not digest-pinned")
@@ -59,16 +59,16 @@ var (
 	previousLayerVersion = flag.String("previous-layer-version", "", "Version of old layer to load drives from")
 
 	// Base image support: build rootfs from Docker image instead of pre-baked rootfs.img
-	baseImage  = flag.String("base-image", "", "Docker image URI to use as rootfs base (e.g. 'ubuntu:22.04'). When set, pulls the image, converts to ext4, and installs thaw-agent.")
+	baseImage  = flag.String("base-image", "", "Docker image URI to use as rootfs base (e.g. 'ubuntu:22.04'). When set, pulls the image, converts to ext4, and installs capsule-thaw-agent.")
 	runnerUser = flag.String("runner-user", "runner", "Username for non-root commands inside the VM")
 
 	// Auth proxy: transparent credential injection for the warmup VM
 	authConfigJSON = flag.String("auth-config", "", "JSON auth proxy config (AuthConfig). When set, starts an auth proxy on the host to provide GCP metadata and HTTPS credential injection.")
 
-	// Path to a pre-built thaw-agent binary to inject into the rootfs.
+	// Path to a pre-built capsule-thaw-agent binary to inject into the rootfs.
 	// If empty or the file does not exist, snapshot-builder will attempt to
-	// build thaw-agent from source (requires Go toolchain on the host).
-	thawAgentPath = flag.String("thaw-agent-path", "/usr/local/bin/thaw-agent", "Path to thaw-agent binary (if missing, builds from source)")
+	// build capsule-thaw-agent from source (requires Go toolchain on the host).
+	thawAgentPath = flag.String("capsule-thaw-agent-path", "/usr/local/bin/capsule-thaw-agent", "Path to capsule-thaw-agent binary (if missing, builds from source)")
 )
 
 func main() {
@@ -206,7 +206,7 @@ func run(logger *logrus.Logger) error {
 	tapName := builderNet.tapName()     // Must match snapshot contract inside namespace
 	guestIP := builderNet.guestIP()     // Slot 0 guest IP remains 172.16.0.2
 	guestMAC := builderNet.guestMAC()   // Deterministic MAC from tap allocation
-	pollIP := builderNet.pollIP()       // Host-reachable IP for thaw-agent polling
+	pollIP := builderNet.pollIP()       // Host-reachable IP for capsule-thaw-agent polling
 	gatewayIP := builderNet.gatewayIP() // Guest-visible gateway, typically 172.16.0.1
 	netmask := builderNet.netmask()     // Guest-visible netmask
 	firecrackerNetNSPath := builderNet.firecrackerNetNSPath()
@@ -838,8 +838,8 @@ func validateBaseImagePolicy(incremental bool, baseImage string) error {
 }
 
 func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, expectedRunnerID string, log *logrus.Entry) error {
-	// Wait for thaw-agent health endpoint to become available
-	// The thaw-agent runs warmup and exposes /health and /warmup-status endpoints
+	// Wait for capsule-thaw-agent health endpoint to become available
+	// The capsule-thaw-agent runs warmup and exposes /health and /warmup-status endpoints
 
 	log.WithFields(logrus.Fields{"guest_ip": guestIP, "expected_runner_id": expectedRunnerID}).Info("Waiting for warmup to complete...")
 
@@ -856,8 +856,8 @@ func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, expe
 		},
 	}
 
-	// Phase 1: Wait for VM to boot and thaw-agent to start
-	log.Info("Phase 1: Waiting for thaw-agent to become responsive...")
+	// Phase 1: Wait for VM to boot and capsule-thaw-agent to start
+	log.Info("Phase 1: Waiting for capsule-thaw-agent to become responsive...")
 	bootCtx, bootCancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer bootCancel()
 
@@ -900,7 +900,7 @@ func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, expe
 			}
 
 			// Ignore stale status from a previous warmup (e.g. parent layer).
-			// The thaw-agent tags warmup status with the runner_id so we can
+			// The capsule-thaw-agent tags warmup status with the runner_id so we can
 			// detect when it hasn't yet picked up the new MMDS data.
 			if expectedRunnerID != "" && status.RunnerID != expectedRunnerID {
 				log.WithFields(logrus.Fields{
@@ -908,7 +908,7 @@ func waitForWarmup(ctx context.Context, vm *firecracker.VM, guestIP string, expe
 					"expected_runner_id": expectedRunnerID,
 					"status_phase":       status.Phase,
 					"status_complete":    status.Complete,
-				}).Info("Waiting for thaw-agent to detect new runner_id (stale status from parent)")
+				}).Info("Waiting for capsule-thaw-agent to detect new runner_id (stale status from parent)")
 				continue
 			}
 
@@ -943,7 +943,7 @@ func waitForHealth(ctx context.Context, client *http.Client, healthURL string, l
 			if _, err := checkHealth(client, healthURL); err == nil {
 				return nil
 			}
-			log.Debug("Waiting for thaw-agent...")
+			log.Debug("Waiting for capsule-thaw-agent...")
 		}
 	}
 }
@@ -967,7 +967,7 @@ func checkHealth(client *http.Client, url string) (map[string]interface{}, error
 	return result, nil
 }
 
-// WarmupStatus represents the warmup status from thaw-agent
+// WarmupStatus represents the warmup status from capsule-thaw-agent
 type WarmupStatus struct {
 	Complete         bool   `json:"complete"`
 	Phase            string `json:"phase"`
@@ -1062,7 +1062,7 @@ func computeRootfsSourceHash(rootfsPath, baseImage, runnerUser, thawAgentPath st
 		}
 		thawAgentHash, err := hashFile(thawAgentPath)
 		if err != nil {
-			return "", fmt.Errorf("hash thaw-agent binary: %w", err)
+			return "", fmt.Errorf("hash capsule-thaw-agent binary: %w", err)
 		}
 		platformShimHash, err := computePlatformShimFingerprint(flavor, runnerUser)
 		if err != nil {
@@ -1157,7 +1157,7 @@ const hostIP = "172.16.0.1" // Gateway IP for the VM tap network
 // restoreFromPreviousSnapshot downloads the previous chunked snapshot from GCS,
 // mounts rootfs and extension drives via FUSE, restores the VM from snapshot,
 // injects fresh MMDS data with mode=warmup and a new runner_id, and resumes.
-// The thaw-agent detects the runner_id change and re-runs warmup incrementally.
+// The capsule-thaw-agent detects the runner_id change and re-runs warmup incrementally.
 func restoreFromPreviousSnapshot(
 	ctx context.Context,
 	logger *logrus.Logger,
@@ -1209,7 +1209,7 @@ func restoreFromPreviousSnapshot(
 	}).Info("Loaded previous chunked snapshot metadata")
 
 	// Check if base rootfs has changed since previous snapshot.
-	// If it has (e.g. new thaw-agent binary, new packages), we must cold boot
+	// If it has (e.g. new capsule-thaw-agent binary, new packages), we must cold boot
 	// to pick up the changes — snapshot restore uses the old rootfs.
 	if chunkedMeta.RootfsSourceHash != "" {
 		provenanceFlavor := rootfsFlavor(chunkedMeta.RootfsFlavor)
@@ -1522,7 +1522,7 @@ func restoreFromPreviousSnapshot(
 	// 11. Set MMDS with mode=warmup and new runner_id
 	// The control plane passes the right commands for this build type via --snapshot-commands
 	mmdsData := buildWarmupMMDS(commands, newDrives)
-	// Override runner_id so thaw-agent detects the change and re-runs warmup
+	// Override runner_id so capsule-thaw-agent detects the change and re-runs warmup
 	mmdsData["latest"].(map[string]interface{})["meta"].(map[string]interface{})["runner_id"] = runnerID
 	injectProxyMMDS(mmdsData, authProxy, authProxyAddr, hostIP)
 
@@ -1536,7 +1536,7 @@ func restoreFromPreviousSnapshot(
 		return nil, nil, nil, nil, "", fmt.Errorf("failed to set MMDS data: %w", err)
 	}
 
-	// 12. Resume VM — thaw-agent wakes up, detects runner_id change, re-runs warmup
+	// 12. Resume VM — capsule-thaw-agent wakes up, detects runner_id change, re-runs warmup
 	log.WithField("runner_id", runnerID).Info("Resuming VM for incremental warmup...")
 	if err := vm.Resume(ctx); err != nil {
 		vm.Stop()
@@ -1952,7 +1952,7 @@ func reattachFromParent(
 }
 
 // buildWarmupMMDS creates the MMDS data for warmup mode.
-// commands are passed through to thaw-agent as warmup.commands.
+// commands are passed through to capsule-thaw-agent as warmup.commands.
 func buildWarmupMMDS(commands []snapshot.SnapshotCommand, drives []snapshot.DriveSpec) map[string]interface{} {
 	job := map[string]interface{}{}
 
@@ -1983,7 +1983,7 @@ func buildWarmupMMDS(commands []snapshot.SnapshotCommand, drives []snapshot.Driv
 }
 
 // injectProxyMMDS adds auth proxy metadata to the MMDS data if an auth proxy is running.
-// The thaw-agent reads this to configure HTTPS_PROXY, GCE_METADATA_HOST, and install the CA certificate.
+// The capsule-thaw-agent reads this to configure HTTPS_PROXY, GCE_METADATA_HOST, and install the CA certificate.
 func injectProxyMMDS(mmdsData map[string]interface{}, proxy *authproxy.AuthProxy, proxyAddr, metadataHost string) {
 	if proxy == nil {
 		return
@@ -2001,7 +2001,7 @@ func injectProxyMMDS(mmdsData map[string]interface{}, proxy *authproxy.AuthProxy
 //  1. Pull the Docker image
 //  2. Create a container and export its filesystem
 //  3. Create an ext4 image and populate it from the export
-//  4. Inject the platform shim (systemd init, thaw-agent, networking)
+//  4. Inject the platform shim (systemd init, capsule-thaw-agent, networking)
 func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.Entry) (rootfsFlavor, error) {
 	log.WithField("image", imageURI).Info("Pulling Docker image...")
 	if output, err := exec.Command("docker", "pull", "--platform=linux/amd64", imageURI).CombinedOutput(); err != nil {
@@ -2078,7 +2078,7 @@ func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.E
 	}
 
 	// Inject platform shim
-	log.Info("Injecting platform shim (systemd, thaw-agent, networking)...")
+	log.Info("Injecting platform shim (systemd, capsule-thaw-agent, networking)...")
 	flavor, err := injectPlatformShim(mountDir, runnerUser, *thawAgentPath, dockerEnv, log)
 	if err != nil {
 		return "", fmt.Errorf("platform shim injection failed: %w", err)
@@ -2089,7 +2089,7 @@ func buildRootfsFromImage(imageURI, outputPath, runnerUser string, log *logrus.E
 }
 
 // injectPlatformShim installs the minimal components needed to run a Firecracker
-// microVM on top of any Docker image: systemd init, thaw-agent, network config.
+// microVM on top of any Docker image: systemd init, capsule-thaw-agent, network config.
 // dockerEnv contains ENV variables extracted from the Docker image config
 // (e.g., ["PATH=/opt/venv/bin:/usr/bin", "HOME=/home/user"]) that are written
 // to /etc/environment so all processes in the VM inherit them.

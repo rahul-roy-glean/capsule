@@ -18,7 +18,7 @@ hosts:
 
 workload:
   # Docker image with your dev toolchain pre-installed.
-  # The platform converts it to a Firecracker rootfs and installs thaw-agent.
+  # The platform converts it to a Firecracker rootfs and installs capsule-thaw-agent.
   # Example: an image with code-server, Node.js, Python, Go, etc.
   base_image: "us-docker.pkg.dev/my-project/images/dev-env:latest"
 

@@ -1,5 +1,5 @@
 version: v1
-name: buf.build/bazel-firecracker/runner
+name: buf.build/capsule/runner
 deps: []
 breaking:
   use:

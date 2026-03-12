@@ -34,11 +34,11 @@ if [ -z "$RUNNER_ID" ] || [ "$RUNNER_ID" = "null" ]; then
   exit 1
 fi
 
-# --- 2. Poll until thaw-agent is ready ---
+# --- 2. Poll until capsule-thaw-agent is ready ---
 echo ""
 echo "=== 2. Poll until ready ==="
 for i in $(seq 1 60); do
-  # Poll thaw-agent health endpoint via exec (most reliable)
+  # Poll capsule-thaw-agent health endpoint via exec (most reliable)
   EXEC_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
     "$MGR/api/v1/runners/$RUNNER_ID/exec" \
     -H 'Content-Type: application/json' \

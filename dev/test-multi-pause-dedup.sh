@@ -289,7 +289,7 @@ if [ "$RESUMED1" = "true" ]; then
   pass "Resume 1 succeeded: $RUNNER_ID_2"
 else
   fail "Resume 1 failed (expected resumed=true)"
-  tail -30 /tmp/fc-dev/logs/firecracker-manager.log
+  tail -30 /tmp/fc-dev/logs/capsule-manager.log
   exit 1
 fi
 

@@ -1,49 +1,111 @@
 <p align="center">
-  <img src="assets/logo.png" width="220" alt="logo" />
+  <img src="assets/hero.png" width="720" alt="Capsule hero image" />
 </p>
 
-# Generic Workload Platform on Firecracker
+# Capsule
 
-Snapshot-first Firecracker microVM platform for fast-start sandboxes, resumable
-sessions, and general-purpose workload execution.
+Capsule is a snapshot-first workload platform built on Firecracker. It lets you
+pre-build microVM images, restore them quickly, and optionally preserve
+session state across allocations.
 
 ## Status
 
-This repository implements a **generic workload platform**. The control plane
-manages layered configs, launches snapshot-builder VMs, allocates workload-keyed
-microVMs onto a host fleet, and can pause/resume session state through GCS-backed
-diff snapshots.
+Capsule is currently alpha software.
 
-Current alpha scope:
+- Supported deployment path: `GCP + Firecracker + Helm`
+- Primary client surface: Python SDK in `sdk/python`
+- Auth model: bearer-token API auth for control-plane requests
+- Stability: API, SDK, and deployment surfaces may change before `v1`
 
-- Supported deployment: `GCP + Firecracker + Helm`
-- Network model: private-network-first control plane with bearer-token API auth
-- Python SDK is a tier-1 surface
-- API and SDK are alpha and may break before `v1`
-- Host images are built separately from the tagged release flow
+If you want the supported zero-to-live path, start with [docs/setup.md](docs/setup.md).
 
-The canonical GCP path is the unified `onboard.yaml` flow documented in
+## Why Capsule
+
+Capsule is designed for workloads that benefit from warm, reusable runtime state
+without giving up VM-level isolation.
+
+- Fast restore from pre-built Firecracker snapshots
+- Layered build model for predictable, content-addressed workload versions
+- Warm pool reuse for low-latency repeated allocations
+- Session pause and resume across hosts using GCS-backed state
+- Generic workload model that works for services, CI runners, dev environments,
+  and interactive sandboxes
+
+## Core Concepts
+
+- `base_image`: the Docker image Capsule converts into a Firecracker guest rootfs
+- `layers`: warmup/build steps that run during snapshot creation
+- `start_command`: the process Capsule launches after restore
+- `workload_key`: the stable key derived from the final layer hash and used for
+  scheduling, pooling, and rollout
+- `session_id`: the identifier used to resume a paused VM state across requests
+
+## Quickstart
+
+The recommended path is the unified `onboard.yaml` workflow.
+
+1. Copy the default config.
+
+```bash
+cp onboard.yaml my-config.yaml
+```
+
+2. Edit at least:
+
+- `platform.gcp_project`
+- `platform.region`
+- `platform.zone`
+- `workload.base_image`
+- `workload.layers`
+- `workload.start_command`
+
+3. Preview the deployment.
+
+```bash
+make onboard-plan CONFIG=my-config.yaml
+```
+
+4. Apply it.
+
+```bash
+make onboard CONFIG=my-config.yaml
+```
+
+The onboard flow bootstraps infrastructure, builds the host image, deploys the
+control plane, stages builder artifacts, registers the workload, builds the
+snapshot chain, and verifies allocation.
+
+For prerequisites, expected output, and troubleshooting, see
 [docs/setup.md](docs/setup.md).
 
-## What This Is
+## First Workload Example
 
-The platform snapshots Firecracker microVMs and restores them on demand with lazy
-loading:
+Most users should interact with Capsule through the Python SDK rather than
+hand-writing HTTP requests.
 
-- Memory is restored through UFFD-backed page fault handling.
-- Disk is restored through FUSE-backed chunk loading.
-- Snapshot chunks are content-addressed and shared across workloads in GCS.
-- Hosts keep warm pools of paused VMs for fast same-host reuse.
-- Session-backed workloads can pause dirty state to GCS and resume on another host.
+```python
+from capsule_sdk import CapsuleClient, RunnerConfig
 
-The current API surface is built around **layered configs**:
+cfg = (
+    RunnerConfig("hello-service")
+    .with_base_image("ubuntu:22.04")
+    .with_commands(["apt-get update", "apt-get install -y python3"])
+    .with_tier("m")
+    .with_auto_pause(True)
+    .with_ttl(300)
+)
 
-- `base_image` defines the workload root filesystem.
-- `layers` define the warmup/build chain baked into snapshots.
-- `start_command` defines the service or runner process launched after restore.
-- `workload_key` identifies the leaf snapshot used for scheduling, pooling, and rollout.
+with CapsuleClient(base_url="http://localhost:8080", token="my-token") as client:
+    workload = client.workloads.onboard(cfg)
+    with client.workloads.start(workload) as runner:
+        output, code = runner.exec_collect("python3", "-c", "print('hello')")
+        print(output, code)
+```
 
-## Architecture
+See [sdk/python/README.md](sdk/python/README.md) for a full SDK walkthrough and
+[docs/HOWTO.md](docs/HOWTO.md) for lower-level API recipes.
+
+## Architecture At A Glance
 
 ```mermaid
 flowchart TD
@@ -53,7 +115,7 @@ flowchart TD
   gcsStore[GCSChunkStore]
   postgres[PostgreSQL]
   hostFleet[HostFleet]
-  thawAgent[thaw-agent]
+  guestAgent[CapsuleThawAgent]
 
   layeredConfig --> controlPlane
   controlPlane --> postgres
@@ -61,131 +123,43 @@ flowchart TD
   builderVm --> gcsStore
   controlPlane --> hostFleet
   hostFleet --> gcsStore
-  hostFleet --> thawAgent
+  hostFleet --> guestAgent
 ```
 
-At a high level:
+At runtime:
 
-- `cmd/control-plane` stores layered configs, enqueues builds, tracks desired snapshot
-  versions, and allocates workload instances.
-- `cmd/firecracker-manager` runs on each GCE host VM and restores or resumes microVMs.
-- `cmd/thaw-agent` runs inside the guest and handles warmup mode, `start_command`,
-  exec/file APIs, and post-resume reconfiguration.
-- `cmd/snapshot-builder` builds chunked snapshots from a Docker base image plus warmup
-  commands.
-- `sdk/python` provides the cleanest current client API for layered-config registration
-  and sandbox allocation.
+- `cmd/capsule-control-plane` manages layered configs, builds, fleet state, and
+  allocation
+- `cmd/capsule-manager` runs on each host VM and restores or resumes microVMs
+- `cmd/capsule-thaw-agent` runs inside the guest and handles warmup, networking,
+  exec, PTY, file APIs, and `start_command`
+- `cmd/snapshot-builder` builds chunked snapshots from a Docker base image plus
+  warmup commands
 
-See [docs/architecture.md](docs/architecture.md) for the current code-grounded design.
+For the detailed design, see [docs/architecture.md](docs/architecture.md).
 
-## How It Works
+## Documentation
 
-1. Register a layered config with `base_image`, `layers`, `config`, and `start_command`.
-2. The control plane materializes the layer chain, computes the leaf `workload_key`, and
-   stores config metadata in PostgreSQL.
-3. A build request launches a nested-virtualization builder VM that runs
-   `cmd/snapshot-builder`.
-4. The builder creates chunked snapshot metadata in GCS and updates
-   `current-pointer.json` for the leaf `workload_key`.
-5. Hosts heartbeat to the control plane, learn desired versions, and lazily sync
-   manifests for workload keys they need.
-6. An allocation request either resumes a paused session, reuses a pooled VM, or restores a
-   fresh microVM from the chunked snapshot.
-7. Inside the guest, `thaw-agent` reads MMDS, configures networking, launches the
-   `start_command`, and exposes the in-VM debug/exec/file APIs.
-
-## Use Cases
-
-- AI sandboxes with session resume across conversation turns.
-- Dev environments with pre-warmed toolchains and editor services.
-- Long-lived service workloads with pooled microVM reuse.
-- CI workloads where the platform-specific behavior is just a `start_command`.
-
-The workload primitives are documented in [examples/README.md](examples/README.md).
-
-## Quickstart
-
-1. Copy and edit the root config:
-
-```bash
-cp onboard.yaml my-config.yaml
-# edit platform.gcp_project and workload settings
-```
-
-2. Preview the actions:
-
-```bash
-make onboard-plan CONFIG=my-config.yaml
-```
-
-3. Run the full deployment:
-
-```bash
-make onboard CONFIG=my-config.yaml
-```
-
-4. The onboard flow bootstraps infra with zero hosts, builds the host image, deploys the
-   control plane, stages builder artifacts, registers/builds the layered workload config,
-   finalizes Terraform against the real control-plane address, and verifies allocation.
-
-If you want to work with the control-plane API directly, register a layered config like
-this:
-
-```bash
-cat > layered-config.json <<'EOF'
-{
-  "display_name": "hello-service",
-  "base_image": "ubuntu:22.04",
-  "layers": [
-    {
-      "name": "runtime",
-      "init_commands": [
-        {"type": "shell", "args": ["bash", "-lc", "apt-get update && apt-get install -y python3"]}
-      ]
-    }
-  ],
-  "config": {
-    "tier": "m",
-    "auto_pause": true,
-    "ttl": 300,
-    "auto_rollout": true
-  },
-  "start_command": {
-    "command": ["python3", "-m", "http.server", "8080"],
-    "port": 8080,
-    "health_path": "/"
-  }
-}
-EOF
-
-curl -sS -X POST "http://CONTROL_PLANE:8080/api/v1/layered-configs" \
-  -H "Content-Type: application/json" \
-  --data @layered-config.json
-```
-
-3. Trigger a build, wait for the leaf layer to become active, then allocate a runner with
-   the returned `leaf_workload_key`.
-
-If you prefer a client library, see [sdk/python/README.md](sdk/python/README.md).
+- [docs/setup.md](docs/setup.md) - deploy Capsule on GCP from zero
+- [docs/HOWTO.md](docs/HOWTO.md) - common API and operational recipes
+- [docs/operations.md](docs/operations.md) - runtime behavior, rollout, and recovery
+- [docs/architecture.md](docs/architecture.md) - component model and data flows
+- [docs/DEV_SETUP.md](docs/DEV_SETUP.md) - local development and contribution workflow
+- [examples/README.md](examples/README.md) - example index and shared workload primitives
+- [sdk/python/README.md](sdk/python/README.md) - Python SDK guide
 
 ## Examples
 
-The `examples/` directory shows intended workload shapes for CI, AI sandboxes, dev
-environments, and storage-heavy workloads.
+The `examples/` directory contains deployable workload configs for common
+Capsule use cases:
 
-Those example `onboard.yaml` files are executable inputs for `make onboard` as long as
-you stay within the currently supported schema:
+- AI sandboxes
+- Persistent dev environments
+- Git-backed CI runners
+- Bazel and Buildbarn-backed workloads
+- AFS-style sandbox services
 
-- `platform`
-- `microvm`
-- `hosts`
-- `workload.base_image`
-- `workload.layers`
-- `workload.config`
-- `workload.start_command`
-- `session`
-
-See [examples/README.md](examples/README.md) for the shared primitives and example map.
+Use [examples/README.md](examples/README.md) to pick the closest starting point.
 
 ## Development
 
@@ -197,16 +171,14 @@ make check
 make lint
 ```
 
-See [docs/DEV_SETUP.md](docs/DEV_SETUP.md) for local development details.
+See [docs/DEV_SETUP.md](docs/DEV_SETUP.md) for local setup, testing, and
+contribution details.
 
-## Docs
+## Contributing
 
-- [docs/architecture.md](docs/architecture.md) - current runtime architecture
-- [docs/setup.md](docs/setup.md) - supported GCP deployment path from zero
-- [docs/HOWTO.md](docs/HOWTO.md) - operational recipes
-- [docs/operations.md](docs/operations.md) - build, rollout, and failure-handling details
-- [examples/README.md](examples/README.md) - workload primitives and example mapping
-- [sdk/python/README.md](sdk/python/README.md) - client SDK
+Contributions are welcome. If you are changing runtime behavior, deployment
+assets, or the public SDK, start with [docs/DEV_SETUP.md](docs/DEV_SETUP.md) and
+run the relevant local checks before opening a change.
 
 ## License
 

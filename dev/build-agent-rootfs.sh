@@ -29,10 +29,10 @@ echo "Size:      $ROOTFS_SIZE (includes Python, Node.js, Claude Code)"
 
 mkdir -p "$SNAPSHOT_DIR"
 
-# --- 1. Build thaw-agent binary (for the Docker build context) ---
+# --- 1. Build capsule-thaw-agent binary (for the Docker build context) ---
 echo ""
-echo "--- Building thaw-agent binary ---"
-CGO_ENABLED=0 GOOS=linux GOARCH=$GOARCH go build -o bin/thaw-agent ./cmd/thaw-agent
+echo "--- Building capsule-thaw-agent binary ---"
+CGO_ENABLED=0 GOOS=linux GOARCH=$GOARCH go build -o bin/capsule-thaw-agent ./cmd/capsule-thaw-agent
 
 # --- 2. Build Docker image ---
 echo ""

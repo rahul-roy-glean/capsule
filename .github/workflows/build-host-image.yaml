@@ -15,7 +15,7 @@ env:
 
 jobs:
   build-binary:
-    name: Build firecracker-manager
+    name: Build capsule-manager
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -39,19 +39,19 @@ jobs:
 
       - name: Build binary
         run: |
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 make firecracker-manager
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 make capsule-manager
           ls -la bin/
 
       - name: Verify binary
         run: |
-          file bin/firecracker-manager
+          file bin/capsule-manager
           # Should be: ELF 64-bit LSB executable, x86-64
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
         with:
-          name: firecracker-manager-${{ steps.version.outputs.version }}
-          path: bin/firecracker-manager
+          name: capsule-manager-${{ steps.version.outputs.version }}
+          path: bin/capsule-manager
           retention-days: 7
 
   build-image:
@@ -69,11 +69,11 @@ jobs:
       - name: Download binary
         uses: actions/download-artifact@v4
         with:
-          name: firecracker-manager-${{ needs.build-binary.outputs.version }}
+          name: capsule-manager-${{ needs.build-binary.outputs.version }}
           path: bin/
 
       - name: Make binary executable
-        run: chmod +x bin/firecracker-manager
+        run: chmod +x bin/capsule-manager
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
@@ -98,7 +98,7 @@ jobs:
         run: |
           packer validate \
             -var="project_id=${{ vars.GCP_PROJECT_ID }}" \
-            -var="firecracker_manager_binary=../../bin/firecracker-manager" \
+            -var="capsule_manager_binary=../../bin/capsule-manager" \
             host-image.pkr.hcl
 
       - name: Packer Build
@@ -106,7 +106,7 @@ jobs:
         run: |
           packer build \
             -var="project_id=${{ vars.GCP_PROJECT_ID }}" \
-            -var="firecracker_manager_binary=../../bin/firecracker-manager" \
+            -var="capsule_manager_binary=../../bin/capsule-manager" \
             -var="zone=${{ vars.GCP_ZONE || 'us-central1-a' }}" \
             host-image.pkr.hcl
 
@@ -115,7 +115,7 @@ jobs:
         run: |
           IMAGE_NAME=$(gcloud compute images list \
             --project=${{ vars.GCP_PROJECT_ID }} \
-            --filter="family:firecracker-host" \
+            --filter="family:capsule-host" \
             --sort-by="~creationTimestamp" \
             --limit=1 \
             --format="value(name)")

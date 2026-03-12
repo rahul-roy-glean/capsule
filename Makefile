@@ -1,9 +1,9 @@
 .PHONY: all build test clean proto docker-build docker-push docker-push-control-plane docker-push-snapshot-builder
 .PHONY: terraform-infra-init terraform-infra-plan terraform-infra-apply terraform-infra-destroy
 .PHONY: terraform-app-init terraform-app-plan terraform-app-apply terraform-app-destroy
-.PHONY: packer-init packer-validate packer-build firecracker-manager-linux release-host-image mig-rolling-update
+.PHONY: packer-init packer-validate packer-build capsule-manager-linux release-host-image mig-rolling-update
 .PHONY: onboard onboard-validate onboard-plan bin-onboard
-.PHONY: firecracker-manager control-plane snapshot-builder thaw-agent
+.PHONY: capsule-manager capsule-control-plane snapshot-builder capsule-thaw-agent
 .PHONY: test-unit test-race test-cover test-integration test-all check
 .PHONY: sdk-python-lint sdk-python-test sdk-python-typecheck sdk-python-check sdk-python-e2e
 .PHONY: dev-build dev-snapshot dev-stack dev-test-snapshot-builder dev-test-pause-resume dev-test-multi-pause-dedup dev-stop
@@ -20,7 +20,7 @@ REGION ?= us-central1
 ENV ?= dev
 ZONE ?= us-central1-a
 CONFIG ?= onboard.yaml
-REGISTRY ?= $(REGION)-docker.pkg.dev/$(PROJECT_ID)/firecracker
+REGISTRY ?= $(REGION)-docker.pkg.dev/$(PROJECT_ID)/capsule
 VERSION ?= $(shell git describe --tags --always --dirty)
 
 # Go build settings
@@ -31,7 +31,7 @@ GOARCH_TARGET ?= amd64
 export PATH := /usr/local/go/bin:$(PATH)
 
 # Binaries
-BINARIES := firecracker-manager control-plane snapshot-builder thaw-agent bin-onboard workload-key
+BINARIES := capsule-manager capsule-control-plane snapshot-builder capsule-thaw-agent bin-onboard workload-key
 
 all: build
 
@@ -40,17 +40,17 @@ build: $(BINARIES)
 
 CROSS_BUILD = CGO_ENABLED=0 GOOS=$(GOOS_TARGET) GOARCH=$(GOARCH_TARGET)
 
-firecracker-manager:
-	$(CROSS_BUILD) $(GO) build $(GOFLAGS) -o bin/firecracker-manager ./cmd/firecracker-manager
+capsule-manager:
+	$(CROSS_BUILD) $(GO) build $(GOFLAGS) -o bin/capsule-manager ./cmd/capsule-manager
 
-control-plane:
-	$(CROSS_BUILD) $(GO) build $(GOFLAGS) -o bin/control-plane ./cmd/control-plane
+capsule-control-plane:
+	$(CROSS_BUILD) $(GO) build $(GOFLAGS) -o bin/capsule-control-plane ./cmd/capsule-control-plane
 
 snapshot-builder:
 	$(CROSS_BUILD) $(GO) build $(GOFLAGS) -o bin/snapshot-builder ./cmd/snapshot-builder
 
-thaw-agent:
-	$(CROSS_BUILD) $(GO) build $(GOFLAGS) -o bin/thaw-agent ./cmd/thaw-agent
+capsule-thaw-agent:
+	$(CROSS_BUILD) $(GO) build $(GOFLAGS) -o bin/capsule-thaw-agent ./cmd/capsule-thaw-agent
 
 bin-onboard:
 	$(CROSS_BUILD) $(GO) build $(GOFLAGS) -o bin/onboard ./cmd/onboard
@@ -116,25 +116,25 @@ docker-build: docker-build-control-plane docker-build-snapshot-builder
 
 docker-build-control-plane:
 	docker buildx build --platform linux/amd64 --load \
-		-t $(REGISTRY)/firecracker-control-plane:$(VERSION) \
-		-t $(REGISTRY)/firecracker-control-plane:latest \
+		-t $(REGISTRY)/capsule-control-plane:$(VERSION) \
+		-t $(REGISTRY)/capsule-control-plane:latest \
 		-f deploy/docker/Dockerfile.control-plane .
 
 docker-build-snapshot-builder:
 	docker buildx build --platform linux/amd64 --load \
-		-t $(REGISTRY)/firecracker-snapshot-builder:$(VERSION) \
-		-t $(REGISTRY)/firecracker-snapshot-builder:latest \
+		-t $(REGISTRY)/capsule-snapshot-builder:$(VERSION) \
+		-t $(REGISTRY)/capsule-snapshot-builder:latest \
 		-f deploy/docker/Dockerfile.snapshot-builder .
 
 docker-push: docker-push-control-plane docker-push-snapshot-builder
 
 docker-push-control-plane:
-	docker push $(REGISTRY)/firecracker-control-plane:$(VERSION)
-	docker push $(REGISTRY)/firecracker-control-plane:latest
+	docker push $(REGISTRY)/capsule-control-plane:$(VERSION)
+	docker push $(REGISTRY)/capsule-control-plane:latest
 
 docker-push-snapshot-builder:
-	docker push $(REGISTRY)/firecracker-snapshot-builder:$(VERSION)
-	docker push $(REGISTRY)/firecracker-snapshot-builder:latest
+	docker push $(REGISTRY)/capsule-snapshot-builder:$(VERSION)
+	docker push $(REGISTRY)/capsule-snapshot-builder:latest
 
 # Build microVM rootfs
 rootfs:
@@ -170,33 +170,33 @@ terraform-app-destroy:
 packer-init:
 	cd deploy/packer && packer init .
 
-packer-validate: firecracker-manager-linux
+packer-validate: capsule-manager-linux
 	cd deploy/packer && packer validate \
 		-var="project_id=$(PROJECT_ID)" \
-		-var="firecracker_manager_binary=../../bin/firecracker-manager" \
-		-var="network=fc-runner-$(ENV)-vpc" \
-		-var="subnetwork=fc-runner-$(ENV)-hosts" \
+		-var="capsule_manager_binary=../../bin/capsule-manager" \
+		-var="network=capsule-$(ENV)-vpc" \
+		-var="subnetwork=capsule-$(ENV)-hosts" \
 		host-image.pkr.hcl
 
-packer-build: firecracker-manager-linux packer-init
+packer-build: capsule-manager-linux packer-init
 	cd deploy/packer && packer build \
 		-var="project_id=$(PROJECT_ID)" \
-		-var="firecracker_manager_binary=../../bin/firecracker-manager" \
-		-var="network=fc-runner-$(ENV)-vpc" \
-		-var="subnetwork=fc-runner-$(ENV)-hosts" \
+		-var="capsule_manager_binary=../../bin/capsule-manager" \
+		-var="network=capsule-$(ENV)-vpc" \
+		-var="subnetwork=capsule-$(ENV)-hosts" \
 		host-image.pkr.hcl
 
-# Cross-compile firecracker-manager for Linux (for Packer builds from macOS)
-firecracker-manager-linux:
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/firecracker-manager ./cmd/firecracker-manager
-	@echo "Built bin/firecracker-manager (linux/amd64)"
+# Cross-compile capsule-manager for Linux (for Packer builds from macOS)
+capsule-manager-linux:
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o bin/capsule-manager ./cmd/capsule-manager
+	@echo "Built bin/capsule-manager (linux/amd64)"
 
 # Full release: build binary, build image, update MIG
 .PHONY: release-host-image
 release-host-image: packer-build
 	@echo ""
 	@echo "=== Host image built successfully ==="
-	@echo "Image family: firecracker-host"
+	@echo "Image family: capsule-host"
 	@echo ""
 	@echo "To roll out to the MIG, run:"
 	@echo "  make mig-rolling-update"
@@ -207,13 +207,13 @@ mig-rolling-update:
 	@echo "Starting rolling update of host MIG..."
 	$(eval TEMPLATE := $(shell gcloud compute instance-templates list \
 		--project=$(PROJECT_ID) \
-		--filter="name~'^fc-runner-$(ENV)-host-'" \
+		--filter="name~'^capsule-$(ENV)-host-'" \
 		--format="value(name)" \
 		--sort-by=~creationTimestamp \
 		--limit=1))
 	@echo "Using template: $(TEMPLATE)"
 	gcloud compute instance-groups managed rolling-action start-update \
-		fc-runner-$(ENV)-hosts \
+		capsule-$(ENV)-hosts \
 		--version=template=$(TEMPLATE) \
 		--region=$(REGION) \
 		--project=$(PROJECT_ID) \
@@ -221,7 +221,7 @@ mig-rolling-update:
 		--max-unavailable=0
 	@echo ""
 	@echo "Rolling update initiated. Monitor with:"
-	@echo "  gcloud compute instance-groups managed list-instances fc-runner-$(ENV)-hosts --region=$(REGION)"
+	@echo "  gcloud compute instance-groups managed list-instances capsule-$(ENV)-hosts --region=$(REGION)"
 
 # Kubernetes
 k8s-deploy:
@@ -239,17 +239,17 @@ dev-setup:
 
 # Run locally (for development)
 run-control-plane:
-	$(GO) run ./cmd/control-plane \
+	$(GO) run ./cmd/capsule-control-plane \
 		--db-host=localhost \
 		--db-port=5432 \
 		--db-user=postgres \
 		--db-password=postgres \
-		--db-name=firecracker_runner \
-		--gcs-bucket=$(PROJECT_ID)-firecracker-snapshots
+		--db-name=capsule \
+		--gcs-bucket=$(PROJECT_ID)-capsule-snapshots
 
 run-host-agent:
-	sudo $(GO) run ./cmd/firecracker-manager \
-		--snapshot-bucket=$(PROJECT_ID)-firecracker-snapshots \
+	sudo $(GO) run ./cmd/capsule-manager \
+		--snapshot-bucket=$(PROJECT_ID)-capsule-snapshots \
 		--snapshot-cache=/tmp/snapshots \
 		--socket-dir=/tmp/firecracker \
 		--log-dir=/tmp/firecracker-logs
@@ -285,12 +285,12 @@ check: build test-unit
 
 # Help
 help:
-	@echo "Firecracker Bazel Runner Platform"
+	@echo "Capsule Platform"
 	@echo ""
 	@echo "Build Targets:"
 	@echo "  build                  - Build all binaries"
-	@echo "  firecracker-manager    - Build firecracker-manager (native)"
-	@echo "  firecracker-manager-linux - Build firecracker-manager (linux/amd64)"
+	@echo "  capsule-manager    - Build capsule-manager (native)"
+	@echo "  capsule-manager-linux - Build capsule-manager (linux/amd64)"
 	@echo "  test                   - Run all tests"
 	@echo "  test-unit              - Unit tests (macOS + Linux)"
 	@echo "  test-race              - Unit tests with race detector"
@@ -332,7 +332,7 @@ help:
 	@echo "  dev-build            - Build binaries + minimal rootfs"
 	@echo "  dev-snapshot         - Build full snapshot for restore testing"
 	@echo "  dev-test-snapshot-builder - Run snapshot-builder smoke tests (legacy + base-image)"
-	@echo "  dev-stack            - Start control-plane + firecracker-manager"
+	@echo "  dev-stack            - Start capsule-control-plane + capsule-manager"
 	@echo "  dev-test-file-ops    - Run E2E file operations test (WS2)"
 	@echo "  dev-test-pty         - Run E2E PTY terminal test (WS3)"
 	@echo "  dev-test-template-tags - Run E2E template tags test (WS6)"
@@ -369,7 +369,7 @@ dev-build:
 dev-snapshot:
 	bash dev/build-snapshot.sh
 
-# Start the full stack (control-plane + firecracker-manager)
+# Start the full stack (control-plane + capsule-manager)
 dev-stack:
 	bash dev/run-stack.sh
 
@@ -455,13 +455,13 @@ dev-run-agent-e2e:
 
 # ── Python SDK ──────────────────────────────────────────────────────────────
 sdk-python-lint:
-	cd sdk/python && python -m ruff check src/bf_sdk/ tests/
+	cd sdk/python && python -m ruff check src/capsule_sdk/ tests/
 
 sdk-python-test:
 	cd sdk/python && python -m pytest tests/ -v
 
 sdk-python-typecheck:
-	cd sdk/python && python -m pyright src/bf_sdk/
+	cd sdk/python && python -m pyright src/capsule_sdk/
 
 sdk-python-check: sdk-python-lint sdk-python-typecheck sdk-python-test
 	@echo "Python SDK checks passed"

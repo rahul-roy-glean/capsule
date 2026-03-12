@@ -31,10 +31,10 @@ type flavorConfig struct {
 }
 
 var commonRequiredPaths = []string{
-	"/usr/local/bin/thaw-agent",
+	"/usr/local/bin/capsule-thaw-agent",
 	"/workspace",
-	"/var/run/thaw-agent",
-	"/var/log/thaw-agent",
+	"/var/run/capsule-thaw-agent",
+	"/var/log/capsule-thaw-agent",
 	"/etc/hostname",
 	"/etc/hosts",
 	"/etc/resolv.conf.default",
@@ -68,8 +68,8 @@ func getFlavorConfig(flavor rootfsFlavor) (flavorConfig, error) {
 			requiredPaths: []string{
 				"/lib/systemd/systemd",
 				"/sbin/init",
-				"/etc/systemd/system/thaw-agent.service",
-				"/etc/systemd/system/multi-user.target.wants/thaw-agent.service",
+				"/etc/systemd/system/capsule-thaw-agent.service",
+				"/etc/systemd/system/multi-user.target.wants/capsule-thaw-agent.service",
 				"/etc/systemd/network/10-eth0.network",
 				"/etc/systemd/system/default.target",
 				"/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service",
@@ -86,8 +86,8 @@ func getFlavorConfig(flavor rootfsFlavor) (flavorConfig, error) {
 				"/sbin/openrc",
 				"/sbin/init",
 				"/lib/systemd/systemd",
-				"/etc/init.d/thaw-agent",
-				"/etc/runlevels/default/thaw-agent",
+				"/etc/init.d/capsule-thaw-agent",
+				"/etc/runlevels/default/capsule-thaw-agent",
 				"/etc/runlevels/default/networking",
 				"/etc/runlevels/default/hostname",
 				"/etc/network/interfaces",
@@ -215,18 +215,18 @@ func missingPlatformBinaries(rootfsDir string) []string {
 
 func installThawAgentBinary(rootfsDir, thawAgentBin string) error {
 	if _, err := os.Stat(thawAgentBin); os.IsNotExist(err) {
-		return fmt.Errorf("thaw-agent binary not found at %s (build with 'make thaw-agent' or set --thaw-agent-path)", thawAgentBin)
+		return fmt.Errorf("capsule-thaw-agent binary not found at %s (build with 'make capsule-thaw-agent' or set --capsule-thaw-agent-path)", thawAgentBin)
 	}
 
-	thawAgentDst := filepath.Join(rootfsDir, "usr/local/bin/thaw-agent")
+	thawAgentDst := filepath.Join(rootfsDir, "usr/local/bin/capsule-thaw-agent")
 	if err := os.MkdirAll(filepath.Dir(thawAgentDst), 0755); err != nil {
-		return fmt.Errorf("create thaw-agent destination directory: %w", err)
+		return fmt.Errorf("create capsule-thaw-agent destination directory: %w", err)
 	}
 	if err := copyFile(thawAgentBin, thawAgentDst); err != nil {
-		return fmt.Errorf("failed to copy thaw-agent: %w", err)
+		return fmt.Errorf("failed to copy capsule-thaw-agent: %w", err)
 	}
 	if err := os.Chmod(thawAgentDst, 0755); err != nil {
-		return fmt.Errorf("chmod thaw-agent: %w", err)
+		return fmt.Errorf("chmod capsule-thaw-agent: %w", err)
 	}
 	return nil
 }
@@ -252,16 +252,16 @@ func configureDebianLikeRootfs(rootfsDir, runnerUser string) error {
 		return fmt.Errorf("create systemd service dir: %w", err)
 	}
 	serviceContent := renderDebianThawAgentService(runnerUser)
-	if err := os.WriteFile(filepath.Join(serviceDir, "thaw-agent.service"), []byte(serviceContent), 0644); err != nil {
-		return fmt.Errorf("write thaw-agent.service: %w", err)
+	if err := os.WriteFile(filepath.Join(serviceDir, "capsule-thaw-agent.service"), []byte(serviceContent), 0644); err != nil {
+		return fmt.Errorf("write capsule-thaw-agent.service: %w", err)
 	}
 
 	wantsDir := filepath.Join(serviceDir, "multi-user.target.wants")
 	if err := os.MkdirAll(wantsDir, 0755); err != nil {
 		return fmt.Errorf("create multi-user.target wants dir: %w", err)
 	}
-	if err := forceSymlink("/etc/systemd/system/thaw-agent.service", filepath.Join(wantsDir, "thaw-agent.service")); err != nil {
-		return fmt.Errorf("enable thaw-agent service: %w", err)
+	if err := forceSymlink("/etc/systemd/system/capsule-thaw-agent.service", filepath.Join(wantsDir, "capsule-thaw-agent.service")); err != nil {
+		return fmt.Errorf("enable capsule-thaw-agent service: %w", err)
 	}
 
 	networkDir := filepath.Join(rootfsDir, "etc/systemd/network")
@@ -316,16 +316,16 @@ func configureAlpineRootfs(rootfsDir, runnerUser string) error {
 	if err := os.MkdirAll(initDir, 0755); err != nil {
 		return fmt.Errorf("create init.d dir: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(initDir, "thaw-agent"), []byte(initScript), 0755); err != nil {
-		return fmt.Errorf("write thaw-agent init script: %w", err)
+	if err := os.WriteFile(filepath.Join(initDir, "capsule-thaw-agent"), []byte(initScript), 0755); err != nil {
+		return fmt.Errorf("write capsule-thaw-agent init script: %w", err)
 	}
 
 	runlevelDir := filepath.Join(rootfsDir, "etc/runlevels/default")
 	if err := os.MkdirAll(runlevelDir, 0755); err != nil {
 		return fmt.Errorf("create default runlevel dir: %w", err)
 	}
-	if err := forceSymlink("/etc/init.d/thaw-agent", filepath.Join(runlevelDir, "thaw-agent")); err != nil {
-		return fmt.Errorf("enable thaw-agent in default runlevel: %w", err)
+	if err := forceSymlink("/etc/init.d/capsule-thaw-agent", filepath.Join(runlevelDir, "capsule-thaw-agent")); err != nil {
+		return fmt.Errorf("enable capsule-thaw-agent in default runlevel: %w", err)
 	}
 
 	interfacesContent := renderAlpineInterfacesConfig()
@@ -405,8 +405,8 @@ func ensureWorkspaceOwnership(rootfsDir, runnerUser string) error {
 func writeCommonRootfsFiles(rootfsDir string, dockerEnv []string, log *logrus.Entry) error {
 	for _, dir := range []string{
 		"workspace",
-		"var/run/thaw-agent",
-		"var/log/thaw-agent",
+		"var/run/capsule-thaw-agent",
+		"var/log/capsule-thaw-agent",
 		"mnt/ephemeral/caches/repository",
 		"mnt/ephemeral/bazel",
 		"mnt/ephemeral/output",
@@ -648,7 +648,7 @@ Wants=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/thaw-agent --runner-user=%s
+ExecStart=/usr/local/bin/capsule-thaw-agent --runner-user=%s
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal+console
@@ -673,14 +673,14 @@ DHCP=no
 func renderAlpineThawAgentInitScript(runnerUser string) string {
 	return fmt.Sprintf(`#!/sbin/openrc-run
 
-name="thaw-agent"
+name="capsule-thaw-agent"
 description="Thaw Agent - MicroVM initialization"
-command="/usr/local/bin/thaw-agent"
+command="/usr/local/bin/capsule-thaw-agent"
 command_args="--runner-user=%s"
 command_background=true
 pidfile="/run/${RC_SVCNAME}.pid"
-output_log="/var/log/thaw-agent/stdout.log"
-error_log="/var/log/thaw-agent/stderr.log"
+output_log="/var/log/capsule-thaw-agent/stdout.log"
+error_log="/var/log/capsule-thaw-agent/stderr.log"
 
 depend() {
 	need net

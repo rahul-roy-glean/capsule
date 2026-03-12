@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
 )
 
 func TestValidateBaseImagePolicy(t *testing.T) {
@@ -61,7 +61,7 @@ func TestComputeRootfsSourceHashLegacyIncludesResizeSetting(t *testing.T) {
 }
 
 func TestComputeRootfsSourceHashBaseImageTracksInputs(t *testing.T) {
-	thawAgentPath := writeTestFile(t, "thaw-agent", []byte("thaw-agent-v1"))
+	thawAgentPath := writeTestFile(t, "capsule-thaw-agent", []byte("capsule-thaw-agent-v1"))
 
 	hashA, err := computeRootfsSourceHash("", "ubuntu@sha256:1111111111111111111111111111111111111111111111111111111111111111", "runner", thawAgentPath, 0, rootfsFlavorDebianLike)
 	if err != nil {
@@ -75,20 +75,20 @@ func TestComputeRootfsSourceHashBaseImageTracksInputs(t *testing.T) {
 		t.Fatal("base-image rootfs provenance hash did not change when image URI changed")
 	}
 
-	if err := os.WriteFile(thawAgentPath, []byte("thaw-agent-v2"), 0644); err != nil {
-		t.Fatalf("rewrite thaw-agent test file: %v", err)
+	if err := os.WriteFile(thawAgentPath, []byte("capsule-thaw-agent-v2"), 0644); err != nil {
+		t.Fatalf("rewrite capsule-thaw-agent test file: %v", err)
 	}
 	hashC, err := computeRootfsSourceHash("", "ubuntu@sha256:1111111111111111111111111111111111111111111111111111111111111111", "runner", thawAgentPath, 0, rootfsFlavorDebianLike)
 	if err != nil {
 		t.Fatalf("computeRootfsSourceHash base image hashC failed: %v", err)
 	}
 	if hashA == hashC {
-		t.Fatal("base-image rootfs provenance hash did not change when thaw-agent content changed")
+		t.Fatal("base-image rootfs provenance hash did not change when capsule-thaw-agent content changed")
 	}
 }
 
 func TestComputeRootfsSourceHashBaseImageRequiresDigestPin(t *testing.T) {
-	thawAgentPath := writeTestFile(t, "thaw-agent", []byte("thaw-agent-v1"))
+	thawAgentPath := writeTestFile(t, "capsule-thaw-agent", []byte("capsule-thaw-agent-v1"))
 
 	if _, err := computeRootfsSourceHash("", "ubuntu:22.04", "runner", thawAgentPath, 0, rootfsFlavorDebianLike); err == nil {
 		t.Fatal("computeRootfsSourceHash accepted an unpinned base image tag, want error")

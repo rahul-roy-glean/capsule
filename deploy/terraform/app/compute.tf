@@ -3,7 +3,7 @@
 # After building with Packer, set use_custom_host_image = true
 data "google_compute_image" "host" {
   count   = var.use_custom_host_image ? 1 : 0
-  family  = "firecracker-host"
+  family  = "capsule-host"
   project = local.infra.project_id
 }
 
@@ -23,7 +23,7 @@ resource "google_compute_instance_template" "firecracker_host" {
   machine_type = var.host_machine_type
   region       = local.infra.region
 
-  tags = ["firecracker-host"]
+  tags = ["capsule-host"]
 
   labels = local.labels
 
@@ -159,15 +159,15 @@ LOGROTATE
     HOST_BOOTSTRAP_TOKEN=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/host-bootstrap-token || echo "")
 
-    # Stop firecracker-manager if already running (from Packer image auto-start)
+    # Stop capsule-manager if already running (from Packer image auto-start)
     # This ensures the override is applied before the service runs
-    systemctl stop firecracker-manager 2>/dev/null || true
+    systemctl stop capsule-manager 2>/dev/null || true
 
-    # Create systemd override for firecracker-manager with configured values
-    mkdir -p /etc/systemd/system/firecracker-manager.service.d
+    # Create systemd override for capsule-manager with configured values
+    mkdir -p /etc/systemd/system/capsule-manager.service.d
 
     # Build the ExecStart line with optional flags
-    EXEC_START="/usr/local/bin/firecracker-manager"
+    EXEC_START="/usr/local/bin/capsule-manager"
     EXEC_START="$EXEC_START --max-runners=$MAX_RUNNERS"
     EXEC_START="$EXEC_START --idle-target=$IDLE_TARGET"
     EXEC_START="$EXEC_START --snapshot-cache=/mnt/data/snapshots"
@@ -203,18 +203,18 @@ LOGROTATE
       ENV_LINES="$ENV_LINES\nEnvironment=ENVIRONMENT=$ENVIRONMENT"
     fi
 
-    cat > /etc/systemd/system/firecracker-manager.service.d/override.conf << OVERRIDE
+    cat > /etc/systemd/system/capsule-manager.service.d/override.conf << OVERRIDE
 [Service]
 ExecStart=
 ExecStart=$EXEC_START
 $([ -n "$ENV_LINES" ] && echo -e "$ENV_LINES")
 OVERRIDE
 
-    # Reload and restart firecracker-manager service with new config
-    echo "Starting firecracker-manager with: max-runners=$MAX_RUNNERS, idle-target=$IDLE_TARGET, vcpus=$VCPUS_PER_RUNNER, memory=$MEMORY_PER_RUNNER"
+    # Reload and restart capsule-manager service with new config
+    echo "Starting capsule-manager with: max-runners=$MAX_RUNNERS, idle-target=$IDLE_TARGET, vcpus=$VCPUS_PER_RUNNER, memory=$MEMORY_PER_RUNNER"
     systemctl daemon-reload
-    systemctl enable firecracker-manager
-    systemctl restart firecracker-manager
+    systemctl enable capsule-manager
+    systemctl restart capsule-manager
 
     STARTUP_END=$(date +%s)
     STARTUP_DURATION=$((STARTUP_END - STARTUP_START))

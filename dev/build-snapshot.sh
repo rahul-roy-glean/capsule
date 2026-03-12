@@ -109,7 +109,7 @@ if [ -n "$ROOTFS_SIZE_GB" ]; then
 fi
 
 if [ -n "$THAW_AGENT_PATH" ]; then
-  BUILDER_FLAGS+=(--thaw-agent-path="$THAW_AGENT_PATH")
+  BUILDER_FLAGS+=(--capsule-thaw-agent-path="$THAW_AGENT_PATH")
 fi
 
 set +e

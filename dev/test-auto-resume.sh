@@ -70,7 +70,7 @@ else
 fi
 
 HOST=$MGR
-sleep 2  # wait for thaw-agent readiness
+sleep 2  # wait for capsule-thaw-agent readiness
 
 # ---------------------------------------------------------------------------
 header "3. Write marker file"

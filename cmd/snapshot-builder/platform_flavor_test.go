@@ -65,7 +65,7 @@ func TestValidateInjectedRootfsDebianLike(t *testing.T) {
 func TestValidateInjectedRootfsDebianLikeWithRootfsLocalSymlinks(t *testing.T) {
 	rootfs := buildValidRootfsFixture(t, rootfsFlavorDebianLike, "runner")
 
-	mustSymlinkRootfs(t, rootfs, "/etc/systemd/system/thaw-agent.service", "/etc/systemd/system/multi-user.target.wants/thaw-agent.service")
+	mustSymlinkRootfs(t, rootfs, "/etc/systemd/system/capsule-thaw-agent.service", "/etc/systemd/system/multi-user.target.wants/capsule-thaw-agent.service")
 	mustWriteRootfsFile(t, rootfs, "/lib/systemd/system/multi-user.target", "fixture\n")
 	mustSymlinkRootfs(t, rootfs, "/lib/systemd/system/multi-user.target", "/etc/systemd/system/default.target")
 	mustWriteRootfsFile(t, rootfs, "/lib/systemd/system/serial-getty@.service", "fixture\n")
@@ -118,8 +118,8 @@ func buildValidRootfsFixture(t *testing.T, flavor rootfsFlavor, runnerUser strin
 		"/etc/init.d",
 		"/etc/runlevels/default",
 		"/etc/network",
-		"/var/run/thaw-agent",
-		"/var/log/thaw-agent",
+		"/var/run/capsule-thaw-agent",
+		"/var/log/capsule-thaw-agent",
 		"/workspace",
 	} {
 		mustMkdirRootfs(t, rootfs, dir)
@@ -128,7 +128,7 @@ func buildValidRootfsFixture(t *testing.T, flavor rootfsFlavor, runnerUser strin
 	for _, binary := range commonRequiredBinaries {
 		mustWriteExecutable(t, rootfs, binaryFixturePath(binary), "#!/bin/sh\n")
 	}
-	mustWriteExecutable(t, rootfs, "/usr/local/bin/thaw-agent", "#!/bin/sh\n")
+	mustWriteExecutable(t, rootfs, "/usr/local/bin/capsule-thaw-agent", "#!/bin/sh\n")
 	mustWriteRootfsFile(t, rootfs, "/etc/hostname", "runner\n")
 	mustWriteRootfsFile(t, rootfs, "/etc/hosts", "127.0.0.1 localhost\n")
 	mustWriteRootfsFile(t, rootfs, "/etc/resolv.conf.default", "nameserver 8.8.8.8\n")
@@ -139,8 +139,8 @@ func buildValidRootfsFixture(t *testing.T, flavor rootfsFlavor, runnerUser strin
 		for _, path := range []string{
 			"/lib/systemd/systemd",
 			"/sbin/init",
-			"/etc/systemd/system/thaw-agent.service",
-			"/etc/systemd/system/multi-user.target.wants/thaw-agent.service",
+			"/etc/systemd/system/capsule-thaw-agent.service",
+			"/etc/systemd/system/multi-user.target.wants/capsule-thaw-agent.service",
 			"/etc/systemd/network/10-eth0.network",
 			"/etc/systemd/system/default.target",
 			"/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service",
@@ -153,8 +153,8 @@ func buildValidRootfsFixture(t *testing.T, flavor rootfsFlavor, runnerUser strin
 			"/sbin/openrc",
 			"/sbin/init",
 			"/lib/systemd/systemd",
-			"/etc/init.d/thaw-agent",
-			"/etc/runlevels/default/thaw-agent",
+			"/etc/init.d/capsule-thaw-agent",
+			"/etc/runlevels/default/capsule-thaw-agent",
 			"/etc/runlevels/default/networking",
 			"/etc/runlevels/default/hostname",
 			"/etc/network/interfaces",

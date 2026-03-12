@@ -59,7 +59,7 @@ echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-ip-forward.conf
 # --- Postgres: create dev database ---
 systemctl enable postgresql
 systemctl start postgresql
-su - postgres -c "psql -tc \"SELECT 1 FROM pg_database WHERE datname='firecracker_runner'\" | grep -q 1 || psql -c 'CREATE DATABASE firecracker_runner'"
+su - postgres -c "psql -tc \"SELECT 1 FROM pg_database WHERE datname='capsule'\" | grep -q 1 || psql -c 'CREATE DATABASE capsule'"
 # Allow local connections without password
 PG_HBA=$(su - postgres -c "psql -t -A -c 'SHOW hba_file'")
 if ! grep -q 'local.*all.*all.*trust' "$PG_HBA" 2>/dev/null; then
@@ -92,4 +92,4 @@ echo ""
 echo "Next steps:"
 echo "  make dev-build                 # Build binaries + rootfs"
 echo "  make dev-test-snapshot-builder # Run snapshot-builder smoke tests"
-echo "  make dev-stack                 # Start control-plane + firecracker-manager"
+echo "  make dev-stack                 # Start control-plane + capsule-manager"

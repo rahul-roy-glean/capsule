@@ -1,66 +1,51 @@
-# Example: GitLab CI Runners
+# Example: GitLab Runners
 
-This example validates the CI-agnostic design. GitLab CI works identically to
-GitHub Actions -- the only difference is the binary name and registration flags.
+Use this example when you want to run GitLab-style CI workloads on Capsule.
 
-## Why no CI-specific config is needed
+The main lesson of this example is simple: most CI platforms differ primarily in
+their runner binary and startup flags, not in the underlying Capsule runtime.
 
-With the generic approach, there is no switch statement or CI-specific config.
-The snapshot contains the CI runner binary. The `start_command` runs it with the
-right flags. The platform injects `${ci_runner_token}` via MMDS. Done.
+## What Changes From Other CI Examples
 
-## Side-by-side comparison
+Compared with a GitHub Actions-style runner setup, the main differences are:
 
-### GitHub Actions
-```yaml
-start_command:
-  command: ["/home/runner/config.sh", "--url", "https://github.com/myorg/myrepo",
-            "--token", "${CI_RUNNER_TOKEN}", "--ephemeral"]
-```
+- the runner binary
+- the registration or startup flags
+- any CI-provider-specific environment variables
 
-### GitLab CI
+The surrounding Capsule model stays the same:
+
+- build a warm snapshot
+- restore a VM
+- launch the runner process with `start_command`
+
+## Example `start_command`
+
 ```yaml
 start_command:
   command: ["gitlab-runner", "run", "--working-directory", "/workspace",
             "--url", "https://gitlab.com", "--token", "${CI_RUNNER_TOKEN}"]
 ```
 
-### Buildkite
-```yaml
-start_command:
-  command: ["buildkite-agent", "start", "--token", "${CI_RUNNER_TOKEN}",
-            "--name", "firecracker-%n"]
-```
+## What You Need To Edit
 
-### Jenkins
-```yaml
-start_command:
-  command: ["java", "-jar", "/opt/jenkins/agent.jar",
-            "-url", "https://jenkins.internal",
-            "-secret", "${CI_RUNNER_TOKEN}", "-name", "fc-%n"]
-```
+Before using this example, update:
 
-All four CI systems work with the same platform code. No CI-specific config,
-no adapter interface, no switch statement.
-
-## What about drain (label removal)?
-
-GitHub Actions drain removes labels via the GitHub API so no new jobs are
-scheduled. This is a GitHub-specific API call that only needs a nilable
-`*cigithub.Client`:
-
-```go
-if githubClient != nil {
-    githubClient.RemoveLabels(ctx, runners)
-}
-```
-
-GitLab and Buildkite don't need label removal -- they use queue-based scheduling.
+- `platform.gcp_project`
+- the GitLab URL
+- the runner token source
+- any runner tags or working-directory settings
 
 ## Onboard
 
 ```bash
 cp examples/ci-gitlab-runners/onboard.yaml my-gitlab.yaml
-# Edit my-gitlab.yaml: set platform.gcp_project and workload/start_command values
+# Edit the fields described above
 make onboard CONFIG=my-gitlab.yaml
 ```
+
+## Good Fit
+
+This example is most useful as a minimal delta from other CI examples. If your
+main question is "how do I run a different CI runner binary on Capsule?", start
+here.

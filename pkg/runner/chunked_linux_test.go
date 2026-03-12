@@ -16,12 +16,12 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/fuse"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/uffd"
+	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
+	"github.com/rahul-roy-glean/capsule/pkg/firecracker"
+	"github.com/rahul-roy-glean/capsule/pkg/fuse"
+	"github.com/rahul-roy-glean/capsule/pkg/network"
+	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
+	"github.com/rahul-roy-glean/capsule/pkg/uffd"
 )
 
 func newTestChunkedManager() *ChunkedManager {

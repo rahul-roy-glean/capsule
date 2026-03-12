@@ -6,7 +6,7 @@ package uffd
 import (
 	"testing"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
 )
 
 func TestNewHandler_FaultConcurrency(t *testing.T) {

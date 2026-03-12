@@ -31,8 +31,8 @@ kill_pid_file() {
 
 echo "=== Stopping dev stack ==="
 
-# 1. Stop firecracker-manager first (triggers graceful VM shutdown)
-kill_pid_file "firecracker-manager"
+# 1. Stop capsule-manager first (triggers graceful VM shutdown)
+kill_pid_file "capsule-manager"
 
 # 2. Stop control-plane
 kill_pid_file "control-plane"

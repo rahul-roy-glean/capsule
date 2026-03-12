@@ -58,17 +58,17 @@ fi
 echo "Firecracker artifacts:"
 ls -lah /opt/firecracker/
 
-# ---- 4. Download snapshot-builder and thaw-agent binaries from GCS ----
+# ---- 4. Download snapshot-builder and capsule-thaw-agent binaries from GCS ----
 echo "Downloading snapshot-builder binary..."
 if [ -n "$SNAPSHOT_BUCKET" ]; then
   gcloud storage cp "gs://${SNAPSHOT_BUCKET}/build-artifacts/snapshot-builder" /usr/local/bin/snapshot-builder 2>/dev/null \
     || echo "WARNING: snapshot-builder binary not found in GCS"
   chmod +x /usr/local/bin/snapshot-builder 2>/dev/null || true
 
-  echo "Downloading thaw-agent binary..."
-  gcloud storage cp "gs://${SNAPSHOT_BUCKET}/build-artifacts/thaw-agent" /usr/local/bin/thaw-agent 2>/dev/null \
-    || echo "WARNING: thaw-agent binary not found in GCS"
-  chmod +x /usr/local/bin/thaw-agent 2>/dev/null || true
+  echo "Downloading capsule-thaw-agent binary..."
+  gcloud storage cp "gs://${SNAPSHOT_BUCKET}/build-artifacts/capsule-thaw-agent" /usr/local/bin/capsule-thaw-agent 2>/dev/null \
+    || echo "WARNING: capsule-thaw-agent binary not found in GCS"
+  chmod +x /usr/local/bin/capsule-thaw-agent 2>/dev/null || true
 fi
 
 # ---- 5. Load tun module; snapshot-builder configures per-build netns itself ----

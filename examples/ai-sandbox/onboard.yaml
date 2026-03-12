@@ -21,7 +21,7 @@ hosts:
 
 workload:
   # Docker image with your sandbox runtime, Python, and model dependencies.
-  # The platform converts it to a Firecracker rootfs and installs thaw-agent.
+  # The platform converts it to a Firecracker rootfs and installs capsule-thaw-agent.
   base_image: "us-docker.pkg.dev/my-project/images/ai-sandbox:latest"
 
   layers:
@@ -36,7 +36,7 @@ workload:
           args: ["python3", "/app/preload_weights.py"]
 
   # The service that runs inside the VM after each restore.
-  # The thaw-agent starts this, waits for GET /health on port 8080 to return 2xx,
+  # The capsule-thaw-agent starts this, waits for GET /health on port 8080 to return 2xx,
   # then tells the host the runner is ready.
   start_command:
     command: ["python3", "/app/sandbox_server.py"]

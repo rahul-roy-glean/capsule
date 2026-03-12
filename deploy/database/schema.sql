@@ -1,2 +1,2 @@
--- Canonical schema has moved to cmd/control-plane/schema.sql
+-- Canonical schema has moved to cmd/capsule-control-plane/schema.sql
 -- (embedded at build time via //go:embed).

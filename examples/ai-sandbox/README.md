@@ -1,63 +1,91 @@
-# Example: AI Sandboxes
+# Example: AI Sandbox
 
-This example configures the platform to serve isolated microVM sandboxes for running untrusted or LLM-generated code. Each request gets a hardware-isolated Firecracker VM restored from a snapshot that has the model weights and runtime pre-loaded.
+Use this example when you want per-request isolated execution for untrusted,
+user-supplied, or model-generated code, while still benefiting from a warm
+snapshot and optional session resume.
 
-## What the snapshot contains
+## What This Example Does
 
-The golden snapshot is built by:
-1. Installing Python dependencies (`pip3 install -r /app/requirements.txt`)
-2. Running `preload_weights.py` to load model weights into memory
-3. Freezing the VM — the Python runtime with weights resident in RAM is preserved
+This example assumes you have a sandbox service image that already contains your
+runtime and model dependencies. Capsule then:
 
-Each new sandbox restores from this frozen state in ~300ms. No cold model-loading on every request.
+1. converts that image into a Firecracker guest rootfs
+2. runs warmup commands during snapshot build
+3. optionally preloads model weights or runtime state before freezing the VM
+4. restores a fresh or session-backed sandbox on each allocation
 
-## Workflow
+## What You Need To Edit
 
-```
-API request: POST /exec  {session_id?, code, timeout}
-  → Control plane selects a warm VM from the idle pool
-  → If pool empty: restore from golden snapshot (~300ms)
-  → If session_id set: resume session from GCS (~300ms, cross-host)
-  → Code runs inside isolated microVM
-  → On completion: VM recycled to pool (pool reuse ~10ms) or paused for session
-```
+Before running this example, update:
 
-## Key isolation properties
+- `platform.gcp_project`
+- `platform.region`
+- `platform.zone`
+- `workload.base_image`
+- `workload.layers`
+- `workload.start_command`
+- `microvm.memory_mb`
+- `microvm.vcpus`
 
-- **Hardware isolation:** KVM hypervisor, no shared kernel with host or other VMs
-- **Network isolation:** VM gets a dedicated tap interface; egress can be blocked
-- **Fresh state:** Each non-session allocation starts from the golden snapshot
-- **No container escape:** No Docker, no containerd, no shared namespace
+## What The Snapshot Typically Contains
 
-## Session persistence for multi-turn conversations
+The snapshot for this pattern is usually built by:
 
-Enable `session` to preserve sandbox state across requests (useful for REPL-style interactions):
+1. installing Python or runtime dependencies
+2. loading model weights, data, or interpreter state
+3. freezing the VM once the runtime is warm
+
+This is what makes restore latency much lower than cold-starting the full stack
+on every request.
+
+## Isolation Properties
+
+- hardware isolation through Firecracker microVMs
+- fresh state for non-session allocations
+- optional network policy enforcement per runner
+- no shared kernel with the host or other guests
+
+## Optional Session Persistence
+
+Enable `session` if you need multi-turn interactions that preserve in-VM state:
 
 ```yaml
 session:
   enabled: true
-  ttl_seconds: 1800   # Pause after 30min idle
-  auto_pause: true    # Pause to GCS instead of destroying
+  ttl_seconds: 1800
+  auto_pause: true
 ```
 
-The sandbox's full memory state (loaded weights, interpreter state, variables) is saved to GCS on pause and restored on resume. Cross-host resume means any host in the fleet can pick up the session.
+With sessions enabled, Capsule can pause the sandbox state to GCS and later
+resume it on any compatible host.
 
 ## Onboard
 
 ```bash
 cp examples/ai-sandbox/onboard.yaml my-sandbox.yaml
-# Edit my-sandbox.yaml: set platform.gcp_project and image/workload values
-# Adjust microvm.memory_mb and workload.config.tier for your model size
+# Edit the fields described above
 make onboard CONFIG=my-sandbox.yaml
 ```
 
-## Sizing guidance
+## Sizing Guidance
 
 | Model size | Recommended `memory_mb` | `vcpus` |
 |---|---|---|
 | <1B params | 4096 | 2 |
-| 1–7B params | 16384 | 4 |
-| 7–13B params | 32768 | 8 |
+| 1-7B params | 16384 | 4 |
+| 7-13B params | 32768 | 8 |
 | 70B+ params | 131072 | 16 |
 
-Set `idle_target` to the number of warm VMs you want ready per host (reduces p50 latency at the cost of memory).
+Increase `idle_target` if you want more warm sandboxes ready per host.
+
+## What This Example Does Not Configure For You
+
+This example does not automatically provide:
+
+- secret injection for external model providers
+- workload-specific auth or API gateway policy
+- internet-exposed ingress hardening
+- application-level sandbox policy inside your own service
+
+Treat it as a strong starting point for the runtime shape, not a complete
+production security policy for every AI workload.

@@ -38,8 +38,8 @@ jobs:
               - 'go.sum'
               - 'Makefile'
             migrations:
-              - 'cmd/control-plane/migrations/**'
-              - 'cmd/control-plane/schema.sql'
+              - 'cmd/capsule-control-plane/migrations/**'
+              - 'cmd/capsule-control-plane/schema.sql'
               - '.github/scripts/check-migrations.sh'
             python_sdk:
               - 'sdk/python/**'
@@ -53,8 +53,8 @@ jobs:
               - 'cmd/onboard/**'
             contract:
               - 'sdk/python/**'
-              - 'cmd/control-plane/**'
-              - 'cmd/firecracker-manager/**'
+              - 'cmd/capsule-control-plane/**'
+              - 'cmd/capsule-manager/**'
               - 'pkg/**'
               - 'go.mod'
               - 'go.sum'
@@ -196,9 +196,9 @@ jobs:
       - name: Install SDK dev dependencies
         run: pip install -e ".[dev]"
       - name: Ruff
-        run: python -m ruff check src/bf_sdk/ tests/
+        run: python -m ruff check src/capsule_sdk/ tests/
       - name: Pyright
-        run: python -m pyright src/bf_sdk/
+        run: python -m pyright src/capsule_sdk/
       - name: Pytest
         run: python -m pytest tests/ -v --ignore=tests/e2e_live.py -m "not contract"
 
@@ -219,7 +219,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: azure/setup-helm@v4
-      - run: helm lint deploy/helm/firecracker-runner
+      - run: helm lint deploy/helm/capsule
 
   example-validation:
     name: Validate Examples
@@ -243,7 +243,7 @@ jobs:
         image: postgres:15
         env:
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: firecracker_runner
+          POSTGRES_DB: capsule
         ports:
           - 5432:5432
         options: >-
@@ -261,19 +261,19 @@ jobs:
           python-version: "3.12"
       - name: Build and start control plane
         run: |
-          go build -o /tmp/control-plane ./cmd/control-plane
-          /tmp/control-plane \
+          go build -o /tmp/capsule-control-plane ./cmd/capsule-control-plane
+          /tmp/capsule-control-plane \
             --db-host=localhost --db-port=5432 \
             --db-user=postgres --db-password=postgres \
-            --db-name=firecracker_runner \
-            --api-auth-token=test-token > /tmp/control-plane.log 2>&1 &
+            --db-name=capsule \
+            --api-auth-token=test-token > /tmp/capsule-control-plane.log 2>&1 &
           for _i in $(seq 1 30); do
             curl -sf http://localhost:8080/health && break || sleep 1
           done
-          curl -sf http://localhost:8080/health || { echo "Control plane failed to start"; cat /tmp/control-plane.log; exit 1; }
+          curl -sf http://localhost:8080/health || { echo "Control plane failed to start"; cat /tmp/capsule-control-plane.log; exit 1; }
       - name: Run contract tests
         run: |
           cd sdk/python
           pip install -e ".[dev]"
-          BF_BASE_URL=http://localhost:8080 BF_TOKEN=test-token \
+          CAPSULE_BASE_URL=http://localhost:8080 CAPSULE_TOKEN=test-token \
             python -m pytest tests/test_contract.py -v -m contract

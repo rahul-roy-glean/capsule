@@ -2,7 +2,7 @@
 # Based on the same tooling as ci-runner-ubuntu-2204.pkr.hcl
 #
 # Platform shim (injected by snapshot-builder) handles:
-#   systemd init, thaw-agent binary + service, network config,
+#   systemd init, capsule-thaw-agent binary + service, network config,
 #   hostname, DNS, /workspace + /mnt/ephemeral dirs, runner user
 # ============================================================================
 FROM ubuntu:22.04

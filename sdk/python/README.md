@@ -1,110 +1,105 @@
-# bf-sdk: Python SDK for bazel-firecracker
+# Capsule SDK
+
+The Capsule SDK is the recommended client surface for registering workloads,
+triggering builds, allocating runners, and interacting with running Capsule
+sandboxes from Python.
+
+## Requirements
+
+- Python `>= 3.10`
+- access to a running Capsule control plane
+- an API token if your deployment requires authenticated requests
 
 ## Installation
 
 ```bash
-pip install bf-sdk
+pip install capsule-sdk
 ```
 
-Or for development:
+For local development:
 
 ```bash
 cd sdk/python
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-## Live E2E
+## Configuration
 
-There is an explicit live SDK E2E at `sdk/python/tests/e2e_live.py`.
-It talks to a real control plane, defaults to `http://localhost:8080`, and
-exercises config registration, build enqueue, allocation, exec, file ops, PTY,
-pause/resume, release, and config cleanup.
+The SDK can be configured directly in code or through environment variables.
 
-Run it with:
+| Parameter | Env var | Default |
+|---|---|---|
+| `base_url` | `CAPSULE_BASE_URL` | `http://localhost:8080` |
+| `token` | `CAPSULE_TOKEN` | `None` |
+| `request_timeout` | `CAPSULE_REQUEST_TIMEOUT` | `30.0` |
+| `startup_timeout` | `CAPSULE_STARTUP_TIMEOUT` | `45.0` |
+| `operation_timeout` | `CAPSULE_OPERATION_TIMEOUT` | `120.0` |
+
+Example:
 
 ```bash
-make sdk-python-e2e
+export CAPSULE_BASE_URL="http://localhost:8080"
+export CAPSULE_TOKEN="my-token"
 ```
-
-If you are not using the default address:
-
-```bash
-BF_BASE_URL="http://localhost:8080" make sdk-python-e2e
-```
-
-If the control plane or local stack is not up, the test raises a clear error
-telling you to spin it up first with `bash dev/run-stack.sh`.
 
 ## Quickstart
 
-The fastest way to get started is the high-level `workloads` API: onboard a workload, then start it by name.
+The fastest way to get started is the high-level `workloads` API.
 
 ```python
-from bf_sdk import BFClient, RunnerConfig
+from capsule_sdk import CapsuleClient, RunnerConfig
 
-# 1. Define your runner config
 cfg = (
     RunnerConfig("My dev sandbox")
     .with_base_image("ubuntu:22.04")
-    .with_commands(["apt-get install -y python3", "pip install -e .[dev]"])
+    .with_commands(["apt-get update", "apt-get install -y python3"])
     .with_tier("m")
     .with_ttl(3600)
     .with_auto_pause(True)
     .with_auto_rollout(True)
 )
 
-with BFClient(base_url="http://localhost:8080", token="my-token") as bf:
-    # 2. Onboard the workload and build it
-    workload = bf.workloads.onboard(cfg)
+with CapsuleClient(base_url="http://localhost:8080", token="my-token") as client:
+    workload = client.workloads.onboard(cfg)
 
-    # 3. Spawn a ready runner by workload name (auto-released on exit)
-    with bf.workloads.start(workload) as r:
-        # Run a command and collect output
-        output, code = r.exec_collect("python", "-c", "print('hello')")
+    with client.workloads.start(workload) as runner:
+        output, code = runner.exec_collect("python3", "-c", "print('hello')")
         print(output, code)
 
-        # Ergonomic file helpers
-        r.write_text("/workspace/hello.txt", "hello")
-        print(r.read_text("/workspace/hello.txt"))
-
-        # Or stream events
-        for event in r.exec("pytest", "-q"):
-            if event.type == "stdout":
-                print(event.data, end="")
-
-        # Interactive PTY shell
-        with r.shell(cols=120, rows=40) as sh:
-            sh.send("ls -la\n")
-            print(sh.recv_stdout(timeout=5.0).decode())
-
-        # Pause and resume
-        r.pause()
-        r.resume()
+        runner.write_text("/workspace/hello.txt", "hello")
+        print(runner.read_text("/workspace/hello.txt"))
 ```
 
-You can also onboard from YAML directly:
+## Onboard From YAML
+
+You can also onboard directly from an `onboard.yaml`-style file:
 
 ```python
-from bf_sdk import BFClient
+from capsule_sdk import CapsuleClient
 
-with BFClient(base_url="http://localhost:8080", token="my-token") as bf:
-    workload = bf.workloads.onboard_yaml(
+with CapsuleClient(base_url="http://localhost:8080", token="my-token") as client:
+    workload = client.workloads.onboard_yaml(
         "examples/afs/onboard.yaml",
         name="afs-sandbox",
     )
 
-    with bf.workloads.start("afs-sandbox") as runner:
+    with client.workloads.start("afs-sandbox") as runner:
         print(runner.read_text("/etc/hostname"))
 ```
 
+The AFS example is an example workload name, not a special SDK mode. See
+`examples/afs/` for the underlying config shape.
+
 ## Async Quickstart
 
-The SDK also exposes a parallel async API for agent frameworks, servers, and other event-loop-native callers:
+Use the async client in event-loop-native applications:
 
 ```python
 import asyncio
 
-from bf_sdk import AsyncBFClient, RunnerConfig
+from capsule_sdk import AsyncCapsuleClient, RunnerConfig
 
 
 async def main() -> None:
@@ -117,108 +112,93 @@ async def main() -> None:
         .with_auto_pause(True)
     )
 
-    async with AsyncBFClient(base_url="http://localhost:8080", token="my-token") as bf:
-        workload = await bf.workloads.onboard(cfg)
-        runner = await bf.workloads.start(workload)
+    async with AsyncCapsuleClient(base_url="http://localhost:8080", token="my-token") as client:
+        workload = await client.workloads.onboard(cfg)
+        runner = await client.workloads.start(workload)
+
         async with runner:
             result = await runner.exec_collect("sh", "-lc", "printf hello")
             print(result.stdout, result.exit_code)
-
-            await runner.write_text("/workspace/hello.txt", "hello")
-            print(await runner.read_text("/workspace/hello.txt"))
-
-            async for event in runner.exec("pytest", "-q"):
-                if event.type == "stdout":
-                    print(event.data, end="")
-
-            async with runner.shell(cols=120, rows=40) as sh:
-                await sh.send("ls -la\n")
-                print((await sh.recv_stdout()).decode())
-
-            await runner.pause()
-            await runner.resume()
 
 
 asyncio.run(main())
 ```
 
-## Low-level API
+## Low-Level APIs
 
-For full control, use the lower-level resource APIs directly. `allocate()` now retries transient capacity failures internally using a stable `request_id`, `allocate_ready()` gives you a single "usable runner" step, and the SDK can resolve workload names for you instead of forcing `leaf_workload_key` through your app:
+For finer control, work directly with the resource clients:
 
 ```python
-from bf_sdk import BFClient
+from capsule_sdk import CapsuleClient
 
-with BFClient(base_url="http://localhost:8080", token="my-token") as client:
-    # Allocate and wait for a usable runner
+with CapsuleClient(base_url="http://localhost:8080", token="my-token") as client:
     with client.runners.allocate_ready("my-workload-key") as runner:
-        # Execute a command (streaming ndjson)
         for event in runner.exec("echo", "hello"):
             if event.type == "stdout":
                 print(event.data, end="")
-            elif event.type == "exit":
-                print(f"Exit code: {event.code}")
-
-        # Typed file results still support dict-style access
-        write_result = runner.write_text("/workspace/out.txt", "hello")
-        print(write_result.bytes_written)
-
-    # Or keep low-level allocation + explicit waiting if you want
-    allocation = client.workloads.allocate("My dev sandbox", startup_timeout=45.0)
-    client.runners.wait_ready(allocation.runner_id, timeout=45.0)
 ```
 
-The async client mirrors the same concepts and models:
+Key low-level surfaces:
 
-```python
-from bf_sdk import AsyncBFClient
-
-
-async def run() -> None:
-    async with AsyncBFClient(base_url="http://localhost:8080", token="my-token") as client:
-        runner = await client.runners.allocate_ready("my-workload-key")
-        async with runner:
-            async for event in runner.exec("echo", "hello"):
-                if event.type == "stdout":
-                    print(event.data, end="")
-```
-
-## Configuration
-
-| Parameter | Env var | Default |
-|---|---|---|
-| `base_url` | `BF_BASE_URL` | `http://localhost:8080` |
-| `token` | `BF_TOKEN` | `None` |
-| `request_timeout` | `BF_REQUEST_TIMEOUT` | `30.0` |
-| `startup_timeout` | `BF_STARTUP_TIMEOUT` | `45.0` |
-| `operation_timeout` | `BF_OPERATION_TIMEOUT` | `120.0` |
-
-`BFClient(timeout=...)` is still supported as a backwards-compatible alias for `request_timeout`.
+- `client.runners`
+- `client.workloads`
+- `client.snapshots`
+- `client.runner_configs`
 
 ## Key Concepts
 
 | SDK concept | Server primitive | Description |
 |---|---|---|
-| `RunnerConfig` | LayeredConfig | Declarative runner shape (layers, tier, TTL, etc.) |
-| `workloads.onboard()` | LayeredConfig create + build | Register a workload from Python or YAML |
-| `runner_configs.build()` | `/layered-configs/{id}/build` | Advanced build control for an already-registered config |
-| `runners.from_config()` | `/runners/allocate` | Spawn a runner from a config |
-| `RunnerSession` | Runner ID + host cache | High-level handle with exec/shell/pause/resume |
+| `RunnerConfig` | `LayeredConfig` | Declarative workload shape |
+| `workloads.onboard()` | create + build | Register a workload from Python or YAML |
+| `workloads.start()` | allocate + wait | Start a ready runner by workload name |
+| `runners.allocate_ready()` | `/runners/allocate` | Allocate and wait for a usable runner |
+| `RunnerSession` | runner handle | High-level exec, file, shell, pause, and resume API |
+
+## Retry And Timeout Behavior
+
+- `request_timeout` applies to a single HTTP request
+- `startup_timeout` covers "get me a usable runner"
+- `operation_timeout` applies to host-side file, PTY, and stream operations
+- `allocate()` retries transient control-plane and capacity errors until `startup_timeout`
+- `workloads.start()` is the preferred high-level path for named workloads
+- `from_config()` waits for runner readiness by default; use `wait_ready=False` for lower-level control
 
 ## Host Reconnection
 
-The SDK caches host addresses from `allocate()` and `connect()` responses. If a host agent returns 503 during `exec()`, the SDK automatically calls `connect()` to get a new host and retries (only if no output has been received yet). Safe read-only host operations also refresh the cached host and retry once, and PTY attach will reconnect once with a refreshed host before surfacing an error.
+The SDK caches host addresses returned by `allocate()` and `connect()`. If a
+host proxy becomes unavailable during a safe retryable operation, the SDK will
+refresh the host via `connect()` and retry once when possible.
 
-## Retry And Timeout Model
+## Live End-To-End Test
 
-- `allocate()` retries transient capacity and control-plane availability failures until `startup_timeout` expires.
-- `workloads.onboard_yaml()` accepts either YAML text or a YAML file path. If the YAML does not include `display_name`, pass `name=...`.
-- `workloads.start()` is the preferred high-level path for named workloads.
-- `from_config()` waits for a ready runner by default; pass `wait_ready=False` if you want lower-level control.
-- `from_config()` and `allocate()` accept a workload display name, config response, config id, or raw workload key. Most callers should stick to a display name and let the SDK resolve the control-plane key.
-- `request_timeout` covers one HTTP request, `startup_timeout` covers "get me a usable runner", and `operation_timeout` covers host-side file/PTY/stream operations.
-- Successful responses include a `request_id` so you can correlate SDK behavior with control-plane logs.
+The repository includes an explicit live SDK E2E at `sdk/python/tests/e2e_live.py`.
+It exercises config registration, build enqueue, allocation, exec, file ops,
+PTY, pause/resume, release, and config cleanup against a real control plane.
 
-Layer commands use the control-plane `SnapshotCommand` shape under the hood:
-`{"type": "shell", "args": ["bash", "-lc", "echo hi"]}`. The shorthand
-`RunnerConfig.with_commands(["echo hi"])` is normalized to that wire format for you.
+Run it with:
+
+```bash
+make sdk-python-e2e
+```
+
+If you are not using the default address:
+
+```bash
+CAPSULE_BASE_URL="http://localhost:8080" make sdk-python-e2e
+```
+
+## Development Checks
+
+```bash
+python -m ruff check src/capsule_sdk/ tests/
+python -m pyright src/capsule_sdk/
+python -m pytest tests/ -v --ignore=tests/e2e_live.py --ignore=tests/e2e_live_async.py
+```
+
+For contract tests against a live control plane:
+
+```bash
+CAPSULE_BASE_URL=http://localhost:8080 CAPSULE_TOKEN=test-token \
+  python -m pytest tests/test_contract.py -v -m contract
+```

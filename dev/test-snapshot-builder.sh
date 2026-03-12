@@ -17,7 +17,7 @@ BASE_SNAPSHOT_DIR="/tmp/fc-dev/snapshots"
 TEST_ROOT="/tmp/fc-dev/snapshot-builder-tests"
 LOG_DIR="$TEST_ROOT/logs"
 BIN="$REPO_ROOT/bin/snapshot-builder"
-THAW_AGENT_BIN="$REPO_ROOT/bin/thaw-agent"
+THAW_AGENT_BIN="$REPO_ROOT/bin/capsule-thaw-agent"
 KERNEL="$BASE_SNAPSHOT_DIR/kernel.bin"
 ROOTFS="$BASE_SNAPSHOT_DIR/rootfs.img"
 
@@ -71,7 +71,7 @@ rm -rf "$TEST_ROOT"/legacy "$TEST_ROOT"/base-image "$TEST_ROOT"/unsupported "$TE
 
 header "0. Prerequisites"
 ensure_file "$BIN" "snapshot-builder binary"
-ensure_file "$THAW_AGENT_BIN" "thaw-agent binary"
+ensure_file "$THAW_AGENT_BIN" "capsule-thaw-agent binary"
 ensure_file "$KERNEL" "kernel"
 ensure_file "$ROOTFS" "rootfs image"
 if [ ! -e /dev/kvm ]; then
@@ -136,7 +136,7 @@ if run_builder_capture "$BASE_LOG" \
   --memory-mb=2048 \
   --warmup-timeout=5m \
   --base-image="$PINNED_IMAGE" \
-  --thaw-agent-path="$THAW_AGENT_BIN" \
+  --capsule-thaw-agent-path="$THAW_AGENT_BIN" \
   --snapshot-commands='[{"type":"shell","args":["echo","dev-snapshot-ready"]}]' \
   --log-level=info; then
   if assert_artifacts_exist "$BASE_OUT"; then
@@ -165,7 +165,7 @@ if run_builder_capture "$INVALID_LOG" \
   --warmup-timeout=5m \
   --build-type=refresh \
   --base-image="$BASE_IMAGE" \
-  --thaw-agent-path="$THAW_AGENT_BIN" \
+  --capsule-thaw-agent-path="$THAW_AGENT_BIN" \
   --snapshot-commands='[{"type":"shell","args":["echo","dev-snapshot-ready"]}]' \
   --log-level=info; then
   fail "Unpinned incremental base-image build unexpectedly succeeded"
@@ -189,7 +189,7 @@ if run_builder_capture "$UNSUPPORTED_LOG" \
   --memory-mb=2048 \
   --warmup-timeout=5m \
   --base-image="$UNSUPPORTED_IMAGE" \
-  --thaw-agent-path="$THAW_AGENT_BIN" \
+  --capsule-thaw-agent-path="$THAW_AGENT_BIN" \
   --snapshot-commands='[{"type":"shell","args":["echo","dev-snapshot-ready"]}]' \
   --log-level=info; then
   fail "Unsupported base image unexpectedly succeeded"

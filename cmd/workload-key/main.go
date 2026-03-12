@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
 )
 
 func main() {

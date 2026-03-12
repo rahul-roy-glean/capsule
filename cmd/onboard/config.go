@@ -6,8 +6,8 @@ import (
 	"os"
 	"os/exec"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
+	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
 	"gopkg.in/yaml.v3"
 )
 
@@ -84,7 +84,7 @@ type WorkloadConfig struct {
 	Config    WorkloadRuntimeConfig `yaml:"config"`
 
 	// StartCommand describes the service to launch inside the VM after restore.
-	// The thaw-agent starts Command, waits for GET HealthPath on Port to return 2xx,
+	// The capsule-thaw-agent starts Command, waits for GET HealthPath on Port to return 2xx,
 	// then signals host readiness.
 	StartCommand StartCommandConfig `yaml:"start_command"`
 }

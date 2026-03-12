@@ -3,11 +3,11 @@
 #
 # Dashboards and alert policies are in the app/ stage.
 
-# Log-based metric for thaw-agent boot phases (runs inside VM)
+# Log-based metric for capsule-thaw-agent boot phases (runs inside VM)
 resource "google_logging_metric" "vm_boot_phase_from_logs" {
   count       = var.enable_monitoring ? 1 : 0
   name        = "firecracker/vm_boot_phase_from_logs"
-  description = "VM boot phase durations from thaw-agent structured logs"
+  description = "VM boot phase durations from capsule-thaw-agent structured logs"
   filter      = <<-EOT
     resource.type="gce_instance"
     jsonPayload.event="boot_phase_complete"
@@ -49,7 +49,7 @@ resource "google_logging_metric" "vm_boot_phase_from_logs" {
 resource "google_logging_metric" "job_complete_from_logs" {
   count       = var.enable_monitoring ? 1 : 0
   name        = "firecracker/job_complete_from_logs"
-  description = "Job completion metrics from thaw-agent structured logs"
+  description = "Job completion metrics from capsule-thaw-agent structured logs"
   filter      = <<-EOT
     resource.type="gce_instance"
     jsonPayload.event="job_complete"

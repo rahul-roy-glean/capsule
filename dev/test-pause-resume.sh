@@ -82,7 +82,7 @@ fi
 # ---------------------------------------------------------------------------
 header "4. Execute: create a file in the VM"
 # ---------------------------------------------------------------------------
-# Brief delay for the thaw-agent to fully initialize after snapshot restore.
+# Brief delay for the capsule-thaw-agent to fully initialize after snapshot restore.
 sleep 1
 EXEC_OUT=$(curl -sf --no-buffer -X POST "$MGR/api/v1/runners/$RUNNER_ID/exec" \
   -H 'Content-Type: application/json' \

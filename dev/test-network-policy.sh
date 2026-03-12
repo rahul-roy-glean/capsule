@@ -58,10 +58,10 @@ vm_tcp_check_blocked() {
   vm_exec "$rid" "[\"bash\",\"-c\",\"timeout 3 bash -c '(echo > /dev/tcp/$host/$port) 2>/dev/null && echo NET_OK || echo NET_BLOCKED' || echo NET_BLOCKED\"]"
 }
 
-# Helper: wait for thaw-agent to be reachable (retry exec up to 10s)
+# Helper: wait for capsule-thaw-agent to be reachable (retry exec up to 10s)
 wait_for_exec() {
   local rid="$1"
-  echo -n "  Waiting for thaw-agent exec..." >&2
+  echo -n "  Waiting for capsule-thaw-agent exec..." >&2
   for i in $(seq 1 10); do
     local out
     out=$(vm_exec "$rid" "[\"echo\",\"THAW_OK\"]")
@@ -72,7 +72,7 @@ wait_for_exec() {
     echo -n "." >&2
     sleep 1
   done
-  echo " FAILED (thaw-agent unreachable after 10s)" >&2
+  echo " FAILED (capsule-thaw-agent unreachable after 10s)" >&2
   return 1
 }
 
@@ -295,9 +295,9 @@ RUNNER_IDS=("${RUNNER_IDS[@]/$RUNNER_ID/}")
 # ---------------------------------------------------------------------------
 header "8. restricted-egress: external egress works"
 # ---------------------------------------------------------------------------
-# Wait for thaw-agent to be reachable before testing network policy
+# Wait for capsule-thaw-agent to be reachable before testing network policy
 if ! wait_for_exec "$RUNNER_ID_CI"; then
-  fail "restricted-egress: thaw-agent exec unreachable (cannot test network policy)"
+  fail "restricted-egress: capsule-thaw-agent exec unreachable (cannot test network policy)"
   dump_netns_iptables "$RUNNER_ID_CI"
 else
   EXEC_CI=$(vm_tcp_check "$RUNNER_ID_CI" "8.8.8.8" "53")
@@ -434,7 +434,7 @@ sleep 2
 header "14. deny-default: allowed CIDR reachable (positive)"
 # ---------------------------------------------------------------------------
 if ! wait_for_exec "$RUNNER_ID_DENY"; then
-  fail "deny-default: thaw-agent exec unreachable (cannot test network policy)"
+  fail "deny-default: capsule-thaw-agent exec unreachable (cannot test network policy)"
   dump_netns_iptables "$RUNNER_ID_DENY"
 else
   ALLOW_EXEC=$(vm_tcp_check "$RUNNER_ID_DENY" "8.8.8.8" "53")

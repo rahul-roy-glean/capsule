@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
+	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
+	"github.com/rahul-roy-glean/capsule/pkg/firecracker"
 	"github.com/sirupsen/logrus"
 )
 

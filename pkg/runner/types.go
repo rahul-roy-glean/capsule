@@ -5,9 +5,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
+	"github.com/rahul-roy-glean/capsule/pkg/network"
+	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
 )
 
 // State represents the state of a runner

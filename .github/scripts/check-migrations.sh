@@ -16,7 +16,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 mode="$1"
-target_paths=("cmd/control-plane/migrations" "cmd/control-plane/schema.sql")
+target_paths=("cmd/capsule-control-plane/migrations" "cmd/capsule-control-plane/schema.sql")
 
 case "$mode" in
   --staged)
@@ -49,13 +49,13 @@ errors=()
 while IFS=$'\t' read -r status path extra; do
   [[ -z "${status}" ]] && continue
 
-  if [[ "${path}" == "cmd/control-plane/schema.sql" || "${extra:-}" == "cmd/control-plane/schema.sql" ]]; then
+  if [[ "${path}" == "cmd/capsule-control-plane/schema.sql" || "${extra:-}" == "cmd/capsule-control-plane/schema.sql" ]]; then
     schema_changed=true
   fi
 
   for candidate in "$path" "${extra:-}"; do
     [[ -z "${candidate}" ]] && continue
-    if [[ "${candidate}" == cmd/control-plane/migrations/*.sql ]]; then
+    if [[ "${candidate}" == cmd/capsule-control-plane/migrations/*.sql ]]; then
       if [[ "${status}" == A* && "${candidate}" == "${path}" ]]; then
         added_migration=true
         base_name="$(basename "${candidate}")"
@@ -70,7 +70,7 @@ while IFS=$'\t' read -r status path extra; do
 done <<< "${diff_output}"
 
 if [[ "${schema_changed}" == "true" && "${added_migration}" != "true" ]]; then
-  errors+=("schema.sql changed without adding a new migration file. Add a new numbered migration under cmd/control-plane/migrations/.")
+  errors+=("schema.sql changed without adding a new migration file. Add a new numbered migration under cmd/capsule-control-plane/migrations/.")
 fi
 
 if [[ ${#errors[@]} -gt 0 ]]; then

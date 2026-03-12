@@ -1,9 +1,9 @@
 # Kubernetes namespace
-resource "kubernetes_namespace" "firecracker_runner" {
+resource "kubernetes_namespace" "capsule" {
   metadata {
-    name = "firecracker-runner"
+    name = "capsule"
     labels = {
-      "app.kubernetes.io/name" = "firecracker-runner"
+      "app.kubernetes.io/name" = "capsule"
     }
   }
 }
@@ -12,7 +12,7 @@ resource "kubernetes_namespace" "firecracker_runner" {
 resource "kubernetes_secret" "db_credentials" {
   metadata {
     name      = "db-credentials"
-    namespace = kubernetes_namespace.firecracker_runner.metadata[0].name
+    namespace = kubernetes_namespace.capsule.metadata[0].name
   }
 
   data = {
@@ -26,7 +26,7 @@ resource "kubernetes_secret" "db_credentials" {
 resource "kubernetes_secret" "github_credentials" {
   metadata {
     name      = "github-credentials"
-    namespace = kubernetes_namespace.firecracker_runner.metadata[0].name
+    namespace = kubernetes_namespace.capsule.metadata[0].name
   }
 
   data = {
@@ -40,7 +40,7 @@ resource "kubernetes_secret" "host_bootstrap_token" {
 
   metadata {
     name      = "host-bootstrap-token"
-    namespace = kubernetes_namespace.firecracker_runner.metadata[0].name
+    namespace = kubernetes_namespace.capsule.metadata[0].name
   }
 
   data = {
@@ -51,8 +51,8 @@ resource "kubernetes_secret" "host_bootstrap_token" {
 # Deploy control plane via Helm
 resource "helm_release" "control_plane" {
   name      = "control-plane"
-  chart     = "${path.module}/../../helm/firecracker-runner"
-  namespace = kubernetes_namespace.firecracker_runner.metadata[0].name
+  chart     = "${path.module}/../../helm/capsule"
+  namespace = kubernetes_namespace.capsule.metadata[0].name
   wait      = true
   timeout   = 600
 
@@ -63,7 +63,7 @@ resource "helm_release" "control_plane" {
 
   set {
     name  = "image.repository"
-    value = "${local.infra.container_registry}/firecracker-control-plane"
+    value = "${local.infra.container_registry}/capsule-control-plane"
   }
 
   set {
@@ -136,7 +136,7 @@ resource "helm_release" "control_plane" {
 data "kubernetes_service" "control_plane" {
   metadata {
     name      = "control-plane"
-    namespace = kubernetes_namespace.firecracker_runner.metadata[0].name
+    namespace = kubernetes_namespace.capsule.metadata[0].name
   }
 
   depends_on = [helm_release.control_plane]
@@ -157,7 +157,7 @@ resource "kubernetes_config_map" "otel_collector" {
 
   metadata {
     name      = "otel-collector-config"
-    namespace = kubernetes_namespace.firecracker_runner.metadata[0].name
+    namespace = kubernetes_namespace.capsule.metadata[0].name
   }
 
   data = {
@@ -208,7 +208,7 @@ resource "kubernetes_deployment" "otel_collector" {
 
   metadata {
     name      = "otel-collector"
-    namespace = kubernetes_namespace.firecracker_runner.metadata[0].name
+    namespace = kubernetes_namespace.capsule.metadata[0].name
     labels = {
       app = "otel-collector"
     }
@@ -278,7 +278,7 @@ resource "kubernetes_service" "otel_collector" {
 
   metadata {
     name      = "otel-collector"
-    namespace = kubernetes_namespace.firecracker_runner.metadata[0].name
+    namespace = kubernetes_namespace.capsule.metadata[0].name
     labels = {
       app = "otel-collector"
     }
@@ -307,7 +307,7 @@ data "kubernetes_service" "otel_collector" {
 
   metadata {
     name      = "otel-collector"
-    namespace = kubernetes_namespace.firecracker_runner.metadata[0].name
+    namespace = kubernetes_namespace.capsule.metadata[0].name
   }
 
   depends_on = [kubernetes_service.otel_collector]

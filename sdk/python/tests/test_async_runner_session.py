@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock
 
-from bf_sdk.async_runner_session import AsyncRunnerSession
-from bf_sdk.models.runner import ConnectResult, ExecEvent, ExecResult, PauseResult
-from bf_sdk.resources.async_runners import AsyncRunners
+from capsule_sdk.async_runner_session import AsyncRunnerSession
+from capsule_sdk.models.runner import ConnectResult, ExecEvent, ExecResult, PauseResult
+from capsule_sdk.resources.async_runners import AsyncRunners
 
 
 def _iter_events(events: list[ExecEvent]):

@@ -34,8 +34,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
-      - run: python -m ruff check src/bf_sdk/ tests/
-      - run: python -m pyright src/bf_sdk/
+      - run: python -m ruff check src/capsule_sdk/ tests/
+      - run: python -m pyright src/capsule_sdk/
       - run: python -m pytest tests/ -v --ignore=tests/e2e_live.py
 
   helm-lint:
@@ -44,7 +44,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: azure/setup-helm@v4
-      - run: helm lint deploy/helm/firecracker-runner
+      - run: helm lint deploy/helm/capsule
 
   build-candidates:
     name: Build Release Candidates
@@ -164,7 +164,7 @@ jobs:
       - name: Package Helm chart
         run: |
           mkdir -p helm-dist
-          helm package deploy/helm/firecracker-runner \
+          helm package deploy/helm/capsule \
             --destination helm-dist \
             --version "${{ steps.version.outputs.helm_version }}" \
             --app-version "${{ steps.version.outputs.helm_version }}"
@@ -200,7 +200,7 @@ jobs:
           - Go binaries attached to this draft release
           - Control plane image candidate: `${{ steps.images.outputs.control_plane_image }}:${{ steps.version.outputs.release_version }}-rc`
           - Snapshot builder image candidate: `${{ steps.images.outputs.snapshot_builder_image }}:${{ steps.version.outputs.release_version }}-rc`
-          - Python SDK candidate: `pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ bf-sdk==${{ steps.version.outputs.pypi_version }}`
+          - Python SDK candidate: `pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ capsule-sdk==${{ steps.version.outputs.pypi_version }}`
           - Helm chart: attached `.tgz` package
           - Host images are built separately via `.github/workflows/build-host-image.yaml`
           - Final GHCR and PyPI coordinates are published only after the KVM E2E gate passes
@@ -224,8 +224,8 @@ jobs:
     needs: build-candidates
     runs-on: [self-hosted, firecracker]
     env:
-      BF_BASE_URL: ${{ vars.BF_BASE_URL }}
-      BF_TOKEN: ${{ secrets.BF_TOKEN }}
+      CAPSULE_BASE_URL: ${{ vars.CAPSULE_BASE_URL }}
+      CAPSULE_TOKEN: ${{ secrets.CAPSULE_TOKEN }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v5
@@ -240,12 +240,12 @@ jobs:
             if python -m pip install \
               --index-url https://test.pypi.org/simple/ \
               --extra-index-url https://pypi.org/simple/ \
-              "bf-sdk==${version}"; then
+              "capsule-sdk==${version}"; then
               exit 0
             fi
             sleep 15
           done
-          echo "failed to install bf-sdk candidate ${version} from TestPyPI"
+          echo "failed to install capsule-sdk candidate ${version} from TestPyPI"
           exit 1
       - name: Run live SDK E2E
         run: python -m pytest sdk/python/tests/e2e_live.py -v

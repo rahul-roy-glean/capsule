@@ -17,10 +17,10 @@ echo "Repo root: $REPO_ROOT"
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
-# Build the thaw-agent binary
-echo "Building thaw-agent binary..."
+# Build the capsule-thaw-agent binary
+echo "Building capsule-thaw-agent binary..."
 mkdir -p "$REPO_ROOT/bin"
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o "$REPO_ROOT/bin/thaw-agent" "$REPO_ROOT/cmd/thaw-agent"
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o "$REPO_ROOT/bin/capsule-thaw-agent" "$REPO_ROOT/cmd/capsule-thaw-agent"
 
 # Build the Docker image from repo root (needed for go.mod, cmd/, pkg/)
 # Force linux/amd64 since Firecracker VMs are x86_64

@@ -1,7 +1,0 @@
-apiVersion: v2
-name: firecracker-runner
-description: Firecracker-based control plane for layered workload snapshots, host orchestration, and session-aware microVM allocation on GCP.
-type: application
-version: 0.1.0
-appVersion: "0.1.0"
-

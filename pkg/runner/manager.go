@@ -16,11 +16,11 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
-	_ "github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy/providers" // register providers
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
+	_ "github.com/rahul-roy-glean/capsule/pkg/authproxy/providers" // register providers
+	"github.com/rahul-roy-glean/capsule/pkg/firecracker"
+	"github.com/rahul-roy-glean/capsule/pkg/network"
+	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
 )
 
 type recentAllocation struct {
@@ -807,7 +807,7 @@ func (m *Manager) ApplyNetworkPolicy(runnerID string, req AllocateRequest) error
 	if r.ServicePort > 0 {
 		ports = append(ports, r.ServicePort)
 	}
-	ports = append(ports, 10500, 10501) // thaw-agent health + debug
+	ports = append(ports, 10500, 10501) // capsule-thaw-agent health + debug
 	enforcer.SetInitialIngressPorts(ports)
 
 	if err := enforcer.Apply(); err != nil {

@@ -38,10 +38,10 @@ vm_exec() {
   echo "$out"
 }
 
-# Helper: wait for thaw-agent exec to be reachable
+# Helper: wait for capsule-thaw-agent exec to be reachable
 wait_for_exec() {
   local rid="$1"
-  echo -n "  Waiting for thaw-agent exec..." >&2
+  echo -n "  Waiting for capsule-thaw-agent exec..." >&2
   for i in $(seq 1 15); do
     local out
     out=$(vm_exec "$rid" "[\"echo\",\"THAW_OK\"]")
@@ -52,7 +52,7 @@ wait_for_exec() {
     echo -n "." >&2
     sleep 1
   done
-  echo " FAILED (thaw-agent unreachable after 15s)" >&2
+  echo " FAILED (capsule-thaw-agent unreachable after 15s)" >&2
   return 1
 }
 
@@ -190,7 +190,7 @@ echo "  internal_ip=$RUNNER_IP"
 
 header "2. Verify proxy port reachable from inside VM"
 if ! wait_for_exec "$RUNNER_ID"; then
-  fail "thaw-agent exec unreachable"
+  fail "capsule-thaw-agent exec unreachable"
 else
   # The proxy binds on the gateway IP (172.16.0.1) inside the netns.
   # We test TCP connectivity from the guest to the proxy port.

@@ -1,4 +1,4 @@
-# Canonical Cloud Monitoring dashboard catalog for Firecracker Runner.
+# Canonical Cloud Monitoring dashboard catalog for Capsule.
 # The previous Prometheus/Grafana manifests that lived here had drifted badly
 # from the metrics the system actually emits today via OpenTelemetry.
 #
@@ -7,15 +7,15 @@
 # `google_monitoring_dashboard` resources.
 #
 # Example import flow:
-#   kubectl -n firecracker-runner get configmap cloud-monitoring-dashboard-catalog \
-#     -o jsonpath='{.data.control-plane-endpoint-health\.json}' > /tmp/control-plane-endpoint-health.json
-#   gcloud monitoring dashboards create --config-from-file=/tmp/control-plane-endpoint-health.json
+#   kubectl -n capsule get configmap cloud-monitoring-dashboard-catalog \
+#     -o jsonpath='{.data.control-plane-endpoint-health\.json}' > /tmp/capsule-control-plane-endpoint-health.json
+#   gcloud monitoring dashboards create --config-from-file=/tmp/capsule-control-plane-endpoint-health.json
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: cloud-monitoring-dashboard-catalog
-  namespace: firecracker-runner
+  namespace: capsule
 data:
   control-plane-endpoint-health.json: |
     {
@@ -1561,7 +1561,7 @@ data:
               "scorecard": {
                 "timeSeriesQuery": {
                   "timeSeriesFilter": {
-                    "filter": "metric.type=\"workload.googleapis.com/chunked.cache_hit_ratio\" AND metric.label.service_name=\"firecracker-manager\"",
+                    "filter": "metric.type=\"workload.googleapis.com/chunked.cache_hit_ratio\" AND metric.label.service_name=\"capsule-manager\"",
                     "aggregation": {
                       "alignmentPeriod": "60s",
                       "perSeriesAligner": "ALIGN_MEAN",
@@ -1582,7 +1582,7 @@ data:
               "scorecard": {
                 "timeSeriesQuery": {
                   "timeSeriesFilter": {
-                    "filter": "metric.type=\"workload.googleapis.com/chunked.disk_cache.size\" AND metric.label.service_name=\"firecracker-manager\"",
+                    "filter": "metric.type=\"workload.googleapis.com/chunked.disk_cache.size\" AND metric.label.service_name=\"capsule-manager\"",
                     "aggregation": {
                       "alignmentPeriod": "60s",
                       "perSeriesAligner": "ALIGN_MAX",
@@ -1603,7 +1603,7 @@ data:
               "scorecard": {
                 "timeSeriesQuery": {
                   "timeSeriesFilter": {
-                    "filter": "metric.type=\"workload.googleapis.com/chunked.mem_cache.size\" AND metric.label.service_name=\"firecracker-manager\"",
+                    "filter": "metric.type=\"workload.googleapis.com/chunked.mem_cache.size\" AND metric.label.service_name=\"capsule-manager\"",
                     "aggregation": {
                       "alignmentPeriod": "60s",
                       "perSeriesAligner": "ALIGN_MAX",
@@ -1624,7 +1624,7 @@ data:
               "scorecard": {
                 "timeSeriesQuery": {
                   "timeSeriesFilter": {
-                    "filter": "metric.type=\"workload.googleapis.com/chunked.dirty_chunks\" AND metric.label.service_name=\"firecracker-manager\"",
+                    "filter": "metric.type=\"workload.googleapis.com/chunked.dirty_chunks\" AND metric.label.service_name=\"capsule-manager\"",
                     "aggregation": {
                       "alignmentPeriod": "60s",
                       "perSeriesAligner": "ALIGN_MAX",
@@ -1647,7 +1647,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.page_faults\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.page_faults\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -1661,7 +1661,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.chunk_fetches\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.chunk_fetches\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -1691,7 +1691,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.cache_hits\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.cache_hits\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -1705,7 +1705,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.cache_misses\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.cache_misses\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -1735,7 +1735,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_reads\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_reads\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -1749,7 +1749,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_writes\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_writes\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -1779,7 +1779,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_cache.size\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_cache.size\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -1793,7 +1793,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_cache.max\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_cache.max\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -1823,7 +1823,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.mem_cache.size\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.mem_cache.size\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -1837,7 +1837,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.mem_cache.max\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.mem_cache.max\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -1867,7 +1867,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/host.cpu_millicores.used\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/host.cpu_millicores.used\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MEAN",
@@ -1881,7 +1881,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/host.cpu_millicores.total\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/host.cpu_millicores.total\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MEAN",
@@ -1911,7 +1911,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/host.memory_mb.used\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/host.memory_mb.used\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MEAN",
@@ -1925,7 +1925,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/host.memory_mb.total\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/host.memory_mb.total\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MEAN",
@@ -1946,7 +1946,7 @@ data:
         ]
       }
     }
-  firecracker-manager-operations.json: |
+  capsule-manager-operations.json: |
     {
       "displayName": "Firecracker Manager Operations",
       "mosaicLayout": {
@@ -1962,7 +1962,7 @@ data:
               "scorecard": {
                 "timeSeriesQuery": {
                   "timeSeriesFilter": {
-                    "filter": "metric.type=\"workload.googleapis.com/firecracker_manager.endpoint.requests\" AND metric.label.service_name=\"firecracker-manager\"",
+                    "filter": "metric.type=\"workload.googleapis.com/capsule_manager.endpoint.requests\" AND metric.label.service_name=\"capsule-manager\"",
                     "aggregation": {
                       "alignmentPeriod": "300s",
                       "perSeriesAligner": "ALIGN_DELTA",
@@ -1983,7 +1983,7 @@ data:
               "scorecard": {
                 "timeSeriesQuery": {
                   "timeSeriesFilter": {
-                    "filter": "metric.type=\"workload.googleapis.com/firecracker_manager.endpoint.requests\" AND metric.label.service_name=\"firecracker-manager\" AND metric.label.status_class=\"5xx\"",
+                    "filter": "metric.type=\"workload.googleapis.com/capsule_manager.endpoint.requests\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.status_class=\"5xx\"",
                     "aggregation": {
                       "alignmentPeriod": "300s",
                       "perSeriesAligner": "ALIGN_DELTA",
@@ -2004,7 +2004,7 @@ data:
               "scorecard": {
                 "timeSeriesQuery": {
                   "timeSeriesFilter": {
-                    "filter": "metric.type=\"workload.googleapis.com/host.heartbeat.total\" AND metric.label.service_name=\"firecracker-manager\" AND metric.label.result=\"failure\"",
+                    "filter": "metric.type=\"workload.googleapis.com/host.heartbeat.total\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.result=\"failure\"",
                     "aggregation": {
                       "alignmentPeriod": "3600s",
                       "perSeriesAligner": "ALIGN_DELTA",
@@ -2025,7 +2025,7 @@ data:
               "scorecard": {
                 "timeSeriesQuery": {
                   "timeSeriesFilter": {
-                    "filter": "metric.type=\"workload.googleapis.com/chunked.cache_hit_ratio\" AND metric.label.service_name=\"firecracker-manager\"",
+                    "filter": "metric.type=\"workload.googleapis.com/chunked.cache_hit_ratio\" AND metric.label.service_name=\"capsule-manager\"",
                     "aggregation": {
                       "alignmentPeriod": "60s",
                       "perSeriesAligner": "ALIGN_MEAN",
@@ -2048,7 +2048,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/firecracker_manager.endpoint.requests\" AND metric.label.service_name=\"firecracker-manager\" AND metric.label.route=\"/api/v1/runners/:id/connect\"",
+                        "filter": "metric.type=\"workload.googleapis.com/capsule_manager.endpoint.requests\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.route=\"/api/v1/runners/:id/connect\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2062,7 +2062,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/firecracker_manager.endpoint.requests\" AND metric.label.service_name=\"firecracker-manager\" AND metric.label.route=\"/api/v1/runners/:id/pause\"",
+                        "filter": "metric.type=\"workload.googleapis.com/capsule_manager.endpoint.requests\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.route=\"/api/v1/runners/:id/pause\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2076,7 +2076,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/firecracker_manager.endpoint.requests\" AND metric.label.service_name=\"firecracker-manager\" AND metric.label.route=\"/api/v1/runners/:id/exec\"",
+                        "filter": "metric.type=\"workload.googleapis.com/capsule_manager.endpoint.requests\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.route=\"/api/v1/runners/:id/exec\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2090,7 +2090,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/firecracker_manager.endpoint.requests\" AND metric.label.service_name=\"firecracker-manager\" AND metric.label.route=\"/api/v1/runners/:id/proxy/*\"",
+                        "filter": "metric.type=\"workload.googleapis.com/capsule_manager.endpoint.requests\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.route=\"/api/v1/runners/:id/proxy/*\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2120,7 +2120,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/firecracker_manager.endpoint.request.duration\" AND metric.label.service_name=\"firecracker-manager\" AND metric.label.route=\"/api/v1/runners/:id/connect\"",
+                        "filter": "metric.type=\"workload.googleapis.com/capsule_manager.endpoint.request.duration\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.route=\"/api/v1/runners/:id/connect\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2139,7 +2139,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/firecracker_manager.endpoint.request.duration\" AND metric.label.service_name=\"firecracker-manager\" AND metric.label.route=\"/api/v1/runners/:id/pause\"",
+                        "filter": "metric.type=\"workload.googleapis.com/capsule_manager.endpoint.request.duration\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.route=\"/api/v1/runners/:id/pause\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2158,7 +2158,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/firecracker_manager.endpoint.request.duration\" AND metric.label.service_name=\"firecracker-manager\" AND metric.label.route=\"/api/v1/runners/:id/exec\"",
+                        "filter": "metric.type=\"workload.googleapis.com/capsule_manager.endpoint.request.duration\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.route=\"/api/v1/runners/:id/exec\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2177,7 +2177,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/firecracker_manager.endpoint.request.duration\" AND metric.label.service_name=\"firecracker-manager\" AND metric.label.route=\"/api/v1/runners/:id/proxy/*\"",
+                        "filter": "metric.type=\"workload.googleapis.com/capsule_manager.endpoint.request.duration\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.route=\"/api/v1/runners/:id/proxy/*\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2212,7 +2212,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/host.heartbeat.total\" AND metric.label.service_name=\"firecracker-manager\" AND metric.label.result=\"success\"",
+                        "filter": "metric.type=\"workload.googleapis.com/host.heartbeat.total\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.result=\"success\"",
                         "aggregation": {
                           "alignmentPeriod": "300s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2226,7 +2226,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/host.heartbeat.total\" AND metric.label.service_name=\"firecracker-manager\" AND metric.label.result=\"failure\"",
+                        "filter": "metric.type=\"workload.googleapis.com/host.heartbeat.total\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.result=\"failure\"",
                         "aggregation": {
                           "alignmentPeriod": "300s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2240,7 +2240,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/host.heartbeat.total\" AND metric.label.service_name=\"firecracker-manager\" AND metric.label.result=\"error\"",
+                        "filter": "metric.type=\"workload.googleapis.com/host.heartbeat.total\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.result=\"error\"",
                         "aggregation": {
                           "alignmentPeriod": "300s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2254,7 +2254,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/host.heartbeat.latency\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/host.heartbeat.latency\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "300s",
                           "perSeriesAligner": "ALIGN_PERCENTILE_95",
@@ -2284,7 +2284,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/vm.allocations\" AND metric.label.service_name=\"firecracker-manager\" AND metric.label.result=\"success\"",
+                        "filter": "metric.type=\"workload.googleapis.com/vm.allocations\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.result=\"success\"",
                         "aggregation": {
                           "alignmentPeriod": "300s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2301,7 +2301,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/vm.allocations\" AND metric.label.service_name=\"firecracker-manager\" AND metric.label.result=\"failure\"",
+                        "filter": "metric.type=\"workload.googleapis.com/vm.allocations\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.result=\"failure\"",
                         "aggregation": {
                           "alignmentPeriod": "300s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2318,7 +2318,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/vm.ready.duration\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/vm.ready.duration\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "300s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2359,7 +2359,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/session.pause.total\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/session.pause.total\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "300s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2376,7 +2376,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/session.resume.total\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/session.resume.total\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "300s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2394,7 +2394,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/session.pause.duration\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/session.pause.duration\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "300s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2413,7 +2413,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/session.resume.duration\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/session.resume.duration\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "300s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2454,7 +2454,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/host.cpu_millicores.used\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/host.cpu_millicores.used\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MEAN",
@@ -2468,7 +2468,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/host.cpu_millicores.total\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/host.cpu_millicores.total\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MEAN",
@@ -2482,7 +2482,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/host.memory_mb.used\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/host.memory_mb.used\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MEAN",
@@ -2496,7 +2496,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/host.memory_mb.total\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/host.memory_mb.total\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MEAN",
@@ -2510,7 +2510,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/host.runners.idle\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/host.runners.idle\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -2524,7 +2524,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/host.runners.busy\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/host.runners.busy\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -2554,7 +2554,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.page_faults\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.page_faults\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2568,7 +2568,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.chunk_fetches\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.chunk_fetches\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2582,7 +2582,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_reads\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_reads\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2596,7 +2596,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_writes\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_writes\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_DELTA",
@@ -2626,7 +2626,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_cache.size\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_cache.size\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -2640,7 +2640,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_cache.max\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.disk_cache.max\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -2654,7 +2654,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.mem_cache.size\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.mem_cache.size\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -2668,7 +2668,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.mem_cache.max\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.mem_cache.max\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -2682,7 +2682,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/chunked.dirty_chunks\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/chunked.dirty_chunks\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_MAX",
@@ -2712,7 +2712,7 @@ data:
                   {
                     "timeSeriesQuery": {
                       "timeSeriesFilter": {
-                        "filter": "metric.type=\"workload.googleapis.com/rpc.server.duration\" AND metric.label.service_name=\"firecracker-manager\"",
+                        "filter": "metric.type=\"workload.googleapis.com/rpc.server.duration\" AND metric.label.service_name=\"capsule-manager\"",
                         "aggregation": {
                           "alignmentPeriod": "60s",
                           "perSeriesAligner": "ALIGN_DELTA",

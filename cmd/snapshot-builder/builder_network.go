@@ -12,14 +12,14 @@ import (
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/capsule/pkg/network"
+	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
 )
 
 const (
 	builderNetworkSlotStart = 128
 	builderNetworkSlotEnd   = 191
-	builderSlotLockDir      = "/var/run/bazel-firecracker-builder-netns"
+	builderSlotLockDir      = "/var/run/capsule-builder-netns"
 )
 
 type builderNetwork struct {
@@ -98,7 +98,7 @@ func setupBuilderNetwork(vmID string, logger *logrus.Logger) (*builderNetwork, e
 	}); err != nil {
 		_ = releaseBuilderSlotLock(slotLock)
 		_ = netnsNet.ReleaseNamespace(resourceID)
-		return nil, fmt.Errorf("forward thaw-agent ports into builder namespace: %w", err)
+		return nil, fmt.Errorf("forward capsule-thaw-agent ports into builder namespace: %w", err)
 	}
 
 	return &builderNetwork{

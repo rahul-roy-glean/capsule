@@ -2,8 +2,8 @@
 """
 E2E Control Plane Simulation Script
 ====================================
-Exercises every surface of the bazel-firecracker control plane HTTP API
-using the bf-sdk Python client, with rich structured logging and clear
+Exercises every surface of the capsule control plane HTTP API
+using the capsule-sdk Python client, with rich structured logging and clear
 pass/fail reporting per scenario.
 
 Usage:
@@ -25,8 +25,8 @@ Suites:
     realistic   - Staggered arrivals, mixed workloads, natural concurrency
 
 Environment variables (override CLI flags):
-    BF_BASE_URL  - Control plane base URL
-    BF_TOKEN     - Bearer auth token
+    CAPSULE_BASE_URL  - Control plane base URL
+    CAPSULE_TOKEN     - Bearer auth token
 """
 
 from __future__ import annotations
@@ -57,12 +57,12 @@ if SDK_PATH not in sys.path:
     sys.path.insert(0, SDK_PATH)
 
 try:
-    import bf_sdk
-    from bf_sdk import BFClient, BFError, BFNotFound, BFServiceUnavailable
-    from bf_sdk._errors import BFRateLimited
-    from bf_sdk._http import HttpClient
+    import capsule_sdk
+    from capsule_sdk import CapsuleClient, CapsuleError, CapsuleNotFound, CapsuleServiceUnavailable
+    from capsule_sdk._errors import CapsuleRateLimited
+    from capsule_sdk._http import HttpClient
 except ImportError as exc:
-    print(f"[FATAL] Cannot import bf_sdk: {exc}")
+    print(f"[FATAL] Cannot import capsule_sdk: {exc}")
     print("  Install with: pip install -e sdk/python  or run from the repo root.")
     sys.exit(1)
 
@@ -200,13 +200,13 @@ def test_case(run: SimulationRun, suite: str, name: str, log: logging.Logger):
     except AssertionError as exc:
         error = str(exc) or "assertion failed"
         log.warning("FAILED (assertion)", extra={"suite": suite, "test": name, "error": error})
-    except BFNotFound as exc:
+    except CapsuleNotFound as exc:
         error = f"Not found: {exc}"
         log.warning("FAILED (not found)", extra={"suite": suite, "test": name, "error": error})
-    except (BFServiceUnavailable, BFRateLimited) as exc:
+    except (CapsuleServiceUnavailable, CapsuleRateLimited) as exc:
         error = f"Service unavailable: {exc}"
         log.warning("FAILED (service unavailable)", extra={"suite": suite, "test": name, "error": error})
-    except BFError as exc:
+    except CapsuleError as exc:
         error = f"API error: {exc}"
         log.warning("FAILED (api error)", extra={"suite": suite, "test": name, "error": error})
     except Exception as exc:  # noqa: BLE001
@@ -241,7 +241,7 @@ def _raw_client(http: HttpClient) -> httpx.Client:
 # SUITE: health
 # ===========================================================================
 
-def suite_health(client: BFClient, run: SimulationRun, log: logging.Logger) -> None:
+def suite_health(client: CapsuleClient, run: SimulationRun, log: logging.Logger) -> None:
     """Basic connectivity and health checks."""
     SUITE = "health"
     http = client._http  # type: ignore[attr-defined]
@@ -286,7 +286,7 @@ def suite_health(client: BFClient, run: SimulationRun, log: logging.Logger) -> N
 # SUITE: snapshots
 # ===========================================================================
 
-def suite_snapshots(client: BFClient, run: SimulationRun, log: logging.Logger) -> None:
+def suite_snapshots(client: CapsuleClient, run: SimulationRun, log: logging.Logger) -> None:
     """Snapshot listing."""
     SUITE = "snapshots"
 
@@ -354,7 +354,7 @@ def _make_test_config_body(tag: str = "") -> dict[str, Any]:
 
 
 def suite_configs(
-    client: BFClient, run: SimulationRun, log: logging.Logger,
+    client: CapsuleClient, run: SimulationRun, log: logging.Logger,
 ) -> dict[str, Any]:
     """
     Layered config CRUD lifecycle.
@@ -471,7 +471,7 @@ def suite_configs(
 # ===========================================================================
 
 def suite_builds(
-    client: BFClient, run: SimulationRun, log: logging.Logger,
+    client: CapsuleClient, run: SimulationRun, log: logging.Logger,
     config_id: str | None = None,
 ) -> None:
     """Trigger and monitor layer builds."""
@@ -531,7 +531,7 @@ def suite_builds(
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             detail = client._layered_configs.get(config_id)
-            build_statuses = [l.build_status for l in (detail.layers or [])]
+            build_statuses = [layer.build_status for layer in (detail.layers or [])]
             active = [bs for bs in build_statuses if bs in {"queued", "running", "waiting_parent"}]
             log.debug("Build poll", extra={
                 "config_id": config_id,
@@ -562,7 +562,7 @@ def suite_builds(
 # ===========================================================================
 
 def suite_runners(
-    client: BFClient, run: SimulationRun, log: logging.Logger,
+    client: CapsuleClient, run: SimulationRun, log: logging.Logger,
     leaf_workload_key: str | None = None,
 ) -> dict[str, Any]:
     """
@@ -699,7 +699,7 @@ def suite_runners(
 # ===========================================================================
 
 def suite_session(
-    client: BFClient, run: SimulationRun, log: logging.Logger,
+    client: CapsuleClient, run: SimulationRun, log: logging.Logger,
     alloc_info: dict[str, Any] | None = None,
     leaf_workload_key: str | None = None,
 ) -> None:
@@ -796,7 +796,7 @@ def suite_session(
 # ===========================================================================
 
 def suite_quarantine(
-    client: BFClient, run: SimulationRun, log: logging.Logger,
+    client: CapsuleClient, run: SimulationRun, log: logging.Logger,
     leaf_workload_key: str | None = None,
 ) -> None:
     """Quarantine / unquarantine a runner."""
@@ -875,7 +875,7 @@ def suite_quarantine(
 # ===========================================================================
 
 def suite_fleet(
-    client: BFClient, run: SimulationRun, log: logging.Logger,
+    client: CapsuleClient, run: SimulationRun, log: logging.Logger,
     leaf_workload_key: str | None = None,
 ) -> None:
     """Fleet convergence and desired-version endpoints."""
@@ -903,7 +903,7 @@ def suite_fleet(
             log.warning("No workload_key — skipping fleet convergence test")
         else:
             with _raw_client(http) as rc:
-                resp = rc.get(f"/api/v1/versions/fleet", params={"workload_key": wk})
+                resp = rc.get("/api/v1/versions/fleet", params={"workload_key": wk})
             if resp.status_code == 500 and "more than one row" in resp.text:
                 # Known control plane DB bug: subquery returns multiple rows when
                 # multiple snapshot builds exist for a workload key.
@@ -916,7 +916,7 @@ def suite_fleet(
                     f"Expected 200 or known 500, got {resp.status_code}: {resp.text[:200]}"
                 )
                 data = resp.json()
-                assert "workload_key" in data, f"Expected 'workload_key' in response"
+                assert "workload_key" in data, "Expected 'workload_key' in response"
                 assert "hosts" in data
                 assert "count" in data
                 log.info("Fleet convergence", extra={
@@ -961,7 +961,7 @@ def suite_fleet(
 # SUITE: canary
 # ===========================================================================
 
-def suite_canary(client: BFClient, run: SimulationRun, log: logging.Logger) -> None:
+def suite_canary(client: CapsuleClient, run: SimulationRun, log: logging.Logger) -> None:
     """Canary report endpoint."""
     SUITE = "canary"
     http = client._http  # type: ignore[attr-defined]
@@ -1007,7 +1007,7 @@ def suite_canary(client: BFClient, run: SimulationRun, log: logging.Logger) -> N
 # SUITE: edge cases
 # ===========================================================================
 
-def suite_edge(client: BFClient, run: SimulationRun, log: logging.Logger) -> None:
+def suite_edge(client: CapsuleClient, run: SimulationRun, log: logging.Logger) -> None:
     """Edge cases, error paths, and boundary conditions."""
     SUITE = "edge"
     http = client._http  # type: ignore[attr-defined]
@@ -1203,14 +1203,14 @@ def suite_edge(client: BFClient, run: SimulationRun, log: logging.Logger) -> Non
 # Each scenario uses threading.Barrier so all workers start their requests
 # at the same instant (after setup), giving maximum contention on the server.
 #
-# Each worker gets its own BFClient so httpx connection pools don't serialize
+# Each worker gets its own CapsuleClient so httpx connection pools don't serialize
 # requests. Results are collected into thread-safe lists (list.append is
 # atomic in CPython).
 # ===========================================================================
 
-def _make_client(base_url: str, token: str | None) -> BFClient:
-    """Construct a fresh BFClient for use in a worker thread."""
-    return BFClient(base_url=base_url, token=token)
+def _make_client(base_url: str, token: str | None) -> CapsuleClient:
+    """Construct a fresh CapsuleClient for use in a worker thread."""
+    return CapsuleClient(base_url=base_url, token=token)
 
 
 def suite_concurrency(
@@ -1368,7 +1368,7 @@ def suite_concurrency(
                     request_id=request_id,
                     session_id=session_id,
                 )
-            except (BFServiceUnavailable, BFRateLimited) as exc:
+            except (CapsuleServiceUnavailable, CapsuleRateLimited) as exc:
                 last_exc = exc
                 if attempt < max_retries:
                     delay = backoff
@@ -1447,7 +1447,7 @@ def suite_concurrency(
             runner_id = resp.runner_id
             allocated_ids.append(resp.runner_id)
             return True, resp.runner_id, True
-        except (BFServiceUnavailable, BFRateLimited) as exc:
+        except (CapsuleServiceUnavailable, CapsuleRateLimited) as exc:
             if _is_capacity_error(str(exc)):
                 return True, f"capacity-limited: {exc}", False
             return False, str(exc), False
@@ -1497,7 +1497,7 @@ def suite_concurrency(
             client.runners.release(runner_id)
             runner_id = None
             return True, "", True
-        except (BFServiceUnavailable, BFRateLimited) as exc:
+        except (CapsuleServiceUnavailable, CapsuleRateLimited) as exc:
             if _is_capacity_error(str(exc)):
                 return True, f"capacity-limited: {exc}", False
             return False, str(exc), False
@@ -1527,7 +1527,7 @@ def suite_concurrency(
         # Session operations (pause, connect) involve GCS snapshot uploads/
         # downloads that can take >30s under concurrent load. Use a longer
         # timeout to avoid spurious timeouts that trigger duplicate work.
-        client = BFClient(base_url=base_url, token=token, timeout=120.0)
+        client = CapsuleClient(base_url=base_url, token=token, timeout=120.0)
         runner_id: str | None = None
         try:
             sess_id = uuid.uuid4().hex
@@ -1559,7 +1559,7 @@ def suite_concurrency(
             client.runners.release(runner_id)
             runner_id = None
             return True, "", True
-        except (BFServiceUnavailable, BFRateLimited) as exc:
+        except (CapsuleServiceUnavailable, CapsuleRateLimited) as exc:
             if _is_capacity_error(str(exc)):
                 return True, f"capacity-limited: {exc}", False
             return False, str(exc), False
@@ -1593,7 +1593,7 @@ def suite_concurrency(
         )
         shared_runner_id = shared_resp.runner_id
         _cs.close()
-    except (BFServiceUnavailable, BFRateLimited) as exc:
+    except (CapsuleServiceUnavailable, CapsuleRateLimited) as exc:
         log.warning("Skipping thundering-herd test (capacity-limited)", extra={"error": str(exc)})
     except Exception as exc:  # noqa: BLE001
         log.warning("Could not allocate for thundering-herd test", extra={"error": str(exc)})
@@ -1656,13 +1656,13 @@ def suite_concurrency(
             runner_id = resp.runner_id
             dedup_runner_ids.append(resp.runner_id)
             return True, resp.runner_id, True
-        except (BFServiceUnavailable, BFRateLimited) as exc:
+        except (CapsuleServiceUnavailable, CapsuleRateLimited) as exc:
             if _is_capacity_error(str(exc)):
                 dedup_runner_ids.append(f"error:{exc}")
                 return True, f"capacity-limited: {exc}", False
             dedup_runner_ids.append(f"error:{exc}")
             return True, f"expected 503 error: {exc}", True
-        except BFError as exc:
+        except CapsuleError as exc:
             dedup_runner_ids.append(f"error:{exc}")
             return True, f"expected error: {exc}", True
         except Exception as exc:  # noqa: BLE001
@@ -1702,7 +1702,7 @@ def suite_concurrency(
         )
         race_runner_id = race_resp.runner_id
         _cr2.close()
-    except (BFServiceUnavailable, BFRateLimited) as exc:
+    except (CapsuleServiceUnavailable, CapsuleRateLimited) as exc:
         log.warning("Skipping release-race test (capacity-limited)", extra={"error": str(exc)})
     except Exception as exc:  # noqa: BLE001
         log.warning("Could not allocate for release-race test", extra={"error": str(exc)})
@@ -1714,7 +1714,7 @@ def suite_concurrency(
                 barrier.wait()
                 ok = client.runners.release(race_runner_id)  # type: ignore[arg-type]
                 return True, f"success={ok}", True
-            except BFError as exc:
+            except CapsuleError as exc:
                 msg = str(exc)
                 is_expected = any(s in msg for s in ("not found", "404", "500"))
                 return is_expected, f"error (expected={is_expected}): {msg}", True
@@ -1787,7 +1787,7 @@ def suite_concurrency(
             client.runners.release(runner_id)
             runner_id = None
             return True, "", True
-        except (BFServiceUnavailable, BFRateLimited) as exc:
+        except (CapsuleServiceUnavailable, CapsuleRateLimited) as exc:
             if _is_capacity_error(str(exc)):
                 return True, f"capacity-limited: {exc}", False
             return False, str(exc), False
@@ -1825,7 +1825,7 @@ def suite_concurrency(
     MAX_OFFSET_MB = 200          # upper bound for random seek offset
 
     def _exec_dirty_worker(wid: int, barrier: Barrier) -> tuple[bool, str, bool]:
-        client = BFClient(base_url=base_url, token=token, timeout=180.0)
+        client = CapsuleClient(base_url=base_url, token=token, timeout=180.0)
         runner_id: str | None = None
         allocated_runner_id: str | None = None  # preserved for logging after release
         rng = random.Random(wid + int(time.monotonic() * 1000))
@@ -1893,7 +1893,7 @@ def suite_concurrency(
                         ))
                         last_exec_err = None
                         break
-                    except (BFServiceUnavailable, BFRateLimited) as exc:
+                    except (CapsuleServiceUnavailable, CapsuleRateLimited) as exc:
                         last_exec_err = exc
                         if attempt < 2:
                             time.sleep(2 * (attempt + 1))
@@ -2022,7 +2022,7 @@ def suite_concurrency(
                 f"timings={cycle_timings}"
             ), True
 
-        except (BFServiceUnavailable, BFRateLimited) as exc:
+        except (CapsuleServiceUnavailable, CapsuleRateLimited) as exc:
             if _is_capacity_error(str(exc)):
                 return True, f"capacity-limited: {exc}", False
             return False, str(exc), False
@@ -2156,7 +2156,7 @@ def suite_realistic(
                     alloc_latency = time.monotonic() - alloc_start
                     last_exc = None
                     break
-                except (BFServiceUnavailable, BFRateLimited) as exc:
+                except (CapsuleServiceUnavailable, CapsuleRateLimited) as exc:
                     last_exc = exc
                     status_code = getattr(exc, "status_code", 503)
                     log.debug("Capacity error on allocate, retrying", extra={
@@ -2231,7 +2231,7 @@ def suite_realistic(
                 success=True,
             ))
 
-        except BFError as exc:
+        except CapsuleError as exc:
             error_msg = f"API error: {exc}"
             sc = getattr(exc, "status_code", None)
             lifecycle_results.append(RunnerLifecycleResult(
@@ -2410,7 +2410,7 @@ def suite_realistic(
 # ===========================================================================
 
 def suite_cleanup(
-    client: BFClient, run: SimulationRun, log: logging.Logger,
+    client: CapsuleClient, run: SimulationRun, log: logging.Logger,
     config_ids: list[str],
 ) -> None:
     """Delete configs created during the run."""
@@ -2434,13 +2434,13 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="E2E Control Plane Simulation")
     p.add_argument(
         "--base-url",
-        default=os.environ.get("BF_BASE_URL", "http://10.0.16.16:8080"),
+        default=os.environ.get("CAPSULE_BASE_URL", "http://10.0.16.16:8080"),
         help="Control plane base URL (default: http://10.0.16.16:8080)",
     )
     p.add_argument(
         "--token",
-        default=os.environ.get("BF_TOKEN", ""),
-        help="Bearer auth token (or set BF_TOKEN env var)",
+        default=os.environ.get("CAPSULE_TOKEN", ""),
+        help="Bearer auth token (or set CAPSULE_TOKEN env var)",
     )
     p.add_argument(
         "--suite",
@@ -2516,11 +2516,11 @@ def main() -> int:
     log.info("Starting E2E simulation", extra={
         "base_url": args.base_url,
         "suite": args.suite,
-        "sdk_version": getattr(bf_sdk, "__version__", "unknown"),
+        "sdk_version": getattr(capsule_sdk, "__version__", "unknown"),
         "auth": "token set" if args.token else "no token",
     })
 
-    with BFClient(base_url=args.base_url, token=args.token or None) as client:
+    with CapsuleClient(base_url=args.base_url, token=args.token or None) as client:
         created_config_ids: list[str] = []
 
         def _run(s: str) -> bool:
@@ -2547,9 +2547,8 @@ def main() -> int:
             suite_builds(client, run, log, config_id=created.get("config_id"))
 
         # -- Runners --
-        alloc_info: dict[str, Any] = {}
         if _run("runners"):
-            alloc_info = suite_runners(
+            suite_runners(
                 client, run, log,
                 leaf_workload_key=FIXED_WORKLOAD_KEY,
             )

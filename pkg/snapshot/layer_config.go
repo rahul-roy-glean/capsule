@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
+	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
 )
 
 // PlatformLayerName is the reserved name for the auto-injected platform layer.
@@ -108,7 +108,7 @@ func validateRefreshInterval(interval string) error {
 
 // MaterializeLayers computes the hash chain for a LayeredConfig.
 // If BaseImage is set, an implicit platform layer (depth 0) is prepended that
-// converts the Docker image to a Firecracker rootfs and installs thaw-agent.
+// converts the Docker image to a Firecracker rootfs and installs capsule-thaw-agent.
 // User layers follow at depth 1+.
 func MaterializeLayers(cfg *LayeredConfig) []LayerMaterialized {
 	var allLayers []LayerDef
@@ -171,7 +171,7 @@ func MaterializeLayers(cfg *LayeredConfig) []LayerMaterialized {
 
 // buildPlatformLayerDef creates the implicit platform layer definition.
 // This layer converts a Docker image to a Firecracker rootfs and installs
-// the minimal system components: systemd init, thaw-agent, networking config.
+// the minimal system components: systemd init, capsule-thaw-agent, networking config.
 //
 // The hash for this layer includes the base_image URI, so changing the
 // Docker image triggers a rebuild while keeping user layers' hashes stable
@@ -184,7 +184,7 @@ func buildPlatformLayerDef(cfg *LayeredConfig) LayerDef {
 
 	// The platform layer's init_commands describe what the snapshot-builder
 	// does internally when --base-image is set. They're included in the hash
-	// so that changes to the platform setup (e.g., new thaw-agent version)
+	// so that changes to the platform setup (e.g., new capsule-thaw-agent version)
 	// produce a different layer hash and trigger a rebuild.
 	//
 	// These are NOT executed as shell commands inside the VM — they're
@@ -193,7 +193,7 @@ func buildPlatformLayerDef(cfg *LayeredConfig) LayerDef {
 		Name: PlatformLayerName,
 		InitCommands: []SnapshotCommand{
 			{Type: "base-image", Args: []string{cfg.BaseImage}},
-			{Type: "platform-setup", Args: []string{"thaw-agent", "systemd", "networking", "docker-env-v2"}, RunAsRoot: true},
+			{Type: "platform-setup", Args: []string{"capsule-thaw-agent", "systemd", "networking", "docker-env-v2"}, RunAsRoot: true},
 			{Type: "platform-user", Args: []string{runnerUser}},
 		},
 	}

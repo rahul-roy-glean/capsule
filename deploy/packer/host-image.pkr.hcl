@@ -26,7 +26,7 @@ variable "firecracker_version" {
 
 variable "image_family" {
   type        = string
-  default     = "firecracker-host"
+  default     = "capsule-host"
   description = "Image family name"
 }
 
@@ -42,13 +42,13 @@ variable "subnetwork" {
   description = "Subnetwork to use for building (empty = default)"
 }
 
-variable "firecracker_manager_binary" {
+variable "capsule_manager_binary" {
   type        = string
   default     = ""
-  description = "Local path to firecracker-manager binary to upload"
+  description = "Local path to capsule-manager binary to upload"
 }
 
-source "googlecompute" "firecracker-host" {
+source "googlecompute" "capsule-host" {
   project_id              = var.project_id
   zone                    = var.zone
   source_image_family     = "ubuntu-2204-lts"
@@ -58,7 +58,7 @@ source "googlecompute" "firecracker-host" {
   disk_size    = 50
   disk_type    = "pd-ssd"
 
-  image_name        = "firecracker-host-{{timestamp}}"
+  image_name        = "capsule-host-{{timestamp}}"
   image_family      = var.image_family
   image_description = "Firecracker host image with KVM support"
 
@@ -66,7 +66,7 @@ source "googlecompute" "firecracker-host" {
 
   network    = var.network
   subnetwork = var.subnetwork
-  tags       = ["firecracker-host"]
+  tags       = ["capsule-host"]
 
   # Use IAP tunnel for SSH (requires firewall rule for 35.235.240.0/20 -> port 22)
   use_iap    = true
@@ -80,7 +80,7 @@ source "googlecompute" "firecracker-host" {
 }
 
 build {
-  sources = ["source.googlecompute.firecracker-host"]
+  sources = ["source.googlecompute.capsule-host"]
 
   # Update system and install base packages
   provisioner "shell" {
@@ -177,29 +177,29 @@ build {
       "sudo mkdir -p /mnt/data/snapshots",
       "sudo mkdir -p /mnt/data/workspaces",
       "sudo mkdir -p /mnt/data/git-cache",
-      "sudo mkdir -p /opt/firecracker-manager",
+      "sudo mkdir -p /opt/capsule-manager",
       "sudo mkdir -p /etc/iptables"
     ]
   }
 
-  # Upload firecracker-manager binary from local build
+  # Upload capsule-manager binary from local build
   provisioner "file" {
-    source      = var.firecracker_manager_binary
-    destination = "/tmp/firecracker-manager"
+    source      = var.capsule_manager_binary
+    destination = "/tmp/capsule-manager"
   }
 
   provisioner "shell" {
     inline = [
-      "sudo mv /tmp/firecracker-manager /usr/local/bin/firecracker-manager",
-      "sudo chmod +x /usr/local/bin/firecracker-manager",
-      "firecracker-manager --version || echo 'firecracker-manager installed (no --version flag)'"
+      "sudo mv /tmp/capsule-manager /usr/local/bin/capsule-manager",
+      "sudo chmod +x /usr/local/bin/capsule-manager",
+      "capsule-manager --version || echo 'capsule-manager installed (no --version flag)'"
     ]
   }
 
-  # Create firecracker-manager systemd service
+  # Create capsule-manager systemd service
   provisioner "shell" {
     inline = [
-      "cat <<'EOF' | sudo tee /etc/systemd/system/firecracker-manager.service",
+      "cat <<'EOF' | sudo tee /etc/systemd/system/capsule-manager.service",
       "[Unit]",
       "Description=Firecracker Manager",
       "After=network.target",
@@ -207,7 +207,7 @@ build {
       "",
       "[Service]",
       "Type=simple",
-      "ExecStart=/usr/local/bin/firecracker-manager",
+      "ExecStart=/usr/local/bin/capsule-manager",
       "Restart=always",
       "RestartSec=5",
       "Environment=LOG_LEVEL=info",

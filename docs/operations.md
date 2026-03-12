@@ -1,11 +1,24 @@
 # Operations Guide
 
-This guide describes the runtime behavior that exists today: layered config builds,
-workload-key rollouts, runner allocation, and session pause/resume.
+This guide is for operators of a running Capsule deployment. It focuses on
+runtime behavior, rollout mechanics, failure recovery, and the main places to
+inspect when something goes wrong.
+
+## Scope
+
+The current operational model assumes:
+
+- workloads are defined as layered configs
+- snapshots are stored in GCS
+- the control plane runs in Kubernetes
+- hosts run `capsule-manager` and restore Firecracker microVMs
+
+For installation and first deployment, use [setup.md](setup.md). For
+request-level recipes, use [HOWTO.md](HOWTO.md).
 
 ## Build Pipeline
 
-### Triggering Builds
+### Triggering builds
 
 Builds are created from layered configs:
 
@@ -16,31 +29,30 @@ curl -X POST "${CONTROL_PLANE_BASE}/api/v1/layered-configs/${CONFIG_ID}/build"
 Layer refreshes are also first-class:
 
 ```bash
-curl -X POST "${CONTROL_PLANE_BASE}/api/v1/layered-configs/${CONFIG_ID}/layers/${LAYER_NAME}/refresh"
+curl -X POST \
+  "${CONTROL_PLANE_BASE}/api/v1/layered-configs/${CONFIG_ID}/layers/${LAYER_NAME}/refresh"
 ```
 
-### What A Build Does
+### What a build does
 
 For each queued layer build, the control plane:
 
-1. materializes the layer chain from `layered_configs`
+1. materializes the full layer chain from `layered_configs`
 2. launches a nested-virtualization builder VM
-3. downloads `snapshot-builder`, `thaw-agent`, `kernel.bin`, and `rootfs.img` from
-   `gs://BUCKET/v1/build-artifacts/`
-4. runs `cmd/snapshot-builder` with the materialized layer commands
-5. uploads chunked snapshot metadata keyed by layer hash
-6. if the layer is the leaf, creates the workload-key alias and updates
-   `current-pointer.json`
+3. downloads `snapshot-builder`, `capsule-thaw-agent`, `kernel.bin`, and `rootfs.img`
+4. runs `cmd/snapshot-builder` with the resolved layer inputs
+5. uploads chunked snapshot metadata keyed by the layer hash
+6. updates the workload-key alias if the leaf layer completed successfully
 
-### Build States
+### Build state surfaces
 
-The DB surfaces build progress through:
+Useful state lives in:
 
 - `snapshot_builds.status` for per-layer queue state
-- `snapshot_layers.status` and `current_version` for active layer state
-- `snapshots.status` for leaf workload versions exposed to the fleet
+- `snapshot_layers.status` and `current_version` for materialized layer state
+- `snapshots.status` for the leaf versions exposed to the fleet
 
-Useful layer-build statuses:
+Common layer-build statuses:
 
 - `queued`
 - `waiting_parent`
@@ -49,7 +61,7 @@ Useful layer-build statuses:
 - `failed`
 - `cancelled`
 
-Useful snapshot statuses:
+Common snapshot statuses:
 
 - `ready`
 - `active`
@@ -58,68 +70,67 @@ Useful snapshot statuses:
 
 ## Rollout And Host Convergence
 
-### Desired Versions
+### Desired versions
 
 The control plane stores desired workload versions in `version_assignments`.
 
-- a `(workload_key, NULL)` row is the fleet-wide default
-- a `(workload_key, host_id)` row is a host-specific override
+- `(workload_key, NULL)` is the fleet-wide default
+- `(workload_key, host_id)` is a host-specific override
 
 Hosts learn convergence state through heartbeats.
 
-### Heartbeat Loop
+### Heartbeat loop
 
-Each host sends:
+Each host reports:
 
 - host identity
 - gRPC and HTTP addresses
 - resource usage
 - loaded workload-key versions
-- draining state
+- drain state
 
 The control plane responds with:
 
 - `desired_versions`
 - `sync_versions`
-- drain instructions
+- optional drain instructions
 
-Check current convergence:
+Check convergence with:
 
 ```bash
 curl -sS "${CONTROL_PLANE_BASE}/api/v1/versions/fleet?workload_key=${WORKLOAD_KEY}"
 ```
 
-### Host Selection
+### Host selection
 
-The scheduler chooses hosts using:
+The scheduler currently considers:
 
-- capacity and resource fit for the requested tier
+- resource fit for the requested tier
 - workload-key cache affinity
 - session stickiness when `session_id` is present
-- optimistic in-memory reservations before the host confirms allocation
+- in-memory reservations before the host confirms allocation
 
 ## Runner Lifecycle
 
-### Fresh Allocation
+### Fresh allocation
 
 For a new allocation:
 
-1. the control plane resolves `tier`, `start_command`, TTL, and network policy from
-   `layered_configs`
+1. the control plane resolves tier, TTL, auto-pause, and network policy
 2. it chooses a host
-3. the host either reuses a pooled VM or restores from chunked snapshot data
-4. MMDS is injected before the resume/boot transition
-5. `thaw-agent` configures the guest and starts the user service
-6. the host proxy exposes the service, exec, PTY, and file APIs
+3. the host reuses a pooled VM or restores from chunked snapshot data
+4. MMDS is injected before boot or resume completes
+5. `capsule-thaw-agent` configures the guest and starts the user service
+6. the host proxy exposes service, exec, PTY, and file APIs
 
-### Session Resume
+### Session resume
 
 If `session_id` is supplied:
 
 1. the control plane checks `session_snapshots`
-2. it prefers the original host if still healthy
+2. it prefers the original host if that host is still healthy
 3. the host resumes from local or GCS-backed session state
-4. `thaw-agent` re-syncs MMDS time and networking after restore
+4. `capsule-thaw-agent` re-synchronizes MMDS-derived networking and timing
 
 ## Session Operations
 
@@ -127,55 +138,56 @@ Session snapshots are incremental and layered.
 
 On pause:
 
-- dirty memory is written as sparse local diffs and optionally uploaded to GCS chunks
+- dirty memory is written as sparse local diffs and may also be uploaded to GCS chunks
 - dirty rootfs and extension-drive chunks are persisted
 - `session_snapshots` is updated to `suspended`
 
 On resume:
 
-- local sessions use the on-host snapshot chain
-- GCS-backed sessions restore with layered UFFD handlers and FUSE-backed disks
+- same-host sessions can restore from local disk state
+- cross-host sessions restore from GCS-backed manifests and chunk data
 - the original `runner_id` is reused
 
 ## Failure Recovery
 
-### Control Plane Restart
+### Control plane restart
 
 The control plane is stateless apart from PostgreSQL:
 
-- host and runner state is rebuilt from DB plus fresh heartbeats
-- build queue state remains in `snapshot_builds`
+- host and runner state is rebuilt from the database plus fresh heartbeats
+- queued and historical build state remains in the build tables
 
-### Host Restart
+### Host restart
 
 On startup, the host agent:
 
-- waits for `/mnt/data`
-- reconstructs managers and chunk stores
-- reconciles orphan sockets, workspaces, and network devices
+- waits for its data volume
+- reconstructs managers and local chunk stores
+- reconciles orphaned sockets, workspaces, and network devices
 - resumes heartbeats
 
-It does not attempt to re-adopt already-running Firecracker VMs from a previous process.
+It does not attempt to adopt already-running Firecracker VMs from a previous
+process instance.
 
-### Builder VM Failure
+### Builder VM failure
 
-If a builder VM terminates before it writes the expected artifacts:
+If a builder VM terminates before writing the expected artifacts:
 
 - the layer build is marked failed
 - children waiting on that layer are cancelled
-- terminated builder VMs are garbage-collected by the control plane
+- terminated builders are cleaned up by the control plane
 
-### Disk Pressure
+### Disk pressure
 
-When disk usage is high:
+When disk usage is high on a host:
 
 - fresh allocations may be rejected
-- autoscaling skips idle-pool expansion
-- orphan cleanup becomes critical for recovery
+- idle-pool expansion may be skipped
+- orphan cleanup becomes a first-order recovery step
 
 ## Observability
 
-### Control Plane
+### Control plane
 
 Useful endpoints:
 
@@ -192,12 +204,12 @@ Useful checks:
 ```bash
 curl http://HOST_IP:8080/health
 curl http://HOST_IP:8080/metrics
-sudo journalctl -u firecracker-manager -f
+sudo journalctl -u capsule-manager -f
 ```
 
 ### Guest
 
-From the host proxy:
+Through the host proxy:
 
 - `GET /api/v1/runners/{id}/service-logs`
 - `POST /api/v1/runners/{id}/exec`
@@ -207,13 +219,13 @@ From the host proxy:
 
 ## GCS Layout
 
-The current deployment uses two main GCS areas:
+The current deployment uses two main storage areas:
 
 ```text
 gs://snapshot-bucket/
 ├── v1/build-artifacts/
 │   ├── snapshot-builder
-│   ├── thaw-agent
+│   ├── capsule-thaw-agent
 │   ├── kernel.bin
 │   └── rootfs.img
 ├── v1/<layer-hash>/
@@ -227,4 +239,14 @@ gs://snapshot-bucket/
     └── mem/...
 ```
 
-The workload-key alias is what hosts and allocators actually consume at runtime.
+Hosts and allocators consume the workload-key alias, not the raw layer hash.
+
+## Recommended Operator Flow
+
+When debugging a production issue, the usual order is:
+
+1. confirm the control plane is healthy
+2. inspect the relevant layered config and snapshot status
+3. confirm the target hosts have converged to the desired version
+4. inspect host logs and metrics
+5. inspect guest-facing proxy endpoints if the VM is up but the workload is unhealthy

@@ -1,14 +1,28 @@
 # Example: Bazel + Buildbarn Remote Execution
 
-This example demonstrates how Bazel constructs (artifact cache, Buildbarn certs,
-repo cache overlay) are expressed using only the generic platform primitives:
-`DriveSpec`, `SnapshotCommand`, and `init_commands`.
+Use this example when you want a CI or build workload that combines:
 
-## How it works: `DriveSpec` + `SnapshotCommand`
+- Bazel repository or artifact cache seeding
+- Buildbarn credentials or certificate material
+- writable per-runner overlay storage
 
-### Artifact cache (seed + overlay)
+The important point is that all of this is expressed with Capsule's generic
+primitives rather than special-purpose Bazel logic in the platform.
 
-The read-only seed is a `DriveSpec` populated during snapshot building:
+## What This Example Shows
+
+This example combines:
+
+- read-only seeded drives for reusable cache state
+- writable per-allocation drives for ephemeral build output
+- `init_commands` for overlay and filesystem setup
+- `start_command` for the actual runner or build process
+
+## Key Patterns
+
+### Seeded artifact cache
+
+A read-only drive is populated during snapshot build and attached to each VM:
 
 ```yaml
 drives:
@@ -17,85 +31,59 @@ drives:
     size_gb: 20
     read_only: true
     mount_path: "/mnt/artifact-cache-seed"
-    commands:
-      - type: "shell"
-        args: ["bazel", "fetch", "--repository_cache=/mnt/artifact-cache-seed", "//..."]
 ```
 
-The per-runner writable upper is also a `DriveSpec`:
+### Writable upper layer
 
-```yaml
-  - drive_id: "artifact_cache_upper"
-    label: "ARTIFACT_CACHE_UPPER"
-    size_gb: 10
-    read_only: false   # → manager creates fresh copy per allocation
-    mount_path: "/mnt/artifact-cache-upper"
-```
-
-The overlayfs mount is an `init_command`:
-
-```yaml
-init_commands:
-  - type: "shell"
-    args: ["bash", "-c", "mount -t overlay overlay -o lowerdir=/mnt/artifact-cache-seed,upperdir=/mnt/artifact-cache-upper/upper,workdir=/mnt/artifact-cache-upper/work /mnt/ephemeral/caches/repository"]
-    run_as_root: true
-```
-
-### Credentials (Buildbarn certs, .netrc, git-credentials)
-
-A single `DriveSpec` replaces `ensureCredentialsImage`, `mountBuildbarnCerts`,
-and `setupCredentialSymlinks`:
+A second writable drive is created fresh per allocation:
 
 ```yaml
 drives:
-  - drive_id: "credentials"
-    label: "CREDENTIALS"
-    size_gb: 1
-    read_only: true
-    mount_path: "/mnt/credentials"
-    commands:
-      - type: "shell"
-        args: ["bash", "-c", "cp -r /host-certs/* /mnt/credentials/"]
-        run_as_root: true
+  - drive_id: "artifact_cache_upper"
+    label: "ARTIFACT_CACHE_UPPER"
+    size_gb: 10
+    read_only: false
+    mount_path: "/mnt/artifact-cache-upper"
 ```
 
-Symlinks are `init_commands`:
+### Overlay setup
 
-```yaml
-init_commands:
-  - type: "shell"
-    args: ["bash", "-c", "ln -sf /mnt/credentials/netrc ~/.netrc"]
-```
+The overlay itself is assembled with `init_commands`, which keeps the behavior
+explicit in config instead of hidden in Go code.
 
-### Runner registration
+### Credentials drive
 
-GitHub Actions registration is a `start_command` -- no special CI config needed:
+Buildbarn certificates, `.netrc`, or other auth material can be staged through a
+small read-only drive and then symlinked into the expected runtime paths.
 
-```yaml
-start_command:
-  command: ["/home/runner/config.sh", "--url", "https://github.com/myorg/myrepo",
-            "--token", "${CI_RUNNER_TOKEN}", "--ephemeral"]
-  env:
-    CI_RUNNER_TOKEN: "${ci_runner_token}"
-```
+## What You Need To Edit
 
-## What the generic primitives replace
+Before using this example, update:
 
-| Old construct | Replaced by |
-|---|---|
-| Hardcoded artifact-cache logic | `DriveSpec` entries in `LayeredConfig` |
-| Hardcoded credentials-image builder | `DriveSpec` with `commands` |
-| Hardcoded per-runner ext4 creation | `DriveSpec` with `read_only: false` |
-| Hardcoded cert-mount in thaw-agent | Generic drive auto-mount + `init_command` |
-| Hardcoded overlay setup in thaw-agent | `init_command` shell overlay mount |
-| Hardcoded symlink setup in thaw-agent | `init_command` shell symlinks |
-| Hardcoded CI config struct | `start_command` + MMDS token injection |
-| Dedicated CLI flags | Zero -- all config in `onboard.yaml` |
+- `platform.gcp_project`
+- `workload.base_image`
+- any Buildbarn host, cert, or credential paths
+- cache sizes and mount paths
+- the final `start_command`
 
 ## Onboard
 
 ```bash
 cp examples/ci-bazel-remote-exec/onboard.yaml my-bazel.yaml
-# Edit my-bazel.yaml: set platform.gcp_project and workload values
+# Edit the fields described above
 make onboard CONFIG=my-bazel.yaml
 ```
+
+## Why This Example Matters
+
+This example is a good reference when you want to express complex build runtime
+state using only:
+
+- `base_image`
+- `layers`
+- `drives`
+- `init_commands`
+- `start_command`
+
+If your workload needs similar cache or credential behavior, this is usually the
+best example to borrow from first.

@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from bf_sdk._shell import MSG_EXIT, MSG_RESIZE, MSG_SIGNAL, MSG_STDIN, MSG_STDOUT, ShellSession
+from capsule_sdk._shell import MSG_EXIT, MSG_RESIZE, MSG_SIGNAL, MSG_STDIN, MSG_STDOUT, ShellSession
 
 
 class TestShellProtocol:

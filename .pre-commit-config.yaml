@@ -46,7 +46,7 @@ repos:
         name: migration guard
         entry: bash .github/scripts/check-migrations.sh --staged
         language: system
-        files: ^(cmd/control-plane/migrations/|cmd/control-plane/schema\.sql|\.github/scripts/check-migrations\.sh)
+        files: ^(cmd/capsule-control-plane/migrations/|cmd/capsule-control-plane/schema\.sql|\.github/scripts/check-migrations\.sh)
         pass_filenames: false
 
       - id: sdk-python-ruff
@@ -58,7 +58,7 @@ repos:
           exit 1; };
           export VIRTUAL_ENV="$PWD/.venv";
           export PATH="$VIRTUAL_ENV/bin:$PATH";
-          .venv/bin/python -m ruff check src/bf_sdk/ tests/'
+          .venv/bin/python -m ruff check src/capsule_sdk/ tests/'
         language: system
         files: ^sdk/python/
         pass_filenames: false
@@ -72,7 +72,7 @@ repos:
           exit 1; };
           export VIRTUAL_ENV="$PWD/.venv";
           export PATH="$VIRTUAL_ENV/bin:$PATH";
-          .venv/bin/python -m pyright src/bf_sdk/'
+          .venv/bin/python -m pyright src/capsule_sdk/'
         language: system
         files: ^sdk/python/
         pass_filenames: false

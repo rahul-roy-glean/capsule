@@ -89,21 +89,21 @@ func stepPackerBuild(cfg *Config, logger *logrus.Logger, planOnly bool) error {
 	if planOnly {
 		fmt.Println("\n[plan] packer-build:")
 		fmt.Printf("  GCP project:    %s\n", cfg.Platform.GCPProject)
-		fmt.Printf("  Image family:   firecracker-host\n")
+		fmt.Printf("  Image family:   capsule-host\n")
 		fmt.Printf("  Source image:   ubuntu-2204-lts (ubuntu-os-cloud)\n")
 		fmt.Printf("  Machine type:   n2-standard-4\n")
-		fmt.Printf("  Binary:         bin/firecracker-manager (linux/amd64)\n")
+		fmt.Printf("  Binary:         bin/capsule-manager (linux/amd64)\n")
 		fmt.Printf("  Provisioners:   7 shell, 1 file upload\n")
 		return nil
 	}
 
-	// Cross-compile firecracker-manager for linux
-	log.Info("Building firecracker-manager for linux/amd64...")
-	buildCmd := exec.Command("make", "firecracker-manager-linux", fmt.Sprintf("PROJECT_ID=%s", cfg.Platform.GCPProject))
+	// Cross-compile capsule-manager for linux
+	log.Info("Building capsule-manager for linux/amd64...")
+	buildCmd := exec.Command("make", "capsule-manager-linux", fmt.Sprintf("PROJECT_ID=%s", cfg.Platform.GCPProject))
 	buildCmd.Stdout = os.Stdout
 	buildCmd.Stderr = os.Stderr
 	if err := buildCmd.Run(); err != nil {
-		return fmt.Errorf("failed to build firecracker-manager: %w", err)
+		return fmt.Errorf("failed to build capsule-manager: %w", err)
 	}
 
 	// Run packer build
@@ -123,16 +123,16 @@ func stepControlPlaneDeploy(cfg *Config, logger *logrus.Logger, planOnly bool) e
 
 	if planOnly {
 		fmt.Println("\n[plan] control-plane-deploy:")
-		fmt.Printf("  Image:          %s-docker.pkg.dev/%s/firecracker/firecracker-control-plane:latest\n",
+		fmt.Printf("  Image:          %s-docker.pkg.dev/%s/capsule/capsule-control-plane:latest\n",
 			cfg.Platform.Region, cfg.Platform.GCPProject)
-		fmt.Printf("  K8s deployer:   Helm chart deploy/helm/firecracker-runner\n")
+		fmt.Printf("  K8s deployer:   Helm chart deploy/helm/capsule\n")
 		fmt.Printf("  Hosts during deploy: none (bootstrap min_hosts forced to 0)\n")
 		if cfg.Platform.ControlPlaneDomain != "" {
 			fmt.Printf("  Domain:         %s (Ingress included)\n", cfg.Platform.ControlPlaneDomain)
 		} else {
 			fmt.Printf("  Domain:         internal LoadBalancer only\n")
 		}
-		fmt.Printf("  Namespace:      firecracker-runner\n")
+		fmt.Printf("  Namespace:      capsule\n")
 		return nil
 	}
 
@@ -212,11 +212,11 @@ func stepControlPlaneDeploy(cfg *Config, logger *logrus.Logger, planOnly bool) e
 
 	log.Info("Deploying control plane Helm chart...")
 	helmArgs := []string{
-		"upgrade", "--install", "control-plane", "deploy/helm/firecracker-runner",
+		"upgrade", "--install", "control-plane", "deploy/helm/capsule",
 		"--namespace", onboardNamespace,
-		"--set", fmt.Sprintf("image.repository=%s-docker.pkg.dev/%s/firecracker/firecracker-control-plane", cfg.Platform.Region, cfg.Platform.GCPProject),
+		"--set", fmt.Sprintf("image.repository=%s-docker.pkg.dev/%s/capsule/capsule-control-plane", cfg.Platform.Region, cfg.Platform.GCPProject),
 		"--set", "image.tag=latest",
-		"--set", fmt.Sprintf("config.gcsBucket=%s-firecracker-snapshots", cfg.Platform.GCPProject),
+		"--set", fmt.Sprintf("config.gcsBucket=%s-capsule-snapshots", cfg.Platform.GCPProject),
 		"--set", fmt.Sprintf("config.gcpProject=%s", cfg.Platform.GCPProject),
 		"--set", fmt.Sprintf("config.environment=%s", cfg.Platform.Environment),
 		"--set", fmt.Sprintf("gcp.projectId=%s", cfg.Platform.GCPProject),
