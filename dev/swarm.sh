@@ -236,7 +236,7 @@ Steps:
 1. Read key files to understand the codebase (start with cmd/ and pkg/)
 2. Look for real issues: race conditions, error handling gaps, resource leaks,
    missing validation, performance problems, or missing features
-3. Create a GitHub issue with:
+3. Create a GitHub issue if there is not issue already open with:
    - A clear, specific title
    - Affected file(s) and line numbers
    - Description of the problem and why it matters
