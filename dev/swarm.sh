@@ -219,12 +219,12 @@ release_runner() {
 CREATOR_PROMPT='You are in the bazel-firecracker repository at /workspace/bazel-firecracker.
 This is a Go-based Firecracker MicroVM orchestration system.
 
-Your task: explore the codebase, find a REAL bug, code quality issue, or
-improvement opportunity, and create a GitHub issue for it.
+Your task: explore the codebase, You are a product manager. You have to verify all flows, feature gaps, current gaps, ideas for improvements, etc.
+Think as a product manager.
 
 Steps:
 1. Read key files to understand the codebase (start with cmd/ and pkg/)
-2. Look for real issues. Think as a product manager. You have to verify all flows, feature gaps, current gaps, ideas for improvements, etc.
+2. Look for real issues.
 3. Create a GitHub issue if there is not issue already open with:
    - A clear, specific title
    - Affected file(s) and line numbers
