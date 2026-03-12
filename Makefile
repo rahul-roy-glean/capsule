@@ -6,10 +6,10 @@
 .PHONY: capsule-manager capsule-control-plane snapshot-builder capsule-thaw-agent
 .PHONY: test-unit test-race test-cover test-integration test-all check
 .PHONY: sdk-python-lint sdk-python-test sdk-python-typecheck sdk-python-check sdk-python-e2e
-.PHONY: dev-build dev-snapshot dev-stack dev-test-snapshot-builder dev-test-pause-resume dev-test-multi-pause-dedup dev-stop
+.PHONY: dev-build dev-snapshot dev-stack dev-test-snapshot-builder dev-test-multi-pause-dedup dev-stop
 .PHONY: dev-test-gcs-pause-resume
 .PHONY: dev-test-file-ops dev-test-pty dev-test-checkpoint
-.PHONY: dev-test-auto-resume dev-test-template-tags dev-test-network-policy dev-test-auth-proxy
+.PHONY: dev-test-auto-resume
 .PHONY: dev-agent-rootfs dev-agent-snapshot dev-test-agent-sessions dev-run-agent-e2e
 .PHONY: dev-setup dev-provision
 .PHONY: bench-allocate bench-session dev-bench-allocate dev-bench-session
@@ -335,9 +335,6 @@ help:
 	@echo "  dev-stack            - Start capsule-control-plane + capsule-manager"
 	@echo "  dev-test-file-ops    - Run E2E file operations test (WS2)"
 	@echo "  dev-test-pty         - Run E2E PTY terminal test (WS3)"
-	@echo "  dev-test-template-tags - Run E2E template tags test (WS6)"
-	@echo "  dev-test-network-policy - Run E2E network policy test"
-	@echo "  dev-test-auth-proxy  - Run E2E auth proxy test (delegated provider)"
 	@echo "  dev-test-checkpoint  - Run E2E checkpoint test (WS4, needs GCS)"
 	@echo "  dev-test-auto-resume - Run E2E auto-resume test (WS5, needs GCS)"
 	@echo "  dev-agent-snapshot   - Provision the AI agent snapshot"
@@ -353,7 +350,7 @@ help:
 
 # === Local Development ===
 # Requires a Linux host with KVM. Run on bare-metal or a GCE VM with nested virt.
-# Workflow: make dev-provision → make dev-build → make dev-test-snapshot-builder → make dev-snapshot → make dev-stack → make dev-test-pause-resume
+# Workflow: make dev-provision → make dev-build → make dev-test-snapshot-builder → make dev-snapshot → make dev-stack → GCS_BUCKET=<bucket> make dev-test-gcs-pause-resume
 # --- Linux dev targets (run directly on a Linux host with KVM) ---
 
 # Install prerequisites on a fresh Linux host (Ubuntu/Debian)
@@ -401,10 +398,6 @@ dev-bench-session: bench-session
 	  --iterations $(or $(ITERATIONS),50) \
 	  --warmup $(or $(WARMUP),5)
 
-# Run E2E pause/resume test
-dev-test-pause-resume:
-	bash dev/test-pause-resume.sh
-
 # Run E2E multi-pause chunk dedup test
 dev-test-multi-pause-dedup:
 	bash dev/test-multi-pause-dedup.sh
@@ -428,17 +421,6 @@ dev-test-checkpoint:
 # Run E2E auto-resume test (WS5)
 dev-test-auto-resume:
 	bash dev/test-auto-resume.sh
-
-# Run E2E template tags test (WS6)
-dev-test-template-tags:
-	bash dev/test-template-tags.sh
-
-dev-test-network-policy:
-	bash dev/test-network-policy.sh
-
-# Run E2E auth proxy test
-dev-test-auth-proxy:
-	bash dev/test-auth-proxy.sh
 
 # AI Agent Sandbox E2E tests
 dev-agent-rootfs:
