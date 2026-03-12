@@ -234,8 +234,7 @@ improvement opportunity, and create a GitHub issue for it.
 
 Steps:
 1. Read key files to understand the codebase (start with cmd/ and pkg/)
-2. Look for real issues: race conditions, error handling gaps, resource leaks,
-   missing validation, performance problems, or missing features
+2. Look for real issues. Think as a product manager. You have to verify all flows, feature gaps, current gaps, ideas for improvements, etc.
 3. Create a GitHub issue if there is not issue already open with:
    - A clear, specific title
    - Affected file(s) and line numbers
