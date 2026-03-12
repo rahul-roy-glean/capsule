@@ -174,10 +174,16 @@ exec_claude() {
   # switches to full buffering when stdout is a pipe).
   # Uses --output-format stream-json so Claude emits one JSON event per line
   # (tool use, text deltas, result) instead of buffering the entire response.
+  # GH_TOKEN is set process-wide by the thaw-agent, but Claude Code
+  # sanitizes auth tokens from its environment. Pass it explicitly so
+  # Claude Code's Bash tool inherits it for gh CLI operations.
+  local full_env
+  full_env=$(echo "$CLAUDE_ENV" | jq '. + {"GH_TOKEN": "proxy-injected", "GITHUB_TOKEN": "proxy-injected"}')
+
   local payload
   payload=$(jq -n \
     --arg prompt "$prompt" \
-    --argjson env "$CLAUDE_ENV" \
+    --argjson env "$full_env" \
     --argjson timeout "$TIMEOUT" \
     '{
       command: ["stdbuf", "-oL", "claude", "-p", $prompt,
