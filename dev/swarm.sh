@@ -24,7 +24,9 @@ CONFIG_ID=""
 REPO="rahul-roy-glean/bazel-firecracker"
 LOG_DIR="/tmp/swarm-$(date +%s)"
 
-# Claude Code environment injected into every /exec call
+# Claude Code environment injected into every /exec call.
+# GCE_METADATA_HOST and METADATA_SERVER_DETECTION are now set process-wide
+# by the thaw-agent, so they don't need to be in the request env.
 CLAUDE_ENV='{
   "CLAUDE_CODE_USE_VERTEX": "1",
   "CLOUD_ML_REGION": "us-east5",
@@ -32,9 +34,7 @@ CLAUDE_ENV='{
   "ANTHROPIC_MODEL": "claude-opus-4-6",
   "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4318",
   "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
-  "OTEL_TRACES_EXPORTER": "otlp",
-  "GCE_METADATA_HOST": "169.254.169.254",
-  "METADATA_SERVER_DETECTION": "assume-present"
+  "OTEL_TRACES_EXPORTER": "otlp"
 }'
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
@@ -181,7 +181,7 @@ exec_claude() {
     --argjson timeout "$TIMEOUT" \
     '{
       command: ["stdbuf", "-oL", "claude", "-p", $prompt,
-                "--output-format", "stream-json",
+                "--output-format", "stream-json", "--verbose",
                 "--dangerously-skip-permissions"],
       env: $env,
       working_dir: "/workspace/bazel-firecracker",
@@ -232,7 +232,7 @@ Steps:
    - Suggested fix approach (if you have one)
 4. You can create multiple issues if you find multiple issues.
 
-To create the issue, run:
+To interact with GitHub:
   gh issue create \
     --repo '"$REPO"' \
     --title "Your title" \
@@ -255,9 +255,8 @@ Steps:
 5. Create a branch: git checkout -b fix/<issue-number>-short-description
 6. Implement the fix (edit files, run tests if possible)
 7. Commit your changes with a descriptive message referencing the issue
-8. Push the branch:
+8. Push and create a PR:
    git push origin fix/<issue-number>-short-description
-9. Create a PR:
    gh pr create \
      --repo '"$REPO"' \
      --title "Fix #<issue-number>: short description" \
