@@ -21,9 +21,9 @@ const (
 	HostBootDuration               HistogramName = "host.boot.duration"
 	HostGCSSyncDuration            HistogramName = "host.gcs_sync.duration"
 	HostHeartbeatLatency           HistogramName = "host.heartbeat.latency"
-	ManagerEndpointRequestDuration HistogramName = "firecracker_manager.endpoint.request.duration"
-	ManagerEndpointRequestSize     HistogramName = "firecracker_manager.endpoint.request.size"
-	ManagerEndpointResponseSize    HistogramName = "firecracker_manager.endpoint.response.size"
+	ManagerEndpointRequestDuration HistogramName = "capsule_manager.endpoint.request.duration"
+	ManagerEndpointRequestSize     HistogramName = "capsule_manager.endpoint.request.size"
+	ManagerEndpointResponseSize    HistogramName = "capsule_manager.endpoint.response.size"
 	CPWebhookLatency               HistogramName = "control_plane.webhook.latency"
 	CPAllocationLatency            HistogramName = "control_plane.allocation.latency"
 	CPQueueWait                    HistogramName = "control_plane.queue.wait"
@@ -46,7 +46,7 @@ const (
 	VMAllocations           CounterName = "vm.allocations"
 	VMTerminations          CounterName = "vm.terminations"
 	HostHeartbeatTotal      CounterName = "host.heartbeat.total"
-	ManagerEndpointRequests CounterName = "firecracker_manager.endpoint.requests"
+	ManagerEndpointRequests CounterName = "capsule_manager.endpoint.requests"
 	CPWebhookRequests       CounterName = "control_plane.webhook.requests"
 	CPAllocations           CounterName = "control_plane.allocations"
 	CPPlacementSelections   CounterName = "control_plane.placement.selections"
@@ -132,7 +132,7 @@ const (
 // UpDownCounter names.
 const (
 	CPEndpointRequestsInFlight      UpDownCounterName = "control_plane.endpoint.requests.inflight"
-	ManagerEndpointRequestsInFlight UpDownCounterName = "firecracker_manager.endpoint.requests.inflight"
+	ManagerEndpointRequestsInFlight UpDownCounterName = "capsule_manager.endpoint.requests.inflight"
 	HostRunnersIdle                 UpDownCounterName = "host.runners.idle"
 	HostRunnersBusy                 UpDownCounterName = "host.runners.busy"
 )
@@ -141,8 +141,8 @@ const (
 var counterDescriptions = map[CounterName]string{
 	VMAllocations:           "Total number of VM allocations",
 	VMTerminations:          "Total number of VM terminations",
-	HostHeartbeatTotal:      "Total host heartbeat attempts from firecracker-manager to the control plane",
-	ManagerEndpointRequests: "Total HTTP requests handled by firecracker-manager endpoints",
+	HostHeartbeatTotal:      "Total host heartbeat attempts from capsule-manager to the control plane",
+	ManagerEndpointRequests: "Total HTTP requests handled by capsule-manager endpoints",
 	CPWebhookRequests:       "Total webhook requests received by the control plane",
 	CPAllocations:           "Total VM allocations performed by the control plane",
 	CPPlacementSelections:   "Total control-plane placement decisions",
@@ -189,9 +189,9 @@ var histogramDescriptions = map[HistogramName]string{
 	HostBootDuration:               "Duration of host boot",
 	HostGCSSyncDuration:            "Duration of GCS sync operations",
 	HostHeartbeatLatency:           "Latency of host heartbeat",
-	ManagerEndpointRequestDuration: "End-to-end latency of a firecracker-manager HTTP endpoint request",
-	ManagerEndpointRequestSize:     "Size of the incoming HTTP request body handled by a firecracker-manager endpoint",
-	ManagerEndpointResponseSize:    "Size of the HTTP response body returned by a firecracker-manager endpoint",
+	ManagerEndpointRequestDuration: "End-to-end latency of a capsule-manager HTTP endpoint request",
+	ManagerEndpointRequestSize:     "Size of the incoming HTTP request body handled by a capsule-manager endpoint",
+	ManagerEndpointResponseSize:    "Size of the HTTP response body returned by a capsule-manager endpoint",
 	CPWebhookLatency:               "Latency of control plane webhook handling",
 	CPAllocationLatency:            "Latency of control plane VM allocation",
 	CPQueueWait:                    "Time spent waiting in the control plane queue",
@@ -295,7 +295,7 @@ var float64GaugeUnits = map[Float64GaugeName]string{}
 // Description and unit maps for up-down counters.
 var upDownCounterDescriptions = map[UpDownCounterName]string{
 	CPEndpointRequestsInFlight:      "Number of in-flight HTTP requests for control plane endpoints",
-	ManagerEndpointRequestsInFlight: "Number of in-flight HTTP requests for firecracker-manager endpoints",
+	ManagerEndpointRequestsInFlight: "Number of in-flight HTTP requests for capsule-manager endpoints",
 	HostRunnersIdle:                 "Number of idle runners on the host",
 	HostRunnersBusy:                 "Number of busy runners on the host",
 }

@@ -5,16 +5,16 @@ from unittest.mock import patch
 
 import pytest
 
-from bf_sdk._config import ConnectionConfig
-from bf_sdk._http import HttpClient
-from bf_sdk.models.layered_config import BuildResponse, CreateConfigResponse, StoredLayeredConfig
-from bf_sdk.models.runner import AllocateRunnerResponse
-from bf_sdk.models.workload import ResolvedWorkloadRef, WorkloadSummary
-from bf_sdk.resources.layered_configs import LayeredConfigs
-from bf_sdk.resources.runners import Runners
-from bf_sdk.resources.workloads import Workloads
-from bf_sdk.runner_config import RunnerConfig
-from bf_sdk.runner_session import RunnerSession
+from capsule_sdk._config import ConnectionConfig
+from capsule_sdk._http import HttpClient
+from capsule_sdk.models.layered_config import BuildResponse, CreateConfigResponse, StoredLayeredConfig
+from capsule_sdk.models.runner import AllocateRunnerResponse
+from capsule_sdk.models.workload import ResolvedWorkloadRef, WorkloadSummary
+from capsule_sdk.resources.layered_configs import LayeredConfigs
+from capsule_sdk.resources.runners import Runners
+from capsule_sdk.resources.workloads import Workloads
+from capsule_sdk.runner_config import RunnerConfig
+from capsule_sdk.runner_session import RunnerSession
 
 
 @pytest.fixture

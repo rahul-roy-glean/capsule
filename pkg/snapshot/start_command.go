@@ -1,12 +1,12 @@
 package snapshot
 
 // StartCommand describes a user service to run inside the microVM after snapshot restore.
-// The thaw-agent starts the command, waits for the health check to pass, then
+// The capsule-thaw-agent starts the command, waits for the health check to pass, then
 // forwards traffic from the host through to the service port.
 //
 // SOURCE OF TRUTH for the StartCommand struct shape.
 // Inline copies exist (with omitempty JSON tags for MMDS serialisation) in:
-//   - cmd/thaw-agent/main.go   — MMDSData.Latest.StartCommand (×2: waitForMMDS + fetchMMDSData)
+//   - cmd/capsule-thaw-agent/main.go   — MMDSData.Latest.StartCommand (×2: waitForMMDS + fetchMMDSData)
 //   - pkg/runner/types.go      — MMDSData.Latest.StartCommand
 //
 // Keep all copies in sync when adding/removing fields.

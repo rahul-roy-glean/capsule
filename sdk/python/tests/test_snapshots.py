@@ -5,10 +5,10 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from bf_sdk._config import ConnectionConfig
-from bf_sdk._http import HttpClient
-from bf_sdk.models.snapshot import Snapshot
-from bf_sdk.resources.snapshots import Snapshots
+from capsule_sdk._config import ConnectionConfig
+from capsule_sdk._http import HttpClient
+from capsule_sdk.models.snapshot import Snapshot
+from capsule_sdk.resources.snapshots import Snapshots
 
 
 @pytest.fixture

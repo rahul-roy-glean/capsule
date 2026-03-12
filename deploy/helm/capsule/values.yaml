@@ -1,0 +1,154 @@
+nameOverride: ""
+fullnameOverride: "control-plane"
+
+namespace:
+  create: false
+  name: capsule
+
+image:
+  # Required. Format: REGION-docker.pkg.dev/PROJECT_ID/REPO_NAME/IMAGE
+  repository: us-central1-docker.pkg.dev/your-project/capsule/capsule-control-plane
+  tag: latest
+  pullPolicy: Always
+
+replicaCount: 1
+
+serviceAccount:
+  create: true
+  name: "control-plane"
+  annotations: {}
+  # Example:
+  # annotations:
+  #   iam.gke.io/gcp-service-account: capsule-dev-control-plane@your-project.iam.gserviceaccount.com
+
+podAnnotations: {}
+
+podLabels: {}
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+
+securityContext: {}
+containerSecurityContext: {}
+
+config:
+  # Used by the control plane for snapshot versioning/artifacts.
+  gcsBucket: your-project-capsule-snapshots
+  
+  # GCP project ID for telemetry and GCP API calls
+  gcpProject: your-project
+  
+  # Environment name (dev, staging, prod) for telemetry labels
+  environment: dev
+
+  # Optional: used for future config expansion; control-plane currently reads env vars.
+  configYaml: |
+    grpc_port: 50051
+    http_port: 8080
+    log_level: info
+
+    scheduler:
+      idle_target: 2
+      max_queue_depth: 100
+
+    snapshot:
+      freshness_check_interval: 1h
+      max_age: 24h
+      canary_percentage: 10
+
+env:
+  # Database connection (via Secret)
+  db:
+    secretName: db-credentials
+    hostKey: host
+    usernameKey: username
+    passwordKey: password
+    name: capsule
+    sslMode: require
+
+auth:
+  apiToken:
+    secretName: ""
+    key: token
+  hostBootstrapToken:
+    secretName: ""
+    key: token
+
+gcp:
+  # Required for safe scale-down and snapshot builder VMs.
+  projectId: your-project
+  region: us-central1
+  zone: us-central1-a
+  hostMigName: capsule-dev-hosts
+  hostAutoscalerName: capsule-dev-hosts-autoscaler
+  # Optional. Set when the default network is unavailable or when builder VMs
+  # must run inside the same VPC as the rest of the deployment.
+  builderNetwork: ""
+  # Optional. Subnet for builder VMs. Required when using a custom-mode VPC.
+  builderSubnet: ""
+  # Optional. Override the image used for snapshot-builder/layer-builder VMs.
+  # By default the control plane uses the `capsule-host` image family.
+  builderImage: ""
+  # Optional. If set, builder VMs use this service account instead of the
+  # project's default compute service account.
+  builderServiceAccount: ""
+
+otelCollector:
+  # Deploy OTel Collector as a sidecar alongside the control-plane container
+  enabled: true
+  image:
+    repository: otel/opentelemetry-collector-contrib
+    tag: latest
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+downscaler:
+  enabled: true
+  interval: 60s
+  maxDeletes: 1
+  maxDrains: 1
+  heartbeatStale: 90s
+
+service:
+  type: LoadBalancer
+  annotations:
+    networking.gke.io/load-balancer-type: "Internal"
+  ports:
+    grpc: 50051
+    http: 8080
+
+ingress:
+  enabled: false
+  className: gce
+  annotations: {}
+  # Example:
+  # annotations:
+  #   kubernetes.io/ingress.global-static-ip-name: capsule-control-plane-ip
+  hosts:
+    - host: runners.example.com
+      paths:
+        - path: /api
+          pathType: Prefix
+  tls: []
+
+autoscaling:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 1
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+

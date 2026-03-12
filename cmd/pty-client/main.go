@@ -1,5 +1,5 @@
 // pty-client connects to a runner's PTY WebSocket and provides an interactive
-// terminal session. It speaks the binary frame protocol used by the thaw-agent:
+// terminal session. It speaks the binary frame protocol used by the capsule-thaw-agent:
 //
 //	0x00  client→server  stdin
 //	0x01  server→client  stdout

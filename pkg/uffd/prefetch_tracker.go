@@ -8,7 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
 )
 
 // PrefetchEntry records a single page fault with its access order.

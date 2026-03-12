@@ -29,8 +29,8 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sys/unix"
 
-	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	fcrotel "github.com/rahul-roy-glean/capsule/pkg/otel"
+	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
 )
 
 // GuestRegionUFFDMapping represents a mapping between a VM memory address

@@ -99,7 +99,7 @@ resource "google_compute_firewall" "iap_ssh" {
   }
 
   source_ranges = ["35.235.240.0/20"] # IAP IP range
-  target_tags   = ["firecracker-host"]
+  target_tags   = ["capsule-host"]
 }
 
 # Allow health checks from GCP
@@ -117,7 +117,7 @@ resource "google_compute_firewall" "health_checks" {
     "35.191.0.0/16",   # GCP health check IPs
   ]
 
-  target_tags = ["firecracker-host"]
+  target_tags = ["capsule-host"]
 }
 
 # Allow gRPC from GKE to hosts
@@ -131,7 +131,7 @@ resource "google_compute_firewall" "grpc" {
   }
 
   source_ranges = [var.gke_pods_cidr]
-  target_tags   = ["firecracker-host"]
+  target_tags   = ["capsule-host"]
 }
 
 # Private service connection for Cloud SQL

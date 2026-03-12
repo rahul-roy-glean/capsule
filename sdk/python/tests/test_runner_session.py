@@ -5,12 +5,12 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from bf_sdk._config import ConnectionConfig
-from bf_sdk._errors import BFHTTPError
-from bf_sdk._http import HttpClient
-from bf_sdk.models.runner import ExecEvent, ExecResult
-from bf_sdk.resources.runners import Runners
-from bf_sdk.runner_session import RunnerSession
+from capsule_sdk._config import ConnectionConfig
+from capsule_sdk._errors import CapsuleHTTPError
+from capsule_sdk._http import HttpClient
+from capsule_sdk.models.runner import ExecEvent, ExecResult
+from capsule_sdk.resources.runners import Runners
+from capsule_sdk.runner_session import RunnerSession
 
 
 @pytest.fixture
@@ -44,7 +44,7 @@ class TestRunnerSession:
 
     def test_context_manager_preserves_original_exception(self, runners: Runners) -> None:
         session = RunnerSession(runners, "r-1")
-        with patch.object(runners, "release", side_effect=BFHTTPError(500, "boom")):
+        with patch.object(runners, "release", side_effect=CapsuleHTTPError(500, "boom")):
             with pytest.raises(ValueError):
                 with session:
                     raise ValueError("user failure")

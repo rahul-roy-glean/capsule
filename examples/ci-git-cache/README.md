@@ -1,12 +1,17 @@
-# Example: CI with Git-Cache Reference Cloning
+# Example: CI With Git Cache
 
-This example demonstrates how a git-cache for fast `actions/checkout` is
-expressed using only `DriveSpec` + `SnapshotCommand`. No platform code changes
-needed.
+Use this example when you want faster repository checkout by seeding a git cache
+into the VM and cloning with `git clone --reference`.
 
-## How it works: `DriveSpec`
+## What This Example Does
 
-### The drive
+This pattern creates a read-only drive containing one or more mirrored
+repositories. At runtime, the workload clones from the network only for objects
+that are not already present in the seeded cache.
+
+## Core Idea
+
+The cache drive is declared in config:
 
 ```yaml
 drives:
@@ -15,50 +20,44 @@ drives:
     size_gb: 10
     read_only: true
     mount_path: "/mnt/git-cache"
-    commands:
-      - type: "shell"
-        args: ["bash", "-c", "git clone --mirror https://github.com/myorg/myrepo /mnt/git-cache/myrepo"]
 ```
 
-That's it. Snapshot-builder creates the ext4 image, runs `git clone --mirror`
-inside it during warmup, chunks it, and stores it in GCS. At runtime, the
-manager attaches it as an extension drive. Thaw-agent auto-mounts it by label at
-`/mnt/git-cache`.
-
-### The workspace setup
+Then the workload uses it from an `init_command`:
 
 ```yaml
 init_commands:
   - type: "shell"
     args: ["bash", "-c", "git clone --reference /mnt/git-cache/myrepo ..."]
-    run_as_root: true
 ```
 
-This replaces `setupWorkspaceFromGitCache()`. The `git clone --reference` command
-is the same one the old function ran — it's just expressed as a command instead
-of being hardcoded in Go.
+## Why Use This Pattern
 
-### What about drive metadata?
+- faster checkout for repeated builds
+- lower network usage
+- explicit cache behavior in config rather than hardcoded platform logic
+- easy extension to other cache-like mounted content
 
-Not needed. The drive's `mount_path` tells thaw-agent where to mount it. The
-`init_commands` know where the cache is because the config author wrote the
-paths. There's no need for a separate metadata struct to pass information that's
-already in the config.
+## What You Need To Edit
 
-## Why this is better
+Before using this example, update:
 
-1. **Adding a new cache type** (e.g., Docker layer cache, npm cache) is just
-   another `DriveSpec` — no platform code changes
-2. **Adding repos to the cache** is editing `commands` — no flag changes
-3. **The workspace setup logic is visible and editable** — it's a shell command
-   in the config, not buried in 80 lines of Go in `cmd/thaw-agent/main.go`
-4. **No URL hardcoding** -- the old approach hardcoded `https://github.com/`
-   in the remote URL rewrite
+- `platform.gcp_project`
+- the mirrored repository URLs
+- the clone destination
+- any additional cache population commands
 
 ## Onboard
 
 ```bash
 cp examples/ci-git-cache/onboard.yaml my-git-cache.yaml
-# Edit my-git-cache.yaml: set platform.gcp_project and workload values
+# Edit the fields described above
 make onboard CONFIG=my-git-cache.yaml
 ```
+
+## Good Fit
+
+This example is a good starting point for:
+
+- GitHub Actions or other CI runners that repeatedly clone the same repo
+- mono-repo build environments
+- workloads that benefit from read-only seed content attached as a drive

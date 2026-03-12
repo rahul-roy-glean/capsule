@@ -9,14 +9,14 @@ import (
 	"os/exec"
 	"time"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
 	"github.com/sirupsen/logrus"
 )
 
 func stepSnapshotBuild(cfg *Config, logger *logrus.Logger, planOnly bool) error {
 	log := logger.WithField("step", "snapshot-build")
 
-	gcsBucket := fmt.Sprintf("%s-firecracker-snapshots", cfg.Platform.GCPProject)
+	gcsBucket := fmt.Sprintf("%s-capsule-snapshots", cfg.Platform.GCPProject)
 	layeredCfg := cfg.ToLayeredConfig()
 	if err := snapshot.ValidateLayeredConfig(layeredCfg); err != nil {
 		return fmt.Errorf("invalid layered workload config: %w", err)
@@ -27,7 +27,7 @@ func stepSnapshotBuild(cfg *Config, logger *logrus.Logger, planOnly bool) error 
 		fmt.Printf("  GCS bucket:     %s\n", gcsBucket)
 		fmt.Printf("  Base image:     %s\n", layeredCfg.BaseImage)
 		fmt.Printf("  Layers:         %d\n", len(layeredCfg.Layers))
-		fmt.Printf("  Build assets:   snapshot-builder, thaw-agent, rootfs.img, kernel.bin\n")
+		fmt.Printf("  Build assets:   snapshot-builder, capsule-thaw-agent, rootfs.img, kernel.bin\n")
 		fmt.Printf("  vCPUs: %d, Memory: %dMB\n", cfg.MicroVM.VCPUs, cfg.MicroVM.MemoryMB)
 		if len(cfg.Workload.StartCommand.Command) > 0 {
 			fmt.Printf("  Start command:  %s\n", cfg.Workload.StartCommand.Command[0])
@@ -37,7 +37,7 @@ func stepSnapshotBuild(cfg *Config, logger *logrus.Logger, planOnly bool) error 
 	}
 
 	log.Info("Building and staging builder artifacts...")
-	buildCmd := exec.Command("make", "snapshot-builder", "thaw-agent", "rootfs")
+	buildCmd := exec.Command("make", "snapshot-builder", "capsule-thaw-agent", "rootfs")
 	if err := runCommandStreaming(buildCmd); err != nil {
 		return fmt.Errorf("failed to build builder artifacts: %w", err)
 	}
@@ -48,7 +48,7 @@ func stepSnapshotBuild(cfg *Config, logger *logrus.Logger, planOnly bool) error 
 		dst string
 	}{
 		{"bin/snapshot-builder", artifactPrefix + "/snapshot-builder"},
-		{"bin/thaw-agent", artifactPrefix + "/thaw-agent"},
+		{"bin/capsule-thaw-agent", artifactPrefix + "/capsule-thaw-agent"},
 		{"images/microvm/output/rootfs.img", artifactPrefix + "/rootfs.img"},
 		{"images/microvm/output/kernel.bin", artifactPrefix + "/kernel.bin"},
 	} {

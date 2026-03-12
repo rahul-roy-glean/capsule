@@ -28,12 +28,12 @@ provider "google-beta" {
 }
 
 locals {
-  name_prefix = "fc-runner-${var.environment}"
+  name_prefix = "capsule-${var.environment}"
 
   labels = {
     environment = var.environment
     managed_by  = "terraform"
-    project     = "firecracker-bazel-runner"
+    project     = "capsule"
   }
 }
 
@@ -58,7 +58,7 @@ resource "google_project_service" "apis" {
 
 # GCS bucket for snapshot artifacts
 resource "google_storage_bucket" "snapshots" {
-  name          = "${var.project_id}-firecracker-snapshots"
+  name          = "${var.project_id}-capsule-snapshots"
   location      = var.region
   storage_class = "STANDARD"
   force_destroy = true  # Set to false in production

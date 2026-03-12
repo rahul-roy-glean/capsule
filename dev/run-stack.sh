@@ -1,5 +1,5 @@
 #!/bin/bash
-# Start the control-plane + firecracker-manager stack.
+# Start the control-plane + capsule-manager stack.
 # Usage: make dev-stack
 set -euo pipefail
 
@@ -30,18 +30,18 @@ if [ ! -f "$SNAPSHOT_DIR/kernel.bin" ]; then
   exit 1
 fi
 
-if [ ! -f "$REPO_ROOT/bin/control-plane" ]; then
-  echo "FAIL: bin/control-plane not found. Run 'make dev-build' first."
+if [ ! -f "$REPO_ROOT/bin/capsule-control-plane" ]; then
+  echo "FAIL: bin/capsule-control-plane not found. Run 'make dev-build' first."
   exit 1
 fi
 
-if [ ! -f "$REPO_ROOT/bin/firecracker-manager" ]; then
-  echo "FAIL: bin/firecracker-manager not found. Run 'make dev-build' first."
+if [ ! -f "$REPO_ROOT/bin/capsule-manager" ]; then
+  echo "FAIL: bin/capsule-manager not found. Run 'make dev-build' first."
   exit 1
 fi
 
 # --- Stop existing processes if running ---
-if [ -f "$PID_DIR/control-plane.pid" ] || [ -f "$PID_DIR/firecracker-manager.pid" ]; then
+if [ -f "$PID_DIR/control-plane.pid" ] || [ -f "$PID_DIR/capsule-manager.pid" ]; then
   echo "Stopping existing stack..."
   bash "$(dirname "$0")/stop-stack.sh" 2>/dev/null || true
 fi
@@ -50,7 +50,7 @@ fi
 # After a manager crash or unclean shutdown the control-plane may have hosts
 # stuck as 'unhealthy' or 'draining'. Reset so the restarted manager can
 # re-register as 'ready'.
-sudo -u postgres psql -d firecracker_runner -c \
+sudo -u postgres psql -d capsule -c \
   "UPDATE hosts SET status = 'ready' WHERE status IN ('unhealthy', 'draining');" \
   > /dev/null 2>&1 || true
 
@@ -70,18 +70,18 @@ echo ""
 echo "=== Starting control-plane ==="
 OTEL_EXPORTER_OTLP_ENDPOINT="$OTEL_ENDPOINT" \
 ENVIRONMENT=dev \
-nohup ./bin/control-plane \
+nohup ./bin/capsule-control-plane \
   --db-host=localhost \
   --db-user=postgres \
   --db-password="${DB_PASSWORD:-postgres}" \
-  --db-name=firecracker_runner \
+  --db-name=capsule \
   --db-ssl-mode=disable \
   --http-port=8080 \
   --grpc-port=50051 \
-  > "$LOG_DIR/control-plane.log" 2>&1 &
+  > "$LOG_DIR/capsule-control-plane.log" 2>&1 &
 CP_PID=$!
 echo "$CP_PID" > "$PID_DIR/control-plane.pid"
-echo "control-plane PID: $CP_PID (log: $LOG_DIR/control-plane.log)"
+echo "control-plane PID: $CP_PID (log: $LOG_DIR/capsule-control-plane.log)"
 
 # Wait for control-plane health
 echo -n "Waiting for control-plane..."
@@ -93,16 +93,16 @@ for i in $(seq 1 30); do
   if [ "$i" = "30" ]; then
     echo " FAIL: control-plane did not become healthy in 30s"
     echo "Last log lines:"
-    tail -20 "$LOG_DIR/control-plane.log"
+    tail -20 "$LOG_DIR/capsule-control-plane.log"
     exit 1
   fi
   echo -n "."
   sleep 1
 done
 
-# --- Start firecracker-manager ---
+# --- Start capsule-manager ---
 echo ""
-echo "=== Starting firecracker-manager ==="
+echo "=== Starting capsule-manager ==="
 
 # In local dev /tmp/fc-dev is not a real mount point; bind-mount it so the
 # manager's data-mount readiness check passes.
@@ -113,7 +113,7 @@ fi
 # Build the full command as an array, then pass to sudo.
 GCS_BUCKET=${GCS_BUCKET:-${SESSION_CHUNK_BUCKET:-}}
 
-MGR_CMD="$REPO_ROOT/bin/firecracker-manager \
+MGR_CMD="$REPO_ROOT/bin/capsule-manager \
   --http-port=9080 \
   --grpc-port=50052 \
   --snapshot-cache=$SNAPSHOT_DIR \
@@ -132,24 +132,24 @@ else
   MGR_CMD="$MGR_CMD --snapshot-bucket=local-dev"
 fi
 
-sudo bash -c "export OTEL_EXPORTER_OTLP_ENDPOINT='$OTEL_ENDPOINT' ENVIRONMENT=dev; nohup $MGR_CMD > $LOG_DIR/firecracker-manager.log 2>&1 &
-echo \$! > /tmp/fc-dev/pids/firecracker-manager.pid"
+sudo bash -c "export OTEL_EXPORTER_OTLP_ENDPOINT='$OTEL_ENDPOINT' ENVIRONMENT=dev; nohup $MGR_CMD > $LOG_DIR/capsule-manager.log 2>&1 &
+echo \$! > /tmp/fc-dev/pids/capsule-manager.pid"
 # Give sudo a moment to fork
 sleep 1
-MGR_PID=$(cat "$PID_DIR/firecracker-manager.pid" 2>/dev/null || echo "unknown")
-echo "firecracker-manager PID: $MGR_PID (log: $LOG_DIR/firecracker-manager.log)"
+MGR_PID=$(cat "$PID_DIR/capsule-manager.pid" 2>/dev/null || echo "unknown")
+echo "capsule-manager PID: $MGR_PID (log: $LOG_DIR/capsule-manager.log)"
 
-# Wait for firecracker-manager health
-echo -n "Waiting for firecracker-manager..."
+# Wait for capsule-manager health
+echo -n "Waiting for capsule-manager..."
 for i in $(seq 1 30); do
   if curl -sf http://localhost:9080/health > /dev/null 2>&1; then
     echo " ready (${i}s)"
     break
   fi
   if [ "$i" = "30" ]; then
-    echo " FAIL: firecracker-manager did not become healthy in 30s"
+    echo " FAIL: capsule-manager did not become healthy in 30s"
     echo "Last log lines:"
-    tail -20 "$LOG_DIR/firecracker-manager.log"
+    tail -20 "$LOG_DIR/capsule-manager.log"
     exit 1
   fi
   echo -n "."
@@ -162,4 +162,4 @@ echo "  Control Plane:       http://localhost:8080"
 echo "  Firecracker Manager: http://localhost:9080"
 echo "  Logs:                $LOG_DIR/"
 echo ""
-echo "Run 'make dev-test-pause-resume' to test sessions, 'make dev-stop' to stop."
+echo "Run 'make dev-test-file-ops' for a quick smoke test or 'GCS_BUCKET=<bucket> make dev-test-gcs-pause-resume' for session coverage."

@@ -17,12 +17,12 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/fuse"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/network"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/uffd"
+	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
+	"github.com/rahul-roy-glean/capsule/pkg/firecracker"
+	"github.com/rahul-roy-glean/capsule/pkg/fuse"
+	"github.com/rahul-roy-glean/capsule/pkg/network"
+	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
+	"github.com/rahul-roy-glean/capsule/pkg/uffd"
 )
 
 type chunkedVM interface {
@@ -55,7 +55,7 @@ type ChunkedManager struct {
 	// "chunked" forces UFFD, "file" forces file-backed, "" uses metadata.
 	memBackend string
 
-	// readyTimeout is the max wait time for thaw-agent health check
+	// readyTimeout is the max wait time for capsule-thaw-agent health check
 	readyTimeout time.Duration
 
 	// cachePopulateGroup deduplicates concurrent downloads of the same local
@@ -95,7 +95,7 @@ type ChunkedManagerConfig struct {
 	// snapshot metadata says, allowing rollback without rebuilding snapshots.
 	MemBackend string
 
-	// ReadyTimeout is the maximum time to wait for the thaw-agent health
+	// ReadyTimeout is the maximum time to wait for the capsule-thaw-agent health
 	// endpoint to return HTTP 200 after VM restore. If the agent doesn't
 	// become healthy within this window the VM is killed and the allocation
 	// fails (default 10s).
@@ -515,7 +515,7 @@ func (cm *ChunkedManager) restoreAndActivateRunner(
 	if err := cm.waitForRunnerReady(ctx, runner.InternalIP.String(), readyTimeout); err != nil {
 		cm.chunkedLogger.WithError(err).WithField("runner_id", runnerID).Error("Thaw-agent failed ready check, killing VM")
 		vm.Stop()
-		return nil, proxy, fmt.Errorf("thaw-agent not ready after %v: %w", readyTimeout, err)
+		return nil, proxy, fmt.Errorf("capsule-thaw-agent not ready after %v: %w", readyTimeout, err)
 	}
 
 	return vm, proxy, nil
@@ -708,7 +708,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	// immediately read the superblock, block group descriptors, and journal.
 	// With FUSE-backed disks these reads block on GCS fetches; if 4 VMs all
 	// resume simultaneously the chunk store is overwhelmed and the guest vCPU
-	// stalls for >20s triggering a soft lockup watchdog before thaw-agent
+	// stalls for >20s triggering a soft lockup watchdog before capsule-thaw-agent
 	// can register with GitHub Actions.
 	//
 	// Prefetching the first 16 chunks (64MB @ 4MB/chunk) covers:
@@ -1191,7 +1191,7 @@ func (cm *ChunkedManager) Close() error {
 	return cm.Manager.Close()
 }
 
-// waitForThawAgent polls the thaw-agent /alive endpoint until it returns
+// waitForThawAgent polls the capsule-thaw-agent /alive endpoint until it returns
 // HTTP 200 or the timeout expires. This ensures the VM is functional after
 // snapshot restore before we expose it to the scheduler.
 func (cm *ChunkedManager) waitForThawAgent(ctx context.Context, ip string, timeout time.Duration) error {
@@ -1222,7 +1222,7 @@ func (cm *ChunkedManager) waitForThawAgent(ctx context.Context, ip string, timeo
 		}
 	}
 
-	return fmt.Errorf("thaw-agent at %s did not become ready within %v", aliveURL, timeout)
+	return fmt.Errorf("capsule-thaw-agent at %s did not become ready within %v", aliveURL, timeout)
 }
 
 // GetChunkedMetadata returns the loaded chunked snapshot metadata (may be nil).

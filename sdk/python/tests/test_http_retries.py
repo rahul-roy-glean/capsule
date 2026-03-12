@@ -5,18 +5,18 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from bf_sdk._config import ConnectionConfig
-from bf_sdk._errors import (
-    BFAuthError,
-    BFConnectionError,
-    BFHTTPError,
-    BFNotFound,
-    BFRateLimited,
-    BFRequestTimeoutError,
-    BFServiceUnavailable,
+from capsule_sdk._config import ConnectionConfig
+from capsule_sdk._errors import (
+    CapsuleAuthError,
+    CapsuleConnectionError,
+    CapsuleHTTPError,
+    CapsuleNotFound,
+    CapsuleRateLimited,
+    CapsuleRequestTimeoutError,
+    CapsuleServiceUnavailable,
 )
-from bf_sdk._http import HttpClient
-from bf_sdk.resources.runners import Runners
+from capsule_sdk._http import HttpClient
+from capsule_sdk.resources.runners import Runners
 
 
 @pytest.fixture
@@ -49,29 +49,29 @@ class TestHttpClient:
     def test_401_raises_auth_error(self, http: HttpClient) -> None:
         mock_resp = httpx.Response(401, json={"error": "bad key"})
         with patch.object(http._client, "request", return_value=mock_resp):
-            with pytest.raises(BFAuthError) as exc_info:
+            with pytest.raises(CapsuleAuthError) as exc_info:
                 http.get("/api/v1/runners")
             assert exc_info.value.status_code == 401
 
     def test_404_raises_not_found(self, http: HttpClient) -> None:
         mock_resp = httpx.Response(404, json={"error": "runner not found"})
         with patch.object(http._client, "request", return_value=mock_resp):
-            with pytest.raises(BFNotFound):
+            with pytest.raises(CapsuleNotFound):
                 http.get("/api/v1/runners/status")
 
     def test_429_retries_then_raises(self, http: HttpClient) -> None:
         mock_resp = httpx.Response(429, json={"error": "rate limited"}, headers={"Retry-After": "0"})
         with patch.object(http._client, "request", return_value=mock_resp) as request:
-            with patch("bf_sdk._http.time.sleep"):  # skip actual sleep
-                with pytest.raises(BFRateLimited):
+            with patch("capsule_sdk._http.time.sleep"):  # skip actual sleep
+                with pytest.raises(CapsuleRateLimited):
                     http.get("/api/v1/runners")
         assert request.call_count == 4
 
     def test_503_retries_then_raises(self, http: HttpClient) -> None:
         mock_resp = httpx.Response(503, json={"error": "unavailable"}, headers={"Retry-After": "0"})
         with patch.object(http._client, "request", return_value=mock_resp) as request:
-            with patch("bf_sdk._http.time.sleep"):
-                with pytest.raises(BFServiceUnavailable) as exc_info:
+            with patch("capsule_sdk._http.time.sleep"):
+                with pytest.raises(CapsuleServiceUnavailable) as exc_info:
                     http.get("/api/v1/runners/status")
                 assert exc_info.value.status_code == 503
         assert request.call_count == 4
@@ -79,29 +79,29 @@ class TestHttpClient:
     def test_500_raises_http_error(self, http: HttpClient) -> None:
         mock_resp = httpx.Response(500, json={"error": "internal"})
         with patch.object(http._client, "request", return_value=mock_resp) as request:
-            with pytest.raises(BFHTTPError) as exc_info:
+            with pytest.raises(CapsuleHTTPError) as exc_info:
                 http.post("/api/v1/runners/release", json_body={"runner_id": "r-1"})
             assert exc_info.value.status_code == 500
         assert request.call_count == 1
 
     def test_connection_error_retries(self, http: HttpClient) -> None:
         with patch.object(http._client, "request", side_effect=httpx.ConnectError("refused")) as request:
-            with patch("bf_sdk._http.time.sleep"):
-                with pytest.raises(BFConnectionError):
+            with patch("capsule_sdk._http.time.sleep"):
+                with pytest.raises(CapsuleConnectionError):
                     http.get("/api/v1/runners")
         assert request.call_count == 4
 
     def test_timeout_error_retries(self, http: HttpClient) -> None:
         with patch.object(http._client, "request", side_effect=httpx.ReadTimeout("timeout")) as request:
-            with patch("bf_sdk._http.time.sleep"):
-                with pytest.raises(BFRequestTimeoutError):
+            with patch("capsule_sdk._http.time.sleep"):
+                with pytest.raises(CapsuleRequestTimeoutError):
                     http.get("/api/v1/runners")
         assert request.call_count == 4
 
     def test_post_timeout_does_not_retry_by_default(self, http: HttpClient) -> None:
         with patch.object(http._client, "request", side_effect=httpx.ReadTimeout("timeout")) as request:
-            with patch("bf_sdk._http.time.sleep"):
-                with pytest.raises(BFRequestTimeoutError):
+            with patch("capsule_sdk._http.time.sleep"):
+                with pytest.raises(CapsuleRequestTimeoutError):
                     http.post("/api/v1/runners/release", json_body={"runner_id": "r-1"})
         assert request.call_count == 1
 
@@ -109,7 +109,7 @@ class TestHttpClient:
         fail_resp = httpx.Response(503, json={"error": "unavailable"}, headers={"Retry-After": "0"})
         ok_resp = httpx.Response(200, json={"status": "ok"})
         with patch.object(http._client, "request", side_effect=[fail_resp, ok_resp]):
-            with patch("bf_sdk._http.time.sleep"):
+            with patch("capsule_sdk._http.time.sleep"):
                 result = http.get("/api/v1/runners/status")
         assert result["status"] == "ok"
         assert result["request_id"]
@@ -123,7 +123,7 @@ class TestHttpClient:
     def test_post_429_does_not_retry_by_default(self, http: HttpClient) -> None:
         mock_resp = httpx.Response(429, json={"error": "rate limited"}, headers={"Retry-After": "0"})
         with patch.object(http._client, "request", return_value=mock_resp) as request:
-            with pytest.raises(BFRateLimited):
+            with pytest.raises(CapsuleRateLimited):
                 http.post("/api/v1/runners/release", json_body={"runner_id": "r-1"})
         assert request.call_count == 1
 
@@ -135,7 +135,7 @@ class TestAllocateRetries:
         ok_resp = httpx.Response(200, json={"runner_id": "r-1", "host_address": "10.0.0.1:8080"})
 
         with patch.object(http._client, "request", side_effect=[fail_resp, ok_resp]) as request:
-            with patch("bf_sdk.resources.runners.time.sleep"):
+            with patch("capsule_sdk.resources.runners.time.sleep"):
                 result = runners.allocate("wk-1", request_id="req-fixed", startup_timeout=2.0)
 
         assert result.runner_id == "r-1"

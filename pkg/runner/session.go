@@ -13,10 +13,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/firecracker"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/uffd"
+	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
+	"github.com/rahul-roy-glean/capsule/pkg/firecracker"
+	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
+	"github.com/rahul-roy-glean/capsule/pkg/uffd"
 )
 
 const (
@@ -1133,10 +1133,10 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	// Set up port forwarding for netns
 	if m.netnsNetwork != nil {
 		if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentHealthPort); err != nil {
-			m.logger.WithError(err).Warn("Failed to forward thaw-agent health port")
+			m.logger.WithError(err).Warn("Failed to forward capsule-thaw-agent health port")
 		}
 		if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentDebugPort); err != nil {
-			m.logger.WithError(err).Warn("Failed to forward thaw-agent debug port")
+			m.logger.WithError(err).Warn("Failed to forward capsule-thaw-agent debug port")
 		}
 		if metadata.ServicePort > 0 {
 			if err := m.netnsNetwork.ForwardPort(runnerID, metadata.ServicePort); err != nil {
@@ -1213,7 +1213,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	m.mu.Unlock()
 	lease.Commit()
 
-	// Inject MMDS data BEFORE resuming so the thaw-agent sees fresh config
+	// Inject MMDS data BEFORE resuming so the capsule-thaw-agent sees fresh config
 	allocReq := AllocateRequest{
 		WorkloadKey: metadata.WorkloadKey,
 	}
@@ -1227,7 +1227,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		m.logger.WithError(err).Warn("Failed to set MMDS data on resumed runner")
 	}
 
-	// Now resume the VM — thaw-agent will read the fresh MMDS data
+	// Now resume the VM — capsule-thaw-agent will read the fresh MMDS data
 	if err := vm.Resume(ctx); err != nil {
 		vm.Stop()
 		uffdHandler.Stop()

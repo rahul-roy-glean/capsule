@@ -29,8 +29,8 @@ import (
 	"golang.org/x/time/rate"
 	"google.golang.org/api/googleapi"
 
-	fcrotel "github.com/rahul-roy-glean/bazel-firecracker/pkg/otel"
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/util/boundedstack"
+	fcrotel "github.com/rahul-roy-glean/capsule/pkg/otel"
+	"github.com/rahul-roy-glean/capsule/pkg/util/boundedstack"
 )
 
 const (
@@ -99,7 +99,7 @@ type ChunkedSnapshotMetadata struct {
 	ExtensionDrives map[string]ExtensionDrive `json:"extension_drives,omitempty"`
 	// RootfsSourceHash is a SHA-256 fingerprint of the effective rootfs
 	// provenance inputs used to build this snapshot, such as the source
-	// rootfs image or base-image configuration, thaw-agent binary, and any
+	// rootfs image or base-image configuration, capsule-thaw-agent binary, and any
 	// requested resize. Used by restore paths to detect rootfs changes and
 	// fall back to cold boot when resuming would use stale rootfs content.
 	RootfsSourceHash string `json:"rootfs_source_hash,omitempty"`

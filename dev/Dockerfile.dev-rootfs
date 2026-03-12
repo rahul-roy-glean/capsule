@@ -1,16 +1,16 @@
 # Minimal dev rootfs for local Firecracker testing (~150-200MB).
-# Contains only systemd + thaw-agent + basic utils.
+# Contains only systemd + capsule-thaw-agent + basic utils.
 # No Go, Java, Node, Python, Bazel, GitHub runner, SSH, or git.
 
-# --- Stage 1: build thaw-agent ---
+# --- Stage 1: build capsule-thaw-agent ---
 FROM golang:1.24 AS builder
 
 WORKDIR /build
 COPY go.mod go.sum ./
-COPY cmd/thaw-agent/ ./cmd/thaw-agent/
+COPY cmd/capsule-thaw-agent/ ./cmd/capsule-thaw-agent/
 COPY pkg/ ./pkg/
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o /thaw-agent ./cmd/thaw-agent
+RUN CGO_ENABLED=0 GOOS=linux go build -o /capsule-thaw-agent ./cmd/capsule-thaw-agent
 
 # --- Stage 2: minimal rootfs ---
 FROM debian:bookworm-slim
@@ -33,7 +33,7 @@ RUN useradd -m -s /bin/bash -G sudo runner \
     && echo "runner ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/runner
 
 # Create workspace directory
-RUN mkdir -p /workspace /var/run/thaw-agent /var/log/thaw-agent \
+RUN mkdir -p /workspace /var/run/capsule-thaw-agent /var/log/capsule-thaw-agent \
     && chown -R runner:runner /workspace
 
 # Configure systemd
@@ -46,12 +46,12 @@ RUN systemctl set-default multi-user.target \
         sys-kernel-debug.mount \
         sys-kernel-tracing.mount
 
-# Configure network (static IP set by thaw-agent via MMDS)
+# Configure network (static IP set by capsule-thaw-agent via MMDS)
 COPY images/microvm/rootfs/etc/systemd/network/10-eth0.network /etc/systemd/network/
 RUN systemctl enable systemd-networkd
 
-# Install thaw-agent binary
-COPY --from=builder /thaw-agent /usr/local/bin/thaw-agent
+# Install capsule-thaw-agent binary
+COPY --from=builder /capsule-thaw-agent /usr/local/bin/capsule-thaw-agent
 
 # Thaw-agent systemd service — use runner user, skip features not needed for dev
 RUN printf '[Unit]\n\
@@ -61,7 +61,7 @@ Wants=network.target\n\
 \n\
 [Service]\n\
 Type=simple\n\
-ExecStart=/usr/local/bin/thaw-agent\n\
+ExecStart=/usr/local/bin/capsule-thaw-agent\n\
 Restart=on-failure\n\
 RestartSec=2\n\
 StandardOutput=journal\n\
@@ -70,8 +70,8 @@ Environment=LOG_LEVEL=debug\n\
 Environment=HOME=/root\n\
 \n\
 [Install]\n\
-WantedBy=multi-user.target\n' > /etc/systemd/system/thaw-agent.service \
-    && systemctl enable thaw-agent.service
+WantedBy=multi-user.target\n' > /etc/systemd/system/capsule-thaw-agent.service \
+    && systemctl enable capsule-thaw-agent.service
 
 # Serial console
 RUN echo "ttyS0" >> /etc/securetty \

@@ -361,7 +361,7 @@ func (c *Client) waitForSocketOrExit(ctx context.Context, timeout time.Duration,
 
 // StartFirecracker starts the Firecracker process.
 // If consolePath is non-empty, the guest serial console output (stdout/stderr)
-// is captured to that file, which includes kernel messages and thaw-agent logs.
+// is captured to that file, which includes kernel messages and capsule-thaw-agent logs.
 func (c *Client) StartFirecracker(ctx context.Context, firecrackerBin string, consolePath string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -420,7 +420,7 @@ func (c *Client) StartFirecracker(ctx context.Context, firecrackerBin string, co
 		Setsid: true,
 	}
 
-	// Capture guest serial console output (kernel + thaw-agent logs via console=ttyS0)
+	// Capture guest serial console output (kernel + capsule-thaw-agent logs via console=ttyS0)
 	if consolePath != "" {
 		if err := os.MkdirAll(filepath.Dir(consolePath), 0755); err != nil {
 			c.logger.WithError(err).Warn("Failed to create console log directory")

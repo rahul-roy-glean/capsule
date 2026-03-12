@@ -76,7 +76,7 @@ if $READY; then
 else
   fail "Runner did not become ready in 60s"
   echo "Manager log tail:"
-  tail -30 /tmp/fc-dev/logs/firecracker-manager.log
+  tail -30 /tmp/fc-dev/logs/capsule-manager.log
   exit 1
 fi
 
@@ -146,7 +146,7 @@ else
   else
     fail "TTL auto-pause: runner still $TTL_STATE after 15s (expected paused)"
     echo "  Manager log (TTL entries):"
-    grep -i "ttl\|auto.pause" /tmp/fc-dev/logs/firecracker-manager.log 2>/dev/null | tail -5 || echo "  (none)"
+    grep -i "ttl\|auto.pause" /tmp/fc-dev/logs/capsule-manager.log 2>/dev/null | tail -5 || echo "  (none)"
   fi
 fi
 
@@ -194,15 +194,15 @@ else
   fail "rootfs marker write failed"
 fi
 
-# 4d. Process state: record the thaw-agent PID — it should survive pause/resume
+# 4d. Process state: record the capsule-thaw-agent PID — it should survive pause/resume
 echo "  --- 4d. Process state ---"
-OUT=$(vm_exec "pgrep thaw-agent | head -1")
+OUT=$(vm_exec "pgrep capsule-thaw-agent | head -1")
 PRE_PAUSE_PID=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '\d+' | head -1)
-echo "  thaw-agent PID before pause: $PRE_PAUSE_PID"
+echo "  capsule-thaw-agent PID before pause: $PRE_PAUSE_PID"
 if [ -n "$PRE_PAUSE_PID" ]; then
-  pass "thaw-agent running (pid=$PRE_PAUSE_PID)"
+  pass "capsule-thaw-agent running (pid=$PRE_PAUSE_PID)"
 else
-  fail "thaw-agent not found"
+  fail "capsule-thaw-agent not found"
 fi
 
 # 4e. Environment / kernel state: record uptime and PID list
@@ -251,7 +251,7 @@ else
   cat "$SESSION_DIR/metadata.json" 2>/dev/null || echo "  (not found)"
   echo ""
   echo "  Manager log (last 50 lines):"
-  tail -50 /tmp/fc-dev/logs/firecracker-manager.log
+  tail -50 /tmp/fc-dev/logs/capsule-manager.log
   exit 1
 fi
 
@@ -300,7 +300,7 @@ if [ "$RESUMED" = "true" ]; then
 else
   fail "Expected resumed=true, got $RESUMED"
   echo "  Manager log (last 30 lines):"
-  tail -30 /tmp/fc-dev/logs/firecracker-manager.log
+  tail -30 /tmp/fc-dev/logs/capsule-manager.log
   exit 1
 fi
 
@@ -322,7 +322,7 @@ done
 if ! $READY; then
   fail "Resumed runner did not become ready in 60s"
   echo "  Manager log (last 30 lines):"
-  tail -30 /tmp/fc-dev/logs/firecracker-manager.log
+  tail -30 /tmp/fc-dev/logs/capsule-manager.log
   exit 1
 fi
 pass "Resumed runner is ready"
@@ -331,7 +331,7 @@ pass "Resumed runner is ready"
 header "9. Verify ALL state preserved after GCS resume"
 # ---------------------------------------------------------------------------
 
-# Wait for exec to actually work (thaw-agent needs time to re-bind after resume)
+# Wait for exec to actually work (capsule-thaw-agent needs time to re-bind after resume)
 echo "  --- Pre-check: waiting for exec to become responsive ---"
 EXEC_READY=false
 for i in $(seq 1 30); do
@@ -354,7 +354,7 @@ else
   fail "Exec NOT reachable on resumed VM after 30s"
   echo "  Last response: $PRECHECK"
   echo "  Manager log (last 10 lines):"
-  tail -10 /tmp/fc-dev/logs/firecracker-manager.log
+  tail -10 /tmp/fc-dev/logs/capsule-manager.log
 fi
 
 # Helper to run a command inside the resumed VM (never fails the script)
@@ -402,21 +402,21 @@ else
   fail "rootfs marker LOST — disk state not restored"
 fi
 
-# 9d. Process: thaw-agent should still be running (PID may change — it restarts on resume to re-read MMDS)
-echo "  --- 9d. Process state (thaw-agent alive) ---"
-OUT=$(vm_exec_resumed "pgrep thaw-agent | head -1")
+# 9d. Process: capsule-thaw-agent should still be running (PID may change — it restarts on resume to re-read MMDS)
+echo "  --- 9d. Process state (capsule-thaw-agent alive) ---"
+OUT=$(vm_exec_resumed "pgrep capsule-thaw-agent | head -1")
 POST_RESUME_PID=$(echo "$OUT" | grep '"type":"stdout"' | grep -oP '\d+' | head -1)
 echo "  PID before pause: $PRE_PAUSE_PID"
 echo "  PID after resume: $POST_RESUME_PID"
 if [ -n "$POST_RESUME_PID" ]; then
-  pass "thaw-agent running after resume (pid=$POST_RESUME_PID)"
+  pass "capsule-thaw-agent running after resume (pid=$POST_RESUME_PID)"
   if [ "$PRE_PAUSE_PID" = "$POST_RESUME_PID" ]; then
     echo "    (same PID — process survived snapshot)"
   else
     echo "    (new PID — agent restarted on resume, expected)"
   fi
 else
-  fail "thaw-agent NOT running after resume"
+  fail "capsule-thaw-agent NOT running after resume"
 fi
 
 # 9e. Kernel: uptime should be >= pre-pause (kernel continues from snapshot)

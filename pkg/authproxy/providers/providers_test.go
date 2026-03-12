@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
+	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
 )
 
 // --- delegated provider tests ---

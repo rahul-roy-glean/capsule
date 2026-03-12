@@ -47,7 +47,7 @@ workload:
 
         # Per-runner writable overlay for the artifact cache.
         # read_only: false tells the manager to create a fresh copy per allocation.
-        # thaw-agent mounts it and sets up overlayfs over the seed.
+        # capsule-thaw-agent mounts it and sets up overlayfs over the seed.
         - drive_id: "artifact_cache_upper"
           label: "ARTIFACT_CACHE_UPPER"
           size_gb: 10
@@ -66,7 +66,7 @@ workload:
               args: ["bash", "-c", "cp -r /host-certs/* /mnt/credentials/certs/ && cp /host-netrc/.netrc /mnt/credentials/netrc"]
               run_as_root: true
 
-  # After each snapshot restore, thaw-agent:
+  # After each snapshot restore, capsule-thaw-agent:
   # 1. Auto-mounts all drives by label at their declared mount_path
   # 2. Sets up overlayfs: seed (ro) + upper (rw) → /mnt/ephemeral/caches/repository
   # 3. Runs start_command
@@ -78,7 +78,7 @@ workload:
       run_as_root: true
     # Symlink credentials into expected locations
     - type: "shell"
-      args: ["bash", "-c", "ln -sf /mnt/credentials/netrc /home/runner/.netrc && ln -sf /mnt/credentials/certs/buildbarn /etc/bazel-firecracker/certs/buildbarn"]
+      args: ["bash", "-c", "ln -sf /mnt/credentials/netrc /home/runner/.netrc && ln -sf /mnt/credentials/certs/buildbarn /etc/capsule/certs/buildbarn"]
       run_as_root: true
 
   start_command:

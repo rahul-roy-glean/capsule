@@ -5,11 +5,11 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from bf_sdk._config import ConnectionConfig
-from bf_sdk._http import HttpClient
-from bf_sdk.models.layered_config import BuildResponse, CreateConfigResponse, LayerDef
-from bf_sdk.resources.layered_configs import LayeredConfigs
-from bf_sdk.runner_config import RunnerConfig, RunnerConfigs
+from capsule_sdk._config import ConnectionConfig
+from capsule_sdk._http import HttpClient
+from capsule_sdk.models.layered_config import BuildResponse, CreateConfigResponse, LayerDef
+from capsule_sdk.resources.layered_configs import LayeredConfigs
+from capsule_sdk.runner_config import RunnerConfig, RunnerConfigs
 
 
 @pytest.fixture

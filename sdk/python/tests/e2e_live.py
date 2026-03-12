@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from bf_sdk import BFClient, RunnerConfig, RunnerSession
+from capsule_sdk import CapsuleClient, RunnerConfig, RunnerSession
 
 
 def _preflight_local_stack(base_url: str) -> None:
@@ -74,7 +74,7 @@ def _normalized_stdout(text: str) -> str:
 
 
 def test_sdk_live_e2e() -> None:
-    base_url = os.getenv("BF_BASE_URL", "http://localhost:8080").rstrip("/")
+    base_url = os.getenv("CAPSULE_BASE_URL", "http://localhost:8080").rstrip("/")
     _preflight_local_stack(base_url)
 
     unique = f"sdk-e2e-{int(time.time())}-{uuid.uuid4().hex[:8]}"
@@ -85,7 +85,7 @@ def test_sdk_live_e2e() -> None:
     workload = None
     released = False
 
-    with BFClient(base_url=base_url) as client:
+    with CapsuleClient(base_url=base_url) as client:
         config = (
             RunnerConfig(unique)
             .with_commands([f"echo {unique}"])

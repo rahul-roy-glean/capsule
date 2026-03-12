@@ -30,12 +30,12 @@ workload:
 
       drives:
         # Git-cache: a read-only ext4 image with bare clones of frequently used repos.
-        # Populated at snapshot-build time. At runtime, thaw-agent auto-mounts it
+        # Populated at snapshot-build time. At runtime, capsule-thaw-agent auto-mounts it
         # and `actions/checkout` uses --reference to avoid full clones.
         #
         # This replaces: BazelConfig.GitCache* (7 fields), mountGitCache(),
         # setupWorkspaceFromGitCache(), findGitCacheReference(), the MMDS
-        # GitCache struct, and 3 thaw-agent flags.
+        # GitCache struct, and 3 capsule-thaw-agent flags.
         - drive_id: "git_cache"
           label: "GIT_CACHE"
           size_gb: 10
@@ -58,7 +58,7 @@ workload:
           mount_path: "/workspace"
 
   # After snapshot restore, set up the workspace from git-cache.
-  # This is an init_command, not a hardcoded thaw-agent boot phase.
+  # This is an init_command, not a hardcoded capsule-thaw-agent boot phase.
   init_commands:
     # Use git clone --reference to set up workspace from the pre-populated cache.
     # This replaces setupWorkspaceFromGitCache() (80 lines of hardcoded Go).

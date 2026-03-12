@@ -75,10 +75,10 @@ vm_tcp_check_blocked() {
   vm_exec "$rid" "[\"bash\",\"-c\",\"timeout 3 bash -c '(echo > /dev/tcp/$host/$port) 2>/dev/null && echo NET_OK || echo NET_BLOCKED' || echo NET_BLOCKED\"]"
 }
 
-# Helper: wait for thaw-agent to be reachable
+# Helper: wait for capsule-thaw-agent to be reachable
 wait_for_exec() {
   local rid="$1"
-  echo -n "  Waiting for thaw-agent exec..." >&2
+  echo -n "  Waiting for capsule-thaw-agent exec..." >&2
   for i in $(seq 1 20); do
     local out
     out=$(vm_exec "$rid" "[\"echo\",\"THAW_OK\"]")
@@ -89,7 +89,7 @@ wait_for_exec() {
     echo -n "." >&2
     sleep 1
   done
-  echo " FAILED (thaw-agent unreachable after 20s)" >&2
+  echo " FAILED (capsule-thaw-agent unreachable after 20s)" >&2
   return 1
 }
 
@@ -246,7 +246,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-header "3. Wait for ready + thaw-agent liveness"
+header "3. Wait for ready + capsule-thaw-agent liveness"
 # ---------------------------------------------------------------------------
 READY=false
 for i in $(seq 1 60); do
@@ -578,7 +578,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-header "16. Wait for resumed runner + thaw-agent liveness"
+header "16. Wait for resumed runner + capsule-thaw-agent liveness"
 # ---------------------------------------------------------------------------
 echo -n "  Waiting for resumed runner to be ready..."
 for i in $(seq 1 30); do

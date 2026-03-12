@@ -4,11 +4,11 @@ from unittest.mock import patch
 
 import pytest
 
-from bf_sdk._config import ConnectionConfig
-from bf_sdk._http import HttpClient
-from bf_sdk.models.file import FileListResult, FileReadResult, FileUploadResult, FileWriteResult
-from bf_sdk.resources.runners import Runners
-from bf_sdk.runner_session import RunnerSession
+from capsule_sdk._config import ConnectionConfig
+from capsule_sdk._http import HttpClient
+from capsule_sdk.models.file import FileListResult, FileReadResult, FileUploadResult, FileWriteResult
+from capsule_sdk.resources.runners import Runners
+from capsule_sdk.runner_session import RunnerSession
 
 
 @pytest.fixture

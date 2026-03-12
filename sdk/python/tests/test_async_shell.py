@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from bf_sdk._shell import MSG_EXIT, MSG_RESIZE, MSG_SIGNAL, MSG_STDIN, MSG_STDOUT
-from bf_sdk._shell_async import AsyncShellSession
+from capsule_sdk._shell import MSG_EXIT, MSG_RESIZE, MSG_SIGNAL, MSG_STDIN, MSG_STDOUT
+from capsule_sdk._shell_async import AsyncShellSession
 
 
 class TestAsyncShellProtocol:

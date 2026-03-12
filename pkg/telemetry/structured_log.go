@@ -12,7 +12,7 @@ type Labels map[string]string
 // LabelPhase is the well-known label key for phase names.
 const LabelPhase = "phase"
 
-// MetricVMReadyDuration is the metric name for VM ready duration (used by thaw-agent).
+// MetricVMReadyDuration is the metric name for VM ready duration (used by capsule-thaw-agent).
 const MetricVMReadyDuration = "vm/ready_duration_seconds"
 
 // StructuredLogger writes metrics as structured log entries that can be

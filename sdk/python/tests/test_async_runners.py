@@ -6,15 +6,20 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 import pytest
 
-from bf_sdk._config import ConnectionConfig
-from bf_sdk._errors import BFAllocationTimeoutError, BFNotFound, BFOperationTimeoutError, BFRunnerUnavailableError
-from bf_sdk._http_async import AsyncHttpClient
-from bf_sdk.async_runner_session import AsyncRunnerSession
-from bf_sdk.models.layered_config import CreateConfigResponse
-from bf_sdk.models.runner import AllocateRunnerResponse, RunnerStatus
-from bf_sdk.models.workload import ResolvedWorkloadRef
-from bf_sdk.resources.async_layered_configs import AsyncLayeredConfigs
-from bf_sdk.resources.async_runners import AsyncRunners
+from capsule_sdk._config import ConnectionConfig
+from capsule_sdk._errors import (
+    CapsuleAllocationTimeoutError,
+    CapsuleNotFound,
+    CapsuleOperationTimeoutError,
+    CapsuleRunnerUnavailableError,
+)
+from capsule_sdk._http_async import AsyncHttpClient
+from capsule_sdk.async_runner_session import AsyncRunnerSession
+from capsule_sdk.models.layered_config import CreateConfigResponse
+from capsule_sdk.models.runner import AllocateRunnerResponse, RunnerStatus
+from capsule_sdk.models.workload import ResolvedWorkloadRef
+from capsule_sdk.resources.async_layered_configs import AsyncLayeredConfigs
+from capsule_sdk.resources.async_runners import AsyncRunners
 
 
 @pytest.fixture
@@ -88,7 +93,11 @@ class TestAsyncRunners:
         mock_resp = httpx.Response(200, json={"runner_id": "r-123", "host_address": "10.0.0.1:8080"})
 
         async def run() -> None:
-            with patch.object(layered_configs, "resolve_workload_ref", AsyncMock(side_effect=BFNotFound("missing"))):
+            with patch.object(
+                layered_configs,
+                "resolve_workload_ref",
+                AsyncMock(side_effect=CapsuleNotFound("missing")),
+            ):
                 with patch.object(http_client._client, "request", AsyncMock(return_value=mock_resp)) as request:
                     await runners.allocate("wk-raw")
             assert request.await_args.kwargs["json"]["workload_key"] == "wk-raw"
@@ -103,7 +112,7 @@ class TestAsyncRunners:
 
         async def run() -> None:
             with patch.object(runners, "status", AsyncMock(side_effect=statuses)):
-                with patch("bf_sdk.resources.async_runners.asyncio.sleep", AsyncMock()):
+                with patch("capsule_sdk.resources.async_runners.asyncio.sleep", AsyncMock()):
                     result = await runners.wait_ready("r-1", timeout=5.0, poll_interval=0.1)
             assert result.status == "ready"
 
@@ -113,7 +122,7 @@ class TestAsyncRunners:
         async def run() -> None:
             terminal = RunnerStatus(runner_id="r-1", status="terminated")
             with patch.object(runners, "status", AsyncMock(return_value=terminal)):
-                with pytest.raises(BFRunnerUnavailableError):
+                with pytest.raises(CapsuleRunnerUnavailableError):
                     await runners.wait_ready("r-1", timeout=1.0, poll_interval=0.1)
 
         asyncio.run(run())
@@ -122,8 +131,8 @@ class TestAsyncRunners:
         async def run() -> None:
             pending = RunnerStatus(runner_id="r-1", status="pending")
             with patch.object(runners, "status", AsyncMock(return_value=pending)):
-                with patch("bf_sdk.resources.async_runners.asyncio.sleep", AsyncMock()):
-                    with pytest.raises(BFOperationTimeoutError):
+                with patch("capsule_sdk.resources.async_runners.asyncio.sleep", AsyncMock()):
+                    with pytest.raises(CapsuleOperationTimeoutError):
                         await runners.wait_ready("r-1", timeout=0.0, poll_interval=0.1)
 
         asyncio.run(run())
@@ -166,9 +175,9 @@ class TestAsyncRunners:
                 with patch.object(
                     AsyncRunnerSession,
                     "wait_ready",
-                    AsyncMock(side_effect=BFOperationTimeoutError("too slow")),
+                    AsyncMock(side_effect=CapsuleOperationTimeoutError("too slow")),
                 ):
-                    with pytest.raises(BFAllocationTimeoutError):
+                    with pytest.raises(CapsuleAllocationTimeoutError):
                         await runners.allocate_ready("wk-1", startup_timeout=1.0)
 
         asyncio.run(run())

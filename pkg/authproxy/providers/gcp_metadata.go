@@ -13,7 +13,7 @@ import (
 	"google.golang.org/api/iamcredentials/v1"
 	"google.golang.org/api/option"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/authproxy"
+	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
 )
 
 func init() {

@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	onboardNamespace     = "firecracker-runner"
+	onboardNamespace     = "capsule"
 	portForwardLocalPort = 18080
 )
 

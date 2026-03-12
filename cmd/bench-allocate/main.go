@@ -25,12 +25,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/cpapi"
+	"github.com/rahul-roy-glean/capsule/pkg/cpapi"
 )
 
 var (
 	flagCP           = flag.String("cp", "http://localhost:8080", "control-plane base URL")
-	flagMgr          = flag.String("mgr", "http://localhost:9080", "firecracker-manager base URL")
+	flagMgr          = flag.String("mgr", "http://localhost:9080", "capsule-manager base URL")
 	flagWorkloadKey  = flag.String("workload-key", "", "workload_key to allocate (required)")
 	flagIterations   = flag.Int("iterations", 50, "number of measured iterations")
 	flagWarmup       = flag.Int("warmup", 5, "warmup iterations (not recorded)")

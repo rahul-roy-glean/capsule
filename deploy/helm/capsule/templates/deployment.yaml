@@ -1,0 +1,163 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "capsule.fullname" . }}
+  namespace: {{ include "capsule.namespace" . }}
+  labels:
+{{ include "capsule.labels" . | indent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+{{ include "capsule.selectorLabels" . | indent 6 }}
+  template:
+    metadata:
+      labels:
+{{ include "capsule.selectorLabels" . | indent 8 }}
+{{- with .Values.podLabels }}
+{{ toYaml . | indent 8 }}
+{{- end }}
+{{- with .Values.podAnnotations }}
+      annotations:
+{{ toYaml . | indent 8 }}
+{{- end }}
+    spec:
+      serviceAccountName: {{ include "capsule.serviceAccountName" . }}
+      containers:
+        - name: control-plane
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.service.ports.grpc }}
+            - name: http
+              containerPort: {{ .Values.service.ports.http }}
+          env:
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.env.db.secretName }}
+                  key: {{ .Values.env.db.hostKey }}
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.env.db.secretName }}
+                  key: {{ .Values.env.db.usernameKey }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.env.db.secretName }}
+                  key: {{ .Values.env.db.passwordKey }}
+            - name: DB_NAME
+              value: {{ .Values.env.db.name | quote }}
+            - name: DB_SSL_MODE
+              value: {{ .Values.env.db.sslMode | quote }}
+            - name: GCS_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "capsule.fullname" . }}-config
+                  key: gcs_bucket
+{{- if .Values.auth.apiToken.secretName }}
+            - name: API_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.apiToken.secretName }}
+                  key: {{ .Values.auth.apiToken.key }}
+{{- end }}
+{{- if .Values.auth.hostBootstrapToken.secretName }}
+            - name: HOST_BOOTSTRAP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.hostBootstrapToken.secretName }}
+                  key: {{ .Values.auth.hostBootstrapToken.key }}
+{{- end }}
+            - name: GCP_PROJECT_ID
+              value: {{ .Values.gcp.projectId | quote }}
+            - name: GCP_REGION
+              value: {{ .Values.gcp.region | quote }}
+            - name: GCP_ZONE
+              value: {{ .Values.gcp.zone | quote }}
+            - name: HOST_MIG_NAME
+              value: {{ .Values.gcp.hostMigName | quote }}
+            - name: HOST_AUTOSCALER_NAME
+              value: {{ .Values.gcp.hostAutoscalerName | quote }}
+            - name: BUILDER_NETWORK
+              value: {{ .Values.gcp.builderNetwork | quote }}
+            - name: BUILDER_SUBNET
+              value: {{ .Values.gcp.builderSubnet | quote }}
+            - name: BUILDER_IMAGE
+              value: {{ .Values.gcp.builderImage | quote }}
+            - name: BUILDER_SERVICE_ACCOUNT
+              value: {{ .Values.gcp.builderServiceAccount | quote }}
+            - name: DOWNSCALER_ENABLED
+              value: {{ .Values.downscaler.enabled | quote }}
+            - name: DOWNSCALER_INTERVAL
+              value: {{ .Values.downscaler.interval | quote }}
+            - name: DOWNSCALER_MAX_DELETES
+              value: {{ .Values.downscaler.maxDeletes | quote }}
+            - name: DOWNSCALER_MAX_DRAINS
+              value: {{ .Values.downscaler.maxDrains | quote }}
+            - name: DOWNSCALER_HEARTBEAT_STALE
+              value: {{ .Values.downscaler.heartbeatStale | quote }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ if .Values.otelCollector.enabled }}"127.0.0.1:4317"{{ else }}"otel-collector.{{ include "capsule.namespace" . }}.svc.cluster.local:4317"{{ end }}
+            - name: ENVIRONMENT
+              value: {{ .Values.config.environment | default "prod" | quote }}
+          resources:
+{{ toYaml .Values.resources | indent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/control-plane
+              readOnly: true
+{{- if .Values.otelCollector.enabled }}
+        - name: otel-collector
+          image: "{{ .Values.otelCollector.image.repository }}:{{ .Values.otelCollector.image.tag }}"
+          args: ["--config=/etc/otelcol/config.yaml"]
+          env:
+            - name: GCP_PROJECT_ID
+              value: {{ .Values.gcp.projectId | quote }}
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+          readinessProbe:
+            tcpSocket:
+              port: 4317
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            failureThreshold: 5
+          livenessProbe:
+            tcpSocket:
+              port: 4317
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          volumeMounts:
+            - name: otel-config
+              mountPath: /etc/otelcol
+          resources:
+{{ toYaml .Values.otelCollector.resources | indent 12 }}
+{{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "capsule.fullname" . }}-config
+{{- if .Values.otelCollector.enabled }}
+        - name: otel-config
+          configMap:
+            name: otel-collector-config
+{{- end }}
+
+

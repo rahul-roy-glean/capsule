@@ -1,4 +1,4 @@
-module github.com/rahul-roy-glean/bazel-firecracker
+module github.com/rahul-roy-glean/capsule
 
 go 1.24.0
 

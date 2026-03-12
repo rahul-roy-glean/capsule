@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rahul-roy-glean/bazel-firecracker/pkg/util/boundedstack"
+	"github.com/rahul-roy-glean/capsule/pkg/util/boundedstack"
 )
 
 // TestEagerFetchQueue tests the eager fetch queue behavior

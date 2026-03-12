@@ -5,14 +5,14 @@
 locals {
   metric_prefix = "workload.googleapis.com"
   cp_service    = "control-plane"
-  mgr_service   = "firecracker-manager"
+  mgr_service   = "capsule-manager"
 }
 
-# Dashboard for Firecracker Runner Overview
+# Dashboard for Capsule Overview
 resource "google_monitoring_dashboard" "firecracker_overview" {
   count = var.enable_monitoring ? 1 : 0
   dashboard_json = jsonencode({
-    displayName = "Firecracker Runner Overview"
+    displayName = "Capsule Overview"
     labels = {
       environment = local.infra.environment
     }
@@ -435,7 +435,7 @@ resource "google_monitoring_dashboard" "firecracker_operations" {
   count   = var.enable_monitoring ? 1 : 0
   project = local.infra.project_id
   dashboard_json = jsonencode({
-    displayName = "Firecracker Runner Operations"
+    displayName = "Capsule Operations"
     labels = {
       environment = local.infra.environment
     }
@@ -2353,7 +2353,7 @@ resource "google_monitoring_dashboard" "manager_operations" {
             scorecard = {
               timeSeriesQuery = {
                 timeSeriesFilter = {
-                  filter = "metric.type=\"${local.metric_prefix}/firecracker_manager.endpoint.requests\" AND metric.label.service_name=\"${local.mgr_service}\""
+                  filter = "metric.type=\"${local.metric_prefix}/capsule_manager.endpoint.requests\" AND metric.label.service_name=\"${local.mgr_service}\""
                   aggregation = {
                     alignmentPeriod    = "300s"
                     perSeriesAligner   = "ALIGN_DELTA"
@@ -2373,7 +2373,7 @@ resource "google_monitoring_dashboard" "manager_operations" {
             scorecard = {
               timeSeriesQuery = {
                 timeSeriesFilter = {
-                  filter = "metric.type=\"${local.metric_prefix}/firecracker_manager.endpoint.requests\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.status_class=\"5xx\""
+                  filter = "metric.type=\"${local.metric_prefix}/capsule_manager.endpoint.requests\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.status_class=\"5xx\""
                   aggregation = {
                     alignmentPeriod    = "300s"
                     perSeriesAligner   = "ALIGN_DELTA"
@@ -2441,7 +2441,7 @@ resource "google_monitoring_dashboard" "manager_operations" {
                   ] : {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/firecracker_manager.endpoint.requests\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.route=\"${route.path}\""
+                      filter = "metric.type=\"${local.metric_prefix}/capsule_manager.endpoint.requests\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.route=\"${route.path}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_DELTA"
@@ -2474,7 +2474,7 @@ resource "google_monitoring_dashboard" "manager_operations" {
                   ] : {
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"${local.metric_prefix}/firecracker_manager.endpoint.request.duration\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.route=\"${route.path}\""
+                      filter = "metric.type=\"${local.metric_prefix}/capsule_manager.endpoint.request.duration\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.route=\"${route.path}\""
                       aggregation = {
                         alignmentPeriod    = "60s"
                         perSeriesAligner   = "ALIGN_DELTA"

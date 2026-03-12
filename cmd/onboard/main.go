@@ -38,7 +38,7 @@ func main() {
 	logger.SetLevel(level)
 	log := logger.WithField("component", "onboard")
 
-	log.Info("=== Bazel Firecracker Onboard ===")
+	log.Info("=== Capsule Onboard ===")
 
 	// Load configuration
 	cfg, err := LoadConfig(*configPath)

@@ -20,7 +20,7 @@ output "environment" {
 
 output "name_prefix" {
   value       = local.name_prefix
-  description = "Resource name prefix (fc-runner-{env})"
+  description = "Resource name prefix (capsule-{env})"
 }
 
 output "labels" {
@@ -96,8 +96,8 @@ output "container_registry" {
 }
 
 output "control_plane_image" {
-  value       = "${google_artifact_registry_repository.containers.location}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.containers.repository_id}/control-plane"
-  description = "Full image path for control-plane container"
+  value       = "${google_artifact_registry_repository.containers.location}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.containers.repository_id}/capsule-control-plane"
+  description = "Full image path for the Capsule control-plane container"
 }
 
 output "vpc_network" {

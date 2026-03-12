@@ -3,7 +3,7 @@
 
 package uffd
 
-import "github.com/rahul-roy-glean/bazel-firecracker/pkg/snapshot"
+import "github.com/rahul-roy-glean/capsule/pkg/snapshot"
 
 // PrefetchTracker is a stub for non-Linux platforms.
 type PrefetchTracker struct{}

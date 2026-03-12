@@ -6,17 +6,17 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from bf_sdk._config import ConnectionConfig
-from bf_sdk._errors import (
-    BFAuthError,
-    BFConnectionError,
-    BFHTTPError,
-    BFNotFound,
-    BFRateLimited,
-    BFRequestTimeoutError,
-    BFServiceUnavailable,
+from capsule_sdk._config import ConnectionConfig
+from capsule_sdk._errors import (
+    CapsuleAuthError,
+    CapsuleConnectionError,
+    CapsuleHTTPError,
+    CapsuleNotFound,
+    CapsuleRateLimited,
+    CapsuleRequestTimeoutError,
+    CapsuleServiceUnavailable,
 )
-from bf_sdk._http_async import AsyncHttpClient
+from capsule_sdk._http_async import AsyncHttpClient
 
 
 @pytest.fixture
@@ -59,7 +59,7 @@ class TestAsyncHttpClient:
 
         async def run() -> None:
             with patch.object(http._client, "request", AsyncMock(return_value=mock_resp)):
-                with pytest.raises(BFAuthError) as exc_info:
+                with pytest.raises(CapsuleAuthError) as exc_info:
                     await http.get("/api/v1/runners")
                 assert exc_info.value.status_code == 401
 
@@ -70,7 +70,7 @@ class TestAsyncHttpClient:
 
         async def run() -> None:
             with patch.object(http._client, "request", AsyncMock(return_value=mock_resp)):
-                with pytest.raises(BFNotFound):
+                with pytest.raises(CapsuleNotFound):
                     await http.get("/api/v1/runners/status")
 
         asyncio.run(run())
@@ -80,8 +80,8 @@ class TestAsyncHttpClient:
 
         async def run() -> None:
             with patch.object(http._client, "request", AsyncMock(return_value=mock_resp)) as request:
-                with patch("bf_sdk._http_async.asyncio.sleep", AsyncMock()):
-                    with pytest.raises(BFRateLimited):
+                with patch("capsule_sdk._http_async.asyncio.sleep", AsyncMock()):
+                    with pytest.raises(CapsuleRateLimited):
                         await http.get("/api/v1/runners")
             assert request.await_count == 4
 
@@ -92,8 +92,8 @@ class TestAsyncHttpClient:
 
         async def run() -> None:
             with patch.object(http._client, "request", AsyncMock(return_value=mock_resp)) as request:
-                with patch("bf_sdk._http_async.asyncio.sleep", AsyncMock()):
-                    with pytest.raises(BFServiceUnavailable) as exc_info:
+                with patch("capsule_sdk._http_async.asyncio.sleep", AsyncMock()):
+                    with pytest.raises(CapsuleServiceUnavailable) as exc_info:
                         await http.get("/api/v1/runners/status")
                     assert exc_info.value.status_code == 503
             assert request.await_count == 4
@@ -105,7 +105,7 @@ class TestAsyncHttpClient:
 
         async def run() -> None:
             with patch.object(http._client, "request", AsyncMock(return_value=mock_resp)) as request:
-                with pytest.raises(BFHTTPError) as exc_info:
+                with pytest.raises(CapsuleHTTPError) as exc_info:
                     await http.post("/api/v1/runners/release", json_body={"runner_id": "r-1"})
                 assert exc_info.value.status_code == 500
             assert request.await_count == 1
@@ -115,8 +115,8 @@ class TestAsyncHttpClient:
     def test_connection_error_retries(self, http: AsyncHttpClient) -> None:
         async def run() -> None:
             with patch.object(http._client, "request", AsyncMock(side_effect=httpx.ConnectError("refused"))) as request:
-                with patch("bf_sdk._http_async.asyncio.sleep", AsyncMock()):
-                    with pytest.raises(BFConnectionError):
+                with patch("capsule_sdk._http_async.asyncio.sleep", AsyncMock()):
+                    with pytest.raises(CapsuleConnectionError):
                         await http.get("/api/v1/runners")
             assert request.await_count == 4
 
@@ -125,8 +125,8 @@ class TestAsyncHttpClient:
     def test_timeout_error_retries(self, http: AsyncHttpClient) -> None:
         async def run() -> None:
             with patch.object(http._client, "request", AsyncMock(side_effect=httpx.ReadTimeout("timeout"))) as request:
-                with patch("bf_sdk._http_async.asyncio.sleep", AsyncMock()):
-                    with pytest.raises(BFRequestTimeoutError):
+                with patch("capsule_sdk._http_async.asyncio.sleep", AsyncMock()):
+                    with pytest.raises(CapsuleRequestTimeoutError):
                         await http.get("/api/v1/runners")
             assert request.await_count == 4
 
@@ -135,8 +135,8 @@ class TestAsyncHttpClient:
     def test_post_timeout_does_not_retry_by_default(self, http: AsyncHttpClient) -> None:
         async def run() -> None:
             with patch.object(http._client, "request", AsyncMock(side_effect=httpx.ReadTimeout("timeout"))) as request:
-                with patch("bf_sdk._http_async.asyncio.sleep", AsyncMock()):
-                    with pytest.raises(BFRequestTimeoutError):
+                with patch("capsule_sdk._http_async.asyncio.sleep", AsyncMock()):
+                    with pytest.raises(CapsuleRequestTimeoutError):
                         await http.post("/api/v1/runners/release", json_body={"runner_id": "r-1"})
             assert request.await_count == 1
 
@@ -148,7 +148,7 @@ class TestAsyncHttpClient:
 
         async def run() -> None:
             with patch.object(http._client, "request", AsyncMock(side_effect=[fail_resp, ok_resp])):
-                with patch("bf_sdk._http_async.asyncio.sleep", AsyncMock()):
+                with patch("capsule_sdk._http_async.asyncio.sleep", AsyncMock()):
                     result = await http.get("/api/v1/runners/status")
             assert result["status"] == "ok"
             assert result["request_id"]

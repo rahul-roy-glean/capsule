@@ -71,7 +71,7 @@ fi
 
 # Use the manager's HTTP endpoint (not the gRPC address from allocate response)
 HOST=$MGR
-sleep 2  # wait for thaw-agent readiness
+sleep 2  # wait for capsule-thaw-agent readiness
 
 # ---------------------------------------------------------------------------
 header "3. Write pre-checkpoint marker"
@@ -149,7 +149,7 @@ header "8. Resume and verify BOTH markers exist"
 # ---------------------------------------------------------------------------
 CONNECT_RESP=$(curl -s -X POST "$HOST/api/v1/runners/$RUNNER_ID/connect")
 echo "  connect response: $CONNECT_RESP"
-sleep 3  # wait for thaw-agent readiness
+sleep 3  # wait for capsule-thaw-agent readiness
 
 # Check pre-checkpoint marker
 EXEC_RESP=$(curl -s -X POST "$HOST/api/v1/runners/$RUNNER_ID/exec" \

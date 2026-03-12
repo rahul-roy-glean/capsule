@@ -3,9 +3,9 @@ requires = ["hatchling", "packaging>=24.2"]
 build-backend = "hatchling.build"
 
 [project]
-name = "bf-sdk"
+name = "capsule-sdk"
 dynamic = ["version"]
-description = "Python SDK for bazel-firecracker"
+description = "Python SDK for Capsule"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -26,10 +26,10 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/bf_sdk"]
+packages = ["src/capsule_sdk"]
 
 [tool.hatch.version]
-path = "src/bf_sdk/_version.py"
+path = "src/capsule_sdk/_version.py"
 
 [tool.ruff]
 target-version = "py310"
