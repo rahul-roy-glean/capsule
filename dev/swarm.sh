@@ -169,14 +169,20 @@ exec_claude() {
   local logfile=$4
   local label=$5  # e.g. "creator-1" for prefixed output
 
-  # Build the JSON payload with jq (safe escaping of the prompt)
+  # Build the JSON payload with jq (safe escaping of the prompt).
+  # Uses stdbuf -oL to force line-buffered stdout from Claude Code (Node.js
+  # switches to full buffering when stdout is a pipe).
+  # Uses --output-format stream-json so Claude emits one JSON event per line
+  # (tool use, text deltas, result) instead of buffering the entire response.
   local payload
   payload=$(jq -n \
     --arg prompt "$prompt" \
     --argjson env "$CLAUDE_ENV" \
     --argjson timeout "$TIMEOUT" \
     '{
-      command: ["claude", "-p", $prompt, "--dangerously-skip-permissions"],
+      command: ["stdbuf", "-oL", "claude", "-p", $prompt,
+                "--output-format", "stream-json",
+                "--dangerously-skip-permissions"],
       env: $env,
       working_dir: "/workspace/bazel-firecracker",
       timeout_seconds: $timeout
@@ -184,10 +190,11 @@ exec_claude() {
 
   echo "  [$label] Executing Claude in $runner_id (log: $logfile) ..."
 
-  # Use tee to write raw ndjson to the log file while streaming through jq
-  # for live formatted output. The --unbuffered flag on jq prevents buffering.
+  # Stream exec output: tee writes raw ndjson to logfile, jq formats live output.
+  # curl -N disables client buffering, jq --unbuffered flushes per line.
   curl -sS -N -X POST "http://$host_addr/api/v1/runners/$runner_id/exec" \
     -H "Content-Type: application/json" \
+    -H "Accept: application/x-ndjson" \
     -d "$payload" \
   | tee "$logfile" \
   | jq --unbuffered -r '
