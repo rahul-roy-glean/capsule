@@ -183,7 +183,7 @@ jobs:
       - name: Generate changelog
         id: changelog
         run: |
-          cat <<EOF >/tmp/release-notes.md
+          cat <<'EOF' >/tmp/release-notes.md
           ## Summary
           EOF
           # Get previous tag
@@ -194,7 +194,7 @@ jobs:
             changelog=$(git log --pretty=format:"- %s (%h)" "$prev_tag".."${GITHUB_REF_NAME}" -- . ':!docs' ':!*.md')
             echo "$changelog" >> /tmp/release-notes.md
           fi
-          cat <<EOF >>/tmp/release-notes.md
+          cat <<'EOF' >>/tmp/release-notes.md
 
           ## Candidate Artifacts
           - Go binaries attached to this draft release

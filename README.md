@@ -4,6 +4,9 @@
 
 # Capsule
 
+[![CI](https://github.com/rahul-roy-glean/bazel-firecracker/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/rahul-roy-glean/bazel-firecracker/actions/workflows/ci.yaml)
+[![Release](https://github.com/rahul-roy-glean/bazel-firecracker/actions/workflows/release.yaml/badge.svg)](https://github.com/rahul-roy-glean/bazel-firecracker/actions/workflows/release.yaml)
+
 Capsule is a snapshot-first workload platform built on Firecracker. It lets you
 pre-build microVM images, restore them quickly, and optionally preserve
 session state across allocations.
