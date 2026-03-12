@@ -54,6 +54,7 @@ done
 
 mkdir -p "$LOG_DIR"
 echo "Logs → $LOG_DIR"
+echo "  Live tail: tail -f $LOG_DIR/*.ndjson"
 echo "Control plane → $CP_BASE"
 echo "Swarm: $NUM_CREATORS creators + $NUM_FIXERS fixers"
 
@@ -160,12 +161,13 @@ wait_ready() {
 }
 
 # Execute a Claude Code prompt inside a runner.
-# Streams ndjson, collects stdout lines into the log file.
+# Streams ndjson lines to the log file and prints live output to console.
 exec_claude() {
   local host_addr=$1
   local runner_id=$2
   local prompt=$3
   local logfile=$4
+  local label=$5  # e.g. "creator-1" for prefixed output
 
   # Build the JSON payload with jq (safe escaping of the prompt)
   local payload
@@ -180,22 +182,38 @@ exec_claude() {
       timeout_seconds: $timeout
     }')
 
-  echo "  Executing Claude in $runner_id (log: $logfile) ..."
+  echo "  [$label] Executing Claude in $runner_id (log: $logfile) ..."
   curl -sS -N -X POST "http://$host_addr/api/v1/runners/$runner_id/exec" \
     -H "Content-Type: application/json" \
     -d "$payload" \
   | while IFS= read -r line; do
       echo "$line" >> "$logfile"
-      # Print stdout lines to console
-      local typ
+      # Parse ndjson and print live output with label prefix
+      local typ data
       typ=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
-      if [[ "$typ" == "stdout" ]]; then
-        echo "$line" | jq -r '.data // empty' 2>/dev/null
-      elif [[ "$typ" == "exit" ]]; then
-        local code
-        code=$(echo "$line" | jq -r '.code // "?"' 2>/dev/null)
-        echo "  [exit $code] $runner_id"
-      fi
+      case "$typ" in
+        stdout)
+          data=$(echo "$line" | jq -r '.data // empty' 2>/dev/null)
+          [[ -n "$data" ]] && echo "  [$label] $data"
+          ;;
+        stderr)
+          data=$(echo "$line" | jq -r '.data // empty' 2>/dev/null)
+          [[ -n "$data" ]] && echo "  [$label] ERR: $data" >&2
+          ;;
+        error)
+          data=$(echo "$line" | jq -r '.message // empty' 2>/dev/null)
+          echo "  [$label] ERROR: $data" >&2
+          ;;
+        exit)
+          local code
+          code=$(echo "$line" | jq -r '.code // "?"' 2>/dev/null)
+          echo "  [$label] exit $code"
+          ;;
+        *)
+          # Show unrecognized types for debugging
+          [[ -n "$typ" ]] && echo "  [$label] [$typ] $(echo "$line" | jq -c '.' 2>/dev/null)"
+          ;;
+      esac
     done
 }
 
@@ -225,7 +243,7 @@ Steps:
    - Suggested fix approach (if you have one)
 
 To create the issue, run:
-  HTTPS_PROXY=http://localhost:3128 gh issue create \
+  gh issue create \
     --repo '"$REPO"' \
     --title "Your title" \
     --body "Your description"
@@ -239,10 +257,10 @@ Your task: find an open GitHub issue, implement a fix, and open a pull request.
 
 Steps:
 1. List open issues:
-   HTTPS_PROXY=http://localhost:3128 gh issue list --repo '"$REPO"'
+   gh issue list --repo '"$REPO"'
 2. Pick one issue that you can realistically fix
 3. Read the issue details:
-   HTTPS_PROXY=http://localhost:3128 gh issue view <number> --repo '"$REPO"'
+   gh issue view <number> --repo '"$REPO"'
 4. Understand the relevant code
 5. Create a branch: git checkout -b fix/<issue-number>-short-description
 6. Implement the fix (edit files, run tests if possible)
@@ -250,7 +268,7 @@ Steps:
 8. Push the branch:
    git push origin fix/<issue-number>-short-description
 9. Create a PR:
-   HTTPS_PROXY=http://localhost:3128 gh pr create \
+   gh pr create \
      --repo '"$REPO"' \
      --title "Fix #<issue-number>: short description" \
      --body "Closes #<issue-number>\n\n## What\n...\n\n## Why\n..."
@@ -293,7 +311,7 @@ main() {
       echo "  Waiting for runner to be ready ..."
       wait_ready "$runner_id" || exit 1
 
-      exec_claude "$host_addr" "$runner_id" "$CREATOR_PROMPT" "$local_log"
+      exec_claude "$host_addr" "$runner_id" "$CREATOR_PROMPT" "$local_log" "creator-$i"
       release_runner "$runner_id"
       echo "  creator-$i complete."
     ) &
@@ -326,7 +344,7 @@ main() {
       echo "  Waiting for runner to be ready ..."
       wait_ready "$runner_id" || exit 1
 
-      exec_claude "$host_addr" "$runner_id" "$FIXER_PROMPT" "$local_log"
+      exec_claude "$host_addr" "$runner_id" "$FIXER_PROMPT" "$local_log" "fixer-$i"
       release_runner "$runner_id"
       echo "  fixer-$i complete."
     ) &
