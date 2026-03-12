@@ -1,4 +1,6 @@
-.PHONY: all build test clean proto docker-build docker-push docker-push-control-plane docker-push-snapshot-builder terraform-init terraform-plan terraform-apply
+.PHONY: all build test clean proto docker-build docker-push docker-push-control-plane docker-push-snapshot-builder
+.PHONY: terraform-infra-init terraform-infra-plan terraform-infra-apply terraform-infra-destroy
+.PHONY: terraform-app-init terraform-app-plan terraform-app-apply terraform-app-destroy
 .PHONY: packer-init packer-validate packer-build firecracker-manager-linux release-host-image mig-rolling-update
 .PHONY: onboard onboard-validate onboard-plan bin-onboard
 .PHONY: firecracker-manager control-plane snapshot-builder thaw-agent
@@ -138,18 +140,31 @@ docker-push-snapshot-builder:
 rootfs:
 	cd images/microvm && ./build-rootfs.sh
 
-# Terraform
-terraform-init:
-	cd deploy/terraform && terraform init
+# Terraform - Infrastructure (Stage 1)
+terraform-infra-init:
+	cd deploy/terraform/infra && terraform init
 
-terraform-plan:
-	cd deploy/terraform && terraform plan -var="project_id=$(PROJECT_ID)" -var="db_password=$(DB_PASSWORD)"
+terraform-infra-plan:
+	cd deploy/terraform/infra && terraform plan
 
-terraform-apply:
-	cd deploy/terraform && terraform apply -var="project_id=$(PROJECT_ID)" -var="db_password=$(DB_PASSWORD)"
+terraform-infra-apply:
+	cd deploy/terraform/infra && terraform apply
 
-terraform-destroy:
-	cd deploy/terraform && terraform destroy -var="project_id=$(PROJECT_ID)" -var="db_password=$(DB_PASSWORD)"
+terraform-infra-destroy:
+	cd deploy/terraform/infra && terraform destroy
+
+# Terraform - Application (Stage 2)
+terraform-app-init:
+	cd deploy/terraform/app && terraform init
+
+terraform-app-plan:
+	cd deploy/terraform/app && terraform plan
+
+terraform-app-apply:
+	cd deploy/terraform/app && terraform apply
+
+terraform-app-destroy:
+	cd deploy/terraform/app && terraform destroy
 
 # Packer
 packer-init:
@@ -287,9 +302,12 @@ help:
 	@echo "  clean                  - Clean build artifacts"
 	@echo ""
 	@echo "Infrastructure:"
-	@echo "  terraform-init         - Initialize Terraform"
-	@echo "  terraform-plan         - Plan Terraform changes"
-	@echo "  terraform-apply        - Apply Terraform changes"
+	@echo "  terraform-infra-init   - Initialize Terraform (infra stage)"
+	@echo "  terraform-infra-plan   - Plan Terraform changes (infra stage)"
+	@echo "  terraform-infra-apply  - Apply Terraform changes (infra stage)"
+	@echo "  terraform-app-init     - Initialize Terraform (app stage)"
+	@echo "  terraform-app-plan     - Plan Terraform changes (app stage)"
+	@echo "  terraform-app-apply    - Apply Terraform changes (app stage)"
 	@echo "  packer-build           - Build GCE host image"
 	@echo "  release-host-image     - Build binary + Packer image"
 	@echo "  mig-rolling-update     - Rolling update hosts to latest image"

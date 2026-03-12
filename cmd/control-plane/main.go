@@ -261,6 +261,13 @@ func main() {
 	cpRunnersTotalCurrentGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPRunnersTotalCurrent)
 	cpRunnersIdleCurrentGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPRunnersIdleCurrent)
 	cpRunnersBusyCurrentGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPRunnersBusyCurrent)
+	cpWorkloadRunnersTotalGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPWorkloadRunnersTotal)
+	cpWorkloadRunnersIdleGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPWorkloadRunnersIdle)
+	cpWorkloadRunnersBusyGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPWorkloadRunnersBusy)
+	cpWorkloadHostsActiveGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPWorkloadHostsActive)
+	cpAllocationCounter, _ := fcrotel.NewCounter(meter, fcrotel.CPAllocations)
+	cpAllocationLatencyHist, _ := fcrotel.NewHistogram(meter, fcrotel.CPAllocationLatency)
+	cpPlacementCounter, _ := fcrotel.NewCounter(meter, fcrotel.CPPlacementSelections)
 	cpFleetCPUTotalGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetCPUTotal)
 	cpFleetCPUUsedGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetCPUUsed)
 	cpFleetCPUFreeGauge, _ := fcrotel.NewGauge(meter, fcrotel.CPFleetCPUFree)
@@ -293,7 +300,7 @@ func main() {
 	tagRegistry := NewSnapshotTagRegistry(db, logger)
 	scheduler := NewScheduler(hostRegistry, db, snapshotManager, tagRegistry, logger)
 	scheduler.SetConfigCache(configCache)
-	scheduler.SetOTel(otelClient, sessionResumeRoutingCounter)
+	scheduler.SetOTel(otelClient, sessionResumeRoutingCounter, cpAllocationCounter, cpAllocationLatencyHist, cpPlacementCounter)
 	layeredConfigRegistry := NewLayeredConfigRegistry(db, snapshotManager, logger)
 	layeredConfigRegistry.SetConfigCache(configCache)
 	layeredConfigRegistry.tagRegistry = tagRegistry
@@ -425,6 +432,7 @@ func main() {
 	go controlPlaneMetricsLoop(ctx, hostRegistry, scheduler, snapshotManager,
 		cpHostsGauge, cpHostsReadyGauge, cpHostsDrainingGauge, cpHostsTerminatingGauge, cpHostsUnhealthyGauge, cpHostsTerminatedGauge,
 		cpRunnersGauge, cpRunnersTotalCurrentGauge, cpRunnersIdleCurrentGauge, cpRunnersBusyCurrentGauge,
+		cpWorkloadRunnersTotalGauge, cpWorkloadRunnersIdleGauge, cpWorkloadRunnersBusyGauge, cpWorkloadHostsActiveGauge,
 		cpFleetCPUTotalGauge, cpFleetCPUUsedGauge, cpFleetCPUFreeGauge,
 		cpFleetMemTotalGauge, cpFleetMemUsedGauge, cpFleetMemFreeGauge,
 		cpFleetUtilGauge, snapshotAgeGauge, logger)
@@ -755,6 +763,7 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 	resp, err := s.scheduler.AllocateRunner(r.Context(), AllocateRunnerRequest{
 		RequestID:           req.RequestID,
 		WorkloadKey:         req.WorkloadKey,
+		Source:              "api",
 		Labels:              req.Labels,
 		SessionID:           req.SessionID,
 		SnapshotTag:         req.SnapshotTag,
@@ -1055,11 +1064,13 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 		// draining/terminating or unreachable — in that case, fall back to
 		// another available host using cache-affinity scheduling.
 		var resumeHost *Host
+		selectionReason := "sticky_same_host"
 		origHost, origErr := s.hostRegistry.GetHost(hostID)
 		if origErr == nil && origHost.Status != "draining" && origHost.Status != "terminating" {
 			resumeHost = origHost
 		} else {
 			// Look up workload_key for affinity scheduling
+			selectionReason = "sticky_fallback"
 			resumeHost = s.scheduler.selectBestHostForWorkloadKey(s.hostRegistry.GetAvailableHosts(), workloadKey)
 		}
 		if resumeHost == nil {
@@ -1069,6 +1080,12 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 			json.NewEncoder(w).Encode(map[string]string{"error": "no available host for session resume"})
 			return
 		}
+		routing := fcrotel.RoutingCrossHost
+		if resumeHost.ID == hostID {
+			routing = fcrotel.RoutingSameHost
+		}
+		s.scheduler.recordResumeRoutingTelemetry(r.Context(), workloadKey, "connect", routing)
+		s.scheduler.recordPlacementTelemetry(r.Context(), workloadKey, "connect", selectionReason, placementCacheState(resumeHost, workloadKey, ""))
 
 		conn, err := grpc.NewClient(resumeHost.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
@@ -1307,6 +1324,7 @@ func (s *ControlPlaneServer) HandleCanaryReport(w http.ResponseWriter, r *http.R
 func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Scheduler, sm *SnapshotManager,
 	cpHostsGauge, cpHostsReadyGauge, cpHostsDrainingGauge, cpHostsTerminatingGauge, cpHostsUnhealthyGauge, cpHostsTerminatedGauge metric.Int64Gauge,
 	cpRunnersGauge, cpRunnersTotalCurrentGauge, cpRunnersIdleCurrentGauge, cpRunnersBusyCurrentGauge metric.Int64Gauge,
+	cpWorkloadRunnersTotalGauge, cpWorkloadRunnersIdleGauge, cpWorkloadRunnersBusyGauge, cpWorkloadHostsActiveGauge metric.Int64Gauge,
 	cpFleetCPUTotalGauge, cpFleetCPUUsedGauge, cpFleetCPUFreeGauge metric.Int64Gauge,
 	cpFleetMemTotalGauge, cpFleetMemUsedGauge, cpFleetMemFreeGauge metric.Int64Gauge,
 	cpFleetUtilGauge metric.Float64Gauge, snapshotAgeGauge metric.Int64Gauge,
@@ -1315,6 +1333,7 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 	log := logger.WithField("component", "metrics-loop")
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+	seenWorkloadKeys := map[string]struct{}{}
 
 	for {
 		select {
@@ -1379,6 +1398,51 @@ func controlPlaneMetricsLoop(ctx context.Context, hr *HostRegistry, sched *Sched
 			cpRunnersTotalCurrentGauge.Record(ctx, totalRunners)
 			cpRunnersIdleCurrentGauge.Record(ctx, totalIdle)
 			cpRunnersBusyCurrentGauge.Record(ctx, totalBusy)
+
+			workloadTotals := map[string]int64{}
+			workloadIdle := map[string]int64{}
+			workloadBusy := map[string]int64{}
+			workloadHosts := map[string]int64{}
+			hr.mu.RLock()
+			for _, host := range hr.hosts {
+				hostWorkloads := map[string]struct{}{}
+				for _, info := range host.RunnerInfos {
+					if info.WorkloadKey == "" {
+						continue
+					}
+					workloadTotals[info.WorkloadKey]++
+					if info.State == "idle" {
+						workloadIdle[info.WorkloadKey]++
+					} else {
+						workloadBusy[info.WorkloadKey]++
+					}
+					hostWorkloads[info.WorkloadKey] = struct{}{}
+				}
+				for workloadKey := range hostWorkloads {
+					workloadHosts[workloadKey]++
+				}
+			}
+			hr.mu.RUnlock()
+
+			for workloadKey := range workloadTotals {
+				seenWorkloadKeys[workloadKey] = struct{}{}
+			}
+			for workloadKey := range workloadIdle {
+				seenWorkloadKeys[workloadKey] = struct{}{}
+			}
+			for workloadKey := range workloadBusy {
+				seenWorkloadKeys[workloadKey] = struct{}{}
+			}
+			for workloadKey := range workloadHosts {
+				seenWorkloadKeys[workloadKey] = struct{}{}
+			}
+			for workloadKey := range seenWorkloadKeys {
+				attrs := metric.WithAttributes(fcrotel.AttrWorkloadKey.String(workloadKey))
+				cpWorkloadRunnersTotalGauge.Record(ctx, workloadTotals[workloadKey], attrs)
+				cpWorkloadRunnersIdleGauge.Record(ctx, workloadIdle[workloadKey], attrs)
+				cpWorkloadRunnersBusyGauge.Record(ctx, workloadBusy[workloadKey], attrs)
+				cpWorkloadHostsActiveGauge.Record(ctx, workloadHosts[workloadKey], attrs)
+			}
 
 			// Record fleet resource metrics
 			cpFleetCPUTotalGauge.Record(ctx, fleetCPUTotal)

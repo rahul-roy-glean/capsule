@@ -89,6 +89,8 @@ gcp:
   # Optional. Set when the default network is unavailable or when builder VMs
   # must run inside the same VPC as the rest of the deployment.
   builderNetwork: ""
+  # Optional. Subnet for builder VMs. Required when using a custom-mode VPC.
+  builderSubnet: ""
   # Optional. Override the image used for snapshot-builder/layer-builder VMs.
   # By default the control plane uses the `firecracker-host` image family.
   builderImage: ""

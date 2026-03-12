@@ -12,6 +12,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -44,6 +45,9 @@ type Scheduler struct {
 	logger          *logrus.Entry
 
 	sessionResumeRoutingCounter metric.Int64Counter
+	allocationCounter           metric.Int64Counter
+	allocationLatency           metric.Float64Histogram
+	placementCounter            metric.Int64Counter
 	otelClient                  *fcrotel.Client
 
 	// connPool caches gRPC connections to host agents, keyed by address.
@@ -151,9 +155,12 @@ func (s *Scheduler) cachedAllocationStillValid(alloc *recentSchedulerAllocation)
 }
 
 // SetOTel attaches OTel instruments for distributed tracing and metrics.
-func (s *Scheduler) SetOTel(c *fcrotel.Client, resumeRouting metric.Int64Counter) {
+func (s *Scheduler) SetOTel(c *fcrotel.Client, resumeRouting metric.Int64Counter, allocationCounter metric.Int64Counter, allocationLatency metric.Float64Histogram, placementCounter metric.Int64Counter) {
 	s.otelClient = c
 	s.sessionResumeRoutingCounter = resumeRouting
+	s.allocationCounter = allocationCounter
+	s.allocationLatency = allocationLatency
+	s.placementCounter = placementCounter
 }
 
 // SetConfigCache sets the in-memory config cache for fast workload config lookups.
@@ -207,6 +214,7 @@ func (s *Scheduler) Close() {
 type AllocateRunnerRequest struct {
 	RequestID           string
 	WorkloadKey         string
+	Source              string
 	Labels              map[string]string
 	SessionID           string
 	VCPUs               int
@@ -227,10 +235,91 @@ type AllocateRunnerResponse struct {
 	Error       string
 }
 
+func (s *Scheduler) recordAllocationTelemetry(ctx context.Context, duration time.Duration, workloadKey, source, result, reason string) {
+	if source == "" {
+		source = "unknown"
+	}
+	attrs := []attribute.KeyValue{
+		fcrotel.AttrResult.String(result),
+		fcrotel.AttrSource.String(source),
+	}
+	if workloadKey != "" {
+		attrs = append(attrs, fcrotel.AttrWorkloadKey.String(workloadKey))
+	}
+	if reason != "" {
+		attrs = append(attrs, fcrotel.AttrReason.String(reason))
+	}
+	if s.allocationCounter != nil {
+		s.allocationCounter.Add(ctx, 1, metric.WithAttributes(attrs...))
+	}
+	if s.allocationLatency != nil {
+		s.allocationLatency.Record(ctx, duration.Seconds(), metric.WithAttributes(attrs...))
+	}
+}
+
+func (s *Scheduler) recordPlacementTelemetry(ctx context.Context, workloadKey, source, selectionReason, cacheState string) {
+	if source == "" {
+		source = "unknown"
+	}
+	attrs := []attribute.KeyValue{
+		fcrotel.AttrSource.String(source),
+		fcrotel.AttrSelectionReason.String(selectionReason),
+		fcrotel.AttrCacheState.String(cacheState),
+	}
+	if workloadKey != "" {
+		attrs = append(attrs, fcrotel.AttrWorkloadKey.String(workloadKey))
+	}
+	if s.placementCounter != nil {
+		s.placementCounter.Add(ctx, 1, metric.WithAttributes(attrs...))
+	}
+}
+
+func (s *Scheduler) recordResumeRoutingTelemetry(ctx context.Context, workloadKey, source, routing string) {
+	if source == "" {
+		source = "unknown"
+	}
+	attrs := []attribute.KeyValue{
+		fcrotel.AttrRouting.String(routing),
+		fcrotel.AttrSource.String(source),
+	}
+	if workloadKey != "" {
+		attrs = append(attrs, fcrotel.AttrWorkloadKey.String(workloadKey))
+	}
+	if s.sessionResumeRoutingCounter != nil {
+		s.sessionResumeRoutingCounter.Add(ctx, 1, metric.WithAttributes(attrs...))
+	}
+}
+
+func placementCacheState(h *Host, workloadKey, targetVersion string) string {
+	if workloadKey == "" || h == nil || h.LoadedManifests == nil {
+		return "miss"
+	}
+	version, ok := h.LoadedManifests[workloadKey]
+	if !ok {
+		return "miss"
+	}
+	if targetVersion == "" {
+		return "warm"
+	}
+	if targetVersion != "" && version == targetVersion {
+		return "exact"
+	}
+	return "stale"
+}
+
 // AllocateRunner allocates a runner on the best available host
 func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerRequest) (_ *AllocateRunnerResponse, retErr error) {
+	allocStart := time.Now()
+	failureReason := ""
 	var idempotentAlloc *recentSchedulerAllocation
 	var allocatedResp *AllocateRunnerResponse
+	defer func() {
+		result := fcrotel.ResultSuccess
+		if retErr != nil {
+			result = fcrotel.ResultFailure
+		}
+		s.recordAllocationTelemetry(ctx, time.Since(allocStart), req.WorkloadKey, req.Source, result, failureReason)
+	}()
 
 	if existing, alloc, leader := s.beginIdempotentAllocation(req.RequestID); existing != nil {
 		return existing, nil
@@ -281,6 +370,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 					SELECT COUNT(*) FROM runners WHERE workload_key = $1 AND status IN ('running','busy','initializing')
 				`, workloadKey).Scan(&currentCount)
 				if currentCount >= wc.MaxConcurrentRunners {
+					failureReason = "max_concurrent_runners"
 					return nil, fmt.Errorf("workload_key %s at max concurrent runners (%d/%d)", workloadKey, currentCount, wc.MaxConcurrentRunners)
 				}
 			}
@@ -306,6 +396,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 						SELECT COUNT(*) FROM runners WHERE workload_key = $1 AND status IN ('running','busy','initializing')
 					`, workloadKey).Scan(&currentCount)
 					if currentCount >= maxConcurrent {
+						failureReason = "max_concurrent_runners"
 						return nil, fmt.Errorf("workload_key %s at max concurrent runners (%d/%d)", workloadKey, currentCount, maxConcurrent)
 					}
 				}
@@ -337,13 +428,16 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 
 	if req.SnapshotTag != "" {
 		if workloadKey == "" {
+			failureReason = "missing_workload_key"
 			return nil, fmt.Errorf("snapshot tag %q requires a workload_key", req.SnapshotTag)
 		}
 		if s.tagRegistry == nil {
+			failureReason = "snapshot_tag_not_found"
 			return nil, fmt.Errorf("snapshot tag %q not found for workload %q", req.SnapshotTag, workloadKey)
 		}
 		v, err := s.tagRegistry.ResolveTagVersion(ctx, workloadKey, req.SnapshotTag)
 		if err != nil {
+			failureReason = "snapshot_tag_not_found"
 			return nil, fmt.Errorf("snapshot tag %q not found for workload %q", req.SnapshotTag, workloadKey)
 		}
 		taggedSnapshotVersion = v
@@ -458,11 +552,13 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 
 	if !anyAvailable {
 		s.hostRegistry.RecordAllocFailure()
+		failureReason = "no_available_hosts"
 		retErr = fmt.Errorf("no available hosts")
 		return nil, retErr
 	}
 	if len(candidates) == 0 {
 		s.hostRegistry.RecordAllocFailure()
+		failureReason = "insufficient_capacity"
 		retErr = fmt.Errorf("no host with sufficient capacity for tier %s (need %d CPU, %d MB memory)", tierName, effectiveCPU, effectiveMemoryMB)
 		return nil, retErr
 	}
@@ -511,22 +607,14 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			"session_id": req.SessionID,
 			"host_id":    sessionHostID,
 		}).Info("Session sticky routing: using original host")
-		if s.sessionResumeRoutingCounter != nil {
-			s.sessionResumeRoutingCounter.Add(ctx, 1, metric.WithAttributes(
-				fcrotel.AttrRouting.String(fcrotel.RoutingSameHost),
-			))
-		}
+		s.recordResumeRoutingTelemetry(ctx, workloadKey, req.Source, fcrotel.RoutingSameHost)
 	} else if stickyFallback {
 		s.logger.WithFields(logrus.Fields{
 			"session_id":      req.SessionID,
 			"original_host":   sessionHostID,
 			"available_hosts": len(candidates),
 		}).Warn("Session sticky host not available, falling back to best-fit")
-		if s.sessionResumeRoutingCounter != nil {
-			s.sessionResumeRoutingCounter.Add(ctx, 1, metric.WithAttributes(
-				fcrotel.AttrRouting.String(fcrotel.RoutingCrossHost),
-			))
-		}
+		s.recordResumeRoutingTelemetry(ctx, workloadKey, req.Source, fcrotel.RoutingCrossHost)
 	}
 
 	// Pre-build proto request (host-independent parts).
@@ -647,6 +735,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		if err != nil {
 			s.hostRegistry.releasePendingReservation(h.ID, effectiveCPU, effectiveMemoryMB)
 			lastErr = err
+			failureReason = "host_connect_error"
 			s.logger.WithError(err).WithField("host", h.InstanceName).Warn("Failed to connect to host, trying next")
 			continue
 		}
@@ -670,6 +759,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			s.hostRegistry.releasePendingReservation(h.ID, effectiveCPU, effectiveMemoryMB)
 			// Non-retryable: context cancelled/deadline exceeded
 			if ctx.Err() != nil {
+				failureReason = "context_cancelled"
 				retErr = ctx.Err()
 				return nil, retErr
 			}
@@ -677,11 +767,13 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			st, _ := status.FromError(err)
 			if st.Code() == codes.InvalidArgument {
 				s.logger.WithError(err).WithField("host", h.InstanceName).Error("gRPC AllocateRunner failed (non-retryable)")
+				failureReason = "host_rpc_invalid_argument"
 				retErr = fmt.Errorf("host agent AllocateRunner failed: %w", err)
 				return nil, retErr
 			}
 			// Retryable gRPC error (transport, unavailable, timeout, etc.)
 			s.logger.WithError(err).WithField("host", h.InstanceName).Warn("gRPC AllocateRunner failed, trying next host")
+			failureReason = "host_rpc_error"
 			lastErr = fmt.Errorf("host agent AllocateRunner failed: %w", err)
 			continue
 		}
@@ -693,10 +785,12 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 					"host":  h.InstanceName,
 					"error": resp.Error,
 				}).Warn("Host agent error, trying next host")
+				failureReason = "host_rejected_retryable"
 				lastErr = fmt.Errorf("host agent returned error: %s", resp.Error)
 				continue
 			}
 			// Non-retryable host error
+			failureReason = "host_rejected_non_retryable"
 			retErr = fmt.Errorf("host agent returned error: %s", resp.Error)
 			return &AllocateRunnerResponse{
 				HostID:      h.ID,
@@ -724,6 +818,13 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			}
 		}
 		s.hostRegistry.releasePendingReservation(h.ID, effectiveCPU, effectiveMemoryMB)
+		selectionReason := "best_fit"
+		if stickySelected && h.ID == sessionHostID {
+			selectionReason = "sticky_same_host"
+		} else if stickyFallback {
+			selectionReason = "sticky_fallback"
+		}
+		s.recordPlacementTelemetry(ctx, workloadKey, req.Source, selectionReason, placementCacheState(h, workloadKey, protoReq.SnapshotVersion))
 
 		allocatedResp = &AllocateRunnerResponse{
 			RunnerID:    resp.Runner.GetId(),
@@ -740,6 +841,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// demand-driven scale-up path sees the signal, not just pre-scan capacity
 	// shortages.
 	s.hostRegistry.RecordAllocFailure()
+	failureReason = "no_suitable_host_after_attempts"
 	if lastErr != nil {
 		retErr = lastErr
 	} else {

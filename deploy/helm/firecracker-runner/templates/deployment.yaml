@@ -85,6 +85,8 @@ spec:
               value: {{ .Values.gcp.hostAutoscalerName | quote }}
             - name: BUILDER_NETWORK
               value: {{ .Values.gcp.builderNetwork | quote }}
+            - name: BUILDER_SUBNET
+              value: {{ .Values.gcp.builderSubnet | quote }}
             - name: BUILDER_IMAGE
               value: {{ .Values.gcp.builderImage | quote }}
             - name: BUILDER_SERVICE_ACCOUNT

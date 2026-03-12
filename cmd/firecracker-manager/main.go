@@ -30,6 +30,8 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
 	pb "github.com/rahul-roy-glean/bazel-firecracker/api/proto/runner"
@@ -66,6 +68,177 @@ var (
 	memBackend       = flag.String("mem-backend", "chunked", "Memory restore backend: 'chunked' (UFFD lazy loading, default) or 'file' (download full snapshot.mem at startup). Overrides the backend recorded in snapshot metadata.")
 	gcsPrefix        = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
 )
+
+type managerEndpointMetrics struct {
+	requests     metric.Int64Counter
+	requestDur   metric.Float64Histogram
+	requestSize  metric.Float64Histogram
+	responseSize metric.Float64Histogram
+	inflight     metric.Int64UpDownCounter
+}
+
+type managerLifecycleMetrics struct {
+	vmAllocCounter       metric.Int64Counter
+	vmReadyHist          metric.Float64Histogram
+	hostHeartbeatHist    metric.Float64Histogram
+	hostHeartbeatCounter metric.Int64Counter
+	sessionPauseHist     metric.Float64Histogram
+	sessionPauseCounter  metric.Int64Counter
+	sessionResumeHist    metric.Float64Histogram
+	sessionResumeCounter metric.Int64Counter
+}
+
+func newManagerEndpointMetrics(meter metric.Meter) *managerEndpointMetrics {
+	requests, _ := fcrotel.NewCounter(meter, fcrotel.ManagerEndpointRequests)
+	requestDur, _ := fcrotel.NewHistogram(meter, fcrotel.ManagerEndpointRequestDuration)
+	requestSize, _ := fcrotel.NewHistogram(meter, fcrotel.ManagerEndpointRequestSize)
+	responseSize, _ := fcrotel.NewHistogram(meter, fcrotel.ManagerEndpointResponseSize)
+	inflight, _ := fcrotel.NewUpDownCounter(meter, fcrotel.ManagerEndpointRequestsInFlight)
+	return &managerEndpointMetrics{
+		requests:     requests,
+		requestDur:   requestDur,
+		requestSize:  requestSize,
+		responseSize: responseSize,
+		inflight:     inflight,
+	}
+}
+
+func instrumentManagerEndpoint(route, operation string, metrics *managerEndpointMetrics, otelClient *fcrotel.Client, next http.Handler) http.Handler {
+	handler := otelhttp.WithRouteTag(route, otelhttp.NewHandler(
+		next,
+		operation,
+		otelhttp.WithTracerProvider(otelClient.TracerProvider),
+		otelhttp.WithMeterProvider(otelClient.MeterProvider),
+	))
+	handler = managerEndpointMetricsMiddleware(route, metrics, handler)
+	return managerRouteMetadataMiddleware(route, operation, handler)
+}
+
+func managerRouteMetadataMiddleware(route, operation string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if recorder, ok := w.(interface{ SetRouteMetadata(string, string) }); ok {
+			recorder.SetRouteMetadata(route, operation)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func setManagerRoute(w http.ResponseWriter, route, operation string) {
+	if recorder, ok := w.(interface{ SetRouteMetadata(string, string) }); ok {
+		recorder.SetRouteMetadata(route, operation)
+	}
+}
+
+func managerEndpointMetricsMiddleware(defaultRoute string, metrics *managerEndpointMetrics, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+		start := time.Now()
+		requestSize := requestContentLength(r)
+		metrics.inflight.Add(r.Context(), 1, metric.WithAttributes(
+			fcrotel.AttrRoute.String(defaultRoute),
+			fcrotel.AttrMethod.String(r.Method),
+		))
+		defer metrics.inflight.Add(r.Context(), -1, metric.WithAttributes(
+			fcrotel.AttrRoute.String(defaultRoute),
+			fcrotel.AttrMethod.String(r.Method),
+		))
+
+		next.ServeHTTP(rec, r)
+
+		route := rec.route
+		if route == "" {
+			route = defaultRoute
+		}
+		attrs := []attribute.KeyValue{
+			fcrotel.AttrRoute.String(route),
+			fcrotel.AttrMethod.String(r.Method),
+			fcrotel.AttrStatusCode.String(fmt.Sprintf("%d", rec.statusCode)),
+			fcrotel.AttrStatusClass.String(httpStatusClass(rec.statusCode)),
+		}
+		metrics.requests.Add(r.Context(), 1, metric.WithAttributes(attrs...))
+		metrics.requestDur.Record(r.Context(), time.Since(start).Seconds(), metric.WithAttributes(attrs...))
+		metrics.requestSize.Record(r.Context(), float64(requestSize), metric.WithAttributes(attrs...))
+		metrics.responseSize.Record(r.Context(), float64(rec.bytesWritten), metric.WithAttributes(attrs...))
+	})
+}
+
+func requestContentLength(r *http.Request) int64 {
+	if r.ContentLength < 0 {
+		return 0
+	}
+	return r.ContentLength
+}
+
+func httpStatusClass(code int) string {
+	return fmt.Sprintf("%dxx", code/100)
+}
+
+func recordSessionPauseMetrics(ctx context.Context, metrics managerLifecycleMetrics, duration time.Duration, result, source string) {
+	attrs := []attribute.KeyValue{
+		fcrotel.AttrResult.String(result),
+		fcrotel.AttrSource.String(source),
+	}
+	if result == fcrotel.ResultSuccess && metrics.sessionPauseHist != nil {
+		metrics.sessionPauseHist.Record(ctx, duration.Seconds(), metric.WithAttributes(attrs...))
+	}
+	if metrics.sessionPauseCounter != nil {
+		metrics.sessionPauseCounter.Add(ctx, 1, metric.WithAttributes(attrs...))
+	}
+}
+
+func sessionResumeRouting(mgr *runner.Manager, sessionID string) string {
+	meta, _ := mgr.GetSessionMetadata(sessionID)
+	if meta != nil && meta.GCSManifestPath != "" {
+		return fcrotel.RoutingGCS
+	}
+	return fcrotel.RoutingLocal
+}
+
+func recordSessionResumeMetrics(ctx context.Context, mgr *runner.Manager, metrics managerLifecycleMetrics, sessionID string, duration time.Duration, result, source string) {
+	attrs := []attribute.KeyValue{
+		fcrotel.AttrResult.String(result),
+		fcrotel.AttrSource.String(source),
+	}
+	if result == fcrotel.ResultSuccess {
+		attrs = append(attrs, fcrotel.AttrRouting.String(sessionResumeRouting(mgr, sessionID)))
+		if metrics.sessionResumeHist != nil {
+			metrics.sessionResumeHist.Record(ctx, duration.Seconds(), metric.WithAttributes(attrs...))
+		}
+	}
+	if metrics.sessionResumeCounter != nil {
+		metrics.sessionResumeCounter.Add(ctx, 1, metric.WithAttributes(attrs...))
+	}
+}
+
+func recordAllocationMetrics(ctx context.Context, metrics managerLifecycleMetrics, duration time.Duration, result, source string) {
+	attrs := metric.WithAttributes(
+		fcrotel.AttrResult.String(result),
+		fcrotel.AttrSource.String(source),
+	)
+	if metrics.vmAllocCounter != nil {
+		metrics.vmAllocCounter.Add(ctx, 1, attrs)
+	}
+	if result == fcrotel.ResultSuccess && metrics.vmReadyHist != nil {
+		metrics.vmReadyHist.Record(ctx, duration.Seconds(), attrs)
+	}
+}
+
+func recordHeartbeatMetrics(ctx context.Context, metrics managerLifecycleMetrics, result, source string, statusCode int, reason string) {
+	if metrics.hostHeartbeatCounter == nil {
+		return
+	}
+	attrs := []attribute.KeyValue{
+		fcrotel.AttrResult.String(result),
+		fcrotel.AttrSource.String(source),
+	}
+	if statusCode > 0 {
+		attrs = append(attrs, fcrotel.AttrStatusCode.String(fmt.Sprintf("%d", statusCode)))
+	}
+	if reason != "" {
+		attrs = append(attrs, fcrotel.AttrReason.String(reason))
+	}
+	metrics.hostHeartbeatCounter.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
 
 // resumeGates prevents thundering-herd on concurrent auto-resume for the same runner.
 var resumeGates sync.Map // runnerID -> *singleflight.Group
@@ -217,6 +390,7 @@ func main() {
 	// VM metrics
 	vmAllocCounter, _ := fcrotel.NewCounter(meter, fcrotel.VMAllocations)
 	vmBootHist, _ := fcrotel.NewHistogram(meter, fcrotel.VMBootDuration)
+	vmReadyHist, _ := fcrotel.NewHistogram(meter, fcrotel.VMReadyDuration)
 
 	// Chunked metrics (gauges for absolute values reported each iteration)
 	diskCacheSizeGauge, _ := fcrotel.NewGauge(meter, fcrotel.ChunkedDiskCacheSize)
@@ -237,12 +411,24 @@ func main() {
 
 	// Heartbeat
 	hbLatencyHist, _ := fcrotel.NewHistogram(meter, fcrotel.HostHeartbeatLatency)
+	hbTotalCounter, _ := fcrotel.NewCounter(meter, fcrotel.HostHeartbeatTotal)
 
 	// Session metrics for server.go
 	sessionPauseHist, _ := fcrotel.NewHistogram(meter, fcrotel.SessionPauseDuration)
 	sessionPauseCounter, _ := fcrotel.NewCounter(meter, fcrotel.SessionPauseTotal)
 	sessionResumeHist, _ := fcrotel.NewHistogram(meter, fcrotel.SessionResumeDuration)
 	sessionResumeCounter, _ := fcrotel.NewCounter(meter, fcrotel.SessionResumeTotal)
+	endpointMetrics := newManagerEndpointMetrics(meter)
+	lifecycleMetrics := managerLifecycleMetrics{
+		vmAllocCounter:       vmAllocCounter,
+		vmReadyHist:          vmReadyHist,
+		hostHeartbeatHist:    hbLatencyHist,
+		hostHeartbeatCounter: hbTotalCounter,
+		sessionPauseHist:     sessionPauseHist,
+		sessionPauseCounter:  sessionPauseCounter,
+		sessionResumeHist:    sessionResumeHist,
+		sessionResumeCounter: sessionResumeCounter,
+	}
 
 	// Create gRPC server
 	grpcServer := grpc.NewServer(
@@ -256,7 +442,7 @@ func main() {
 	// Register services
 	hostAgentServer := NewHostAgentServer(mgr, chunkedMgr, logger)
 	pb.RegisterHostAgentServer(grpcServer, hostAgentServer)
-	hostAgentServer.SetOTelInstruments(sessionPauseHist, sessionPauseCounter, sessionResumeHist, sessionResumeCounter)
+	hostAgentServer.SetOTelInstruments(lifecycleMetrics)
 
 	// Register health service
 	healthServer := health.NewServer()
@@ -281,11 +467,14 @@ func main() {
 
 	// Start HTTP server for health and metrics
 	httpMux := http.NewServeMux()
-	httpMux.HandleFunc("/health", healthHandler(mgr))
-	httpMux.HandleFunc("/ready", readyHandler(mgr))
-	httpMux.HandleFunc("/api/v1/runners/quarantine", drainingGuard(mgr, quarantineRunnerHandler(mgr, logger)))
-	httpMux.HandleFunc("/api/v1/runners/unquarantine", drainingGuard(mgr, unquarantineRunnerHandler(mgr, logger)))
-	httpMux.HandleFunc("/api/v1/runners/network-policy", func(w http.ResponseWriter, r *http.Request) {
+	instrumentHTTPHandler := func(route, operation string, handler http.Handler) http.Handler {
+		return instrumentManagerEndpoint(route, operation, endpointMetrics, otelClient, handler)
+	}
+	httpMux.Handle("/health", instrumentHTTPHandler("/health", "firecracker_manager.health", healthHandler(mgr)))
+	httpMux.Handle("/ready", instrumentHTTPHandler("/ready", "firecracker_manager.ready", readyHandler(mgr)))
+	httpMux.Handle("/api/v1/runners/quarantine", instrumentHTTPHandler("/api/v1/runners/quarantine", "firecracker_manager.quarantine_runner", drainingGuard(mgr, quarantineRunnerHandler(mgr, logger))))
+	httpMux.Handle("/api/v1/runners/unquarantine", instrumentHTTPHandler("/api/v1/runners/unquarantine", "firecracker_manager.unquarantine_runner", drainingGuard(mgr, unquarantineRunnerHandler(mgr, logger))))
+	httpMux.Handle("/api/v1/runners/network-policy", instrumentHTTPHandler("/api/v1/runners/network-policy", "firecracker_manager.network_policy", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			getNetworkPolicyHandler(mgr, logger)(w, r)
@@ -294,13 +483,13 @@ func main() {
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
-	})
-	httpMux.HandleFunc("/api/v1/gc", gcHandler(mgr, logger))
-	httpMux.HandleFunc("/api/v1/runners/", drainingGuard(mgr, runnerProxyHandler(mgr, logger)))
+	})))
+	httpMux.Handle("/api/v1/gc", instrumentHTTPHandler("/api/v1/gc", "firecracker_manager.gc", gcHandler(mgr, logger)))
+	httpMux.Handle("/api/v1/runners/", instrumentHTTPHandler("/api/v1/runners/*", "firecracker_manager.runners", drainingGuard(mgr, runnerProxyHandler(mgr, logger, lifecycleMetrics))))
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *httpPort),
-		Handler: httpMux,
+		Handler: managerAPILoggingMiddleware(logger, httpMux),
 	}
 
 	go func() {
@@ -339,7 +528,7 @@ func main() {
 
 	// Start heartbeat loop if control plane is configured
 	if *controlPlane != "" {
-		go heartbeatLoop(ctx, mgr, chunkedMgr, *controlPlane, *hostBootstrapToken, instanceName, zone, *grpcPort, *httpPort, logger, hbLatencyHist)
+		go heartbeatLoop(ctx, mgr, chunkedMgr, *controlPlane, *hostBootstrapToken, instanceName, zone, *grpcPort, *httpPort, logger, lifecycleMetrics)
 	}
 
 	// Wait for shutdown signal
@@ -354,7 +543,7 @@ func main() {
 
 	// Send a drain heartbeat to the control plane so it stops allocating to this host.
 	if *controlPlane != "" {
-		sendDrainHeartbeat(mgr, chunkedMgr, *controlPlane, *hostBootstrapToken, instanceName, zone, *grpcPort, *httpPort, logger)
+		sendDrainHeartbeat(mgr, chunkedMgr, *controlPlane, *hostBootstrapToken, instanceName, zone, *grpcPort, *httpPort, logger, lifecycleMetrics)
 	}
 
 	// Pause all session-bound runners so their state is saved to GCS and they
@@ -410,6 +599,75 @@ func readyHandler(mgr *runner.Manager) http.HandlerFunc {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "Ready: %d runners", status.ActiveRunners)
 	}
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	statusCode   int
+	bytesWritten int64
+	route        string
+	operation    string
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.statusCode = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(p []byte) (int, error) {
+	n, err := r.ResponseWriter.Write(p)
+	r.bytesWritten += int64(n)
+	return n, err
+}
+
+func (r *statusRecorder) SetRouteMetadata(route, operation string) {
+	r.route = route
+	r.operation = operation
+	if recorder, ok := r.ResponseWriter.(interface{ SetRouteMetadata(string, string) }); ok {
+		recorder.SetRouteMetadata(route, operation)
+	}
+}
+
+func managerAPILoggingMiddleware(logger *logrus.Logger, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" || r.URL.Path == "/ready" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		duration := time.Since(start)
+
+		fields := logrus.Fields{
+			"method":         r.Method,
+			"path":           r.URL.Path,
+			"status":         rec.statusCode,
+			"status_class":   httpStatusClass(rec.statusCode),
+			"duration_ms":    duration.Milliseconds(),
+			"remote_addr":    r.RemoteAddr,
+			"response_bytes": rec.bytesWritten,
+		}
+		if rec.route != "" {
+			fields["route"] = rec.route
+		}
+		if rec.operation != "" {
+			fields["operation"] = rec.operation
+		}
+		if r.ContentLength >= 0 {
+			fields["request_bytes"] = r.ContentLength
+		}
+
+		entry := logger.WithFields(fields)
+		if rec.statusCode >= 500 {
+			entry.Error("Manager HTTP request completed with server error")
+		} else if rec.statusCode >= 400 {
+			entry.Warn("Manager HTTP request completed with client error")
+		} else {
+			entry.Info("Manager HTTP request completed")
+		}
+	})
 }
 
 // autoscaleInstruments holds OTel instruments used by the autoscale loop.
@@ -522,7 +780,7 @@ type hostHeartbeatResponse struct {
 	Error        string            `json:"error,omitempty"`
 }
 
-func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, controlPlane, hostBootstrapToken, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger, hbLatencyHist metric.Float64Histogram) {
+func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, controlPlane, hostBootstrapToken, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger, lifecycleMetrics managerLifecycleMetrics) {
 	log := logger.WithField("component", "heartbeat")
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -569,6 +827,7 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			req, err := http.NewRequestWithContext(ctx, http.MethodPost, heartbeatURL, bytes.NewReader(b))
 			if err != nil {
 				log.WithError(err).Warn("Failed to create heartbeat request")
+				recordHeartbeatMetrics(ctx, lifecycleMetrics, fcrotel.ResultError, "periodic", 0, "request_create")
 				continue
 			}
 			req.Header.Set("Content-Type", "application/json")
@@ -578,31 +837,38 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			resp, err := client.Do(req)
 			if err != nil {
 				log.WithError(err).Warn("Heartbeat request failed")
+				recordHeartbeatMetrics(ctx, lifecycleMetrics, fcrotel.ResultFailure, "periodic", 0, "request_send")
 				continue
 			}
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 
-			// Record heartbeat latency
-			hbLatencyHist.Record(ctx, time.Since(hbStart).Seconds())
+			// Record heartbeat latency after a response is received.
+			if lifecycleMetrics.hostHeartbeatHist != nil {
+				lifecycleMetrics.hostHeartbeatHist.Record(ctx, time.Since(hbStart).Seconds())
+			}
 
 			if resp.StatusCode >= 400 {
 				log.WithFields(logrus.Fields{
 					"status": resp.StatusCode,
 					"body":   string(body),
 				}).Warn("Heartbeat rejected by control plane")
+				recordHeartbeatMetrics(ctx, lifecycleMetrics, fcrotel.ResultFailure, "periodic", resp.StatusCode, "http_rejected")
 				continue
 			}
 
 			var hbResp hostHeartbeatResponse
 			if err := json.Unmarshal(body, &hbResp); err != nil {
 				log.WithError(err).WithField("body", string(body)).Warn("Failed to parse heartbeat response")
+				recordHeartbeatMetrics(ctx, lifecycleMetrics, fcrotel.ResultError, "periodic", resp.StatusCode, "response_parse")
 				continue
 			}
 			if hbResp.Error != "" {
 				log.WithField("error", hbResp.Error).Warn("Control plane heartbeat error")
+				recordHeartbeatMetrics(ctx, lifecycleMetrics, fcrotel.ResultError, "periodic", resp.StatusCode, "control_plane_error")
 				continue
 			}
+			recordHeartbeatMetrics(ctx, lifecycleMetrics, fcrotel.ResultSuccess, "periodic", resp.StatusCode, "")
 
 			changed := mgr.SetDraining(hbResp.ShouldDrain)
 			if changed {
@@ -655,7 +921,7 @@ func heartbeatLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 
 // sendDrainHeartbeat sends a single heartbeat with Draining=true so the control
 // plane marks this host as draining before the process exits.
-func sendDrainHeartbeat(mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, controlPlane, hostBootstrapToken, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger) {
+func sendDrainHeartbeat(mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, controlPlane, hostBootstrapToken, instanceName, zone string, grpcPort, httpPort int, logger *logrus.Logger, lifecycleMetrics managerLifecycleMetrics) {
 	log := logger.WithField("component", "drain-heartbeat")
 
 	cp := strings.TrimSpace(controlPlane)
@@ -694,6 +960,7 @@ func sendDrainHeartbeat(mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, heartbeatURL, bytes.NewReader(b))
 	if err != nil {
 		log.WithError(err).Warn("Failed to create drain heartbeat request")
+		recordHeartbeatMetrics(ctx, lifecycleMetrics, fcrotel.ResultError, "drain", 0, "request_create")
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -705,9 +972,15 @@ func sendDrainHeartbeat(mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, 
 	resp, err := client.Do(req)
 	if err != nil {
 		log.WithError(err).Warn("Failed to send drain heartbeat")
+		recordHeartbeatMetrics(ctx, lifecycleMetrics, fcrotel.ResultFailure, "drain", 0, "request_send")
 		return
 	}
 	resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		recordHeartbeatMetrics(ctx, lifecycleMetrics, fcrotel.ResultFailure, "drain", resp.StatusCode, "http_rejected")
+	} else {
+		recordHeartbeatMetrics(ctx, lifecycleMetrics, fcrotel.ResultSuccess, "drain", resp.StatusCode, "")
+	}
 	log.WithField("status", resp.StatusCode).Info("Drain heartbeat sent to control plane")
 }
 
@@ -949,7 +1222,7 @@ func gcHandler(mgr *runner.Manager, logger *logrus.Logger) http.HandlerFunc {
 // This allows external clients to reach services running inside microVMs
 // (e.g., claude_sandbox_service) without knowing about network namespaces,
 // veth IPs, or DNAT. The client just needs the host address and runner ID.
-func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.HandlerFunc {
+func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger, lifecycleMetrics managerLifecycleMetrics) http.HandlerFunc {
 	log := logger.WithField("handler", "runner-proxy")
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Parse URL: /api/v1/runners/{runnerID}/proxy/{path...}
@@ -964,6 +1237,7 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 
 		// Handle /api/v1/runners/{id}/token/gcp (GCP token refresh for long jobs)
 		if tokenParts := strings.SplitN(suffix, "/token/gcp", 2); len(tokenParts) == 2 && tokenParts[1] == "" {
+			setManagerRoute(w, "/api/v1/runners/:id/token/gcp", "firecracker_manager.runner_gcp_token")
 			gcpTokenHandler(w, r, logger)
 			return
 		}
@@ -972,20 +1246,23 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 		if execParts := strings.SplitN(suffix, "/exec", 2); len(execParts) == 2 && execParts[1] == "" {
 			runnerID := execParts[0]
 			runnerID = strings.TrimSuffix(runnerID, "/")
-			handleExecCommand(w, r, mgr, log, runnerID)
+			setManagerRoute(w, "/api/v1/runners/:id/exec", "firecracker_manager.runner_exec")
+			handleExecCommand(w, r, mgr, log, runnerID, lifecycleMetrics)
 			return
 		}
 
 		// Handle /api/v1/runners/{id}/pty (interactive terminal via WebSocket)
 		if ptyParts := strings.SplitN(suffix, "/pty", 2); len(ptyParts) == 2 && (ptyParts[1] == "" || ptyParts[1][0] == '?') {
 			runnerID := strings.TrimSuffix(ptyParts[0], "/")
-			handlePTYProxy(w, r, mgr, log, runnerID)
+			setManagerRoute(w, "/api/v1/runners/:id/pty", "firecracker_manager.runner_pty")
+			handlePTYProxy(w, r, mgr, log, runnerID, lifecycleMetrics)
 			return
 		}
 
 		// Handle /api/v1/runners/{id}/service-logs (proxy to thaw-agent's service-logs)
 		if slParts := strings.SplitN(suffix, "/service-logs", 2); len(slParts) == 2 {
 			runnerID := strings.TrimSuffix(slParts[0], "/")
+			setManagerRoute(w, "/api/v1/runners/:id/service-logs", "firecracker_manager.runner_service_logs")
 			handleServiceLogs(w, r, mgr, log, runnerID, slParts[1])
 			return
 		}
@@ -994,7 +1271,8 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 		if pauseParts := strings.SplitN(suffix, "/pause", 2); len(pauseParts) == 2 && pauseParts[1] == "" {
 			runnerID := pauseParts[0]
 			runnerID = strings.TrimSuffix(runnerID, "/")
-			handlePauseRunner(w, r, mgr, log, runnerID)
+			setManagerRoute(w, "/api/v1/runners/:id/pause", "firecracker_manager.runner_pause")
+			handlePauseRunner(w, r, mgr, log, runnerID, lifecycleMetrics)
 			return
 		}
 
@@ -1002,6 +1280,7 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 		if cpParts := strings.SplitN(suffix, "/checkpoint", 2); len(cpParts) == 2 && cpParts[1] == "" {
 			runnerID := cpParts[0]
 			runnerID = strings.TrimSuffix(runnerID, "/")
+			setManagerRoute(w, "/api/v1/runners/:id/checkpoint", "firecracker_manager.runner_checkpoint")
 			handleCheckpointRunner(w, r, mgr, log, runnerID)
 			return
 		}
@@ -1010,7 +1289,8 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 		if connectParts := strings.SplitN(suffix, "/connect", 2); len(connectParts) == 2 && connectParts[1] == "" {
 			runnerID := connectParts[0]
 			runnerID = strings.TrimSuffix(runnerID, "/")
-			handleConnectRunner(w, r, mgr, log, runnerID)
+			setManagerRoute(w, "/api/v1/runners/:id/connect", "firecracker_manager.runner_connect")
+			handleConnectRunner(w, r, mgr, log, runnerID, lifecycleMetrics)
 			return
 		}
 
@@ -1018,7 +1298,8 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 		if filesParts := strings.SplitN(suffix, "/files/", 2); len(filesParts) == 2 {
 			runnerID := strings.TrimSuffix(filesParts[0], "/")
 			fileOp := filesParts[1]
-			handleFileOp(w, r, mgr, log, runnerID, fileOp)
+			setManagerRoute(w, "/api/v1/runners/:id/files/"+fileOp, "firecracker_manager.runner_files")
+			handleFileOp(w, r, mgr, log, runnerID, fileOp, lifecycleMetrics)
 			return
 		}
 
@@ -1028,6 +1309,7 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 			http.Error(w, "Invalid URL: expected /api/v1/runners/{id}/proxy/{path}", http.StatusBadRequest)
 			return
 		}
+		setManagerRoute(w, "/api/v1/runners/:id/proxy/*", "firecracker_manager.runner_proxy")
 
 		runnerID := parts[0]
 		proxyPath := "/" + parts[1]
@@ -1041,7 +1323,7 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 
 		// Auto-resume suspended runners on proxy traffic
 		if rn.State == runner.StateSuspended {
-			resumed, resumeErr := autoResumeIfSuspended(r.Context(), mgr, log, runnerID, rn)
+			resumed, resumeErr := autoResumeIfSuspended(r.Context(), mgr, log, runnerID, rn, lifecycleMetrics)
 			if resumeErr != nil {
 				log.WithError(resumeErr).WithField("runner_id", runnerID).Warn("Auto-resume failed for proxy")
 				http.Error(w, "auto-resume failed: "+resumeErr.Error(), http.StatusServiceUnavailable)
@@ -1095,7 +1377,7 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger) http.Handler
 
 // handleExecCommand proxies a POST /exec request to a runner's thaw-agent,
 // streaming the ndjson response back to the client line-by-line.
-func handleExecCommand(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string) {
+func handleExecCommand(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string, lifecycleMetrics managerLifecycleMetrics) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -1118,7 +1400,7 @@ func handleExecCommand(w http.ResponseWriter, r *http.Request, mgr *runner.Manag
 
 	// Auto-resume if suspended
 	if rn.State == runner.StateSuspended {
-		resumed, err := autoResumeIfSuspended(r.Context(), mgr, log, runnerID, rn)
+		resumed, err := autoResumeIfSuspended(r.Context(), mgr, log, runnerID, rn, lifecycleMetrics)
 		if err != nil {
 			log.WithError(err).WithField("runner_id", runnerID).Warn("Auto-resume failed for exec")
 			http.Error(w, "auto-resume failed: "+err.Error(), http.StatusServiceUnavailable)
@@ -1184,7 +1466,7 @@ func handleExecCommand(w http.ResponseWriter, r *http.Request, mgr *runner.Manag
 
 // handlePTYProxy upgrades the client connection to WebSocket, dials the
 // thaw-agent's /pty endpoint inside the VM, and pumps frames bidirectionally.
-func handlePTYProxy(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string) {
+func handlePTYProxy(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string, lifecycleMetrics managerLifecycleMetrics) {
 	// Look up runner
 	rn, err := mgr.GetRunner(runnerID)
 	if err != nil {
@@ -1202,7 +1484,7 @@ func handlePTYProxy(w http.ResponseWriter, r *http.Request, mgr *runner.Manager,
 
 	// Auto-resume if suspended
 	if rn.State == runner.StateSuspended {
-		resumed, err := autoResumeIfSuspended(r.Context(), mgr, log, runnerID, rn)
+		resumed, err := autoResumeIfSuspended(r.Context(), mgr, log, runnerID, rn, lifecycleMetrics)
 		if err != nil {
 			log.WithError(err).WithField("runner_id", runnerID).Warn("Auto-resume failed for pty")
 			http.Error(w, "auto-resume failed: "+err.Error(), http.StatusServiceUnavailable)
@@ -1285,7 +1567,7 @@ func handlePTYProxy(w http.ResponseWriter, r *http.Request, mgr *runner.Manager,
 // handleFileOp proxies a /files/{op} request to a runner's thaw-agent.
 // For download/upload ops, it uses streaming (raw bytes, no timeout).
 // For metadata ops (read/write/list/stat/remove/mkdir), it uses JSON with a 30s timeout.
-func handleFileOp(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID, fileOp string) {
+func handleFileOp(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID, fileOp string, lifecycleMetrics managerLifecycleMetrics) {
 	// download is GET, everything else is POST
 	isDownload := fileOp == "download"
 	isUpload := fileOp == "upload"
@@ -1317,7 +1599,7 @@ func handleFileOp(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, l
 
 	// Auto-resume if suspended
 	if rn.State == runner.StateSuspended {
-		resumed, err := autoResumeIfSuspended(r.Context(), mgr, log, runnerID, rn)
+		resumed, err := autoResumeIfSuspended(r.Context(), mgr, log, runnerID, rn, lifecycleMetrics)
 		if err != nil {
 			log.WithError(err).WithField("runner_id", runnerID).Warn("Auto-resume failed for file op")
 			http.Error(w, "auto-resume failed: "+err.Error(), http.StatusServiceUnavailable)
@@ -1397,7 +1679,7 @@ func handleFileOp(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, l
 // autoResumeIfSuspended checks if a runner is suspended and auto-resumes it.
 // Returns the updated runner or an error. If the runner is not suspended, it
 // returns the original runner unchanged.
-func autoResumeIfSuspended(ctx context.Context, mgr *runner.Manager, log *logrus.Entry, runnerID string, rn *runner.Runner) (*runner.Runner, error) {
+func autoResumeIfSuspended(ctx context.Context, mgr *runner.Manager, log *logrus.Entry, runnerID string, rn *runner.Runner, lifecycleMetrics managerLifecycleMetrics) (*runner.Runner, error) {
 	if rn.State != runner.StateSuspended || rn.SessionID == "" {
 		return rn, nil
 	}
@@ -1412,16 +1694,20 @@ func autoResumeIfSuspended(ctx context.Context, mgr *runner.Manager, log *logrus
 	group := val.(*singleflight.Group)
 
 	result, err, _ := group.Do(runnerID, func() (interface{}, error) {
+		start := time.Now()
 		resumed, err := mgr.ResumeFromSession(ctx, rn.SessionID, rn.WorkloadKey)
 		if err != nil {
+			recordSessionResumeMetrics(ctx, mgr, lifecycleMetrics, rn.SessionID, time.Since(start), fcrotel.ResultFailure, "auto_resume")
 			return nil, fmt.Errorf("auto-resume failed: %w", err)
 		}
 
 		// Wait for thaw-agent exec readiness — /alive responds before /exec
 		// is fully functional after snapshot restore, so probe with a real exec.
 		if err := waitForThawAgentExec(resumed.InternalIP, 30*time.Second); err != nil {
+			recordSessionResumeMetrics(ctx, mgr, lifecycleMetrics, rn.SessionID, time.Since(start), fcrotel.ResultFailure, "auto_resume")
 			return nil, fmt.Errorf("thaw-agent not ready after resume: %w", err)
 		}
+		recordSessionResumeMetrics(ctx, mgr, lifecycleMetrics, rn.SessionID, time.Since(start), fcrotel.ResultSuccess, "auto_resume")
 
 		return resumed, nil
 	})
@@ -1584,20 +1870,23 @@ func isMounted(target string) bool {
 }
 
 // handlePauseRunner handles POST /api/v1/runners/{id}/pause
-func handlePauseRunner(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string) {
+func handlePauseRunner(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string, lifecycleMetrics managerLifecycleMetrics) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
+	start := time.Now()
 	result, err := mgr.PauseRunner(r.Context(), runnerID)
 	if err != nil {
 		log.WithError(err).WithField("runner_id", runnerID).Error("Failed to pause runner")
+		recordSessionPauseMetrics(r.Context(), lifecycleMetrics, time.Since(start), fcrotel.ResultFailure, "http")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
+	recordSessionPauseMetrics(r.Context(), lifecycleMetrics, time.Since(start), fcrotel.ResultSuccess, "http")
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1635,7 +1924,7 @@ func handleCheckpointRunner(w http.ResponseWriter, r *http.Request, mgr *runner.
 
 // handleConnectRunner handles POST /api/v1/runners/{id}/connect
 // If running: extends TTL (200). If suspended: resumes (201).
-func handleConnectRunner(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string) {
+func handleConnectRunner(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string, lifecycleMetrics managerLifecycleMetrics) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -1664,14 +1953,17 @@ func handleConnectRunner(w http.ResponseWriter, r *http.Request, mgr *runner.Man
 			http.Error(w, "runner has no session_id", http.StatusBadRequest)
 			return
 		}
+		start := time.Now()
 		resumed, err := mgr.ResumeFromSession(r.Context(), rn.SessionID, rn.WorkloadKey)
 		if err != nil {
 			log.WithError(err).WithField("runner_id", runnerID).Error("Failed to resume runner")
+			recordSessionResumeMetrics(r.Context(), mgr, lifecycleMetrics, rn.SessionID, time.Since(start), fcrotel.ResultFailure, "connect_http")
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
+		recordSessionResumeMetrics(r.Context(), mgr, lifecycleMetrics, rn.SessionID, time.Since(start), fcrotel.ResultSuccess, "connect_http")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(map[string]string{

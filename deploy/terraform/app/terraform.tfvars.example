@@ -1,0 +1,35 @@
+# Copy this file to terraform.tfvars and fill in your values
+
+# Remote state (required)
+infra_state_bucket = "your-terraform-state-bucket"
+infra_state_prefix = "firecracker/infra"
+
+# Database password (must match infra stage)
+db_password = "your-secure-password-here"
+
+# GitHub webhook secret
+github_webhook_secret = ""
+
+# Host bootstrap token
+host_bootstrap_token = ""
+
+# Control plane image tag
+control_plane_image_tag = "latest"
+
+# Host VM configuration
+host_machine_type      = "n2-standard-64"
+host_disk_size_gb      = 200
+host_data_disk_size_gb = 500
+min_hosts              = 1
+max_hosts              = 20
+use_custom_host_image  = false
+
+# MicroVM configuration
+microvm_subnet       = "172.16.0.0/24"
+max_runners_per_host = 4
+idle_runners_target  = 2
+chunk_cache_size_gb  = 2
+mem_cache_size_gb    = 2
+
+# Telemetry
+enable_otel_collector = true  # Deploy OTel Collector in GKE; ILB IP auto-wired to hosts

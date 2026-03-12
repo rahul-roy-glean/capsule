@@ -12,6 +12,8 @@ processors:
 exporters:
   googlecloud:
     project: ${GCP_PROJECT_ID}
+    metric:
+      service_resource_labels: true
     # Traces go to Cloud Trace, metrics go to Cloud Monitoring automatically.
 
 service:
