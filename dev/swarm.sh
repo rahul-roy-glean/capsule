@@ -240,6 +240,7 @@ Steps:
    - Affected file(s) and line numbers
    - Description of the problem and why it matters
    - Suggested fix approach (if you have one)
+4. You can create multiple issues if you find multiple issues.
 
 To create the issue, run:
   gh issue create \
