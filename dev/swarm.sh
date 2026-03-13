@@ -259,7 +259,7 @@ Steps:
    gh issue view <number> --repo '"$REPO"'
 4. Understand the relevant code
 5. Create a branch: git checkout -b fix/<issue-number>-short-description
-6. Implement the fix (edit files, run tests if possible)
+6. Implement the fix (edit files, run tests if possible), run pre-commits hooks. You need to first run pre-commit install to install the hooks.
 7. Commit your changes with a descriptive message referencing the issue
 8. Push and create a PR:
    git push origin fix/<issue-number>-short-description
