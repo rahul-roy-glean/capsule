@@ -30,6 +30,7 @@ type hostHeartbeatRequest struct {
 type heartbeatRunnerInfo struct {
 	RunnerID    string `json:"runner_id"`
 	State       string `json:"state"`
+	SessionID   string `json:"session_id,omitempty"`
 	WorkloadKey string `json:"workload_key"`
 	IdleSince   string `json:"idle_since,omitempty"` // RFC3339
 }
@@ -122,6 +123,7 @@ func (s *ControlPlaneServer) HandleHostHeartbeat(w http.ResponseWriter, r *http.
 			info := HostRunnerInfo{
 				RunnerID:    ri.RunnerID,
 				State:       ri.State,
+				SessionID:   ri.SessionID,
 				WorkloadKey: ri.WorkloadKey,
 			}
 			if ri.IdleSince != "" {
@@ -133,6 +135,24 @@ func (s *ControlPlaneServer) HandleHostHeartbeat(w http.ResponseWriter, r *http.
 		}
 		s.hostRegistry.mu.Lock()
 		host.RunnerInfos = infos
+		for _, info := range infos {
+			runner := s.hostRegistry.runners[info.RunnerID]
+			if runner == nil {
+				runner = &Runner{
+					ID:          info.RunnerID,
+					HostID:      host.ID,
+					Status:      info.State,
+					SessionID:   info.SessionID,
+					WorkloadKey: info.WorkloadKey,
+				}
+				s.hostRegistry.runners[info.RunnerID] = runner
+				continue
+			}
+			runner.HostID = host.ID
+			runner.Status = info.State
+			runner.SessionID = info.SessionID
+			runner.WorkloadKey = info.WorkloadKey
+		}
 		s.hostRegistry.mu.Unlock()
 	} else {
 		s.hostRegistry.mu.Lock()

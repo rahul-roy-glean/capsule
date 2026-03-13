@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS runners (
     host_id UUID REFERENCES hosts(id) ON DELETE CASCADE,
     status VARCHAR(32) DEFAULT 'pending' CHECK (status IN ('pending', 'booting', 'initializing', 'idle', 'busy', 'draining', 'quarantined', 'retiring', 'terminated')),
     internal_ip VARCHAR(45),
+    session_id VARCHAR(255),
     job_id VARCHAR(255),
     workload_key VARCHAR(16),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -81,6 +82,9 @@ CREATE TABLE IF NOT EXISTS jobs (
 -- Session snapshots: tracks session pause/resume state
 CREATE TABLE IF NOT EXISTS session_snapshots (
     session_id VARCHAR(255) PRIMARY KEY,
+    parent_session_id VARCHAR(255),
+    forked_from_runner_id VARCHAR(255),
+    forked_at TIMESTAMP WITH TIME ZONE,
     workload_key VARCHAR(16) NOT NULL,
     host_id VARCHAR(255) NOT NULL,
     runner_id VARCHAR(255) NOT NULL,

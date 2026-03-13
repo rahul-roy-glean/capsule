@@ -439,6 +439,7 @@ func (m *Manager) buildMMDSData(ctx context.Context, runner *Runner, tap *networ
 
 	var data MMDSData
 	data.Latest.Meta.RunnerID = runner.ID
+	data.Latest.Meta.SessionID = runner.SessionID
 	data.Latest.Meta.HostID = m.config.HostID
 	data.Latest.Meta.InstanceName = m.config.InstanceName
 	data.Latest.Meta.Environment = m.config.Environment
@@ -1146,6 +1147,7 @@ func (m *Manager) GetRunnerHeartbeatInfo() []RunnerHeartbeatInfo {
 		info := RunnerHeartbeatInfo{
 			RunnerID:    r.ID,
 			State:       r.State,
+			SessionID:   r.SessionID,
 			WorkloadKey: r.WorkloadKey,
 		}
 		if r.State == StateIdle && !r.LastExecAt.IsZero() {
