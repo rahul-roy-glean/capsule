@@ -22,7 +22,7 @@ ZONE ?= us-central1-a
 CONFIG ?= onboard.yaml
 REGISTRY ?= $(REGION)-docker.pkg.dev/$(PROJECT_ID)/capsule
 VERSION ?= $(shell git describe --tags --always --dirty)
-PACKER_SERVICE_ACCOUNT_EMAIL ?= compute-engine@salessavvy-test.iam.gserviceaccount.com
+PACKER_SERVICE_ACCOUNT_EMAIL ?= test@project.com # always specify this
 
 # Go build settings
 GO := go
