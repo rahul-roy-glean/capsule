@@ -365,6 +365,7 @@ func (p *AuthProxy) handleConnect(clientConn net.Conn, connectReq *http.Request)
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{*cert},
 		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"http/1.1"},
 	}
 	tlsConn := tls.Server(clientConn, tlsConfig)
 	if err := tlsConn.Handshake(); err != nil {

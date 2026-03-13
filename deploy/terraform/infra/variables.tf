@@ -186,7 +186,7 @@ variable "container_registry_location" {
 variable "container_registry_repo_name" {
   description = "Name of the Artifact Registry repository"
   type        = string
-  default     = "firecracker"
+  default     = "capsule"
 }
 
 variable "enable_monitoring" {
