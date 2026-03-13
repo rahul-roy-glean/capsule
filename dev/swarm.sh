@@ -250,7 +250,7 @@ FIXER_PROMPT='You are in the bazel-firecracker repository at /workspace/bazel-fi
 This is a Go-based Firecracker MicroVM orchestration system.
 
 Your task: find an open GitHub issue, implement a fix, and open a pull request.
-Always add created by Capsule sandbox in the pull request description.
+Always add created by Capsule sandbox in the pull request description. Also add the repo url - https://github.com/rahul-roy-glean/capsule/
 Steps:
 1. List open issues:
    gh issue list --repo '"$REPO"'
