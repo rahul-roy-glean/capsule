@@ -470,14 +470,18 @@ func (p *AuthProxy) tunnel(clientConn net.Conn, targetHost string) {
 	}
 	defer upstream.Close()
 
-	done := make(chan struct{}, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
 	cp := func(dst, src net.Conn) {
+		defer wg.Done()
 		io.Copy(dst, src)
-		done <- struct{}{}
+		if tc, ok := dst.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
 	}
 	go cp(upstream, clientConn)
 	go cp(clientConn, upstream)
-	<-done
+	wg.Wait()
 }
 
 // serveTokenUpdate runs the host-side token push endpoint.
