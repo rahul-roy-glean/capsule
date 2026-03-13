@@ -159,8 +159,8 @@ type MMDSData struct {
 			CACertPEM    string            `json:"ca_cert_pem,omitempty"`
 			Address      string            `json:"address,omitempty"`
 			MetadataHost string            `json:"metadata_host,omitempty"`
-			AuthHosts    []string          `json:"auth_hosts,omitempty"`    // non-wildcard hosts for transparent iptables redirect
-			AuthEnv      map[string]string `json:"auth_env,omitempty"`     // env vars from providers (e.g. GH_TOKEN)
+			AuthHosts    []string          `json:"auth_hosts,omitempty"` // non-wildcard hosts for transparent iptables redirect
+			AuthEnv      map[string]string `json:"auth_env,omitempty"`   // env vars from providers (e.g. GH_TOKEN)
 		} `json:"proxy,omitempty"`
 	} `json:"latest"`
 }
