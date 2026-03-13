@@ -3104,7 +3104,7 @@ resource "google_monitoring_alert_policy" "host_unhealthy" {
       duration = "300s"
       aggregations {
         alignment_period   = "60s"
-        per_series_aligner = "ALIGN_MEAN"
+        per_series_aligner = "ALIGN_DELTA"
         group_by_fields    = ["metric.label.host_id"]
       }
     }

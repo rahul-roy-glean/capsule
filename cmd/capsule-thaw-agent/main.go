@@ -189,9 +189,11 @@ type MMDSData struct {
 			Drives   []snapshot.DriveSpec       `json:"drives,omitempty"`
 		} `json:"warmup,omitempty"`
 		Proxy struct {
-			CACertPEM    string `json:"ca_cert_pem"`
-			Address      string `json:"address"`
-			MetadataHost string `json:"metadata_host"`
+			CACertPEM    string            `json:"ca_cert_pem"`
+			Address      string            `json:"address"`
+			MetadataHost string            `json:"metadata_host"`
+			AuthHosts    []string          `json:"auth_hosts,omitempty"`
+			AuthEnv      map[string]string `json:"auth_env,omitempty"`
 		} `json:"proxy,omitempty"`
 		// Mirrors snapshot.StartCommand -- keep in sync with pkg/snapshot/start_command.go.
 		StartCommand struct {
@@ -732,9 +734,11 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					Drives   []snapshot.DriveSpec       `json:"drives,omitempty"`
 				} `json:"warmup,omitempty"`
 				Proxy struct {
-					CACertPEM    string `json:"ca_cert_pem"`
-					Address      string `json:"address"`
-					MetadataHost string `json:"metadata_host"`
+					CACertPEM    string            `json:"ca_cert_pem"`
+					Address      string            `json:"address"`
+					MetadataHost string            `json:"metadata_host"`
+					AuthHosts    []string          `json:"auth_hosts,omitempty"`
+					AuthEnv      map[string]string `json:"auth_env,omitempty"`
 				} `json:"proxy,omitempty"`
 				// Mirrors snapshot.StartCommand -- keep in sync with pkg/snapshot/start_command.go.
 				StartCommand struct {
@@ -1458,14 +1462,18 @@ func runShellCommand(args []string, runAsRoot bool, data *MMDSData) error {
 }
 
 // configureAuthProxy sets up the guest environment to use the host-side auth proxy.
-// It installs the proxy's CA certificate into the system trust store and sets
-// HTTPS_PROXY/HTTP_PROXY environment variables so all child processes (bazel, pip, etc.)
-// route through the proxy for transparent credential injection.
+//
+// Sets HTTPS_PROXY process-wide so all child processes (warmup commands, /exec
+// requests, start_command workloads) route through the proxy. The proxy SSL-bumps
+// matching hosts and injects credentials (Bearer for API, Basic for git HTTP).
 //
 // Returns a stop function for the metadata forwarder (if started). The caller MUST
 // call stop() after warmup commands complete to restore MMDS access for the poll loop.
 func configureAuthProxy(data *MMDSData) (stopForwarder func(), err error) {
 	proxyAddr := data.Latest.Proxy.Address
+	if proxyAddr != "" && !strings.HasPrefix(proxyAddr, "http") {
+		proxyAddr = "http://" + proxyAddr
+	}
 	caCertPEM := data.Latest.Proxy.CACertPEM
 
 	// 1. Install the proxy CA certificate so TLS verification passes through the MITM proxy
@@ -1505,17 +1513,26 @@ func configureAuthProxy(data *MMDSData) (stopForwarder func(), err error) {
 		}
 	}
 
-	// 2. Build proxy environment variables for child processes.
-	// These are stored in globalProxyEnv and appended to child command environments
-	// rather than set process-wide with os.Setenv. This prevents proxy env vars from
-	// being baked into snapshots and causing "connection refused" errors at runtime
-	// (when the build-time proxy is no longer running).
+	// 2. Set proxy env vars process-wide so ALL child processes (warmup
+	// commands, /exec requests, start_command workloads) route through the
+	// auth proxy. The proxy SSL-bumps CONNECT for matching hosts and injects
+	// credentials. Also stored in globalProxyEnv for warmup shell commands.
 	metadataHost := data.Latest.Proxy.MetadataHost
 	noProxy := "169.254.169.254,localhost,127.0.0.1"
 	if metadataHost != "" {
 		noProxy += "," + metadataHost
 	}
-	proxyEnv := []string{
+
+	os.Setenv("HTTPS_PROXY", proxyAddr)
+	os.Setenv("HTTP_PROXY", proxyAddr)
+	os.Setenv("https_proxy", proxyAddr)
+	os.Setenv("http_proxy", proxyAddr)
+	os.Setenv("NO_PROXY", noProxy)
+	os.Setenv("no_proxy", noProxy)
+
+	// globalProxyEnv is still populated for warmup shell commands that
+	// build env from scratch (runShellCommand appends these).
+	globalProxyEnv = []string{
 		"HTTPS_PROXY=" + proxyAddr,
 		"HTTP_PROXY=" + proxyAddr,
 		"https_proxy=" + proxyAddr,
@@ -1523,16 +1540,41 @@ func configureAuthProxy(data *MMDSData) (stopForwarder func(), err error) {
 		"NO_PROXY=" + noProxy,
 		"no_proxy=" + noProxy,
 	}
+
 	if metadataHost != "" {
-		proxyEnv = append(proxyEnv, "GCE_METADATA_HOST="+metadataHost)
-		// Firecracker VMs lack GCE DMI data (/sys/class/dmi/id/product_name).
-		// Node.js gcp-metadata library skips the metadata probe when DMI
-		// doesn't match "Google", causing "Could not load default credentials".
-		// Force the library to assume the metadata server is present.
-		proxyEnv = append(proxyEnv, "METADATA_SERVER_DETECTION=assume-present")
-		log.WithField("metadata_host", metadataHost).Info("Set GCE_METADATA_HOST for google-auth")
+		os.Setenv("GCE_METADATA_HOST", metadataHost)
+		os.Setenv("METADATA_SERVER_DETECTION", "assume-present")
+		globalProxyEnv = append(globalProxyEnv, "GCE_METADATA_HOST="+metadataHost)
+		globalProxyEnv = append(globalProxyEnv, "METADATA_SERVER_DETECTION=assume-present")
+		log.WithField("metadata_host", metadataHost).Info("Set GCE_METADATA_HOST process-wide")
 	}
-	globalProxyEnv = proxyEnv
+
+	// Set NODE_EXTRA_CA_CERTS so Node.js apps trust the proxy CA.
+	if caCertPEM != "" {
+		certPath := "/usr/local/share/ca-certificates/auth-proxy.crt"
+		os.Setenv("NODE_EXTRA_CA_CERTS", certPath)
+		log.WithField("cert", certPath).Info("Set NODE_EXTRA_CA_CERTS for proxy CA")
+	}
+
+	// Set auth provider env vars (e.g. GH_TOKEN=proxy-injected) process-wide
+	// so tools like gh CLI attempt requests, which the proxy then intercepts.
+	for k, v := range data.Latest.Proxy.AuthEnv {
+		os.Setenv(k, v)
+		log.WithFields(logrus.Fields{"key": k}).Info("Set auth provider env var")
+	}
+
+	// Write proxy env to a file as fallback — commands that need the full
+	// HTTPS_PROXY can source /etc/auth-proxy.env explicitly.
+	var envLines []string
+	for _, e := range globalProxyEnv {
+		envLines = append(envLines, "export "+e)
+	}
+	envContent := strings.Join(envLines, "\n") + "\n"
+	if err := os.WriteFile("/etc/auth-proxy.env", []byte(envContent), 0644); err != nil {
+		log.WithError(err).Warn("Failed to write /etc/auth-proxy.env")
+	} else {
+		log.Info("Wrote /etc/auth-proxy.env for opt-in proxy usage")
+	}
 
 	// 3. Intercept GCE metadata requests at the network level.
 	// Firecracker's MMDS V1 intercepts all traffic to 169.254.169.254 on the

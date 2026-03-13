@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -484,6 +485,28 @@ func (cm *ChunkedManager) restoreAndActivateRunner(
 		mmdsData.Latest.Proxy.Address = proxy.ProxyAddress()
 		mmdsData.Latest.Proxy.CACertPEM = string(proxy.CACertPEM)
 		mmdsData.Latest.Proxy.MetadataHost = proxy.GatewayIP()
+		// Pass non-wildcard auth hosts so the thaw-agent can set up iptables
+		// transparent redirect rules for them (e.g., github.com, api.github.com).
+		// Wildcard hosts (e.g., *.googleapis.com) are excluded — they can't be
+		// redirected via iptables and should use HTTPS_PROXY instead.
+		if req.AuthConfig != nil {
+			seen := make(map[string]bool)
+			for _, p := range req.AuthConfig.Providers {
+				for _, h := range p.Hosts {
+					if !strings.Contains(h, "*") && !seen[h] {
+						seen[h] = true
+						mmdsData.Latest.Proxy.AuthHosts = append(mmdsData.Latest.Proxy.AuthHosts, h)
+					}
+				}
+				// Merge provider env vars (e.g., GH_TOKEN for GitHub auth).
+				for k, v := range p.Env {
+					if mmdsData.Latest.Proxy.AuthEnv == nil {
+						mmdsData.Latest.Proxy.AuthEnv = make(map[string]string)
+					}
+					mmdsData.Latest.Proxy.AuthEnv[k] = v
+				}
+			}
+		}
 	}
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
