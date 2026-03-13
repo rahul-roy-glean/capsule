@@ -84,18 +84,30 @@ func (p *githubAppProvider) Matches(host string) bool {
 }
 
 func (p *githubAppProvider) InjectCredentials(req *http.Request) error {
-	if len(p.repos) > 0 && !p.matchesRepo(req) {
-		return nil // not a request for a configured repo, skip injection
+	host := req.URL.Host
+	if host == "" {
+		host = req.Host
+	}
+
+	isAPI := strings.Contains(host, "api.github.com")
+
+	if isAPI {
+	} else {
+		if len(p.repos) > 0 && !p.matchesRepo(req) {
+			return nil
+		}
 	}
 
 	token, err := p.getToken()
 	if err != nil {
 		return err
 	}
-	// GitHub's git HTTP protocol requires Basic auth with x-access-token as
-	// the username and the installation token as the password. The "token"
-	// header format only works for the REST API, not for git clone/fetch/push.
-	req.SetBasicAuth("x-access-token", token)
+
+	if isAPI {
+		req.Header.Set("Authorization", "Bearer "+token)
+	} else {
+		req.SetBasicAuth("x-access-token", token)
+	}
 	return nil
 }
 

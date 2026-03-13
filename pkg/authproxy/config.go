@@ -11,6 +11,7 @@ type ProviderConfig struct {
 	Type   string            `json:"type"`   // "gcp-metadata", "github-app", "bearer-token", "delegated"
 	Hosts  []string          `json:"hosts"`  // host glob patterns this provider handles
 	Config map[string]string `json:"config"` // provider-specific key-value config
+	Env    map[string]string `json:"env,omitempty"` // env vars to set in VM so tools attempt requests (e.g. GH_TOKEN)
 }
 
 // ProxyConfig holds settings for the HTTPS proxy.

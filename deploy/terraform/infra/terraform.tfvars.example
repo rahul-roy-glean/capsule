@@ -21,4 +21,4 @@ gke_services_cidr = "10.2.0.0/16"
 
 # Container Registry (Artifact Registry)
 container_registry_location  = "us-central1"
-container_registry_repo_name = "firecracker"
+container_registry_repo_name = "capsule"
