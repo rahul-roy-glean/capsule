@@ -250,25 +250,27 @@ FIXER_PROMPT='You are in the bazel-firecracker repository at /workspace/bazel-fi
 This is a Go-based Firecracker MicroVM orchestration system.
 
 Your task: find an open GitHub issue, implement a fix, and open a pull request.
-
+Always add created by Capsule sandbox in the pull request description.
 Steps:
 1. List open issues:
    gh issue list --repo '"$REPO"'
 2. Pick one issue that you can realistically fix
 3. Read the issue details:
    gh issue view <number> --repo '"$REPO"'
-4. Understand the relevant code
-5. Create a branch: git checkout -b fix/<issue-number>-short-description
-6. Implement the fix (edit files, run tests if possible), run pre-commits hooks. You need to first run pre-commit install to install the hooks.
-7. Commit your changes with a descriptive message referencing the issue
-8. Push and create a PR:
+4. List open pull requests:
+   gh pr list --repo '"$REPO"'
+   Check if any of the pull requests are related to the issue.
+   If no, then pick teh issue and work on it. Else pick another issue.
+5. Understand the relevant code.
+6. Create a branch: git checkout -b fix/<issue-number>-short-description
+7. Implement the fix (edit files, run tests if possible), run pre-commits hooks. You need to first run pre-commit install to install the hooks.
+8. Commit your changes with a descriptive message referencing the issue and add created by Capsule sandbox in the commit message.
+9. Push and create a PR:
    git push origin fix/<issue-number>-short-description
    gh pr create \
      --repo '"$REPO"' \
      --title "Fix #<issue-number>: short description" \
-     --body "Closes #<issue-number>\n\n## What\n...\n\n## Why\n..."
-
-IMPORTANT: Make a real, working fix. Test your changes if possible.'
+     --body "Closes #<issue-number>\n\n## What\n...\n\n## Why\n..."'
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
