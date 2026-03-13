@@ -2,13 +2,10 @@
 
 # Remote state (required)
 infra_state_bucket = "your-terraform-state-bucket"
-infra_state_prefix = "firecracker/infra"
+infra_state_prefix = "capsule/infra"
 
 # Database password (must match infra stage)
 db_password = "your-secure-password-here"
-
-# GitHub webhook secret
-github_webhook_secret = ""
 
 # Host bootstrap token
 host_bootstrap_token = ""
