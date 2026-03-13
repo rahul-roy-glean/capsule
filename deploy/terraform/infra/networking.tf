@@ -1,5 +1,31 @@
+locals {
+  use_existing_network              = var.network_mode == "existing"
+  use_existing_gke_subnet           = local.use_existing_network && trimspace(var.existing_gke_subnet_name) != ""
+  gke_subnet_primary_cidr           = trimspace(var.gke_subnet_cidr) != "" ? var.gke_subnet_cidr : cidrsubnet(var.vpc_cidr, 4, 1)
+  manage_cloud_nat                  = !local.use_existing_network || var.manage_existing_network_nat
+  manage_private_service_connection = !local.use_existing_network || var.manage_existing_network_private_service_connection
+}
+
+data "google_compute_network" "existing" {
+  count = local.use_existing_network ? 1 : 0
+  name  = var.existing_network_name
+}
+
+data "google_compute_subnetwork" "existing_hosts" {
+  count  = local.use_existing_network ? 1 : 0
+  name   = var.existing_host_subnet_name
+  region = var.region
+}
+
+data "google_compute_subnetwork" "existing_gke" {
+  count  = local.use_existing_gke_subnet ? 1 : 0
+  name   = var.existing_gke_subnet_name
+  region = var.region
+}
+
 # VPC Network
 resource "google_compute_network" "main" {
+  count                   = local.use_existing_network ? 0 : 1
   name                    = "${local.name_prefix}-vpc"
   auto_create_subnetworks = false
   routing_mode            = "REGIONAL"
@@ -9,10 +35,11 @@ resource "google_compute_network" "main" {
 
 # Main subnet for host VMs
 resource "google_compute_subnetwork" "hosts" {
+  count         = local.use_existing_network ? 0 : 1
   name          = "${local.name_prefix}-hosts"
   ip_cidr_range = cidrsubnet(var.vpc_cidr, 4, 0) # /20 for hosts
   region        = var.region
-  network       = google_compute_network.main.id
+  network       = google_compute_network.main[0].id
 
   private_ip_google_access = true
 
@@ -25,10 +52,11 @@ resource "google_compute_subnetwork" "hosts" {
 
 # Subnet for GKE cluster
 resource "google_compute_subnetwork" "gke" {
+  count         = local.use_existing_gke_subnet ? 0 : 1
   name          = "${local.name_prefix}-gke"
-  ip_cidr_range = cidrsubnet(var.vpc_cidr, 4, 1) # /20 for GKE nodes
+  ip_cidr_range = local.gke_subnet_primary_cidr
   region        = var.region
-  network       = google_compute_network.main.id
+  network       = local.use_existing_network ? data.google_compute_network.existing[0].id : google_compute_network.main[0].id
 
   private_ip_google_access = true
 
@@ -43,20 +71,67 @@ resource "google_compute_subnetwork" "gke" {
   }
 }
 
-# Cloud Router for NAT
-resource "google_compute_router" "main" {
-  name    = "${local.name_prefix}-router"
-  region  = var.region
-  network = google_compute_network.main.id
+locals {
+  network_name      = local.use_existing_network ? data.google_compute_network.existing[0].name : google_compute_network.main[0].name
+  network_id        = local.use_existing_network ? data.google_compute_network.existing[0].id : google_compute_network.main[0].id
+  network_self_link = local.use_existing_network ? data.google_compute_network.existing[0].self_link : google_compute_network.main[0].self_link
+
+  host_subnet_name = local.use_existing_network ? data.google_compute_subnetwork.existing_hosts[0].name : google_compute_subnetwork.hosts[0].name
+  host_subnet_id   = local.use_existing_network ? data.google_compute_subnetwork.existing_hosts[0].id : google_compute_subnetwork.hosts[0].id
+  host_subnet_cidr = local.use_existing_network ? data.google_compute_subnetwork.existing_hosts[0].ip_cidr_range : google_compute_subnetwork.hosts[0].ip_cidr_range
+
+  gke_subnet_name = local.use_existing_gke_subnet ? data.google_compute_subnetwork.existing_gke[0].name : google_compute_subnetwork.gke[0].name
+  gke_subnet_id   = local.use_existing_gke_subnet ? data.google_compute_subnetwork.existing_gke[0].id : google_compute_subnetwork.gke[0].id
+  gke_subnet_cidr = local.use_existing_gke_subnet ? data.google_compute_subnetwork.existing_gke[0].ip_cidr_range : google_compute_subnetwork.gke[0].ip_cidr_range
+
+  gke_pods_secondary_range_name     = local.use_existing_gke_subnet ? var.existing_gke_pods_secondary_range_name : "pods"
+  gke_services_secondary_range_name = local.use_existing_gke_subnet ? var.existing_gke_services_secondary_range_name : "services"
+  gke_secondary_ranges = local.use_existing_gke_subnet ? {
+    for range in data.google_compute_subnetwork.existing_gke[0].secondary_ip_range : range.range_name => range.ip_cidr_range
+    } : {
+    for range in google_compute_subnetwork.gke[0].secondary_ip_range : range.range_name => range.ip_cidr_range
+  }
+
+  gke_pods_cidr     = lookup(local.gke_secondary_ranges, local.gke_pods_secondary_range_name, null)
+  gke_services_cidr = lookup(local.gke_secondary_ranges, local.gke_services_secondary_range_name, null)
+
+  internal_source_ranges = distinct(compact([
+    local.host_subnet_cidr,
+    local.gke_subnet_cidr,
+    local.gke_pods_cidr,
+  ]))
+
+  nat_subnet_ids = distinct([
+    local.host_subnet_id,
+    local.gke_subnet_id,
+  ])
 }
 
-# Cloud NAT for host egress
+# Cloud Router for NAT
+resource "google_compute_router" "main" {
+  count   = local.manage_cloud_nat ? 1 : 0
+  name    = "${local.name_prefix}-router"
+  region  = var.region
+  network = local.network_id
+}
+
+# Cloud NAT for Capsule host and GKE subnet egress
 resource "google_compute_router_nat" "main" {
+  count                              = local.manage_cloud_nat ? 1 : 0
   name                               = "${local.name_prefix}-nat"
-  router                             = google_compute_router.main.name
+  router                             = google_compute_router.main[0].name
   region                             = var.region
   nat_ip_allocate_option             = "AUTO_ONLY"
-  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+  source_subnetwork_ip_ranges_to_nat = "LIST_OF_SUBNETWORKS"
+
+  dynamic "subnetwork" {
+    for_each = toset(local.nat_subnet_ids)
+
+    content {
+      name                    = subnetwork.value
+      source_ip_ranges_to_nat = ["ALL_IP_RANGES"]
+    }
+  }
 
   log_config {
     enable = true
@@ -66,10 +141,10 @@ resource "google_compute_router_nat" "main" {
 
 # Firewall rules
 
-# Allow internal communication within VPC
+# Allow internal communication between Capsule subnets and pods
 resource "google_compute_firewall" "internal" {
   name    = "${local.name_prefix}-allow-internal"
-  network = google_compute_network.main.name
+  network = local.network_name
 
   allow {
     protocol = "icmp"
@@ -85,13 +160,13 @@ resource "google_compute_firewall" "internal" {
     ports    = ["0-65535"]
   }
 
-  source_ranges = [var.vpc_cidr, var.gke_pods_cidr]
+  source_ranges = local.internal_source_ranges
 }
 
 # Allow SSH from IAP
 resource "google_compute_firewall" "iap_ssh" {
   name    = "${local.name_prefix}-allow-iap-ssh"
-  network = google_compute_network.main.name
+  network = local.network_name
 
   allow {
     protocol = "tcp"
@@ -105,7 +180,7 @@ resource "google_compute_firewall" "iap_ssh" {
 # Allow health checks from GCP
 resource "google_compute_firewall" "health_checks" {
   name    = "${local.name_prefix}-allow-health-checks"
-  network = google_compute_network.main.name
+  network = local.network_name
 
   allow {
     protocol = "tcp"
@@ -113,8 +188,8 @@ resource "google_compute_firewall" "health_checks" {
   }
 
   source_ranges = [
-    "130.211.0.0/22",  # GCP health check IPs
-    "35.191.0.0/16",   # GCP health check IPs
+    "130.211.0.0/22", # GCP health check IPs
+    "35.191.0.0/16",  # GCP health check IPs
   ]
 
   target_tags = ["capsule-host"]
@@ -123,30 +198,40 @@ resource "google_compute_firewall" "health_checks" {
 # Allow gRPC from GKE to hosts
 resource "google_compute_firewall" "grpc" {
   name    = "${local.name_prefix}-allow-grpc"
-  network = google_compute_network.main.name
+  network = local.network_name
 
   allow {
     protocol = "tcp"
     ports    = ["50051"] # gRPC port
   }
 
-  source_ranges = [var.gke_pods_cidr]
+  source_ranges = compact([local.gke_pods_cidr])
   target_tags   = ["capsule-host"]
+
+  lifecycle {
+    precondition {
+      condition     = local.gke_pods_cidr != null
+      error_message = "The selected GKE subnet must already contain the configured pods secondary range."
+    }
+  }
 }
 
 # Private service connection for Cloud SQL
 resource "google_compute_global_address" "private_ip_range" {
-  name          = "${local.name_prefix}-private-ip"
+  count         = local.manage_private_service_connection ? 1 : 0
+  name          = trimspace(var.private_service_range_name) != "" ? var.private_service_range_name : "${local.name_prefix}-private-ip"
   purpose       = "VPC_PEERING"
   address_type  = "INTERNAL"
-  prefix_length = 16
-  network       = google_compute_network.main.id
+  address       = trimspace(var.private_service_range_address) != "" ? var.private_service_range_address : null
+  prefix_length = var.private_service_range_prefix_length
+  network       = local.network_id
 }
 
 resource "google_service_networking_connection" "private_vpc_connection" {
-  network                 = google_compute_network.main.id
+  count                   = local.manage_private_service_connection ? 1 : 0
+  network                 = local.network_id
   service                 = "servicenetworking.googleapis.com"
-  reserved_peering_ranges = [google_compute_global_address.private_ip_range.name]
+  reserved_peering_ranges = [google_compute_global_address.private_ip_range[0].name]
 
   depends_on = [google_project_service.apis]
 }

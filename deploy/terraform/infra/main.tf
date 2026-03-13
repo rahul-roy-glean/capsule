@@ -61,7 +61,7 @@ resource "google_storage_bucket" "snapshots" {
   name          = "${var.project_id}-capsule-snapshots"
   location      = var.region
   storage_class = "STANDARD"
-  force_destroy = true  # Set to false in production
+  force_destroy = true # Set to false in production
 
   versioning {
     enabled = true

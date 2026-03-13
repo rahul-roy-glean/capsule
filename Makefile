@@ -22,6 +22,7 @@ ZONE ?= us-central1-a
 CONFIG ?= onboard.yaml
 REGISTRY ?= $(REGION)-docker.pkg.dev/$(PROJECT_ID)/capsule
 VERSION ?= $(shell git describe --tags --always --dirty)
+PACKER_SERVICE_ACCOUNT_EMAIL ?= compute-engine@salessavvy-test.iam.gserviceaccount.com
 
 # Go build settings
 GO := go
@@ -176,14 +177,16 @@ packer-validate: capsule-manager-linux
 		-var="capsule_manager_binary=../../bin/capsule-manager" \
 		-var="network=capsule-$(ENV)-vpc" \
 		-var="subnetwork=capsule-$(ENV)-hosts" \
+		-var="service_account_email=$(PACKER_SERVICE_ACCOUNT_EMAIL)" \
 		host-image.pkr.hcl
 
 packer-build: capsule-manager-linux packer-init
 	cd deploy/packer && packer build \
 		-var="project_id=$(PROJECT_ID)" \
 		-var="capsule_manager_binary=../../bin/capsule-manager" \
-		-var="network=capsule-$(ENV)-vpc" \
-		-var="subnetwork=capsule-$(ENV)-hosts" \
+		-var="network=default" \
+		-var="subnetwork=default" \
+		-var="service_account_email=$(PACKER_SERVICE_ACCOUNT_EMAIL)" \
 		host-image.pkr.hcl
 
 # Cross-compile capsule-manager for Linux (for Packer builds from macOS)

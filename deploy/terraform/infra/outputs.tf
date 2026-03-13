@@ -46,12 +46,12 @@ output "gke_cluster_name" {
 }
 
 output "host_subnet_id" {
-  value       = google_compute_subnetwork.hosts.id
+  value       = local.host_subnet_id
   description = "Host subnet ID for instance templates"
 }
 
 output "host_subnet_name" {
-  value       = google_compute_subnetwork.hosts.name
+  value       = local.host_subnet_name
   description = "Host subnet name for builder VMs"
 }
 
@@ -101,7 +101,7 @@ output "control_plane_image" {
 }
 
 output "vpc_network" {
-  value       = google_compute_network.main.name
+  value       = local.network_name
   description = "VPC network name"
 }
 

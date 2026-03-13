@@ -48,6 +48,12 @@ variable "capsule_manager_binary" {
   description = "Local path to capsule-manager binary to upload"
 }
 
+variable "service_account_email" {
+  type        = string
+  default     = ""
+  description = "Service account attached to the temporary packer build VM"
+}
+
 source "googlecompute" "capsule-host" {
   project_id              = var.project_id
   zone                    = var.zone
@@ -62,7 +68,9 @@ source "googlecompute" "capsule-host" {
   image_family      = var.image_family
   image_description = "Firecracker host image with KVM support"
 
-  ssh_username = "ubuntu"
+  ssh_username          = "ubuntu"
+  service_account_email = var.service_account_email
+  scopes                = ["https://www.googleapis.com/auth/cloud-platform"]
 
   network    = var.network
   subnetwork = var.subnetwork

@@ -4,7 +4,7 @@ resource "google_sql_database_instance" "main" {
   database_version = "POSTGRES_15"
   region           = var.region
 
-  deletion_protection = false  # Set to true in production
+  deletion_protection = false # Set to true in production
 
   settings {
     tier              = var.db_tier
@@ -24,7 +24,7 @@ resource "google_sql_database_instance" "main" {
 
     ip_configuration {
       ipv4_enabled    = false
-      private_network = google_compute_network.main.id
+      private_network = local.network_id
     }
 
     maintenance_window {

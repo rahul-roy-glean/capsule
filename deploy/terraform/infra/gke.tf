@@ -5,8 +5,8 @@ resource "google_container_cluster" "control_plane" {
   name     = "${local.name_prefix}-control-plane"
   location = var.zone
 
-  network    = google_compute_network.main.name
-  subnetwork = google_compute_subnetwork.gke.name
+  network    = local.network_name
+  subnetwork = local.gke_subnet_name
 
   # Enable Workload Identity
   workload_identity_config {
@@ -17,18 +17,29 @@ resource "google_container_cluster" "control_plane" {
   private_cluster_config {
     enable_private_nodes    = true
     enable_private_endpoint = false
-    master_ipv4_cidr_block  = "172.16.0.0/28"
+    master_ipv4_cidr_block  = var.gke_master_ipv4_cidr_block
   }
 
   # IP allocation policy for VPC-native cluster
   ip_allocation_policy {
-    cluster_secondary_range_name  = "pods"
-    services_secondary_range_name = "services"
+    cluster_secondary_range_name  = local.gke_pods_secondary_range_name
+    services_secondary_range_name = local.gke_services_secondary_range_name
   }
 
   # Remove default node pool
   remove_default_node_pool = true
   initial_node_count       = 1
+
+  # Even though the default node pool is removed, GKE still needs a valid
+  # service account while creating the cluster. Some projects disable the
+  # default Compute Engine service account, so use the managed SA explicitly.
+  node_config {
+    service_account = google_service_account.control_plane.email
+
+    oauth_scopes = [
+      "https://www.googleapis.com/auth/cloud-platform",
+    ]
+  }
 
   # Allow all IPs to reach the API server (auth is via IAM)
   master_authorized_networks_config {
@@ -75,8 +86,29 @@ resource "google_container_cluster" "control_plane" {
   # Allow cluster deletion (set to true in production)
   deletion_protection = false
 
+  lifecycle {
+    precondition {
+      condition     = !local.use_existing_network || try(data.google_compute_subnetwork.existing_hosts[0].network, "") == local.network_self_link
+      error_message = "existing_host_subnet_name must belong to existing_network_name."
+    }
+
+    precondition {
+      condition     = !local.use_existing_gke_subnet || try(data.google_compute_subnetwork.existing_gke[0].network, "") == local.network_self_link
+      error_message = "existing_gke_subnet_name must belong to existing_network_name."
+    }
+
+    precondition {
+      condition     = local.gke_pods_cidr != null
+      error_message = "The selected GKE subnet must already contain the configured pods secondary range."
+    }
+
+    precondition {
+      condition     = local.gke_services_cidr != null
+      error_message = "The selected GKE subnet must already contain the configured services secondary range."
+    }
+  }
+
   depends_on = [
-    google_compute_subnetwork.gke,
     google_project_service.apis,
   ]
 }
@@ -99,9 +131,10 @@ resource "google_container_node_pool" "control_plane" {
   }
 
   node_config {
-    machine_type = var.gke_node_machine_type
-    disk_size_gb = 100
-    disk_type    = "pd-ssd"
+    machine_type    = var.gke_node_machine_type
+    disk_size_gb    = 100
+    disk_type       = "pd-ssd"
+    service_account = google_service_account.control_plane.email
 
     oauth_scopes = [
       "https://www.googleapis.com/auth/cloud-platform",
