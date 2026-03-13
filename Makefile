@@ -1,4 +1,5 @@
 .PHONY: all build test clean proto docker-build docker-push docker-push-control-plane docker-push-snapshot-builder
+.PHONY: upload-build-artifacts deploy-all
 .PHONY: terraform-infra-init terraform-infra-plan terraform-infra-apply terraform-infra-destroy
 .PHONY: terraform-app-init terraform-app-plan terraform-app-apply terraform-app-destroy
 .PHONY: packer-init packer-validate packer-build capsule-manager-linux release-host-image mig-rolling-update
@@ -23,6 +24,12 @@ CONFIG ?= onboard.yaml
 REGISTRY ?= $(REGION)-docker.pkg.dev/$(PROJECT_ID)/capsule
 VERSION ?= $(shell git describe --tags --always --dirty)
 PACKER_SERVICE_ACCOUNT_EMAIL ?= test@project.com # always specify this
+SNAPSHOT_BUCKET ?= $(PROJECT_ID)-capsule-snapshots
+ARTIFACTS_PATH = gs://$(SNAPSHOT_BUCKET)/v1/build-artifacts
+KERNEL_URL = https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.14-def/x86_64/vmlinux-5.10.242
+TF_STATE_BUCKET ?= $(PROJECT_ID)-capsule-tf-state
+INFRA_TF_PREFIX ?= terraform/infra
+APP_TF_PREFIX ?= terraform/app
 
 # Go build settings
 GO := go
@@ -137,35 +144,54 @@ docker-push-snapshot-builder:
 	docker push $(REGISTRY)/capsule-snapshot-builder:$(VERSION)
 	docker push $(REGISTRY)/capsule-snapshot-builder:latest
 
+# Upload build artifacts (thaw-agent, snapshot-builder, kernel.bin) to GCS in parallel
+upload-build-artifacts: capsule-thaw-agent snapshot-builder
+	@echo "Uploading build artifacts to $(ARTIFACTS_PATH)/ ..."
+	@curl -sfL -o /tmp/kernel.bin $(KERNEL_URL)
+	@cp bin/capsule-thaw-agent /tmp/thaw-agent
+	@gcloud storage cp /tmp/thaw-agent bin/snapshot-builder /tmp/kernel.bin $(ARTIFACTS_PATH)/ --project=$(PROJECT_ID)
+	@rm -f /tmp/kernel.bin /tmp/thaw-agent
+	@echo "Done. Uploaded: thaw-agent, snapshot-builder, kernel.bin"
+
+# Build and deploy everything: GCS artifacts, control plane image, host Packer image
+deploy-all: upload-build-artifacts docker-build-control-plane packer-build
+	@docker push $(REGISTRY)/capsule-control-plane:$(VERSION)
+	@docker push $(REGISTRY)/capsule-control-plane:latest
+	@echo ""
+	@echo "=== Deploy complete ==="
+	@echo "  GCS artifacts:    $(ARTIFACTS_PATH)/"
+	@echo "  Control plane:    $(REGISTRY)/capsule-control-plane:$(VERSION)"
+	@echo "  Host image:       capsule-host (Packer)"
+
 # Build microVM rootfs
 rootfs:
 	cd images/microvm && ./build-rootfs.sh
 
 # Terraform - Infrastructure (Stage 1)
 terraform-infra-init:
-	cd deploy/terraform/infra && terraform init
+	cd deploy/terraform/infra && terraform init -backend-config="bucket=$(TF_STATE_BUCKET)" -backend-config="prefix=$(INFRA_TF_PREFIX)"
 
 terraform-infra-plan:
-	cd deploy/terraform/infra && terraform plan
+	cd deploy/terraform/infra && terraform plan -var-file=terraform.tfvars
 
 terraform-infra-apply:
-	cd deploy/terraform/infra && terraform apply
+	cd deploy/terraform/infra && terraform apply -var-file=terraform.tfvars
 
 terraform-infra-destroy:
-	cd deploy/terraform/infra && terraform destroy
+	cd deploy/terraform/infra && terraform destroy -var-file=terraform.tfvars
 
 # Terraform - Application (Stage 2)
 terraform-app-init:
-	cd deploy/terraform/app && terraform init
+	cd deploy/terraform/app && terraform init -backend-config="bucket=$(TF_STATE_BUCKET)" -backend-config="prefix=$(APP_TF_PREFIX)"
 
 terraform-app-plan:
-	cd deploy/terraform/app && terraform plan
+	cd deploy/terraform/app && terraform plan -var-file=terraform.tfvars -var="infra_state_bucket=$(TF_STATE_BUCKET)" -var="infra_state_prefix=$(INFRA_TF_PREFIX)"
 
 terraform-app-apply:
-	cd deploy/terraform/app && terraform apply
+	cd deploy/terraform/app && terraform apply -var-file=terraform.tfvars -var="infra_state_bucket=$(TF_STATE_BUCKET)" -var="infra_state_prefix=$(INFRA_TF_PREFIX)"
 
 terraform-app-destroy:
-	cd deploy/terraform/app && terraform destroy
+	cd deploy/terraform/app && terraform destroy -var-file=terraform.tfvars -var="infra_state_bucket=$(TF_STATE_BUCKET)" -var="infra_state_prefix=$(INFRA_TF_PREFIX)"
 
 # Packer
 packer-init:

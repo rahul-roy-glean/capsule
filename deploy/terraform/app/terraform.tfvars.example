@@ -1,9 +1,5 @@
 # Copy this file to terraform.tfvars and fill in your values
 
-# Remote state (required)
-infra_state_bucket = "your-terraform-state-bucket"
-infra_state_prefix = "capsule/infra"
-
 # Database password (must match infra stage)
 db_password = "your-secure-password-here"
 
