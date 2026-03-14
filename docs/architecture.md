@@ -202,6 +202,9 @@ The runtime itself is generic. Repository-level adapters currently include:
 These adapters are clients of the runtime, not special-case branches in the
 core architecture.
 
+For a proposed secure access and credential architecture that sits alongside the
+runtime rather than inside it, see [secure-access-plane.md](secure-access-plane.md).
+
 ## Deployment Notes
 
 The supported deployment flow is the `onboard.yaml` path described in
