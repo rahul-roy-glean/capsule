@@ -55,8 +55,8 @@ type LayerMaterialized struct {
 
 // ValidateLayeredConfig checks a LayeredConfig for correctness.
 func ValidateLayeredConfig(cfg *LayeredConfig) error {
-	if len(cfg.Layers) == 0 {
-		return fmt.Errorf("at least one layer is required")
+	if len(cfg.Layers) == 0 && cfg.BaseImage == "" {
+		return fmt.Errorf("at least one layer is required when no base_image is set")
 	}
 
 	names := make(map[string]bool)
