@@ -99,6 +99,16 @@ class RunnerSession:
             self._runner_id = result.runner_id
         return result
 
+    def fork(self) -> RunnerSession:
+        """Fork the current live session into a new independent RunnerSession."""
+        result = self._runners.fork(self._runner_id)
+        return RunnerSession(
+            self._runners,
+            result.runner_id,
+            host_address=result.host_address,
+            session_id=result.session_id,
+        )
+
     def release(self) -> bool:
         """Release (destroy) the runner."""
         if self._released:

@@ -8,7 +8,7 @@ import pytest
 from capsule_sdk._config import ConnectionConfig
 from capsule_sdk._errors import CapsuleHTTPError
 from capsule_sdk._http import HttpClient
-from capsule_sdk.models.runner import ExecEvent, ExecResult
+from capsule_sdk.models.runner import ExecEvent, ExecResult, ForkSessionResponse
 from capsule_sdk.resources.runners import Runners
 from capsule_sdk.runner_session import RunnerSession
 
@@ -92,6 +92,22 @@ class TestRunnerSession:
         assert result.runner_id == "r-2"
         assert session.runner_id == "r-2"
         assert runners._host_cache["r-2"] == "10.0.0.2:8080"
+
+    def test_fork(self, runners: Runners) -> None:
+        session = RunnerSession(runners, "r-1", host_address="10.0.0.1:8080", session_id="s-1")
+        with patch.object(
+            runners,
+            "fork",
+            return_value=ForkSessionResponse(
+                runner_id="r-fork",
+                host_address="10.0.0.9:8080",
+                session_id="s-fork",
+            ),
+        ) as fork:
+            forked = session.fork()
+        fork.assert_called_once_with("r-1")
+        assert forked.runner_id == "r-fork"
+        assert forked.session_id == "s-fork"
 
     def test_shell(self, runners: Runners) -> None:
         runners._host_cache["r-1"] = "10.0.0.1:8080"

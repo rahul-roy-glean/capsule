@@ -86,12 +86,13 @@ func TestSessionMetadataPreservesWorkloadKey(t *testing.T) {
 	}
 }
 
-// TestRunnerHeartbeatInfoIncludesWorkloadKey verifies that runner heartbeats
-// include the WorkloadKey so the control plane can track it.
-func TestRunnerHeartbeatInfoIncludesWorkloadKey(t *testing.T) {
+// TestRunnerHeartbeatInfoIncludesSessionState verifies that runner heartbeats
+// include the session/workload keys so the control plane can track live ownership.
+func TestRunnerHeartbeatInfoIncludesSessionState(t *testing.T) {
 	info := RunnerHeartbeatInfo{
 		RunnerID:    "r1",
 		State:       StateIdle,
+		SessionID:   "sess-1",
 		WorkloadKey: "my-workload-key",
 	}
 	data, _ := json.Marshal(info)
@@ -100,6 +101,9 @@ func TestRunnerHeartbeatInfoIncludesWorkloadKey(t *testing.T) {
 
 	if decoded["workload_key"] != "my-workload-key" {
 		t.Errorf("heartbeat workload_key = %v, want %q", decoded["workload_key"], "my-workload-key")
+	}
+	if decoded["session_id"] != "sess-1" {
+		t.Errorf("heartbeat session_id = %v, want %q", decoded["session_id"], "sess-1")
 	}
 }
 

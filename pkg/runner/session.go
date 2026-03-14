@@ -53,13 +53,16 @@ type CheckpointResult struct {
 
 // SessionMetadata is written to each session directory as metadata.json.
 type SessionMetadata struct {
-	SessionID   string    `json:"session_id"`
-	WorkloadKey string    `json:"workload_key"`
-	RunnerID    string    `json:"runner_id"`
-	HostID      string    `json:"host_id"`
-	Layers      int       `json:"layers"`
-	CreatedAt   time.Time `json:"created_at"`
-	PausedAt    time.Time `json:"paused_at"`
+	SessionID          string    `json:"session_id"`
+	ParentSessionID    string    `json:"parent_session_id,omitempty"`
+	ForkedFromRunnerID string    `json:"forked_from_runner_id,omitempty"`
+	ForkedAt           time.Time `json:"forked_at,omitempty"`
+	WorkloadKey        string    `json:"workload_key"`
+	RunnerID           string    `json:"runner_id"`
+	HostID             string    `json:"host_id"`
+	Layers             int       `json:"layers"`
+	CreatedAt          time.Time `json:"created_at"`
+	PausedAt           time.Time `json:"paused_at"`
 	// RootfsPath is the path to the dirty rootfs overlay for this session.
 	RootfsPath string `json:"rootfs_path"`
 	// Resource config preserved across pause/resume
@@ -1372,6 +1375,79 @@ func (m *Manager) GetSessionMetadata(sessionID string) (*SessionMetadata, error)
 func (m *Manager) CleanupSession(sessionID string) error {
 	sessionDir := filepath.Join(m.sessionBaseDir(), sessionID)
 	return os.RemoveAll(sessionDir)
+}
+
+// ForkRunnerSession checkpoints a live runner, then materializes a new forked
+// session metadata record that can be resumed independently.
+func (m *Manager) ForkRunnerSession(ctx context.Context, runnerID, newSessionID, newRunnerID string) (*SessionMetadata, error) {
+	runner, err := m.GetRunner(runnerID)
+	if err != nil {
+		return nil, err
+	}
+	if runner.SessionID == "" {
+		return nil, fmt.Errorf("runner %s has no session_id, cannot fork", runnerID)
+	}
+	if runner.State != StateIdle && runner.State != StateBusy {
+		return nil, fmt.Errorf("runner %s is in state %s, cannot fork", runnerID, runner.State)
+	}
+	if _, err := m.CheckpointRunner(ctx, runnerID); err != nil {
+		return nil, err
+	}
+	return m.ForkSession(runner.SessionID, newSessionID, newRunnerID, runnerID)
+}
+
+// ForkSession creates a new session lineage from a checkpointed source session.
+// The source must have a GCS-backed manifest so the fork has an immutable disk
+// view even while the original runner continues to execute.
+func (m *Manager) ForkSession(sourceSessionID, newSessionID, newRunnerID, sourceRunnerID string) (*SessionMetadata, error) {
+	if sourceSessionID == "" {
+		return nil, fmt.Errorf("source session_id is required")
+	}
+	if newSessionID == "" {
+		return nil, fmt.Errorf("new session_id is required")
+	}
+	if newRunnerID == "" {
+		return nil, fmt.Errorf("new runner_id is required")
+	}
+	if sourceSessionID == newSessionID {
+		return nil, fmt.Errorf("new session_id must differ from source session_id")
+	}
+
+	sourceMeta, err := m.GetSessionMetadata(sourceSessionID)
+	if err != nil {
+		return nil, fmt.Errorf("load source session metadata: %w", err)
+	}
+	if sourceMeta.GCSManifestPath == "" {
+		return nil, fmt.Errorf("session %s is not GCS-backed; active session forking requires a cloud-backed checkpoint", sourceSessionID)
+	}
+
+	now := time.Now().UTC()
+	forkedMeta := *sourceMeta
+	forkedMeta.SessionID = newSessionID
+	forkedMeta.ParentSessionID = sourceSessionID
+	if sourceRunnerID != "" {
+		forkedMeta.ForkedFromRunnerID = sourceRunnerID
+	} else {
+		forkedMeta.ForkedFromRunnerID = sourceMeta.RunnerID
+	}
+	forkedMeta.ForkedAt = now
+	forkedMeta.RunnerID = newRunnerID
+	forkedMeta.HostID = m.config.HostID
+	forkedMeta.CreatedAt = now
+	forkedMeta.PausedAt = now
+
+	sessionDir := filepath.Join(m.sessionBaseDir(), newSessionID)
+	if err := os.MkdirAll(sessionDir, 0755); err != nil {
+		return nil, fmt.Errorf("create forked session dir: %w", err)
+	}
+	metadataBytes, err := json.MarshalIndent(forkedMeta, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal forked session metadata: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionDir, "metadata.json"), metadataBytes, 0644); err != nil {
+		return nil, fmt.Errorf("write forked session metadata: %w", err)
+	}
+	return &forkedMeta, nil
 }
 
 // FindRunnerBySessionID returns a runner with the given session ID, if any.

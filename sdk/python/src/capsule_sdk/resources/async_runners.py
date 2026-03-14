@@ -35,6 +35,7 @@ from capsule_sdk.models.runner import (
     AllocateRunnerResponse,
     ConnectResult,
     ExecEvent,
+    ForkSessionResponse,
     PauseResult,
     Runner,
     RunnerListResponse,
@@ -187,9 +188,39 @@ class AsyncRunners:
         data = await self._http.post("/api/v1/runners/pause", json_body={"runner_id": runner_id})
         return PauseResult.model_validate(data)
 
-    async def connect(self, runner_id: str) -> ConnectResult:
-        data = await self._http.post("/api/v1/runners/connect", json_body={"runner_id": runner_id})
+    async def connect(self, runner_id: str | None = None, *, session_id: str | None = None) -> ConnectResult:
+        if not runner_id and not session_id:
+            raise ValueError("runner_id or session_id is required")
+        body: dict[str, str] = {}
+        if runner_id:
+            body["runner_id"] = runner_id
+        if session_id:
+            body["session_id"] = session_id
+        data = await self._http.post("/api/v1/runners/connect", json_body=body)
         result = ConnectResult.model_validate(data)
+        if result.host_address:
+            self._host_cache[result.runner_id] = result.host_address
+        return result
+
+    async def attach_session(self, session_id: str) -> AsyncRunnerSession:
+        result = await self.connect(session_id=session_id)
+        return AsyncRunnerSession(
+            self,
+            result.runner_id,
+            host_address=result.host_address,
+            session_id=result.session_id or session_id,
+        )
+
+    async def fork(self, runner_id: str | None = None, *, session_id: str | None = None) -> ForkSessionResponse:
+        if not runner_id and not session_id:
+            raise ValueError("runner_id or session_id is required")
+        body: dict[str, str] = {}
+        if runner_id:
+            body["runner_id"] = runner_id
+        if session_id:
+            body["session_id"] = session_id
+        data = await self._http.post("/api/v1/sessions/fork", json_body=body)
+        result = ForkSessionResponse.model_validate(data)
         if result.host_address:
             self._host_cache[result.runner_id] = result.host_address
         return result

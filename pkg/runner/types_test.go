@@ -8,6 +8,7 @@ import (
 func TestMMDSData_JobID(t *testing.T) {
 	var data MMDSData
 	data.Latest.Meta.RunnerID = "runner-1"
+	data.Latest.Meta.SessionID = "session-1"
 	data.Latest.Meta.HostID = "host-1"
 	data.Latest.Meta.JobID = "gh-12345"
 	data.Latest.Meta.Environment = "test"
@@ -25,6 +26,9 @@ func TestMMDSData_JobID(t *testing.T) {
 
 	if decoded.Latest.Meta.JobID != "gh-12345" {
 		t.Errorf("JobID = %q, want %q", decoded.Latest.Meta.JobID, "gh-12345")
+	}
+	if decoded.Latest.Meta.SessionID != "session-1" {
+		t.Errorf("SessionID = %q, want %q", decoded.Latest.Meta.SessionID, "session-1")
 	}
 }
 
