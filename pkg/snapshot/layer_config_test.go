@@ -80,8 +80,8 @@ func TestValidateLayeredConfig_OnPushInterval(t *testing.T) {
 			},
 		},
 	}
-	if err := ValidateLayeredConfig(cfg); err != nil {
-		t.Errorf("on_push should be valid: %v", err)
+	if err := ValidateLayeredConfig(cfg); err == nil {
+		t.Errorf("on_push should be rejected as invalid")
 	}
 }
 
@@ -456,6 +456,34 @@ func TestMaterializeLayers_WorkspaceDriveInHash(t *testing.T) {
 	// Different workspace sizes should produce different hashes
 	if layers1[0].LayerHash == layers2[0].LayerHash {
 		t.Error("different workspace sizes should produce different layer hashes")
+	}
+}
+
+func TestValidateConfigID(t *testing.T) {
+	tests := []struct {
+		id      string
+		wantErr bool
+	}{
+		{"my-workload", false},
+		{"abc", false},
+		{"a-b", false},
+		{"project-prod-123", false},
+		{"ab", true},          // too short
+		{"a", true},           // too short
+		{"-abc", true},        // leading hyphen
+		{"abc-", true},        // trailing hyphen
+		{"ABC", true},         // uppercase
+		{"my workload", true}, // spaces
+		{"my_workload", true}, // underscores
+		{"aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeefffffffff01234567890", true}, // >64 chars
+		{"aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffffffgggg", false},      // exactly 64 chars
+		{"aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffffffggggg", true},      // 65 chars
+	}
+	for _, tt := range tests {
+		err := ValidateConfigID(tt.id)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("ValidateConfigID(%q) error=%v, wantErr=%v", tt.id, err, tt.wantErr)
+		}
 	}
 }
 

@@ -16,23 +16,21 @@ from capsule_sdk.resources.layered_configs import LayeredConfigs
 class RunnerConfig:
     """Declarative runner configuration.
 
-    A RunnerConfig is a pure-data description of a desired runner shape.
-    It maps 1:1 to a LayeredConfig on the server, with fluent builder
-    methods for ergonomic construction.
+    The first argument is the config ID — a unique, stable slug identifier
+    (lowercase alphanumeric with hyphens, 3-64 chars). This is used as both
+    the display name and the primary key on the server.
 
     Usage::
 
         cfg = (
             RunnerConfig("my-workload")
-            .with_display_name("My sandbox")
             .with_base_image("ubuntu:22.04")
             .with_commands(["pip install -e .[dev]"])
             .with_tier("m")
-            .with_auto_pause(True)
         )
     """
 
-    display_name: str
+    display_name: str  # This IS the config_id
     _base_image: str | None = field(default=None, repr=False)
     _layers: list[LayerDef] | None = field(default=None, repr=False)
     _commands: list[dict[str, Any]] = field(default_factory=lambda: list[dict[str, Any]](), repr=False)
