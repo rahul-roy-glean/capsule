@@ -148,10 +148,9 @@ docker-push-snapshot-builder:
 upload-build-artifacts: capsule-thaw-agent snapshot-builder
 	@echo "Uploading build artifacts to $(ARTIFACTS_PATH)/ ..."
 	@curl -sfL -o /tmp/kernel.bin $(KERNEL_URL)
-	@cp bin/capsule-thaw-agent /tmp/thaw-agent
-	@gcloud storage cp /tmp/thaw-agent bin/snapshot-builder /tmp/kernel.bin $(ARTIFACTS_PATH)/ --project=$(PROJECT_ID)
-	@rm -f /tmp/kernel.bin /tmp/thaw-agent
-	@echo "Done. Uploaded: thaw-agent, snapshot-builder, kernel.bin"
+	@gcloud storage cp bin/capsule-thaw-agent bin/snapshot-builder /tmp/kernel.bin $(ARTIFACTS_PATH)/ --project=$(PROJECT_ID)
+	@rm -f /tmp/kernel.bin
+	@echo "Done. Uploaded: capsule-thaw-agent, snapshot-builder, kernel.bin"
 
 # Build and deploy everything: GCS artifacts, control plane image, host Packer image
 deploy-all: upload-build-artifacts docker-build-control-plane packer-build
