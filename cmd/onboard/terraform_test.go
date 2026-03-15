@@ -36,7 +36,7 @@ func TestGenerateTFVars_Bootstrap(t *testing.T) {
 		{"environment", `environment = "prod"`},
 		{"admin_cidrs", `admin_cidrs = ["203.0.113.10/32"]`},
 		{"min_hosts", `min_hosts = 0`},
-		{"max_hosts", `max_hosts = 20`},
+		{"max_hosts", `max_hosts = 0`},
 		{"chunk_cache_size_gb", `chunk_cache_size_gb = 8`},
 		{"mem_cache_size_gb", `mem_cache_size_gb = 8`},
 		{"use_custom_host_image false", `use_custom_host_image = false`},
@@ -84,6 +84,9 @@ func TestGenerateTFVars_Finalize(t *testing.T) {
 
 	if !strings.Contains(content, "use_custom_host_image = true") {
 		t.Error("finalize tfvars should have use_custom_host_image = true")
+	}
+	if !strings.Contains(content, "max_hosts = 20") {
+		t.Error("finalize tfvars should preserve configured max_hosts")
 	}
 	if !strings.Contains(content, `control_plane_addr = "http://10.0.0.5:8080"`) {
 		t.Error("finalize tfvars should include control_plane_addr")

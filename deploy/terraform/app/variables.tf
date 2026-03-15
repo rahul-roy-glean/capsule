@@ -65,7 +65,7 @@ variable "max_hosts" {
 }
 
 variable "use_custom_host_image" {
-  description = "Whether to use the custom Packer-built host image. Set to false for initial deployment, then true after building with Packer."
+  description = "Whether to use the custom Packer-built host image. Stock Ubuntu is bootstrap-only and must keep max_hosts = 0 until finalize."
   type        = bool
   default     = false
 }
