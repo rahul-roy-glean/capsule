@@ -9,6 +9,7 @@ require (
 	cloud.google.com/go/compute v1.52.0
 	cloud.google.com/go/secretmanager v1.14.7
 	cloud.google.com/go/storage v1.56.0
+	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/creack/pty v1.1.24
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/google/uuid v1.6.0

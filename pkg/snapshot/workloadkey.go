@@ -37,10 +37,11 @@ func ComputeWorkloadKey(commands []SnapshotCommand) string {
 }
 
 // ComputeLayerHash returns a full 64-char SHA256 hex hash for a layer.
-// The hash is computed from parentLayerHash + canonical(initCommands) + canonical(drives).
+// The hash is computed from parentLayerHash + canonical(initCommands) + canonical(drives) + tier.
 // Commands are sorted using the same canonical sort as ComputeWorkloadKey.
-// Drives are sorted by DriveID.
-func ComputeLayerHash(parentLayerHash string, initCommands []SnapshotCommand, drives []DriveSpec) string {
+// Drives are sorted by DriveID. Tier is included because it determines
+// the snapshot's vCPU/memory configuration (baked into Firecracker snapshots).
+func ComputeLayerHash(parentLayerHash string, initCommands []SnapshotCommand, drives []DriveSpec, tier string) string {
 	sortedCmds := make([]SnapshotCommand, len(initCommands))
 	copy(sortedCmds, initCommands)
 	sort.Slice(sortedCmds, func(i, j int) bool {
@@ -64,7 +65,7 @@ func ComputeLayerHash(parentLayerHash string, initCommands []SnapshotCommand, dr
 	cmdsJSON, _ := json.Marshal(sortedCmds)
 	drivesJSON, _ := json.Marshal(sortedDrives)
 
-	h := sha256.Sum256([]byte(parentLayerHash + string(cmdsJSON) + string(drivesJSON)))
+	h := sha256.Sum256([]byte(parentLayerHash + string(cmdsJSON) + string(drivesJSON) + tier))
 	return hex.EncodeToString(h[:])
 }
 

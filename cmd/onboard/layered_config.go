@@ -1,13 +1,17 @@
 package main
 
-import "github.com/rahul-roy-glean/capsule/pkg/snapshot"
+import (
+	"strings"
+
+	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
+)
 
 func (c *Config) ToLayeredConfig() *snapshot.LayeredConfig {
 	cfg := &snapshot.LayeredConfig{
 		BaseImage: c.Workload.BaseImage,
 		Layers:    c.materializedLayers(),
 	}
-	cfg.DisplayName = c.Platform.GCPProject + "-" + c.Platform.Environment
+	cfg.DisplayName = strings.ToLower(c.Platform.GCPProject + "-" + c.Platform.Environment)
 	if cfg.DisplayName == "-" {
 		cfg.DisplayName = "firecracker-workload"
 	}
