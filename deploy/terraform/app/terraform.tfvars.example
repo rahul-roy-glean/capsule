@@ -15,7 +15,7 @@ host_disk_size_gb      = 200
 host_data_disk_size_gb = 500
 min_hosts              = 1
 max_hosts              = 20
-use_custom_host_image  = false
+use_custom_host_image  = true
 
 # MicroVM configuration
 microvm_subnet       = "172.16.0.0/24"
