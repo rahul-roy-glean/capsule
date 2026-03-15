@@ -13,8 +13,8 @@ func TestComputeLayerHash_Deterministic(t *testing.T) {
 		{DriveID: "data", SizeGB: 10},
 	}
 
-	h1 := ComputeLayerHash("", cmds, drives)
-	h2 := ComputeLayerHash("", cmds, drives)
+	h1 := ComputeLayerHash("", cmds, drives, "standard")
+	h2 := ComputeLayerHash("", cmds, drives, "standard")
 
 	if h1 != h2 {
 		t.Errorf("ComputeLayerHash not deterministic: %s != %s", h1, h2)
@@ -34,8 +34,8 @@ func TestComputeLayerHash_OrderIndependent(t *testing.T) {
 		{Type: "shell", Args: []string{"echo", "hello"}},
 	}
 
-	h1 := ComputeLayerHash("parent123", cmds1, nil)
-	h2 := ComputeLayerHash("parent123", cmds2, nil)
+	h1 := ComputeLayerHash("parent123", cmds1, nil, "")
+	h2 := ComputeLayerHash("parent123", cmds2, nil, "")
 
 	if h1 != h2 {
 		t.Errorf("ComputeLayerHash should be order-independent: %s != %s", h1, h2)
@@ -50,8 +50,8 @@ func TestComputeLayerHash_DifferentInputs(t *testing.T) {
 		{Type: "shell", Args: []string{"echo", "world"}},
 	}
 
-	h1 := ComputeLayerHash("", cmds1, nil)
-	h2 := ComputeLayerHash("", cmds2, nil)
+	h1 := ComputeLayerHash("", cmds1, nil, "")
+	h2 := ComputeLayerHash("", cmds2, nil, "")
 
 	if h1 == h2 {
 		t.Errorf("Different commands should produce different hashes")
@@ -63,8 +63,8 @@ func TestComputeLayerHash_ParentAffectsHash(t *testing.T) {
 		{Type: "shell", Args: []string{"echo", "hello"}},
 	}
 
-	h1 := ComputeLayerHash("", cmds, nil)
-	h2 := ComputeLayerHash("parentABC", cmds, nil)
+	h1 := ComputeLayerHash("", cmds, nil, "")
+	h2 := ComputeLayerHash("parentABC", cmds, nil, "")
 
 	if h1 == h2 {
 		t.Errorf("Different parent hashes should produce different layer hashes")
@@ -78,8 +78,8 @@ func TestComputeLayerHash_DrivesAffectHash(t *testing.T) {
 	drives1 := []DriveSpec{{DriveID: "a", SizeGB: 10}}
 	drives2 := []DriveSpec{{DriveID: "b", SizeGB: 10}}
 
-	h1 := ComputeLayerHash("", cmds, drives1)
-	h2 := ComputeLayerHash("", cmds, drives2)
+	h1 := ComputeLayerHash("", cmds, drives1, "")
+	h2 := ComputeLayerHash("", cmds, drives2, "")
 
 	if h1 == h2 {
 		t.Errorf("Different drives should produce different hashes")
@@ -91,11 +91,24 @@ func TestComputeLayerHash_DriveOrderIndependent(t *testing.T) {
 	drives1 := []DriveSpec{{DriveID: "a", SizeGB: 10}, {DriveID: "b", SizeGB: 20}}
 	drives2 := []DriveSpec{{DriveID: "b", SizeGB: 20}, {DriveID: "a", SizeGB: 10}}
 
-	h1 := ComputeLayerHash("", cmds, drives1)
-	h2 := ComputeLayerHash("", cmds, drives2)
+	h1 := ComputeLayerHash("", cmds, drives1, "")
+	h2 := ComputeLayerHash("", cmds, drives2, "")
 
 	if h1 != h2 {
 		t.Errorf("Drive order should not affect hash: %s != %s", h1, h2)
+	}
+}
+
+func TestComputeLayerHash_TierAffectsHash(t *testing.T) {
+	cmds := []SnapshotCommand{
+		{Type: "shell", Args: []string{"echo", "hello"}},
+	}
+
+	h1 := ComputeLayerHash("", cmds, nil, "small")
+	h2 := ComputeLayerHash("", cmds, nil, "large")
+
+	if h1 == h2 {
+		t.Errorf("Different tiers should produce different hashes")
 	}
 }
 

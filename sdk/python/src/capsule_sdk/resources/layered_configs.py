@@ -143,13 +143,14 @@ class LayeredConfigs:
         if isinstance(config_ref, str):
             return config_ref
 
-        if hasattr(config_ref, "display_name"):
-            value = cast(Any, config_ref).display_name
+        # Prefer config_id (which equals display_name for new configs)
+        if hasattr(config_ref, "config_id"):
+            value = cast(Any, config_ref).config_id
             if isinstance(value, str) and value:
                 return value
 
-        if hasattr(config_ref, "config_id"):
-            value = cast(Any, config_ref).config_id
+        if hasattr(config_ref, "display_name"):
+            value = cast(Any, config_ref).display_name
             if isinstance(value, str) and value:
                 return value
 

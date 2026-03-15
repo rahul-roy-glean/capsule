@@ -101,3 +101,4 @@ __pycache__/
 deploy/terraform/.terraform/
 
 sdk/python/dist
+sdk/python/.venv/
