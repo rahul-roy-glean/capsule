@@ -16,6 +16,7 @@ from capsule_sdk._errors import (
     CapsuleTimeoutError,
 )
 from capsule_sdk._shell_async import AsyncShellSession
+from capsule_sdk._validation import validate_config_id
 from capsule_sdk._version import __version__
 from capsule_sdk.async_client import AsyncCapsuleClient
 from capsule_sdk.async_runner_config import AsyncRunnerConfigs
@@ -57,4 +58,5 @@ __all__ = [
     "WorkloadSummary",
     "Workloads",
     "__version__",
+    "validate_config_id",
 ]

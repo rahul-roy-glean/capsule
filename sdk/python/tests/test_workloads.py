@@ -40,17 +40,17 @@ def workloads(layered_configs: LayeredConfigs, runners: Runners) -> Workloads:
 
 class TestWorkloads:
     def test_onboard_runner_config(self, workloads: Workloads, layered_configs: LayeredConfigs) -> None:
-        cfg = RunnerConfig("My Sandbox").with_commands(["echo hi"])
-        created = CreateConfigResponse(config_id="c1", leaf_workload_key="wk-leaf")
-        build = BuildResponse(config_id="c1", status="build_enqueued")
+        cfg = RunnerConfig("my-sandbox").with_commands(["echo hi"])
+        created = CreateConfigResponse(config_id="my-sandbox", leaf_workload_key="wk-leaf")
+        build = BuildResponse(config_id="my-sandbox", status="build_enqueued")
         with patch.object(layered_configs, "create", return_value=created) as create:
             with patch.object(layered_configs, "build", return_value=build) as build_call:
                 result = workloads.onboard(cfg)
-        assert result.display_name == "My Sandbox"
-        assert result.config_id == "c1"
+        assert result.display_name == "my-sandbox"
+        assert result.config_id == "my-sandbox"
         assert result.workload_key == "wk-leaf"
         create.assert_called_once()
-        build_call.assert_called_once_with("c1", force=False, clean=False)
+        build_call.assert_called_once_with("my-sandbox", force=False, clean=False)
 
     def test_onboard_yaml_string(self, workloads: Workloads, layered_configs: LayeredConfigs) -> None:
         yaml_spec = """

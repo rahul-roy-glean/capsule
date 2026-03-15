@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from capsule_sdk._snapshot_commands import normalize_snapshot_commands
+from capsule_sdk._validation import validate_config_id
 from capsule_sdk.models.layered_config import (
     BuildResponse,
     CreateConfigResponse,
@@ -102,6 +103,8 @@ class RunnerConfig:
 
     def to_create_body(self) -> dict[str, Any]:
         """Return a dict suitable for ``LayeredConfigs.create()``."""
+        validate_config_id(self.display_name)
+
         if self._layers is not None:
             layers = [ld.model_dump(exclude_none=True) for ld in self._layers]
         elif self._commands:
