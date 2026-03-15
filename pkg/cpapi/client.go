@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -182,7 +181,7 @@ func (c *Client) doWithRetry(method, path string, reqBody any, result any) error
 				}
 			}
 			time.Sleep(delay)
-			backoff = time.Duration(float64(backoff) * math.Min(2.0, 1.5))
+			backoff = time.Duration(float64(backoff) * 2.0)
 			continue
 		}
 
