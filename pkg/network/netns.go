@@ -63,6 +63,9 @@ type NetNSConfig struct {
 // vethSupernet is the supernet covering all per-VM veth /30 subnets.
 const vethSupernet = "10.200.0.0/16"
 
+// procSysIPv4ConfDir is overridden in tests.
+var procSysIPv4ConfDir = "/proc/sys/net/ipv4/conf"
+
 // innerBridgeName is the bridge created inside each namespace.
 const innerBridgeName = "br-vm"
 
@@ -189,6 +192,29 @@ func addIPTablesRuleIfMissing(binary string, checkArgs, addArgs []string) error 
 	return nil
 }
 
+func setInterfaceSysctl(iface, key, value string) error {
+	if iface == "" {
+		return fmt.Errorf("sysctl interface is empty")
+	}
+	path := filepath.Join(procSysIPv4ConfDir, iface, key)
+	if err := os.WriteFile(path, []byte(value), 0644); err != nil {
+		return fmt.Errorf("write %s=%s: %w", path, value, err)
+	}
+	return nil
+}
+
+func configureHostVethSysctls(iface string) error {
+	// Per-VM veth links carry traffic that is intentionally DNATed into the
+	// namespace and bridged again to the guest. Strict rp_filter on ephemeral
+	// veth-h interfaces treats that return path as martian traffic and breaks
+	// host -> 10.200.{slot}.2 readiness probes. Loose mode preserves source
+	// validation while allowing this expected asymmetric path.
+	if err := setInterfaceSysctl(iface, "rp_filter", "2"); err != nil {
+		return err
+	}
+	return nil
+}
+
 // CreateNamespaceForVM creates an isolated network namespace for a VM.
 //
 // The slot parameter determines the veth /30 subnet (10.200.{slot}.0/30).
@@ -295,6 +321,16 @@ func (n *NetNSNetwork) CreateNamespaceForVM(vmID string, slot int) (*VMNamespace
 		newNS.Close()
 		return nil, fmt.Errorf("failed to bring up veth host: %w", err)
 	}
+	if err := configureHostVethSysctls(vethHost); err != nil {
+		netlink.LinkDel(vethHostLink)
+		netns.DeleteNamed(nsName)
+		newNS.Close()
+		return nil, fmt.Errorf("failed to configure host veth sysctls: %w", err)
+	}
+	n.logger.WithFields(logrus.Fields{
+		"interface": vethHost,
+		"rp_filter": "2",
+	}).Debug("Configured host-side veth sysctls")
 
 	// 6. Configure inside the namespace (netlink operations respect thread namespace)
 	if err := netns.Set(newNS); err != nil {

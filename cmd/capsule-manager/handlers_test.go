@@ -9,6 +9,15 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+type flushRecorder struct {
+	*httptest.ResponseRecorder
+	flushed bool
+}
+
+func (f *flushRecorder) Flush() {
+	f.flushed = true
+}
+
 func TestHealthHandler_Returns200(t *testing.T) {
 	handler := healthHandler(nil) // healthHandler doesn't use mgr
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -55,5 +64,21 @@ func TestGCHandler_WrongMethod(t *testing.T) {
 
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Errorf("gcHandler GET status = %d, want %d", w.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestStatusRecorder_ForwardsFlush(t *testing.T) {
+	base := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	rec := &statusRecorder{ResponseWriter: base, statusCode: http.StatusOK}
+
+	flusher, ok := any(rec).(http.Flusher)
+	if !ok {
+		t.Fatal("statusRecorder should implement http.Flusher when the wrapped writer does")
+	}
+
+	flusher.Flush()
+
+	if !base.flushed {
+		t.Fatal("statusRecorder.Flush should forward to the wrapped ResponseWriter")
 	}
 }

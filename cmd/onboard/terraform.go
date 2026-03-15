@@ -187,11 +187,13 @@ func generateTFVars(cfg *Config, finalize bool, targetDir ...string) (string, er
 	// --- Hosts ---
 	addStr("host_machine_type", cfg.Hosts.MachineType)
 	minHosts := cfg.Hosts.MinCount
+	maxHosts := cfg.Hosts.MaxCount
 	if !finalize {
 		minHosts = 0
+		maxHosts = 0
 	}
 	addInt("min_hosts", minHosts)
-	addInt("max_hosts", cfg.Hosts.MaxCount)
+	addInt("max_hosts", maxHosts)
 	addInt("host_data_disk_size_gb", cfg.Hosts.DataDiskGB)
 	addInt("chunk_cache_size_gb", cfg.Hosts.ChunkCacheSizeGB)
 	addInt("mem_cache_size_gb", cfg.Hosts.MemCacheSizeGB)

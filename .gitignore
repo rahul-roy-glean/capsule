@@ -100,4 +100,5 @@ __pycache__/
 # Terraform provider cache (non-glob match for root terraform dir)
 deploy/terraform/.terraform/
 
+sdk/python/dist
 sdk/python/.venv/
