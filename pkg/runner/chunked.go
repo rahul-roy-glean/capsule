@@ -1220,7 +1220,7 @@ func (cm *ChunkedManager) Close() error {
 func (cm *ChunkedManager) waitForThawAgent(ctx context.Context, ip string, timeout time.Duration) error {
 	aliveURL := fmt.Sprintf("http://%s:%d/alive", ip, snapshot.ThawAgentDebugPort)
 	deadline := time.Now().Add(timeout)
-	pollInterval := 200 * time.Millisecond
+	pollInterval := 100 * time.Millisecond
 
 	client := &http.Client{Timeout: 2 * time.Second}
 

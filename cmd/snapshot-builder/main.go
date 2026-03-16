@@ -325,21 +325,19 @@ func run(logger *logrus.Logger) error {
 			var reattachErr error
 			vm, fuseDisk, fuseExtDisks, incrUffdHandler, rootfsFlavorForProvenance, reattachErr = reattachFromParent(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, firecrackerNetNSPath, gcpAccessToken, commands, newDrives, expectedRunnerID, authProxy, authProxyAddr)
 			if reattachErr != nil {
-				log.WithError(reattachErr).Warn("Reattach failed, falling back to cold boot")
-				vm = nil
-				expectedRunnerID = "" // Cold boot fallback — no stale state
+				// Child layers MUST restore from parent — cold boot would produce
+				// a fundamentally different snapshot (wrong rootfs, missing parent state).
+				// Fail the build so it can be retried instead of silently degrading.
 				if incrUffdHandler != nil {
 					incrUffdHandler.Stop()
-					incrUffdHandler = nil
 				}
 				if fuseDisk != nil {
 					fuseDisk.Unmount()
-					fuseDisk = nil
 				}
 				for _, d := range fuseExtDisks {
 					d.Unmount()
 				}
-				fuseExtDisks = nil
+				return fmt.Errorf("parent layer restore failed (cold boot not allowed for child layers): %w", reattachErr)
 			}
 		} else {
 			log.Info("Attempting incremental restore from previous snapshot...")
