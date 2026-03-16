@@ -233,6 +233,9 @@ func main() {
 		*runnerDir = "/home/" + *runnerUsername
 	}
 
+	// Expand file handler allowed roots to include the runner user's home dir
+	initAllowedRoots(*runnerUsername)
+
 	// Setup logger
 	log = logrus.New()
 	log.SetFormatter(&logrus.JSONFormatter{})
@@ -1102,6 +1105,13 @@ func watchForSnapshotRestore() {
 
 		// New current_time detected -- this means we were restored from a snapshot
 		lastTime = ct
+
+		// Thaw frozen filesystems FIRST.  The host freezes ext4 drives
+		// before taking a session snapshot.  Without thawing, any I/O on
+		// those mounts (e.g. /workspace) blocks in D-state indefinitely,
+		// causing request handlers to hang and the agent to appear dead.
+		thawFrozenFilesystems()
+
 		hostTime, err := time.Parse(time.RFC3339, ct)
 		if err != nil {
 			log.WithError(err).Warn("watchForSnapshotRestore: failed to parse current_time")
