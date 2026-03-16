@@ -1318,6 +1318,56 @@ func thawFrozenFilesystems() {
 	}
 }
 
+func isMountPoint(path string) bool {
+	return exec.Command("mountpoint", "-q", path).Run() == nil
+}
+
+func mountedSource(path string) string {
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		if fields[1] == path {
+			return fields[0]
+		}
+	}
+	return ""
+}
+
+func detachMount(label, mountPath string) error {
+	log.WithFields(logrus.Fields{
+		"label":          label,
+		"mount_path":     mountPath,
+		"current_source": mountedSource(mountPath),
+	}).Info("Remounting drive (block device may have been swapped)")
+
+	if out, err := exec.Command("umount", mountPath).CombinedOutput(); err != nil {
+		log.WithError(err).WithFields(logrus.Fields{
+			"label":      label,
+			"mount_path": mountPath,
+		}).Warnf("Plain umount failed (output: %s)", string(out))
+	} else if !isMountPoint(mountPath) {
+		return nil
+	}
+
+	if out, err := exec.Command("umount", "-l", mountPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to unmount existing mount at %s for label %s: %w (output: %s)", mountPath, label, err, string(out))
+	}
+	if isMountPoint(mountPath) {
+		return fmt.Errorf("mount path %s is still mounted after lazy unmount for label %s (current_source=%s)", mountPath, label, mountedSource(mountPath))
+	}
+	log.WithFields(logrus.Fields{
+		"label":      label,
+		"mount_path": mountPath,
+	}).Info("Lazy unmount succeeded")
+	return nil
+}
+
 // runWarmupMode runs the snapshot warmup process by dispatching each command,
 // then runs infra-level finalization steps (runner update, page pre-warm) that
 // are always needed regardless of which user commands were specified.
@@ -1333,11 +1383,13 @@ func runWarmupMode(data *MMDSData) error {
 		if d.MountPath == "" || d.Label == "" {
 			continue
 		}
-		if exec.Command("mountpoint", "-q", d.MountPath).Run() == nil {
+		if isMountPoint(d.MountPath) {
 			// Drive is mounted from parent snapshot but the block device was
-			// swapped during reattach. Force unmount so we can remount fresh.
-			log.WithFields(logrus.Fields{"label": d.Label, "mount_path": d.MountPath}).Info("Remounting drive (block device may have been swapped)")
-			exec.Command("umount", "-f", d.MountPath).Run()
+			// swapped during reattach. We must verify the old mount is detached
+			// before mounting again, otherwise mount(8) reports "already mounted".
+			if err := detachMount(d.Label, d.MountPath); err != nil {
+				return err
+			}
 		}
 		if err := os.MkdirAll(d.MountPath, 0755); err != nil {
 			return fmt.Errorf("failed to create mount point %s: %w", d.MountPath, err)
