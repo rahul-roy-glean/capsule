@@ -564,7 +564,7 @@ func (r *LayeredConfigRegistry) HandleLayeredConfigs(w http.ResponseWriter, req 
 			return
 		}
 		if sub == "promote" {
-			r.tagRegistry.HandlePromote(w, req, wk)
+			r.handlePromote(w, req, wk)
 			return
 		}
 	}
@@ -577,6 +577,53 @@ func (r *LayeredConfigRegistry) HandleLayeredConfigs(w http.ResponseWriter, req 
 	default:
 		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+// handlePromote promotes a tagged version to active, updating snapshot status
+// and version assignments so hosts converge to the new version.
+func (r *LayeredConfigRegistry) handlePromote(w http.ResponseWriter, req *http.Request, workloadKey string) {
+	if req.Method != http.MethodPost {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if body.Tag == "" {
+		writeAPIError(w, http.StatusBadRequest, "tag is required")
+		return
+	}
+	version, err := r.tagRegistry.PromoteTag(req.Context(), workloadKey, body.Tag)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeAPIError(w, http.StatusNotFound, err.Error())
+		} else {
+			writeAPIError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+
+	// Activate the snapshot and assign the version fleet-wide so hosts converge.
+	if r.snapshotManager != nil {
+		if err := r.snapshotManager.SetActiveSnapshotForKey(req.Context(), workloadKey, version); err != nil {
+			r.logger.WithError(err).Warn("promote: failed to set active snapshot")
+		}
+		if err := r.snapshotManager.AssignVersion(req.Context(), workloadKey, nil, version); err != nil {
+			r.logger.WithError(err).Warn("promote: failed to assign version")
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"workload_key": workloadKey,
+		"tag":          body.Tag,
+		"version":      version,
+		"status":       "promoted",
+	})
 }
 
 func (r *LayeredConfigRegistry) handleCreateLayeredConfig(w http.ResponseWriter, req *http.Request) {
