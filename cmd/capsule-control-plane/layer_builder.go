@@ -307,9 +307,13 @@ func (s *LayerBuildScheduler) EnqueueChainBuild(ctx context.Context, layers []sn
 				}
 			}
 		}
-		for _, cmd := range layer.InitCommands {
-			if cmd.Type == "platform-user" && len(cmd.Args) > 0 {
-				runnerUser = cmd.Args[0]
+		// Search all layers for platform-user (set on the platform layer),
+		// so child layers inherit runner_user for rootfs hash consistency.
+		for _, l := range layers {
+			for _, cmd := range l.InitCommands {
+				if cmd.Type == "platform-user" && len(cmd.Args) > 0 {
+					runnerUser = cmd.Args[0]
+				}
 			}
 		}
 
@@ -1266,10 +1270,12 @@ func (s *LayerBuildScheduler) launchLayerBuildVM(ctx context.Context, instanceNa
 	}
 
 	s.logger.WithFields(logrus.Fields{
-		"instance":   instanceName,
-		"layer_hash": layerHash[:16],
-		"version":    version,
-		"build_type": buildType,
+		"instance":    instanceName,
+		"layer_hash":  layerHash[:16],
+		"version":     version,
+		"build_type":  buildType,
+		"runner_user": runnerUser,
+		"base_image":  baseImage,
 	}).Info("Launching layer build VM")
 
 	instancesClient, err := compute.NewInstancesRESTClient(ctx)
@@ -1302,6 +1308,12 @@ func (s *LayerBuildScheduler) launchLayerBuildVM(ctx context.Context, instanceNa
 	if oldLayerVersion != "" {
 		layerFlags += fmt.Sprintf(` --previous-layer-version="%s"`, oldLayerVersion)
 	}
+
+	s.logger.WithFields(logrus.Fields{
+		"layer_hash":  layerHash[:16],
+		"layer_flags": layerFlags,
+		"runner_user": runnerUser,
+	}).Info("Layer build flags")
 
 	// Auth config flag: pass via base64-encoded env var to avoid shell quoting issues
 	authConfigSetup := ""

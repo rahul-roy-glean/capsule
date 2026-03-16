@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -1240,6 +1241,25 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		return nil, fmt.Errorf("failed to resume VM after MMDS injection: %w", err)
 	}
 
+	// Wait for the capsule-thaw-agent inside the VM to become responsive.
+	// After snapshot restore the agent needs ~1-2s to detect the new MMDS
+	// current_time, thaw frozen filesystems, and reconfigure networking.
+	// Without this check the control plane may route requests to a runner
+	// whose agent is not yet ready (or whose guest is stuck), causing
+	// silent 30s timeouts.
+	readyTimeout := 5 * time.Second
+	if err := m.waitForThawAgentReady(ctx, internalIP.String(), readyTimeout); err != nil {
+		m.logger.WithError(err).WithFields(logrus.Fields{
+			"runner_id":  runnerID,
+			"session_id": sessionID,
+			"ip":         internalIP.String(),
+		}).Warn("Thaw-agent not ready after session resume")
+		// Don't fail the resume — the agent may just be slow. Log the
+		// warning so operators can investigate, but still return the
+		// runner. The caller will get a timeout on the first request
+		// which is no worse than the current behavior.
+	}
+
 	m.logger.WithFields(logrus.Fields{
 		"runner_id":  runnerID,
 		"session_id": sessionID,
@@ -1247,6 +1267,39 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	}).Info("Runner resumed from session snapshot successfully")
 
 	return runner, nil
+}
+
+// waitForThawAgentReady polls the capsule-thaw-agent /alive endpoint until it
+// returns HTTP 200 or the timeout expires.
+func (m *Manager) waitForThawAgentReady(ctx context.Context, ip string, timeout time.Duration) error {
+	aliveURL := fmt.Sprintf("http://%s:%d/alive", ip, snapshot.ThawAgentDebugPort)
+	deadline := time.Now().Add(timeout)
+	pollInterval := 100 * time.Millisecond
+
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		resp, err := client.Get(aliveURL)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				m.logger.WithField("url", aliveURL).Debug("Thaw-agent ready after session resume")
+				return nil
+			}
+		}
+
+		select {
+		case <-time.After(pollInterval):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	return fmt.Errorf("capsule-thaw-agent at %s did not become ready within %v", aliveURL, timeout)
 }
 
 // buildExtensionDriveBaseIndex constructs a ChunkIndex for an extension drive
