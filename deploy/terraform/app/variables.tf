@@ -65,7 +65,7 @@ variable "max_hosts" {
 }
 
 variable "use_custom_host_image" {
-  description = "Whether to use the custom Packer-built host image. Set to false for initial deployment, then true after building with Packer."
+  description = "Whether to use the custom Packer-built host image. Stock Ubuntu is bootstrap-only and must keep max_hosts = 0 until finalize."
   type        = bool
   default     = false
 }
@@ -98,6 +98,12 @@ variable "mem_cache_size_gb" {
   description = "Size in GB of the in-memory LRU chunk cache for UFFD page fault handling"
   type        = number
   default     = 2
+}
+
+variable "host_log_level" {
+  description = "Log level for capsule-manager on host VMs (debug, info, warn, error)"
+  type        = string
+  default     = "info"
 }
 
 variable "enable_otel_collector" {

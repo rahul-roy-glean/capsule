@@ -102,9 +102,23 @@ CREATE TABLE IF NOT EXISTS snapshot_layers (
     refresh_interval     VARCHAR(64) DEFAULT '',
     current_version      VARCHAR(255),
     build_artifact_hash  VARCHAR(64) DEFAULT '',  -- MD5 hash of capsule-thaw-agent binary used for current_version; stale value triggers rebuild
+    all_chain_drives_hash VARCHAR(64) DEFAULT '',  -- SHA256 of all_chain_drives JSON at build time; mismatch triggers rebuild
     status               VARCHAR(32) DEFAULT 'pending',
     created_at           TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at           TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- config_layer_settings: per-config layer behavior (refresh_commands, refresh_interval, all_chain_drives)
+CREATE TABLE IF NOT EXISTS config_layer_settings (
+    config_id        VARCHAR(255) NOT NULL,
+    layer_hash       VARCHAR(64) NOT NULL REFERENCES snapshot_layers(layer_hash),
+    config_name      VARCHAR(255) NOT NULL DEFAULT '',
+    refresh_commands JSONB DEFAULT '[]',
+    refresh_interval VARCHAR(64) DEFAULT '',
+    all_chain_drives JSONB DEFAULT '[]',
+    created_at       TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at       TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    PRIMARY KEY (config_id, layer_hash)
 );
 
 -- snapshot_builds: the build queue
@@ -123,14 +137,30 @@ CREATE TABLE IF NOT EXISTS snapshot_builds (
     max_retries       INT DEFAULT 3,
     old_layer_hash    VARCHAR(64),
     old_layer_version VARCHAR(255),
-    config_id         VARCHAR(64) DEFAULT '',
+    config_id         VARCHAR(255) DEFAULT '',
+    init_commands     JSONB DEFAULT '[]',
+    refresh_commands  JSONB DEFAULT '[]',
+    drives            JSONB DEFAULT '[]',
+    all_chain_drives  JSONB DEFAULT '[]',
+    base_image        VARCHAR(512) DEFAULT '',
+    runner_user       VARCHAR(64) DEFAULT '',
     created_at        TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     UNIQUE(layer_hash, version)
 );
 
+-- config_workload_keys: tracks workload_key lifecycle per config (active/draining)
+CREATE TABLE IF NOT EXISTS config_workload_keys (
+    config_id          VARCHAR(255) NOT NULL,
+    leaf_workload_key  VARCHAR(16) NOT NULL,
+    leaf_layer_hash    VARCHAR(64) NOT NULL,
+    status             VARCHAR(16) NOT NULL DEFAULT 'active',  -- active, draining
+    created_at         TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    PRIMARY KEY (config_id, leaf_workload_key)
+);
+
 -- layered_configs: top-level config ownership
 CREATE TABLE IF NOT EXISTS layered_configs (
-    config_id              VARCHAR(64) PRIMARY KEY,
+    config_id              VARCHAR(255) PRIMARY KEY,
     display_name           VARCHAR(255) NOT NULL,
     config_json            TEXT NOT NULL,
     leaf_layer_hash        VARCHAR(64),
@@ -179,6 +209,10 @@ CREATE INDEX IF NOT EXISTS idx_version_assignments_host ON version_assignments(h
 
 CREATE INDEX IF NOT EXISTS idx_layers_parent ON snapshot_layers(parent_layer_hash);
 CREATE INDEX IF NOT EXISTS idx_layers_status ON snapshot_layers(status);
+
+CREATE INDEX IF NOT EXISTS idx_cls_layer ON config_layer_settings(layer_hash);
+
+CREATE INDEX IF NOT EXISTS idx_cwk_status ON config_workload_keys(status);
 
 CREATE INDEX IF NOT EXISTS idx_builds_status ON snapshot_builds(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_builds_layer ON snapshot_builds(layer_hash);
@@ -251,3 +285,4 @@ COMMENT ON TABLE snapshot_tags IS 'Named aliases for snapshot versions (e.g., st
 
 -- Migrations (idempotent)
 ALTER TABLE snapshot_layers ADD COLUMN IF NOT EXISTS build_artifact_hash VARCHAR(64) DEFAULT '';
+ALTER TABLE snapshot_layers ADD COLUMN IF NOT EXISTS all_chain_drives_hash VARCHAR(64) DEFAULT '';

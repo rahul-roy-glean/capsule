@@ -15,7 +15,20 @@ import (
 
 // allowedRoots are the only directory prefixes under which file operations are
 // permitted.  Paths outside these roots get a 403 Forbidden response.
+// Initialized with static defaults; initAllowedRoots adds /home/<runner-user>.
 var allowedRoots = []string{"/workspace", "/tmp", "/var/tmp", "/home/runner"}
+
+// initAllowedRoots adds the runner user's home directory to allowedRoots if it
+// isn't already present.  Called once after flag parsing.
+func initAllowedRoots(runnerUser string) {
+	homeDir := "/home/" + runnerUser
+	for _, r := range allowedRoots {
+		if r == homeDir {
+			return
+		}
+	}
+	allowedRoots = append(allowedRoots, homeDir)
+}
 
 // validatePath checks that p is absolute, resolves symlinks, and verifies the
 // resolved path falls under one of allowedRoots.  It returns the resolved

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, cast
 import yaml
 
 from capsule_sdk._errors import CapsuleNotFound
+from capsule_sdk._validation import validate_config_id
 from capsule_sdk.models.layered_config import (
     BuildResponse,
     CreateConfigResponse,
@@ -263,8 +264,9 @@ class AsyncWorkloads:
         display_name = normalized.get("display_name") or normalized.get("name") or provided_name or source_name
         if not isinstance(display_name, str) or not display_name:
             raise ValueError(
-                "Workload specs must provide a display name via `display_name`, `name`, or the `name=` argument."
+                "Workload specs must provide a config ID (slug) via `display_name`, `name`, or the `name=` argument."
             )
+        validate_config_id(display_name)
         normalized["display_name"] = display_name
         normalized.pop("name", None)
         return normalized

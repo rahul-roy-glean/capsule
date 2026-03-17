@@ -207,22 +207,7 @@ build {
   # Create capsule-manager systemd service
   provisioner "shell" {
     inline = [
-      "cat <<'EOF' | sudo tee /etc/systemd/system/capsule-manager.service",
-      "[Unit]",
-      "Description=Firecracker Manager",
-      "After=network.target",
-      "Wants=network.target",
-      "",
-      "[Service]",
-      "Type=simple",
-      "ExecStart=/usr/local/bin/capsule-manager",
-      "Restart=always",
-      "RestartSec=5",
-      "Environment=LOG_LEVEL=info",
-      "",
-      "[Install]",
-      "WantedBy=multi-user.target",
-      "EOF",
+      "sudo tee /etc/systemd/system/capsule-manager.service > /dev/null <<'EOF'\n[Unit]\nDescription=Firecracker Manager\nAfter=network.target\nWants=network.target\n\n[Service]\nType=simple\nExecStart=/usr/local/bin/capsule-manager\nRestart=always\nRestartSec=5\nEnvironment=LOG_LEVEL=info\n\n[Install]\nWantedBy=multi-user.target\nEOF",
       "sudo systemctl daemon-reload"
     ]
   }

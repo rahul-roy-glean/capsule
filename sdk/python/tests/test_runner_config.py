@@ -35,7 +35,7 @@ class TestRunnerConfig:
 
     def test_fluent_builder(self) -> None:
         cfg = (
-            RunnerConfig("My Sandbox")
+            RunnerConfig("my-sandbox")
             .with_base_image("ubuntu:22.04")
             .with_commands(["pip install -e .", "pytest -q"])
             .with_tier("m")
@@ -44,7 +44,7 @@ class TestRunnerConfig:
             .with_auto_rollout(True)
             .with_network_policy_preset("restricted-egress")
         )
-        assert cfg.display_name == "My Sandbox"
+        assert cfg.display_name == "my-sandbox"
         assert cfg._base_image == "ubuntu:22.04"
         assert len(cfg._commands) == 2
         assert cfg._commands[0] == {"type": "shell", "args": ["bash", "-lc", "pip install -e ."]}
@@ -61,7 +61,7 @@ class TestRunnerConfig:
 
     def test_to_create_body_simple(self) -> None:
         cfg = (
-            RunnerConfig("Sandbox")
+            RunnerConfig("sandbox")
             .with_base_image("ubuntu:22.04")
             .with_commands(["echo hi"])
             .with_tier("s")
@@ -69,7 +69,7 @@ class TestRunnerConfig:
             .with_auto_pause(True)
         )
         body = cfg.to_create_body()
-        assert body["display_name"] == "Sandbox"
+        assert body["display_name"] == "sandbox"
         assert body["base_image"] == "ubuntu:22.04"
         assert body["layers"] == [
             {"name": "main", "init_commands": [{"type": "shell", "args": ["bash", "-lc", "echo hi"]}]},
@@ -79,7 +79,7 @@ class TestRunnerConfig:
         assert body["config"]["auto_pause"] is True
 
     def test_to_create_body_no_config(self) -> None:
-        cfg = RunnerConfig("bare").with_commands(["echo hi"])
+        cfg = RunnerConfig("bare-cfg").with_commands(["echo hi"])
         body = cfg.to_create_body()
         assert "config" not in body
         assert body["layers"] == [
@@ -91,7 +91,7 @@ class TestRunnerConfig:
             LayerDef(name="deps", init_commands=[{"type": "shell", "args": ["bash", "-lc", "apt install -y curl"]}]),
             LayerDef(name="app", init_commands=[{"type": "shell", "args": ["bash", "-lc", "pip install ."]}]),
         ]
-        cfg = RunnerConfig("multi").with_layers(layers).with_tier("l")
+        cfg = RunnerConfig("multi-layer").with_layers(layers).with_tier("l")
         body = cfg.to_create_body()
         assert len(body["layers"]) == 2
         assert body["layers"][0]["name"] == "deps"
@@ -121,12 +121,24 @@ class TestRunnerConfig:
         body = cfg.to_create_body()
         assert body["config"]["auto_rollout"] is True
 
+    def test_invalid_config_id_rejected(self) -> None:
+        with pytest.raises(ValueError, match="config_id"):
+            RunnerConfig("My Sandbox").to_create_body()
+
+    def test_invalid_config_id_too_short(self) -> None:
+        with pytest.raises(ValueError, match="config_id"):
+            RunnerConfig("ab").to_create_body()
+
+    def test_invalid_config_id_uppercase(self) -> None:
+        with pytest.raises(ValueError, match="config_id"):
+            RunnerConfig("MyWorkload").to_create_body()
+
 
 class TestRunnerConfigs:
     def test_apply(self, runner_configs: RunnerConfigs, http_client: HttpClient) -> None:
         resp_data = {"config_id": "abc123", "leaf_workload_key": "wk-leaf"}
         mock_resp = httpx.Response(201, json=resp_data)
-        cfg = RunnerConfig("Sandbox").with_commands(["echo hi"])
+        cfg = RunnerConfig("sandbox").with_commands(["echo hi"])
         with patch.object(http_client._client, "request", return_value=mock_resp):
             result = runner_configs.apply(cfg)
         assert isinstance(result, CreateConfigResponse)

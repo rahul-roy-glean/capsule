@@ -202,6 +202,26 @@ resource "google_service_account_iam_member" "control_plane_use_builder_sa" {
   member             = "serviceAccount:${google_service_account.control_plane.email}"
 }
 
+# IAM for snapshot builder to write metrics and logs (OTel on builder VMs)
+resource "google_project_iam_member" "builder_metrics" {
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
+  member  = "serviceAccount:${google_service_account.snapshot_builder.email}"
+}
+
+resource "google_project_iam_member" "builder_logs" {
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.snapshot_builder.email}"
+}
+
+# Allow snapshot builder to impersonate host agent SA (for gcp-metadata auth provider)
+resource "google_service_account_iam_member" "builder_impersonate_host" {
+  service_account_id = google_service_account.host_agent.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = "serviceAccount:${google_service_account.snapshot_builder.email}"
+}
+
 # IAM for host agent to read secrets (GitHub App key)
 resource "google_project_iam_member" "host_secrets" {
   project = var.project_id

@@ -620,6 +620,12 @@ func (r *statusRecorder) Write(p []byte) (int, error) {
 	return n, err
 }
 
+func (r *statusRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
 func (r *statusRecorder) SetRouteMetadata(route, operation string) {
 	r.route = route
 	r.operation = operation

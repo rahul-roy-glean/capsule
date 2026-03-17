@@ -1,6 +1,6 @@
 # Host VM Image
-# When use_custom_host_image is false, use Ubuntu for initial deployment
-# After building with Packer, set use_custom_host_image = true
+# Bootstrap mode can use stock Ubuntu only while hosts remain disabled.
+# Host VMs must use the custom image before the MIG is allowed to scale up.
 data "google_compute_image" "host" {
   count   = var.use_custom_host_image ? 1 : 0
   family  = "capsule-host"
@@ -75,6 +75,7 @@ resource "google_compute_instance_template" "firecracker_host" {
     chunk-cache-size-gb     = var.chunk_cache_size_gb
     mem-cache-size-gb       = var.mem_cache_size_gb
     otel-collector-endpoint = local.otel_collector_addr
+    log-level               = var.host_log_level
   }
 
   metadata_startup_script = <<-EOF
@@ -159,6 +160,31 @@ LOGROTATE
     HOST_BOOTSTRAP_TOKEN=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/host-bootstrap-token || echo "")
 
+    if [ ! -x /usr/local/bin/capsule-manager ]; then
+      echo "ERROR: /usr/local/bin/capsule-manager is missing. This template is not using the baked capsule-host image."
+      echo "ERROR: Set use_custom_host_image=true before allowing host VMs to boot."
+      exit 1
+    fi
+
+    if [ ! -f /etc/systemd/system/capsule-manager.service ] && [ ! -f /lib/systemd/system/capsule-manager.service ]; then
+      cat > /etc/systemd/system/capsule-manager.service <<'SERVICE'
+[Unit]
+Description=Firecracker Manager
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/capsule-manager
+Restart=always
+RestartSec=5
+Environment=LOG_LEVEL=info
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+    fi
+
     # Stop capsule-manager if already running (from Packer image auto-start)
     # This ensures the override is applied before the service runs
     systemctl stop capsule-manager 2>/dev/null || true
@@ -167,7 +193,10 @@ LOGROTATE
     mkdir -p /etc/systemd/system/capsule-manager.service.d
 
     # Build the ExecStart line with optional flags
+    LOG_LEVEL=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/log-level || echo "info")
     EXEC_START="/usr/local/bin/capsule-manager"
+    EXEC_START="$EXEC_START --log-level=$LOG_LEVEL"
     EXEC_START="$EXEC_START --max-runners=$MAX_RUNNERS"
     EXEC_START="$EXEC_START --idle-target=$IDLE_TARGET"
     EXEC_START="$EXEC_START --snapshot-cache=/mnt/data/snapshots"
@@ -211,7 +240,7 @@ $([ -n "$ENV_LINES" ] && echo -e "$ENV_LINES")
 OVERRIDE
 
     # Reload and restart capsule-manager service with new config
-    echo "Starting capsule-manager with: max-runners=$MAX_RUNNERS, idle-target=$IDLE_TARGET, vcpus=$VCPUS_PER_RUNNER, memory=$MEMORY_PER_RUNNER"
+    echo "Starting capsule-manager with: max-runners=$MAX_RUNNERS, idle-target=$IDLE_TARGET, chunk-cache-gb=$CHUNK_CACHE_SIZE_GB, mem-cache-gb=$MEM_CACHE_SIZE_GB"
     systemctl daemon-reload
     systemctl enable capsule-manager
     systemctl restart capsule-manager
@@ -282,5 +311,12 @@ resource "google_compute_region_instance_group_manager" "hosts" {
 
   instance_lifecycle_policy {
     force_update_on_repair = "YES"
+  }
+
+  lifecycle {
+    precondition {
+      condition     = var.use_custom_host_image || var.max_hosts == 0
+      error_message = "Stock Ubuntu host images are bootstrap-only. Set use_custom_host_image = true before allowing any hosts, or keep max_hosts = 0 until finalize."
+    }
   }
 }

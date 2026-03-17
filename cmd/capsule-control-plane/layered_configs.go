@@ -2,9 +2,7 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -101,17 +99,20 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 	leafLayer := layers[len(layers)-1]
 	leafWorkloadKey = snapshot.ComputeLeafWorkloadKey(leafLayer.LayerHash)
 
-	// Compute config_id from JSON
+	// config_id = display_name (validated as a slug)
+	if err := snapshot.ValidateConfigID(cfg.DisplayName); err != nil {
+		return "", "", fmt.Errorf("invalid config_id: %w", err)
+	}
+	configID = cfg.DisplayName
+
+	// Marshal config for storage
 	cfgJSON, err := json.Marshal(cfg)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to marshal config: %w", err)
 	}
-	h := sha256.Sum256(cfgJSON)
-	configID = hex.EncodeToString(h[:])[:16]
 
 	r.logger.WithFields(logrus.Fields{
 		"config_id":         configID,
-		"display_name":      cfg.DisplayName,
 		"leaf_workload_key": leafWorkloadKey,
 		"num_layers":        len(layers),
 	}).Info("Registering layered config")
@@ -122,7 +123,17 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 	}
 	defer tx.Rollback()
 
-	// Insert layers in topological order (root first)
+	// Read current active workload_key for this config (might not exist for new configs)
+	var oldLeafWK sql.NullString
+	tx.QueryRowContext(ctx,
+		`SELECT leaf_workload_key FROM config_workload_keys
+		 WHERE config_id = $1 AND status = 'active'`,
+		configID).Scan(&oldLeafWK)
+
+	// Insert layers in topological order (root first).
+	// The snapshot_layers UPSERT no longer overwrites config-scoped fields
+	// (config_name, refresh_commands, refresh_interval, all_chain_drives) on
+	// shared rows — those live in config_layer_settings instead.
 	for _, layer := range layers {
 		initCmdsJSON, _ := json.Marshal(layer.InitCommands)
 		refreshCmdsJSON, _ := json.Marshal(layer.RefreshCommands)
@@ -138,10 +149,6 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 			INSERT INTO snapshot_layers (layer_hash, parent_layer_hash, config_name, depth, init_commands, refresh_commands, drives, all_chain_drives, refresh_interval)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 			ON CONFLICT (layer_hash) DO UPDATE SET
-				config_name = EXCLUDED.config_name,
-				refresh_commands = EXCLUDED.refresh_commands,
-				refresh_interval = EXCLUDED.refresh_interval,
-				all_chain_drives = EXCLUDED.all_chain_drives,
 				status = CASE WHEN snapshot_layers.status = 'inactive' THEN 'pending' ELSE snapshot_layers.status END,
 				current_version = CASE WHEN snapshot_layers.status = 'inactive' THEN NULL ELSE snapshot_layers.current_version END,
 				updated_at = NOW()
@@ -150,6 +157,46 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 		if err != nil {
 			return "", "", fmt.Errorf("failed to insert layer %s: %w", layer.Name, err)
 		}
+
+		// Upsert per-config layer settings (config-scoped fields)
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO config_layer_settings (config_id, layer_hash, config_name,
+				refresh_commands, refresh_interval, all_chain_drives)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (config_id, layer_hash) DO UPDATE SET
+				config_name = EXCLUDED.config_name,
+				refresh_commands = EXCLUDED.refresh_commands,
+				refresh_interval = EXCLUDED.refresh_interval,
+				all_chain_drives = EXCLUDED.all_chain_drives,
+				updated_at = NOW()
+		`, configID, layer.LayerHash, layer.Name,
+			string(refreshCmdsJSON), layer.RefreshInterval, string(allChainDrivesJSON))
+		if err != nil {
+			return "", "", fmt.Errorf("failed to insert config_layer_settings for layer %s: %w", layer.Name, err)
+		}
+	}
+
+	// If workload_key changed, drain old and activate new
+	if oldLeafWK.Valid && oldLeafWK.String != "" && oldLeafWK.String != leafWorkloadKey {
+		_, err = tx.ExecContext(ctx,
+			`UPDATE config_workload_keys SET status = 'draining'
+			 WHERE config_id = $1 AND status = 'active'`,
+			configID)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to drain old workload key: %w", err)
+		}
+	}
+
+	// Upsert active workload_key
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO config_workload_keys (config_id, leaf_workload_key, leaf_layer_hash, status)
+		 VALUES ($1, $2, $3, 'active')
+		 ON CONFLICT (config_id, leaf_workload_key) DO UPDATE SET
+		     leaf_layer_hash = EXCLUDED.leaf_layer_hash,
+		     status = 'active'`,
+		configID, leafWorkloadKey, leafLayer.LayerHash)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to upsert config_workload_keys: %w", err)
 	}
 
 	// Marshal start_command
@@ -307,20 +354,23 @@ func (r *LayeredConfigRegistry) GetLayerStatuses(ctx context.Context, configID s
 
 	rows, err := r.db.QueryContext(ctx, `
 		WITH RECURSIVE chain AS (
-			SELECT layer_hash, parent_layer_hash, config_name, depth, status, current_version
+			SELECT layer_hash, parent_layer_hash, depth, status, current_version
 			FROM snapshot_layers WHERE layer_hash = $1
 			UNION ALL
-			SELECT sl.layer_hash, sl.parent_layer_hash, sl.config_name, sl.depth, sl.status, sl.current_version
+			SELECT sl.layer_hash, sl.parent_layer_hash, sl.depth, sl.status, sl.current_version
 			FROM snapshot_layers sl
 			JOIN chain c ON sl.layer_hash = c.parent_layer_hash
 		)
-		SELECT c.layer_hash, c.config_name, c.depth, c.status, c.current_version,
+		SELECT c.layer_hash,
+		       cls.config_name,
+		       c.depth, c.status, c.current_version,
 		       sb.status, sb.version
 		FROM chain c
+		JOIN config_layer_settings cls ON cls.layer_hash = c.layer_hash AND cls.config_id = $2
 		LEFT JOIN snapshot_builds sb ON sb.layer_hash = c.layer_hash
 			AND sb.status IN ('queued', 'waiting_parent', 'running')
 		ORDER BY c.depth
-	`, leafHash)
+	`, leafHash, configID)
 	if err != nil {
 		return nil, err
 	}
@@ -354,6 +404,7 @@ func (r *LayeredConfigRegistry) GetLayerStatuses(ctx context.Context, configID s
 
 // DeleteLayeredConfig deletes a layered config. Layers shared by other configs are preserved;
 // orphaned layers (not referenced by any remaining config) are deactivated and their builds cancelled.
+// All changes are wrapped in a transaction for atomicity [L2].
 func (r *LayeredConfigRegistry) DeleteLayeredConfig(ctx context.Context, configID string) error {
 	// Load the config's layer hashes and workload key before deleting
 	var configJSON, leafWorkloadKey string
@@ -368,21 +419,37 @@ func (r *LayeredConfigRegistry) DeleteLayeredConfig(ctx context.Context, configI
 	}
 	layers := snapshot.MaterializeLayers(&cfg)
 
-	// Delete the config
-	result, err := r.db.ExecContext(ctx, `DELETE FROM layered_configs WHERE config_id = $1`, configID)
+	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("layered config not found: %s", configID)
+	defer tx.Rollback()
+
+	// Collect all workload_keys for this config (active + draining) before deleting
+	var allWKs []string
+	wkRows, err := tx.QueryContext(ctx,
+		`SELECT leaf_workload_key FROM config_workload_keys WHERE config_id = $1`, configID)
+	if err == nil {
+		for wkRows.Next() {
+			var wk string
+			wkRows.Scan(&wk)
+			allWKs = append(allWKs, wk)
+		}
+		wkRows.Close()
 	}
 
-	// Invalidate the workload config cache so the next allocation re-reads from DB.
-	// If another config shares the same leaf_workload_key, the cache will be
-	// repopulated on the next cache miss.
-	if r.configCache != nil && leafWorkloadKey != "" {
-		r.configCache.InvalidateWorkloadConfig(leafWorkloadKey)
+	// Delete config_workload_keys, config_layer_settings, and the config
+	tx.ExecContext(ctx, `DELETE FROM config_workload_keys WHERE config_id = $1`, configID)
+	tx.ExecContext(ctx, `DELETE FROM config_layer_settings WHERE config_id = $1`, configID)
+
+	// Delete the config
+	result, err := tx.ExecContext(ctx, `DELETE FROM layered_configs WHERE config_id = $1`, configID)
+	if err != nil {
+		return err
+	}
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("layered config not found: %s", configID)
 	}
 
 	// For each layer, check if it's still referenced by another config.
@@ -390,7 +457,7 @@ func (r *LayeredConfigRegistry) DeleteLayeredConfig(ctx context.Context, configI
 	// If the layer is in any config's chain, preserve it.
 	for _, layer := range layers {
 		var referenced int
-		r.db.QueryRowContext(ctx, `
+		tx.QueryRowContext(ctx, `
 			WITH RECURSIVE config_layers AS (
 				SELECT sl.layer_hash, sl.parent_layer_hash
 				FROM snapshot_layers sl
@@ -411,10 +478,10 @@ func (r *LayeredConfigRegistry) DeleteLayeredConfig(ctx context.Context, configI
 		}
 
 		// Deactivate orphaned layer and clear current_version so re-registration starts fresh
-		r.db.ExecContext(ctx, `UPDATE snapshot_layers SET status='inactive', current_version=NULL WHERE layer_hash=$1`, layer.LayerHash)
+		tx.ExecContext(ctx, `UPDATE snapshot_layers SET status='inactive', current_version=NULL WHERE layer_hash=$1`, layer.LayerHash)
 
-		// Cancel active builds
-		r.db.ExecContext(ctx, `
+		// Cancel active builds [M4]
+		tx.ExecContext(ctx, `
 			UPDATE snapshot_builds SET status='cancelled'
 			WHERE layer_hash=$1 AND status IN ('queued','waiting_parent','running')
 		`, layer.LayerHash)
@@ -423,6 +490,30 @@ func (r *LayeredConfigRegistry) DeleteLayeredConfig(ctx context.Context, configI
 			"layer_hash": layer.LayerHash[:16],
 			"layer_name": layer.Name,
 		}).Info("Deactivated orphaned layer and cancelled builds")
+	}
+
+	// Clean up workload_key metadata for all workload_keys (active + draining)
+	// that are no longer referenced by any other config
+	for _, wk := range allWKs {
+		var otherCount int
+		tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM config_workload_keys WHERE leaf_workload_key = $1`,
+			wk).Scan(&otherCount)
+		if otherCount == 0 {
+			tx.ExecContext(ctx, `DELETE FROM version_assignments WHERE workload_key = $1`, wk)
+			tx.ExecContext(ctx, `UPDATE snapshots SET status = 'deprecated' WHERE workload_key = $1 AND status = 'active'`, wk)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	// Invalidate the workload config cache so the next allocation re-reads from DB.
+	// If another config shares the same leaf_workload_key, the cache will be
+	// repopulated on the next cache miss.
+	if r.configCache != nil && leafWorkloadKey != "" {
+		r.configCache.InvalidateWorkloadConfig(leafWorkloadKey)
 	}
 
 	return nil
@@ -473,7 +564,7 @@ func (r *LayeredConfigRegistry) HandleLayeredConfigs(w http.ResponseWriter, req 
 			return
 		}
 		if sub == "promote" {
-			r.tagRegistry.HandlePromote(w, req, wk)
+			r.handlePromote(w, req, wk)
 			return
 		}
 	}
@@ -486,6 +577,53 @@ func (r *LayeredConfigRegistry) HandleLayeredConfigs(w http.ResponseWriter, req 
 	default:
 		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+// handlePromote promotes a tagged version to active, updating snapshot status
+// and version assignments so hosts converge to the new version.
+func (r *LayeredConfigRegistry) handlePromote(w http.ResponseWriter, req *http.Request, workloadKey string) {
+	if req.Method != http.MethodPost {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if body.Tag == "" {
+		writeAPIError(w, http.StatusBadRequest, "tag is required")
+		return
+	}
+	version, err := r.tagRegistry.PromoteTag(req.Context(), workloadKey, body.Tag)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeAPIError(w, http.StatusNotFound, err.Error())
+		} else {
+			writeAPIError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+
+	// Activate the snapshot and assign the version fleet-wide so hosts converge.
+	if r.snapshotManager != nil {
+		if err := r.snapshotManager.SetActiveSnapshotForKey(req.Context(), workloadKey, version); err != nil {
+			r.logger.WithError(err).Warn("promote: failed to set active snapshot")
+		}
+		if err := r.snapshotManager.AssignVersion(req.Context(), workloadKey, nil, version); err != nil {
+			r.logger.WithError(err).Warn("promote: failed to assign version")
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"workload_key": workloadKey,
+		"tag":          body.Tag,
+		"version":      version,
+		"status":       "promoted",
+	})
 }
 
 func (r *LayeredConfigRegistry) handleCreateLayeredConfig(w http.ResponseWriter, req *http.Request) {
@@ -505,16 +643,29 @@ func (r *LayeredConfigRegistry) handleCreateLayeredConfig(w http.ResponseWriter,
 		return
 	}
 
-	// Get layer statuses for the response
+	// Get actual layer statuses from DB (layers may already be active if shared)
 	layers := snapshot.MaterializeLayers(&cfg)
 	layerInfos := make([]map[string]interface{}, len(layers))
 	for i, l := range layers {
-		layerInfos[i] = map[string]interface{}{
+		layerStatus := "pending"
+		var currentVersion sql.NullString
+		var dbStatus sql.NullString
+		r.db.QueryRowContext(req.Context(),
+			`SELECT status, current_version FROM snapshot_layers WHERE layer_hash = $1`,
+			l.LayerHash).Scan(&dbStatus, &currentVersion)
+		if dbStatus.Valid {
+			layerStatus = dbStatus.String
+		}
+		info := map[string]interface{}{
 			"name":   l.Name,
 			"hash":   l.LayerHash,
 			"depth":  l.Depth,
-			"status": "pending",
+			"status": layerStatus,
 		}
+		if currentVersion.Valid && currentVersion.String != "" {
+			info["current_version"] = currentVersion.String
+		}
+		layerInfos[i] = info
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -620,34 +771,35 @@ func (r *LayeredConfigRegistry) handleTriggerBuild(w http.ResponseWriter, req *h
 	layers := snapshot.MaterializeLayers(&cfg)
 	forceRebuild := req.URL.Query().Get("force") == "true"
 	cleanBuild := req.URL.Query().Get("clean") == "true"
-
-	// clean=true: clear current_version for all layers so they rebuild from scratch (init)
 	if cleanBuild {
-		for _, layer := range layers {
-			if _, err := r.db.ExecContext(req.Context(),
-				`UPDATE snapshot_layers SET current_version=NULL WHERE layer_hash=$1`,
-				layer.LayerHash); err != nil {
-				logrus.WithError(err).WithField("layer_hash", layer.LayerHash[:16]).Error("Failed to clear layer version during clean build")
-				writeAPIError(w, http.StatusInternalServerError, "failed to clear layer versions")
-				return
-			}
-		}
+		forceRebuild = true
 	}
 
+	var enqueued int
 	if r.layerBuilder != nil {
-		if err := r.layerBuilder.EnqueueChainBuild(req.Context(), layers, 0, "init", configID, forceRebuild, cleanBuild); err != nil {
+		var err error
+		enqueued, err = r.layerBuilder.EnqueueChainBuild(req.Context(), layers, 0, "init", configID, forceRebuild, cleanBuild)
+		if err != nil {
 			writeAPIError(w, http.StatusInternalServerError, fmt.Sprintf("failed to enqueue build: %s", err))
 			return
 		}
 	}
 
+	status := "build_enqueued"
+	httpStatus := http.StatusAccepted
+	if enqueued == 0 {
+		status = "no_build_needed"
+		httpStatus = http.StatusOK
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]string{
+	w.WriteHeader(httpStatus)
+	json.NewEncoder(w).Encode(map[string]interface{}{
 		"config_id": configID,
-		"status":    "build_enqueued",
-		"force":     fmt.Sprintf("%v", forceRebuild),
-		"clean":     fmt.Sprintf("%v", cleanBuild),
+		"status":    status,
+		"enqueued":  enqueued,
+		"force":     forceRebuild,
+		"clean":     cleanBuild,
 	})
 }
 
@@ -694,19 +846,30 @@ func (r *LayeredConfigRegistry) handleRefreshLayer(w http.ResponseWriter, req *h
 		return
 	}
 
+	var enqueued int
 	if r.layerBuilder != nil {
-		if err := r.layerBuilder.EnqueueChainBuild(req.Context(), layers, startDepth, "refresh", configID); err != nil {
+		var err error
+		enqueued, err = r.layerBuilder.EnqueueChainBuild(req.Context(), layers, startDepth, "refresh", configID)
+		if err != nil {
 			writeAPIError(w, http.StatusInternalServerError, fmt.Sprintf("failed to enqueue refresh: %s", err))
 			return
 		}
 	}
 
+	status := "refresh_enqueued"
+	httpStatus := http.StatusAccepted
+	if enqueued == 0 {
+		status = "no_refresh_needed"
+		httpStatus = http.StatusOK
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]string{
+	w.WriteHeader(httpStatus)
+	json.NewEncoder(w).Encode(map[string]interface{}{
 		"config_id":  configID,
 		"layer_name": layerName,
-		"status":     "refresh_enqueued",
+		"status":     status,
+		"enqueued":   enqueued,
 	})
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
@@ -12,6 +13,20 @@ import (
 
 // PlatformLayerName is the reserved name for the auto-injected platform layer.
 const PlatformLayerName = "_platform"
+
+var validConfigID = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*[a-z0-9]$`)
+
+// ValidateConfigID checks that a config_id is a valid slug:
+// lowercase alphanumeric with hyphens, 3-64 characters, no leading/trailing hyphens.
+func ValidateConfigID(id string) error {
+	if len(id) < 3 || len(id) > 64 {
+		return fmt.Errorf("config_id must be 3-64 characters, got %d", len(id))
+	}
+	if !validConfigID.MatchString(id) {
+		return fmt.Errorf("config_id must be lowercase alphanumeric with hyphens (no leading/trailing hyphens)")
+	}
+	return nil
+}
 
 // LayerDef defines a single layer in a layered snapshot config.
 type LayerDef struct {
@@ -55,8 +70,8 @@ type LayerMaterialized struct {
 
 // ValidateLayeredConfig checks a LayeredConfig for correctness.
 func ValidateLayeredConfig(cfg *LayeredConfig) error {
-	if len(cfg.Layers) == 0 {
-		return fmt.Errorf("at least one layer is required")
+	if len(cfg.Layers) == 0 && cfg.BaseImage == "" {
+		return fmt.Errorf("at least one layer is required when no base_image is set")
 	}
 
 	names := make(map[string]bool)
@@ -96,12 +111,9 @@ func ValidateLayeredConfig(cfg *LayeredConfig) error {
 
 // validateRefreshInterval checks that a refresh_interval value is valid.
 func validateRefreshInterval(interval string) error {
-	if interval == "on_push" {
-		return nil
-	}
 	_, err := time.ParseDuration(interval)
 	if err != nil {
-		return fmt.Errorf("%q is not a valid duration or 'on_push'", interval)
+		return fmt.Errorf("%q is not a valid duration", interval)
 	}
 	return nil
 }
@@ -134,9 +146,10 @@ func MaterializeLayers(cfg *LayeredConfig) []LayerMaterialized {
 
 	result := make([]LayerMaterialized, len(allLayers))
 	parentHash := ""
+	tier := cfg.Config.Tier
 
 	for i, layer := range allLayers {
-		layerHash := ComputeLayerHash(parentHash, layer.InitCommands, layer.Drives)
+		layerHash := ComputeLayerHash(parentHash, layer.InitCommands, layer.Drives, tier)
 		result[i] = LayerMaterialized{
 			LayerDef:        layer,
 			LayerHash:       layerHash,
