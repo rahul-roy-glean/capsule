@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS snapshot_layers (
     refresh_interval     VARCHAR(64) DEFAULT '',
     current_version      VARCHAR(255),
     build_artifact_hash  VARCHAR(64) DEFAULT '',  -- MD5 hash of capsule-thaw-agent binary used for current_version; stale value triggers rebuild
+    all_chain_drives_hash VARCHAR(64) DEFAULT '',  -- SHA256 of all_chain_drives JSON at build time; mismatch triggers rebuild
     status               VARCHAR(32) DEFAULT 'pending',
     created_at           TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at           TIMESTAMP WITH TIME ZONE DEFAULT NOW()
@@ -278,3 +279,4 @@ COMMENT ON TABLE snapshot_tags IS 'Named aliases for snapshot versions (e.g., st
 
 -- Migrations (idempotent)
 ALTER TABLE snapshot_layers ADD COLUMN IF NOT EXISTS build_artifact_hash VARCHAR(64) DEFAULT '';
+ALTER TABLE snapshot_layers ADD COLUMN IF NOT EXISTS all_chain_drives_hash VARCHAR(64) DEFAULT '';
