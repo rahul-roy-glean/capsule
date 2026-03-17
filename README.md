@@ -147,6 +147,7 @@ For the detailed design, see [docs/architecture.md](docs/architecture.md).
 - [docs/HOWTO.md](docs/HOWTO.md) - common API and operational recipes
 - [docs/operations.md](docs/operations.md) - runtime behavior, rollout, and recovery
 - [docs/architecture.md](docs/architecture.md) - component model and data flows
+- [docs/secure-access-plane-future.md](docs/secure-access-plane-future.md) - strategic direction for secure access and agent authority
 - [docs/DEV_SETUP.md](docs/DEV_SETUP.md) - local development and contribution workflow
 - [examples/README.md](examples/README.md) - example index and shared workload primitives
 - [sdk/python/README.md](sdk/python/README.md) - Python SDK guide
