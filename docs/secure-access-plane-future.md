@@ -739,6 +739,258 @@ If harness-in-sandbox remains strategic, invest in:
 
 Without this, Lane 3 remains substantially riskier.
 
+## What Changes If Capsule Drops Remote Gateway Execution
+
+The most important clarification is that dropping remote gateway execution is
+not the same thing as dropping the secure access plane.
+
+Two different changes are possible:
+
+- remove the trusted authority entirely
+- keep a trusted authority, but remove remote execution as a delivery lane
+
+The first option would collapse Capsule back into a sandbox plus local runtime
+policies. That would simplify the control topology, but it would also remove a
+central place to hold:
+
+- workload attestation
+- grant issuance
+- approvals
+- lifecycle-aware revocation
+- actor-chain audit
+
+That would be a strategic step backward.
+
+The second option is more coherent:
+
+- keep a secure access plane
+- remove remote execution from its delivery model
+- rely on local execution plus grants, helper sessions, and runtime controls
+
+This does simplify the architecture in one important dimension.
+
+### What Simplifies If Remote Execution Is Removed
+
+Removing remote execution means Capsule no longer needs:
+
+- a remote executor fleet
+- command streaming infrastructure
+- command serialization and quoting protocols for brokered CLIs
+- a second execution environment that mirrors local tooling
+- a split between local workspace state and remote command state
+
+That makes the system easier to explain and improves local fidelity for:
+
+- code-centric workflows
+- workspace-local build and test loops
+- local scripts that depend on generated files
+- direct in-sandbox HTTP workflows
+
+### What Becomes Harder
+
+The hard parts do not disappear. They move into the sandbox and runtime model.
+
+Without remote execution, Capsule must still solve:
+
+- how local CLIs authenticate safely
+- how provider SDKs avoid ambient credential discovery
+- how helper surfaces are protected from arbitrary generated code
+- how access is revoked when a session pauses, resumes, forks, or migrates
+- how reusable authority is kept out of long-lived sandboxes
+
+In other words:
+
+> Removing remote execution simplifies topology, but not the core authority
+> problem for long-lived sandboxes.
+
+## The Controls Capsule Would Need Without Remote Execution
+
+If Capsule drops remote execution as a lane, then the architecture must become
+more explicit about its local controls.
+
+### 1. Compute isolation controls
+
+These protect the runtime boundary itself:
+
+- VM or strong sandbox isolation
+- unprivileged process identity
+- seccomp or equivalent syscall restrictions
+- no ptrace
+- no `sudo` or setuid escape path
+- restricted localhost and helper socket access
+- protected helper directories
+
+### 2. Filesystem and persistence controls
+
+This becomes more important in long-lived sandboxes because the workspace
+itself accumulates value and risk over time.
+
+Useful controls include:
+
+- explicit read-only vs read-write roots
+- protected helper configuration paths
+- protected durable system state
+- scratch space distinct from durable workspace state
+- optional overlay or staging semantics for persistent mutations
+
+### 3. Network and egress controls
+
+These become the primary external guardrail when execution stays local:
+
+- per-runner egress grants
+- destination allowlists
+- optional method and path restrictions for REST
+- per-binary matching where possible
+- header or proxy transforms
+- TTL-bound installation and revocation
+- explicit deny logs
+
+### 4. Identity and grant controls
+
+Even without remote execution, Capsule still needs a real access authority:
+
+- attested runner identity
+- user and virtual identity resolution
+- session-bound and runner-bound grants
+- ideally turn-bound grants
+- capability scoping
+- lifecycle-aware revocation
+
+### 5. Helper and credential controls
+
+This is the hardest area in a no-remote-execution architecture.
+
+Capsule should prefer:
+
+- no durable credentials injected by default
+- short-lived helper-based credentials only
+- provider-native helper patterns such as exec plugins, `credential_process`,
+  askpass, or executable-sourced identity flows
+- no reusable refresh tokens in the sandbox
+- helper lifetime bound to grants, not to the sandbox lifetime
+
+## Why Lane 0 Is Too Weak for Long-Lived Sandboxes
+
+The original lane-zero idea of local uncredentialed compute is good enough for:
+
+- agentic file sandboxes
+- short-lived tool invocation
+- local build and test loops
+- ordinary code execution without external authority
+
+It is not a sufficient ambient model for long-lived sandboxes.
+
+The reason is not only external credentials. It is also accumulated local
+authority:
+
+- persistent workspace state
+- local caches
+- shell history
+- generated artifacts
+- background processes
+- auth-adjacent configuration
+- prior-turn outputs that may themselves be sensitive
+
+For long-lived sandboxes, unrestricted local execution over persistent state is
+not a neutral baseline. It is itself a trust decision.
+
+## Revised Default Lane Model for Long-Lived Sandboxes
+
+If Capsule removes remote execution, the lane model should be revised rather
+than flattened.
+
+### Lane A: Local Scratch Compute
+
+This becomes the safe default.
+
+It is intended for:
+
+- reading code
+- generating code
+- local tests
+- ordinary file transforms
+- ephemeral temp-file work
+
+Properties:
+
+- no privileged network access
+- no helper access
+- no durable secret material
+- no access to protected control surfaces
+
+### Lane B: Local Durable State Mutation
+
+This is distinct from scratch compute and should be treated as a more sensitive
+lane.
+
+Examples:
+
+- mutating persistent workspace roots
+- changing durable runtime configuration
+- installing packages into durable state
+- altering persistent helper-related files
+- starting long-lived background processes
+
+This lane may not always require human approval, but it should not be treated
+as identical to scratch compute.
+
+### Lane C: Grant-Mediated Local HTTP Access
+
+This becomes the main external effect lane for HTTP-heavy workflows:
+
+- direct API calls from code inside the sandbox
+- bounded REST and GraphQL access
+- allowlisted destinations with short-lived grants
+
+### Lane D: Selected Helper-Backed Local CLI Families
+
+This is still an exception lane, not an ambient default.
+
+It should start with a small, explicit set of families such as:
+
+- `kubectl`
+- Google WIF or executable ADC
+- AWS `credential_process`
+- selected Git credential helpers
+
+### Unsupported by Default
+
+If Capsule drops remote execution, it should be explicit about what it does not
+support by default:
+
+- arbitrary privileged CLIs
+- arbitrary SDK credential discovery chains
+- arbitrary metadata-based auth flows
+
+That narrower product definition is what makes a no-remote-execution
+architecture coherent.
+
+## Decision Framing
+
+Capsule has two coherent futures.
+
+### Option 1: Keep remote execution
+
+Choose this if Capsule wants:
+
+- broad privileged-access coverage
+- strong safe defaults for CLI-heavy workflows
+- easier support for arbitrary new tool families
+- a clean place to centralize approvals and audit
+
+### Option 2: Drop remote execution and narrow the product deliberately
+
+Choose this if Capsule wants to optimize for:
+
+- long-lived local execution
+- code and file workflows
+- bounded direct HTTP access
+- a small number of carefully supported helper-backed CLI families
+
+If Capsule takes this path, it should say so clearly. The system would still
+need a secure access plane, but that access plane would become primarily a
+grant, policy, helper, and audit authority rather than a remote executor.
+
 ## Final Recommendations
 
 The most important decisions for Capsule are:
@@ -753,6 +1005,11 @@ The most important decisions for Capsule are:
 6. Move toward secretless or near-secretless sandboxes by default.
 7. Make grants lifecycle-aware and, ideally, turn-aware.
 8. Build full actor-chain audit from the beginning.
+
+If Capsule later chooses to drop remote execution, it should do so only
+alongside a deliberate narrowing of scope and a revised lane model for
+long-lived sandboxes rather than by treating the original lane-zero model as
+sufficient.
 
 ## Bottom Line
 
