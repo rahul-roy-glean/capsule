@@ -149,6 +149,7 @@ For the detailed design, see [docs/architecture.md](docs/architecture.md).
 - [docs/architecture.md](docs/architecture.md) - component model and data flows
 - [docs/secure-access-plane-future.md](docs/secure-access-plane-future.md) - strategic direction for secure access and agent authority
 - [docs/secure-access-plane-one-pager.md](docs/secure-access-plane-one-pager.md) - condensed secure access plane architecture summary and diagrams
+- [docs/secure-access-plane-general-design.md](docs/secure-access-plane-general-design.md) - concrete externalized secure access plane design proposal
 - [docs/DEV_SETUP.md](docs/DEV_SETUP.md) - local development and contribution workflow
 - [examples/README.md](examples/README.md) - example index and shared workload primitives
 - [sdk/python/README.md](sdk/python/README.md) - Python SDK guide
