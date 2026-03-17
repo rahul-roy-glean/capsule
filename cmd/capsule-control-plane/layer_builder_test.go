@@ -1101,3 +1101,152 @@ func TestLayerBuilder_EnqueueChainBuild_InsertError(t *testing.T) {
 		t.Errorf("unmet expectations: %v", err)
 	}
 }
+
+// --- 12. computeAllChainDrivesHash ---
+
+func TestComputeAllChainDrivesHash_EmptyInputs(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"empty string", ""},
+		{"empty array", "[]"},
+		{"null", "null"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := computeAllChainDrivesHash(tt.input)
+			if got != "" {
+				t.Errorf("computeAllChainDrivesHash(%q) = %q, want empty", tt.input, got)
+			}
+		})
+	}
+}
+
+func TestComputeAllChainDrivesHash_NonEmpty(t *testing.T) {
+	input := `[{"drive_id":"d1","is_root_device":false}]`
+	got := computeAllChainDrivesHash(input)
+	if len(got) != 64 {
+		t.Errorf("expected 64-char hex, got %d chars: %q", len(got), got)
+	}
+	// Must be deterministic
+	got2 := computeAllChainDrivesHash(input)
+	if got != got2 {
+		t.Errorf("not deterministic: %q != %q", got, got2)
+	}
+}
+
+func TestComputeAllChainDrivesHash_DifferentInputsDiffer(t *testing.T) {
+	a := computeAllChainDrivesHash(`[{"drive_id":"d1"}]`)
+	b := computeAllChainDrivesHash(`[{"drive_id":"d2"}]`)
+	if a == b {
+		t.Errorf("different inputs produced same hash: %q", a)
+	}
+}
+
+// --- 13. isAllChainDrivesStale ---
+
+func TestIsAllChainDrivesStale_Mismatch(t *testing.T) {
+	s, mock := newTestScheduler(t)
+	ctx := context.Background()
+	layerHash := "abcdef1234567890abcdef1234567890"
+
+	// config_layer_settings returns non-empty drives
+	mock.ExpectQuery(`SELECT COALESCE`).
+		WithArgs("cfg-1", layerHash).
+		WillReturnRows(sqlmock.NewRows([]string{"all_chain_drives"}).
+			AddRow(`[{"drive_id":"d1"}]`))
+
+	// snapshot_layers returns a different stored hash
+	mock.ExpectQuery(`SELECT all_chain_drives_hash FROM snapshot_layers`).
+		WithArgs(layerHash).
+		WillReturnRows(sqlmock.NewRows([]string{"all_chain_drives_hash"}).
+			AddRow("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+
+	result := s.isAllChainDrivesStale(ctx, layerHash, "cfg-1")
+	if !result {
+		t.Error("expected stale=true for hash mismatch, got false")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestIsAllChainDrivesStale_EmptyStoredHash(t *testing.T) {
+	s, mock := newTestScheduler(t)
+	ctx := context.Background()
+	layerHash := "abcdef1234567890abcdef1234567890"
+
+	// config_layer_settings returns non-empty drives
+	mock.ExpectQuery(`SELECT COALESCE`).
+		WithArgs("cfg-1", layerHash).
+		WillReturnRows(sqlmock.NewRows([]string{"all_chain_drives"}).
+			AddRow(`[{"drive_id":"d1"}]`))
+
+	// snapshot_layers returns empty stored hash (first deploy case)
+	mock.ExpectQuery(`SELECT all_chain_drives_hash FROM snapshot_layers`).
+		WithArgs(layerHash).
+		WillReturnRows(sqlmock.NewRows([]string{"all_chain_drives_hash"}).
+			AddRow(""))
+
+	result := s.isAllChainDrivesStale(ctx, layerHash, "cfg-1")
+	if result {
+		t.Error("expected stale=false for empty stored hash (first deploy), got true")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestIsAllChainDrivesStale_EmptyCurrentDrives(t *testing.T) {
+	s, mock := newTestScheduler(t)
+	ctx := context.Background()
+	layerHash := "abcdef1234567890abcdef1234567890"
+
+	// config_layer_settings returns empty drives
+	mock.ExpectQuery(`SELECT COALESCE`).
+		WithArgs("cfg-1", layerHash).
+		WillReturnRows(sqlmock.NewRows([]string{"all_chain_drives"}).
+			AddRow("[]"))
+
+	// No need to query snapshot_layers since current hash is empty
+	result := s.isAllChainDrivesStale(ctx, layerHash, "cfg-1")
+	if result {
+		t.Error("expected stale=false for empty current drives, got true")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestIsAllChainDrivesStale_MatchingHash(t *testing.T) {
+	s, mock := newTestScheduler(t)
+	ctx := context.Background()
+	layerHash := "abcdef1234567890abcdef1234567890"
+	drivesJSON := `[{"drive_id":"d1"}]`
+	expectedHash := computeAllChainDrivesHash(drivesJSON)
+
+	// config_layer_settings returns drives
+	mock.ExpectQuery(`SELECT COALESCE`).
+		WithArgs("cfg-1", layerHash).
+		WillReturnRows(sqlmock.NewRows([]string{"all_chain_drives"}).
+			AddRow(drivesJSON))
+
+	// snapshot_layers returns matching hash
+	mock.ExpectQuery(`SELECT all_chain_drives_hash FROM snapshot_layers`).
+		WithArgs(layerHash).
+		WillReturnRows(sqlmock.NewRows([]string{"all_chain_drives_hash"}).
+			AddRow(expectedHash))
+
+	result := s.isAllChainDrivesStale(ctx, layerHash, "cfg-1")
+	if result {
+		t.Error("expected stale=false for matching hash, got true")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}

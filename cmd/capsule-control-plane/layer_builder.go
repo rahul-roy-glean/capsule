@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -69,7 +71,7 @@ func (s *LayerBuildScheduler) Run(ctx context.Context) {
 // layer status to 'active'. Runs periodically as a safety net.
 func (s *LayerBuildScheduler) reconcileCompletedBuilds(ctx context.Context) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT sb.build_id, sb.layer_hash, sb.version
+		SELECT sb.build_id, sb.layer_hash, sb.version, COALESCE(sb.all_chain_drives::text, '[]')
 		FROM snapshot_builds sb
 		JOIN snapshot_layers sl ON sb.layer_hash = sl.layer_hash
 		WHERE sb.status = 'completed'
@@ -85,8 +87,8 @@ func (s *LayerBuildScheduler) reconcileCompletedBuilds(ctx context.Context) {
 	// Track which layer_hashes we've already fixed (take the latest completed build)
 	fixed := make(map[string]bool)
 	for rows.Next() {
-		var buildID, layerHash, version string
-		if err := rows.Scan(&buildID, &layerHash, &version); err != nil {
+		var buildID, layerHash, version, buildAllChainDrives string
+		if err := rows.Scan(&buildID, &layerHash, &version, &buildAllChainDrives); err != nil {
 			continue
 		}
 		if fixed[layerHash] {
@@ -95,7 +97,8 @@ func (s *LayerBuildScheduler) reconcileCompletedBuilds(ctx context.Context) {
 		fixed[layerHash] = true
 
 		artifactHash := s.snapshotManager.ThawAgentHash(ctx)
-		if _, err := s.db.ExecContext(ctx, `UPDATE snapshot_layers SET current_version=$1, build_artifact_hash=$3, status='active', updated_at=NOW() WHERE layer_hash=$2 AND status='pending'`, version, layerHash, artifactHash); err != nil {
+		drivesHash := computeAllChainDrivesHash(buildAllChainDrives)
+		if _, err := s.db.ExecContext(ctx, `UPDATE snapshot_layers SET current_version=$1, build_artifact_hash=$3, all_chain_drives_hash=$4, status='active', updated_at=NOW() WHERE layer_hash=$2 AND status='pending'`, version, layerHash, artifactHash, drivesHash); err != nil {
 			s.logger.WithError(err).WithField("layer_hash", layerHash[:16]).Error("Reconcile: failed to activate layer")
 			continue
 		}
@@ -121,6 +124,41 @@ func (s *LayerBuildScheduler) isPlatformLayerStale(ctx context.Context, layerHas
 		layerHash).Scan(&storedHash)
 	if !storedHash.Valid || storedHash.String == "" {
 		return true // no stored hash, assume stale
+	}
+	return storedHash.String != currentHash
+}
+
+// computeAllChainDrivesHash returns the SHA256 hex digest of the all_chain_drives
+// JSON string. Returns "" for empty, null, or "[]" inputs.
+func computeAllChainDrivesHash(allChainDrivesJSON string) string {
+	if allChainDrivesJSON == "" || allChainDrivesJSON == "[]" || allChainDrivesJSON == "null" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(allChainDrivesJSON))
+	return hex.EncodeToString(h[:])
+}
+
+// isAllChainDrivesStale checks whether the all_chain_drives for a given layer+config
+// have changed since the layer was last built. Returns true if the stored hash
+// does not match the current all_chain_drives from config_layer_settings.
+// Returns false when the stored hash is empty (avoids thundering herd on first
+// deploy — hash gets populated on next natural build).
+func (s *LayerBuildScheduler) isAllChainDrivesStale(ctx context.Context, layerHash, configID string) bool {
+	var currentDrivesJSON string
+	s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(all_chain_drives::text, '[]') FROM config_layer_settings WHERE config_id=$1 AND layer_hash=$2`,
+		configID, layerHash).Scan(&currentDrivesJSON)
+	currentHash := computeAllChainDrivesHash(currentDrivesJSON)
+	if currentHash == "" {
+		return false // no drives configured, nothing to detect
+	}
+
+	var storedHash sql.NullString
+	s.db.QueryRowContext(ctx,
+		`SELECT all_chain_drives_hash FROM snapshot_layers WHERE layer_hash=$1`,
+		layerHash).Scan(&storedHash)
+	if !storedHash.Valid || storedHash.String == "" {
+		return false // no stored hash yet, will populate on next build
 	}
 	return storedHash.String != currentHash
 }
@@ -181,6 +219,24 @@ func (s *LayerBuildScheduler) EnqueueChainBuild(ctx context.Context, layers []sn
 						`UPDATE snapshot_layers SET current_version=NULL, build_artifact_hash='' WHERE layer_hash=$1`,
 						layer.LayerHash)
 					// Also invalidate all descendants so they won't be skipped [H3]
+					s.db.ExecContext(ctx, `
+						WITH RECURSIVE descendants AS (
+							SELECT layer_hash FROM snapshot_layers WHERE parent_layer_hash = $1
+							UNION ALL
+							SELECT sl.layer_hash FROM snapshot_layers sl
+							JOIN descendants d ON sl.parent_layer_hash = d.layer_hash
+						)
+						UPDATE snapshot_layers SET current_version = NULL
+						WHERE layer_hash IN (SELECT layer_hash FROM descendants)
+					`, layer.LayerHash)
+				} else if s.isAllChainDrivesStale(ctx, layer.LayerHash, configID) {
+					s.logger.WithFields(logrus.Fields{
+						"layer_hash": layer.LayerHash[:16],
+						"config_id":  configID,
+					}).Info("all_chain_drives changed, invalidating layer and descendants")
+					s.db.ExecContext(ctx,
+						`UPDATE snapshot_layers SET current_version=NULL, all_chain_drives_hash='' WHERE layer_hash=$1`,
+						layer.LayerHash)
 					s.db.ExecContext(ctx, `
 						WITH RECURSIVE descendants AS (
 							SELECT layer_hash FROM snapshot_layers WHERE parent_layer_hash = $1
@@ -690,6 +746,13 @@ func (s *LayerBuildScheduler) onBuildComplete(ctx context.Context, buildID, laye
 	// the build as 'completed' but the layer stuck at 'pending'.
 	artifactHash := s.snapshotManager.ThawAgentHash(ctx)
 
+	// Read all_chain_drives from the completed build row to compute its hash
+	var buildAllChainDrives string
+	s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(all_chain_drives::text, '[]') FROM snapshot_builds WHERE build_id=$1`,
+		buildID).Scan(&buildAllChainDrives)
+	drivesHash := computeAllChainDrivesHash(buildAllChainDrives)
+
 	tx, txErr := s.db.BeginTx(ctx, nil)
 	if txErr != nil {
 		s.logger.WithError(txErr).WithField("build_id", buildID).Error("Failed to begin completion transaction")
@@ -713,8 +776,8 @@ func (s *LayerBuildScheduler) onBuildComplete(ctx context.Context, buildID, laye
 		return
 	}
 
-	// Update layer status and record the current capsule-thaw-agent hash for staleness detection.
-	if _, err := tx.ExecContext(ctx, `UPDATE snapshot_layers SET current_version=$1, build_artifact_hash=$3, status='active', updated_at=NOW() WHERE layer_hash=$2`, version, layerHash, artifactHash); err != nil {
+	// Update layer status and record hashes for staleness detection.
+	if _, err := tx.ExecContext(ctx, `UPDATE snapshot_layers SET current_version=$1, build_artifact_hash=$3, all_chain_drives_hash=$4, status='active', updated_at=NOW() WHERE layer_hash=$2`, version, layerHash, artifactHash, drivesHash); err != nil {
 		s.logger.WithError(err).WithFields(logrus.Fields{
 			"build_id":   buildID,
 			"layer_hash": layerHash[:16],
@@ -1006,7 +1069,13 @@ func (s *LayerBuildScheduler) checkRefreshSchedules(ctx context.Context) {
 		        WHERE layer_hash = cls.layer_hash AND status = 'completed') AS last_completed,
 		       EXISTS(SELECT 1 FROM snapshot_builds
 		              WHERE layer_hash = cls.layer_hash
-		              AND status IN ('queued','waiting_parent','running')) AS has_active_build
+		              AND status IN ('queued','waiting_parent','running')) AS has_active_build,
+		       COALESCE((SELECT base_image FROM snapshot_builds
+		                 WHERE config_id = cls.config_id AND status = 'completed' AND base_image != ''
+		                 ORDER BY completed_at DESC LIMIT 1), '') AS base_image,
+		       COALESCE((SELECT runner_user FROM snapshot_builds
+		                 WHERE config_id = cls.config_id AND status = 'completed' AND runner_user != ''
+		                 ORDER BY completed_at DESC LIMIT 1), '') AS runner_user
 		FROM config_layer_settings cls
 		JOIN snapshot_layers sl ON cls.layer_hash = sl.layer_hash
 		WHERE cls.refresh_interval != '' AND cls.refresh_interval != 'on_push'
@@ -1024,9 +1093,10 @@ func (s *LayerBuildScheduler) checkRefreshSchedules(ctx context.Context) {
 		var initCmdsJSON, refreshCmdsJSON, drivesJSON, allChainDrivesJSON string
 		var lastCompleted sql.NullTime
 		var hasActiveBuild bool
+		var baseImage, runnerUser string
 		if err := rows.Scan(&configID, &layerHash, &refreshInterval, &currentVersion,
 			&initCmdsJSON, &refreshCmdsJSON, &drivesJSON, &allChainDrivesJSON,
-			&lastCompleted, &hasActiveBuild); err != nil {
+			&lastCompleted, &hasActiveBuild, &baseImage, &runnerUser); err != nil {
 			continue
 		}
 		if hasActiveBuild {
@@ -1048,12 +1118,14 @@ func (s *LayerBuildScheduler) checkRefreshSchedules(ctx context.Context) {
 		s.db.ExecContext(ctx, `
 			INSERT INTO snapshot_builds (layer_hash, version, status, build_type, config_id,
 				old_layer_hash, old_layer_version,
-				init_commands, refresh_commands, drives, all_chain_drives)
-			VALUES ($1, $2, 'queued', 'refresh', $3, $4, $5, $6, $7, $8, $9)
+				init_commands, refresh_commands, drives, all_chain_drives,
+				base_image, runner_user)
+			VALUES ($1, $2, 'queued', 'refresh', $3, $4, $5, $6, $7, $8, $9, $10, $11)
 			ON CONFLICT (layer_hash, version) DO NOTHING
 		`, layerHash, version, configID,
 			sql.NullString{String: layerHash, Valid: true}, currentVersion,
-			initCmdsJSON, refreshCmdsJSON, drivesJSON, allChainDrivesJSON)
+			initCmdsJSON, refreshCmdsJSON, drivesJSON, allChainDrivesJSON,
+			baseImage, runnerUser)
 
 		s.logger.WithFields(logrus.Fields{
 			"layer_hash": layerHash[:16],
@@ -1070,6 +1142,15 @@ func (s *LayerBuildScheduler) checkRefreshSchedules(ctx context.Context) {
 // Scoped by config_id to only cascade within the owning config's branch [H2],
 // and filters out inactive layers [M4]. Populates self-contained build columns.
 func (s *LayerBuildScheduler) enqueueChildRebuilds(ctx context.Context, parentLayerHash string, configID string) {
+	// Resolve base_image and runner_user from prior completed builds in this config
+	var baseImage, runnerUser string
+	s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(base_image, ''), COALESCE(runner_user, '')
+		FROM snapshot_builds
+		WHERE config_id = $1 AND status = 'completed' AND base_image != ''
+		ORDER BY completed_at DESC LIMIT 1
+	`, configID).Scan(&baseImage, &runnerUser)
+
 	rows, err := s.db.QueryContext(ctx, `
 		WITH RECURSIVE descendants AS (
 			SELECT sl.layer_hash, sl.parent_layer_hash
@@ -1150,14 +1231,16 @@ func (s *LayerBuildScheduler) enqueueChildRebuilds(ctx context.Context, parentLa
 		s.db.ExecContext(ctx, `
 			INSERT INTO snapshot_builds (layer_hash, version, status, build_type,
 				old_layer_hash, old_layer_version, config_id,
-				init_commands, refresh_commands, drives, all_chain_drives)
-			VALUES ($1, $2, 'waiting_parent', $3, $4, $5, $6, $7, $8, $9, $10)
+				init_commands, refresh_commands, drives, all_chain_drives,
+				base_image, runner_user)
+			VALUES ($1, $2, 'waiting_parent', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			ON CONFLICT (layer_hash, version) DO NOTHING
 		`, childHash, version, buildType,
 			sql.NullString{String: oldLayerHash, Valid: oldLayerHash != ""},
 			sql.NullString{String: oldLayerVersion, Valid: oldLayerVersion != ""},
 			configID,
-			initCmdsJSON, refreshCmdsJSON, drivesJSON, allChainDrivesJSON)
+			initCmdsJSON, refreshCmdsJSON, drivesJSON, allChainDrivesJSON,
+			baseImage, runnerUser)
 	}
 }
 

@@ -75,6 +75,7 @@ resource "google_compute_instance_template" "firecracker_host" {
     chunk-cache-size-gb     = var.chunk_cache_size_gb
     mem-cache-size-gb       = var.mem_cache_size_gb
     otel-collector-endpoint = local.otel_collector_addr
+    log-level               = var.host_log_level
   }
 
   metadata_startup_script = <<-EOF
@@ -192,7 +193,10 @@ SERVICE
     mkdir -p /etc/systemd/system/capsule-manager.service.d
 
     # Build the ExecStart line with optional flags
+    LOG_LEVEL=$(curl -sf -H "Metadata-Flavor: Google" \
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes/log-level || echo "info")
     EXEC_START="/usr/local/bin/capsule-manager"
+    EXEC_START="$EXEC_START --log-level=$LOG_LEVEL"
     EXEC_START="$EXEC_START --max-runners=$MAX_RUNNERS"
     EXEC_START="$EXEC_START --idle-target=$IDLE_TARGET"
     EXEC_START="$EXEC_START --snapshot-cache=/mnt/data/snapshots"

@@ -100,6 +100,12 @@ variable "mem_cache_size_gb" {
   default     = 2
 }
 
+variable "host_log_level" {
+  description = "Log level for capsule-manager on host VMs (debug, info, warn, error)"
+  type        = string
+  default     = "info"
+}
+
 variable "enable_otel_collector" {
   description = "Deploy a standalone OTel Collector in GKE with an internal LB. Its IP is automatically passed to host VMs."
   type        = bool

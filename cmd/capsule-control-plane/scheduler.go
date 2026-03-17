@@ -386,6 +386,15 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			var configJSON sql.NullString
 
 			err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, start_command, tier, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, config_json FROM layered_configs WHERE leaf_workload_key = $1 ORDER BY created_at DESC LIMIT 1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON, &configJSON)
+			if err != nil {
+				// Fallback: workload_key may be from a previous config version (draining).
+				err = s.db.QueryRowContext(ctx, `
+					SELECT lc.max_concurrent_runners, lc.start_command, lc.tier, lc.runner_ttl_seconds, lc.auto_pause, lc.network_policy_preset, lc.network_policy, lc.config_json
+					FROM config_workload_keys cwk
+					JOIN layered_configs lc ON lc.config_id = cwk.config_id
+					WHERE cwk.leaf_workload_key = $1
+					ORDER BY lc.created_at DESC LIMIT 1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON, &configJSON)
+			}
 			if err == nil {
 				if tierCol.Valid && tierCol.String != "" {
 					tierName = tierCol.String
