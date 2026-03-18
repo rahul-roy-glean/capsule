@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/sirupsen/logrus"
@@ -66,6 +67,11 @@ const vethSupernet = "10.200.0.0/16"
 // procSysIPv4ConfDir is overridden in tests.
 var procSysIPv4ConfDir = "/proc/sys/net/ipv4/conf"
 
+var (
+	netInterfaceByName  = net.InterfaceByName
+	defaultRouteIfaceFn = detectDefaultRouteIface
+)
+
 // innerBridgeName is the bridge created inside each namespace.
 const innerBridgeName = "br-vm"
 
@@ -88,23 +94,15 @@ func NewNetNSNetwork(cfg NetNSConfig) (*NetNSNetwork, error) {
 		logger = logrus.New()
 	}
 
-	extIface := cfg.ExternalIface
-	// Auto-detect the external interface from the default route if the
-	// configured one doesn't exist (e.g., "eth0" on hosts that use "ens4").
-	if _, err := net.InterfaceByName(extIface); err != nil {
-		if detected := detectDefaultRouteIface(); detected != "" {
-			logger.WithField("component", "netns-network").WithFields(logrus.Fields{
-				"configured": extIface,
-				"detected":   detected,
-			}).Info("Configured external interface not found, using detected default route interface")
-			extIface = detected
-		}
+	extIface, err := resolveExternalIface(cfg.ExternalIface, logger)
+	if err != nil {
+		return nil, err
 	}
 
 	// Detect MTU from external interface to avoid fragmentation.
 	// GCP uses 1460, AWS uses 9001, default is 1500.
 	extMTU := 1500
-	if iface, err := net.InterfaceByName(extIface); err == nil {
+	if iface, err := netInterfaceByName(extIface); err == nil {
 		extMTU = iface.MTU
 	}
 
@@ -127,9 +125,10 @@ func (n *NetNSNetwork) Setup() error {
 	defer n.mu.Unlock()
 
 	n.logger.WithFields(logrus.Fields{
-		"subnet":  n.subnet.String(),
-		"gateway": n.gateway.String(),
-		"vm_ip":   n.vmIP.String(),
+		"subnet":         n.subnet.String(),
+		"gateway":        n.gateway.String(),
+		"vm_ip":          n.vmIP.String(),
+		"external_iface": n.externalIface,
 	}).Info("Setting up per-VM network namespace infrastructure")
 
 	// Enable IP forwarding
@@ -139,32 +138,71 @@ func (n *NetNSNetwork) Setup() error {
 
 	// Host-level MASQUERADE for veth supernet so traffic from namespaces can reach the internet.
 	// Each namespace's veth-h is in 10.200.{slot}.0/30; we cover them all with 10.200.0.0/16.
-	addIPTablesRuleIfMissing("iptables",
+	if err := addIPTablesRuleIfMissing("iptables",
 		[]string{"-t", "nat", "-C", "POSTROUTING", "-s", vethSupernet, "-o", n.externalIface, "-j", "MASQUERADE"},
 		[]string{"-t", "nat", "-A", "POSTROUTING", "-s", vethSupernet, "-o", n.externalIface, "-j", "MASQUERADE"},
-	)
+	); err != nil {
+		return fmt.Errorf("configure host MASQUERADE on %q: %w", n.externalIface, err)
+	}
 
 	// FORWARD rules for veth traffic to/from external interface
-	addIPTablesRuleIfMissing("iptables",
+	if err := addIPTablesRuleIfMissing("iptables",
 		[]string{"-C", "FORWARD", "-s", vethSupernet, "-o", n.externalIface, "-j", "ACCEPT"},
 		[]string{"-A", "FORWARD", "-s", vethSupernet, "-o", n.externalIface, "-j", "ACCEPT"},
-	)
-	addIPTablesRuleIfMissing("iptables",
+	); err != nil {
+		return fmt.Errorf("configure outbound FORWARD on %q: %w", n.externalIface, err)
+	}
+	if err := addIPTablesRuleIfMissing("iptables",
 		[]string{"-C", "FORWARD", "-d", vethSupernet, "-i", n.externalIface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"},
 		[]string{"-A", "FORWARD", "-d", vethSupernet, "-i", n.externalIface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"},
-	)
+	); err != nil {
+		return fmt.Errorf("configure inbound FORWARD on %q: %w", n.externalIface, err)
+	}
 
 	// Clamp TCP MSS to path MTU
-	addIPTablesRuleIfMissing("iptables",
+	if err := addIPTablesRuleIfMissing("iptables",
 		[]string{"-t", "mangle", "-C", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"},
 		[]string{"-t", "mangle", "-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"},
-	)
+	); err != nil {
+		return fmt.Errorf("configure TCP MSS clamping: %w", err)
+	}
 
 	n.logger.Info("Host-level NAT rules configured for per-VM namespaces")
 	return nil
 }
 
 // addIPTablesRuleIfMissing checks if a rule exists (checkArgs) and adds it (addArgs) if missing.
+func resolveExternalIface(configured string, logger *logrus.Logger) (string, error) {
+	configured = strings.TrimSpace(configured)
+	detected := defaultRouteIfaceFn()
+	if logger == nil {
+		logger = logrus.New()
+	}
+
+	switch strings.ToLower(configured) {
+	case "", "auto":
+		if detected == "" {
+			return "", fmt.Errorf("could not auto-detect external interface from default route")
+		}
+		if _, err := netInterfaceByName(detected); err != nil {
+			return "", fmt.Errorf("detected external interface %q not found: %w", detected, err)
+		}
+		logger.WithField("component", "netns-network").WithField("external_iface", detected).
+			Info("Using auto-detected default route interface for host networking")
+		return detected, nil
+	default:
+		if _, err := netInterfaceByName(configured); err != nil {
+			return "", fmt.Errorf("configured external interface %q not found: %w", configured, err)
+		}
+		if detected != "" && configured != detected {
+			return "", fmt.Errorf("configured external interface %q does not match default route interface %q", configured, detected)
+		}
+		logger.WithField("component", "netns-network").WithField("external_iface", configured).
+			Info("Using configured external interface for host networking")
+		return configured, nil
+	}
+}
+
 // detectDefaultRouteIface returns the network interface used by the default route.
 func detectDefaultRouteIface() string {
 	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
