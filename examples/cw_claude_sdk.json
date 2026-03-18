@@ -1,0 +1,115 @@
+{
+  "display_name": "code-writer-sandbox-claude-sdk-main",
+  "base_image": "us-central1-docker.pkg.dev/scio-engineering/glean-images/claude_sandbox_service@sha256:18db7023219ec3fda941cf3e8ffda81d57cd6431c753d80d4fc0335e4e716089",
+  "layers": [
+    {
+      "name": "platform-fixups",
+      "init_commands": [
+        {
+          "type": "shell",
+          "args": ["bash", "-c", "mkdir -p /etc/mcp-config && echo '{\"mcpServers\":{}}' > /etc/mcp-config/mcp-config.json && cp /etc/mcp-config/mcp-config.json /home/claude/.claude.json && chown claude:claude /home/claude/.claude.json && echo 'Platform fixups applied'"],
+          "run_as_root": true
+        }
+      ]
+    },
+    {
+      "name": "repo",
+      "init_commands": [
+        {
+          "type": "shell",
+          "args": ["bash", "-c", "git clone --single-branch --branch master https://github.com/askscio/scio /workspace/repo"]
+        }
+      ],
+      "refresh_commands": [
+        {
+          "type": "shell",
+          "args": ["bash", "-c", "cd /workspace/repo && git fetch origin master && git reset --hard origin/master"]
+        }
+      ],
+      "drives": [
+        {
+          "drive_id": "workspace",
+          "label": "WORKSPACE",
+          "size_gb": 50,
+          "read_only": false,
+          "mount_path": "/workspace"
+        }
+      ],
+      "refresh_interval": "6h"
+    },
+    {
+      "name": "bazel-deps",
+      "init_commands": [
+        {
+          "type": "shell",
+          "args": ["bash", "-c", "cd /workspace/repo && bazel --output_base=/mnt/bazel-cache/output_base --output_user_root=/mnt/bazel-cache/output_user_root version && KEYTOOL=$(find /mnt/bazel-cache/output_user_root -name keytool -path '*/bin/keytool' -type f 2>/dev/null | head -1) && CACERTS=$(find /mnt/bazel-cache/output_user_root -name cacerts -path '*/lib/security/cacerts' -type f 2>/dev/null | head -1) && echo \"Found keytool=$KEYTOOL cacerts=$CACERTS\" && cp $CACERTS /tmp/bazel-cacerts && if [ -n \"$KEYTOOL\" ] && [ -f /tmp/bazel-cacerts ] && [ -f /usr/local/share/ca-certificates/auth-proxy.crt ]; then $KEYTOOL -importcert -noprompt -trustcacerts -alias auth-proxy -file /usr/local/share/ca-certificates/auth-proxy.crt -keystore /tmp/bazel-cacerts -storepass changeit && echo 'Imported proxy CA into copied keystore'; fi && bazel --host_jvm_args=-Djavax.net.ssl.trustStore=/tmp/bazel-cacerts --host_jvm_args=-Djavax.net.ssl.trustStorePassword=changeit --output_base=/mnt/bazel-cache/output_base --output_user_root=/mnt/bazel-cache/output_user_root fetch --repository_cache=/mnt/bazel-cache/repository_cache //python_scio/ci/..."]
+        }
+      ],
+      "refresh_commands": [
+        {
+          "type": "shell",
+          "args": ["bash", "-c", "cd /workspace/repo && KEYTOOL=$(find /mnt/bazel-cache/output_user_root -name keytool -path '*/bin/keytool' -type f 2>/dev/null | head -1) && CACERTS=$(find /mnt/bazel-cache/output_user_root -name cacerts -path '*/lib/security/cacerts' -type f 2>/dev/null | head -1) && cp $CACERTS /tmp/bazel-cacerts && if [ -n \"$KEYTOOL\" ] && [ -f /tmp/bazel-cacerts ] && [ -f /usr/local/share/ca-certificates/auth-proxy.crt ]; then $KEYTOOL -importcert -noprompt -trustcacerts -alias auth-proxy -file /usr/local/share/ca-certificates/auth-proxy.crt -keystore /tmp/bazel-cacerts -storepass changeit 2>/dev/null; true; fi && bazel --host_jvm_args=-Djavax.net.ssl.trustStore=/tmp/bazel-cacerts --host_jvm_args=-Djavax.net.ssl.trustStorePassword=changeit --output_base=/mnt/bazel-cache/output_base --output_user_root=/mnt/bazel-cache/output_user_root fetch --repository_cache=/mnt/bazel-cache/repository_cache //python_scio/ci/..."]
+        }
+      ],
+      "drives": [
+        {
+          "drive_id": "bazel_cache",
+          "label": "BAZELCACHE",
+          "size_gb": 50,
+          "read_only": false,
+          "mount_path": "/mnt/bazel-cache"
+        }
+      ]
+    }
+  ],
+  "config": {
+    "tier": "l",
+    "auto_rollout": true,
+    "rootfs_size_gb": 8,
+    "runner_user": "claude",
+    "auth": {
+      "providers": [
+        {
+          "type": "github-app",
+          "hosts": ["github.com", "api.github.com"],
+          "config": {
+            "app_id": "360565",
+            "secret_ref": "sm://scio-ci/glean-github-ci-app",
+            "repos": "askscio/scio"
+          },
+          "env": {
+            "GH_TOKEN": "proxy-injected",
+            "GITHUB_TOKEN": "proxy-injected"
+          }
+        },
+        {
+          "type": "gcp-metadata",
+          "hosts": ["*.pkg.dev", "*.googleapis.com"],
+          "config": {
+            "service_account": "capsule-test-host-agent@salessavvy-test.iam.gserviceaccount.com"
+          }
+        }
+      ]
+    }
+  },
+  "start_command": {
+    "command": ["bash", "-c", "cd /app && exec gunicorn --config /app/gunicorn_config.py python_scio.platform.common.app.claude_sandbox_service.claude_sandbox_service:app"],
+    "port": 8080,
+    "health_path": "/health",
+    "run_as": "claude",
+    "env": {
+      "CLAUDE_CODE_USE_VERTEX": "1",
+      "CLOUD_ML_REGION": "global",
+      "ANTHROPIC_VERTEX_PROJECT_ID": "salessavvy-test",
+      "ANTHROPIC_MODEL": "claude-sonnet-4-6",
+      "ENABLE_TOOL_SEARCH": "0",
+      "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4318",
+      "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+      "OTEL_TRACES_EXPORTER": "otlp",
+      "REPO_DIR": "/workspace/repo",
+      "CLAUDE_HOME": "/home/claude",
+      "GH_TOKEN": "proxy-injected",
+      "GITHUB_TOKEN": "proxy-injected"
+    }
+  }
+}

@@ -3,12 +3,15 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
 )
 
 func TestPauseRunner_NoSessionID(t *testing.T) {
@@ -656,6 +659,80 @@ func TestResumeFromSession_DuplicateActiveSession(t *testing.T) {
 	_, err := m.ResumeFromSession(context.Background(), "sess-1", "")
 	if err == nil {
 		t.Error("ResumeFromSession should fail when session already has an active runner")
+	}
+}
+
+func TestForwardResumePorts_FailsOnDebugPort(t *testing.T) {
+	m := newTestManager()
+	var forwarded []int
+	m.forwardPortFn = func(_ string, port int) error {
+		forwarded = append(forwarded, port)
+		if port == snapshot.ThawAgentDebugPort {
+			return errors.New("debug forward failed")
+		}
+		return nil
+	}
+
+	err := m.forwardResumePorts("runner-1", 8080)
+	if err == nil {
+		t.Fatal("forwardResumePorts() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "debug port") {
+		t.Fatalf("forwardResumePorts() error = %v, want debug port context", err)
+	}
+	if len(forwarded) != 2 || forwarded[0] != snapshot.ThawAgentHealthPort || forwarded[1] != snapshot.ThawAgentDebugPort {
+		t.Fatalf("forwarded ports = %v, want [%d %d]", forwarded, snapshot.ThawAgentHealthPort, snapshot.ThawAgentDebugPort)
+	}
+}
+
+func TestForwardResumePorts_FailsOnServicePort(t *testing.T) {
+	m := newTestManager()
+	var forwarded []int
+	m.forwardPortFn = func(_ string, port int) error {
+		forwarded = append(forwarded, port)
+		if port == 8080 {
+			return errors.New("service forward failed")
+		}
+		return nil
+	}
+
+	err := m.forwardResumePorts("runner-1", 8080)
+	if err == nil {
+		t.Fatal("forwardResumePorts() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "service port 8080") {
+		t.Fatalf("forwardResumePorts() error = %v, want service port context", err)
+	}
+	want := []int{snapshot.ThawAgentHealthPort, snapshot.ThawAgentDebugPort, 8080}
+	if len(forwarded) != len(want) {
+		t.Fatalf("forwarded ports len = %d, want %d (%v)", len(forwarded), len(want), forwarded)
+	}
+	for i, port := range want {
+		if forwarded[i] != port {
+			t.Fatalf("forwarded[%d] = %d, want %d (full=%v)", i, forwarded[i], port, forwarded)
+		}
+	}
+}
+
+func TestWaitForResumedRunnerReachability_UsesExecProbe(t *testing.T) {
+	m := newTestManager()
+	called := false
+	m.waitForExecReadyFn = func(_ context.Context, ip string, timeout time.Duration) error {
+		called = true
+		if ip != "10.200.1.2" {
+			t.Fatalf("ip = %q, want %q", ip, "10.200.1.2")
+		}
+		if timeout != 30*time.Second {
+			t.Fatalf("timeout = %s, want %s", timeout, 30*time.Second)
+		}
+		return nil
+	}
+
+	if err := m.waitForResumedRunnerReachability(context.Background(), "10.200.1.2", 30*time.Second); err != nil {
+		t.Fatalf("waitForResumedRunnerReachability() error = %v", err)
+	}
+	if !called {
+		t.Fatal("waitForResumedRunnerReachability() did not call exec readiness probe")
 	}
 }
 

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -1132,19 +1131,10 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		os.Remove(latestStateFile)
 	}
 
-	// Set up port forwarding for netns
-	if m.netnsNetwork != nil {
-		if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentHealthPort); err != nil {
-			m.logger.WithError(err).Warn("Failed to forward capsule-thaw-agent health port")
-		}
-		if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentDebugPort); err != nil {
-			m.logger.WithError(err).Warn("Failed to forward capsule-thaw-agent debug port")
-		}
-		if metadata.ServicePort > 0 {
-			if err := m.netnsNetwork.ForwardPort(runnerID, metadata.ServicePort); err != nil {
-				m.logger.WithField("port", metadata.ServicePort).WithError(err).Warn("Failed to forward service port on resume")
-			}
-		}
+	if err := m.forwardResumePorts(runnerID, metadata.ServicePort); err != nil {
+		uffdHandler.Stop()
+		vm.Stop()
+		return nil, err
 	}
 
 	// Build runner record
@@ -1231,34 +1221,18 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 
 	// Now resume the VM — capsule-thaw-agent will read the fresh MMDS data
 	if err := vm.Resume(ctx); err != nil {
-		vm.Stop()
-		uffdHandler.Stop()
-		m.mu.Lock()
-		delete(m.runners, runnerID)
-		delete(m.vms, runnerID)
-		delete(m.uffdHandlers, runnerID)
-		m.cleanupRunner(runnerID, tap.Name, "")
-		m.mu.Unlock()
+		m.rollbackResumedRunner(runnerID, tap.Name, vm, uffdHandler, proxy)
 		return nil, fmt.Errorf("failed to resume VM after MMDS injection: %w", err)
 	}
 
-	// Wait for the capsule-thaw-agent inside the VM to become responsive.
-	// After snapshot restore the agent needs ~1-2s to detect the new MMDS
-	// current_time, thaw frozen filesystems, and reconfigure networking.
-	// Without this check the control plane may route requests to a runner
-	// whose agent is not yet ready (or whose guest is stuck), causing
-	// silent 30s timeouts.
-	readyTimeout := 5 * time.Second
-	if err := m.waitForThawAgentReady(ctx, internalIP.String(), readyTimeout); err != nil {
-		m.logger.WithError(err).WithFields(logrus.Fields{
-			"runner_id":  runnerID,
-			"session_id": sessionID,
-			"ip":         internalIP.String(),
-		}).Warn("Thaw-agent not ready after session resume")
-		// Don't fail the resume — the agent may just be slow. Log the
-		// warning so operators can investigate, but still return the
-		// runner. The caller will get a timeout on the first request
-		// which is no worse than the current behavior.
+	// Wait for the capsule-thaw-agent inside the VM to become functionally
+	// responsive. /alive can return before exec/file/log handlers are routable
+	// after snapshot restore, so use a real exec probe and fail the resume if it
+	// never recovers.
+	readyTimeout := 30 * time.Second
+	if err := m.waitForResumedRunnerReachability(ctx, internalIP.String(), readyTimeout); err != nil {
+		m.rollbackResumedRunner(runnerID, tap.Name, vm, uffdHandler, proxy)
+		return nil, fmt.Errorf("capsule-thaw-agent not ready after session resume: %w", err)
 	}
 
 	m.logger.WithFields(logrus.Fields{
@@ -1270,37 +1244,57 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	return runner, nil
 }
 
-// waitForThawAgentReady polls the capsule-thaw-agent /alive endpoint until it
-// returns HTTP 200 or the timeout expires.
-func (m *Manager) waitForThawAgentReady(ctx context.Context, ip string, timeout time.Duration) error {
-	aliveURL := fmt.Sprintf("http://%s:%d/alive", ip, snapshot.ThawAgentDebugPort)
-	deadline := time.Now().Add(timeout)
-	pollInterval := 100 * time.Millisecond
-
-	client := &http.Client{Timeout: 2 * time.Second}
-
-	for time.Now().Before(deadline) {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
-		resp, err := client.Get(aliveURL)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				m.logger.WithField("url", aliveURL).Debug("Thaw-agent ready after session resume")
-				return nil
-			}
-		}
-
-		select {
-		case <-time.After(pollInterval):
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+func (m *Manager) forwardResumePorts(runnerID string, servicePort int) error {
+	if m.netnsNetwork == nil && m.forwardPortFn == nil {
+		return nil
 	}
 
-	return fmt.Errorf("capsule-thaw-agent at %s did not become ready within %v", aliveURL, timeout)
+	if err := m.forwardPort(runnerID, snapshot.ThawAgentHealthPort); err != nil {
+		return fmt.Errorf("failed to forward capsule-thaw-agent health port: %w", err)
+	}
+	if err := m.forwardPort(runnerID, snapshot.ThawAgentDebugPort); err != nil {
+		return fmt.Errorf("failed to forward capsule-thaw-agent debug port: %w", err)
+	}
+	if servicePort > 0 {
+		if err := m.forwardPort(runnerID, servicePort); err != nil {
+			return fmt.Errorf("failed to forward service port %d on resume: %w", servicePort, err)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) forwardPort(runnerID string, port int) error {
+	if m.forwardPortFn != nil {
+		return m.forwardPortFn(runnerID, port)
+	}
+	return m.netnsNetwork.ForwardPort(runnerID, port)
+}
+
+func (m *Manager) waitForResumedRunnerReachability(ctx context.Context, ip string, timeout time.Duration) error {
+	if m.waitForExecReadyFn != nil {
+		return m.waitForExecReadyFn(ctx, ip, timeout)
+	}
+	return WaitForThawAgentExec(ctx, ip, timeout)
+}
+
+func (m *Manager) rollbackResumedRunner(runnerID, tapName string, vm *firecracker.VM, uffdHandler uffdStopper, proxy *authproxy.AuthProxy) {
+	if vm != nil {
+		vm.Stop()
+	}
+	if uffdHandler != nil {
+		uffdHandler.Stop()
+	}
+	if proxy != nil {
+		proxy.Stop()
+	}
+
+	m.mu.Lock()
+	delete(m.runners, runnerID)
+	delete(m.vms, runnerID)
+	delete(m.uffdHandlers, runnerID)
+	delete(m.authProxies, runnerID)
+	m.cleanupRunner(runnerID, tapName, "")
+	m.mu.Unlock()
 }
 
 // buildExtensionDriveBaseIndex constructs a ChunkIndex for an extension drive

@@ -357,7 +357,7 @@ class Runners:
             | ResolvedWorkloadRef
         ),
         *,
-        tag: str = "stable",
+        tag: str = "",
         request_id: str | None = None,
         labels: dict[str, str] | None = None,
         session_id: str | None = None,

@@ -1709,7 +1709,7 @@ func autoResumeIfSuspended(ctx context.Context, mgr *runner.Manager, log *logrus
 
 		// Wait for capsule-thaw-agent exec readiness — /alive responds before /exec
 		// is fully functional after snapshot restore, so probe with a real exec.
-		if err := waitForThawAgentExec(resumed.InternalIP, 30*time.Second); err != nil {
+		if err := runner.WaitForThawAgentExec(ctx, resumed.InternalIP.String(), 30*time.Second); err != nil {
 			recordSessionResumeMetrics(ctx, mgr, lifecycleMetrics, rn.SessionID, time.Since(start), fcrotel.ResultFailure, "auto_resume")
 			return nil, fmt.Errorf("capsule-thaw-agent not ready after resume: %w", err)
 		}
@@ -1725,30 +1725,6 @@ func autoResumeIfSuspended(ctx context.Context, mgr *runner.Manager, log *logrus
 		return nil, err
 	}
 	return result.(*runner.Runner), nil
-}
-
-// waitForThawAgentExec polls the capsule-thaw-agent by sending a trivial exec command
-// until it responds successfully. This is more reliable than checking /alive
-// after snapshot restore, because /alive can respond before the exec handler
-// is fully functional.
-func waitForThawAgentExec(ip net.IP, timeout time.Duration) error {
-	execURL := fmt.Sprintf("http://%s:%d/exec", ip.String(), snapshot.ThawAgentDebugPort)
-	client := &http.Client{Timeout: 5 * time.Second}
-	deadline := time.Now().Add(timeout)
-	body := []byte(`{"command":["echo","ready"],"timeout_seconds":3}`)
-
-	for time.Now().Before(deadline) {
-		resp, err := client.Post(execURL, "application/json", bytes.NewReader(body))
-		if err == nil {
-			respBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK && strings.Contains(string(respBody), "ready") {
-				return nil
-			}
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	return fmt.Errorf("capsule-thaw-agent at %s not ready after %s", ip.String(), timeout)
 }
 
 // handleServiceLogs proxies GET /runners/{id}/service-logs to the capsule-thaw-agent's
