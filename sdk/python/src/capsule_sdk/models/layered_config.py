@@ -49,6 +49,8 @@ class LayeredConfigConfig(CapsuleModel):
     tier: str | None = None
     auto_rollout: bool | None = None
     session_max_age_seconds: int | None = None
+    checkpoint_interval_seconds: int | None = None
+    checkpoint_quiet_window_seconds: int | None = None
     rootfs_size_gb: int | None = None
     runner_user: str | None = None
     workspace_size_gb: int | None = None
@@ -68,6 +70,8 @@ class StoredLayeredConfig(CapsuleModel):
     start_command: dict[str, Any] | None = None
     runner_ttl_seconds: int | None = None
     session_max_age_seconds: int | None = None
+    checkpoint_interval_seconds: int | None = None
+    checkpoint_quiet_window_seconds: int | None = None
     auto_pause: bool | None = None
     auto_rollout: bool | None = None
     max_concurrent_runners: int | None = None

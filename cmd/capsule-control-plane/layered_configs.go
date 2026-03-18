@@ -46,22 +46,24 @@ func (r *LayeredConfigRegistry) SetConfigCache(cc *ConfigCache) {
 
 // StoredLayeredConfig is the DB representation of a layered config.
 type StoredLayeredConfig struct {
-	ConfigID             string                 `json:"config_id"`
-	DisplayName          string                 `json:"display_name"`
-	LeafLayerHash        string                 `json:"leaf_layer_hash"`
-	LeafWorkloadKey      string                 `json:"leaf_workload_key"`
-	Tier                 string                 `json:"tier"`
-	StartCommand         *snapshot.StartCommand `json:"start_command,omitempty"`
-	RunnerTTLSeconds     int                    `json:"runner_ttl_seconds"`
-	SessionMaxAgeSeconds int                    `json:"session_max_age_seconds"`
-	AutoPause            bool                   `json:"auto_pause"`
-	AutoRollout          bool                   `json:"auto_rollout"`
-	MaxConcurrentRunners int                    `json:"max_concurrent_runners"`
-	BuildSchedule        string                 `json:"build_schedule"`
-	NetworkPolicyPreset  string                 `json:"network_policy_preset,omitempty"`
-	NetworkPolicy        json.RawMessage        `json:"network_policy,omitempty"`
-	CreatedAt            time.Time              `json:"created_at"`
-	UpdatedAt            time.Time              `json:"updated_at"`
+	ConfigID                     string                 `json:"config_id"`
+	DisplayName                  string                 `json:"display_name"`
+	LeafLayerHash                string                 `json:"leaf_layer_hash"`
+	LeafWorkloadKey              string                 `json:"leaf_workload_key"`
+	Tier                         string                 `json:"tier"`
+	StartCommand                 *snapshot.StartCommand `json:"start_command,omitempty"`
+	RunnerTTLSeconds             int                    `json:"runner_ttl_seconds"`
+	SessionMaxAgeSeconds         int                    `json:"session_max_age_seconds"`
+	CheckpointIntervalSeconds    int                    `json:"checkpoint_interval_seconds"`
+	CheckpointQuietWindowSeconds int                    `json:"checkpoint_quiet_window_seconds"`
+	AutoPause                    bool                   `json:"auto_pause"`
+	AutoRollout                  bool                   `json:"auto_rollout"`
+	MaxConcurrentRunners         int                    `json:"max_concurrent_runners"`
+	BuildSchedule                string                 `json:"build_schedule"`
+	NetworkPolicyPreset          string                 `json:"network_policy_preset,omitempty"`
+	NetworkPolicy                json.RawMessage        `json:"network_policy,omitempty"`
+	CreatedAt                    time.Time              `json:"created_at"`
+	UpdatedAt                    time.Time              `json:"updated_at"`
 }
 
 // LayerStatus is the status of a single layer in a layered config.
@@ -210,9 +212,9 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO layered_configs (config_id, display_name, config_json, leaf_layer_hash, leaf_workload_key,
 			tier, start_command,
-			runner_ttl_seconds, session_max_age_seconds, auto_pause, auto_rollout,
+			runner_ttl_seconds, session_max_age_seconds, checkpoint_interval_seconds, checkpoint_quiet_window_seconds, auto_pause, auto_rollout,
 			max_concurrent_runners, build_schedule, network_policy_preset, network_policy)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		ON CONFLICT (config_id) DO UPDATE SET
 			display_name = EXCLUDED.display_name,
 			config_json = EXCLUDED.config_json,
@@ -222,6 +224,8 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 			start_command = EXCLUDED.start_command,
 			runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
 			session_max_age_seconds = EXCLUDED.session_max_age_seconds,
+			checkpoint_interval_seconds = EXCLUDED.checkpoint_interval_seconds,
+			checkpoint_quiet_window_seconds = EXCLUDED.checkpoint_quiet_window_seconds,
 			auto_pause = EXCLUDED.auto_pause,
 			auto_rollout = EXCLUDED.auto_rollout,
 			max_concurrent_runners = EXCLUDED.max_concurrent_runners,
@@ -231,7 +235,7 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 			updated_at = NOW()
 	`, configID, cfg.DisplayName, string(cfgJSON), leafLayer.LayerHash, leafWorkloadKey,
 		tierName, startCommandJSON,
-		cfg.Config.TTL, cfg.Config.SessionMaxAgeSeconds, cfg.Config.AutoPause, cfg.Config.AutoRollout,
+		cfg.Config.TTL, cfg.Config.SessionMaxAgeSeconds, cfg.Config.CheckpointIntervalSeconds, cfg.Config.CheckpointQuietWindowSeconds, cfg.Config.AutoPause, cfg.Config.AutoRollout,
 		0, "", cfg.Config.NetworkPolicyPreset, networkPolicyVal(cfg.Config.NetworkPolicy))
 
 	if err != nil {
@@ -255,16 +259,18 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 			}
 		}
 		r.configCache.PutWorkloadConfig(&WorkloadConfig{
-			WorkloadKey:          leafWorkloadKey,
-			Tier:                 tierName,
-			StartCommand:         cfg.StartCommand,
-			RunnerTTLSeconds:     cfg.Config.TTL,
-			SessionMaxAgeSeconds: cfg.Config.SessionMaxAgeSeconds,
-			AutoPause:            cfg.Config.AutoPause,
-			MaxConcurrentRunners: 0,
-			NetworkPolicyPreset:  cfg.Config.NetworkPolicyPreset,
-			NetworkPolicyJSON:    npJSON,
-			AuthConfigJSON:       authJSON,
+			WorkloadKey:                  leafWorkloadKey,
+			Tier:                         tierName,
+			StartCommand:                 cfg.StartCommand,
+			RunnerTTLSeconds:             cfg.Config.TTL,
+			SessionMaxAgeSeconds:         cfg.Config.SessionMaxAgeSeconds,
+			CheckpointIntervalSeconds:    cfg.Config.CheckpointIntervalSeconds,
+			CheckpointQuietWindowSeconds: cfg.Config.CheckpointQuietWindowSeconds,
+			AutoPause:                    cfg.Config.AutoPause,
+			MaxConcurrentRunners:         0,
+			NetworkPolicyPreset:          cfg.Config.NetworkPolicyPreset,
+			NetworkPolicyJSON:            npJSON,
+			AuthConfigJSON:               authJSON,
 		})
 	}
 	return configID, leafWorkloadKey, nil
@@ -280,13 +286,13 @@ func (r *LayeredConfigRegistry) GetLayeredConfig(ctx context.Context, configID s
 	err := r.db.QueryRowContext(ctx, `
 		SELECT config_id, display_name, leaf_layer_hash, leaf_workload_key,
 		       tier, start_command,
-		       runner_ttl_seconds, session_max_age_seconds, auto_pause, auto_rollout,
+		       runner_ttl_seconds, session_max_age_seconds, checkpoint_interval_seconds, checkpoint_quiet_window_seconds, auto_pause, auto_rollout,
 		       max_concurrent_runners, build_schedule, network_policy_preset, network_policy,
 		       created_at, updated_at
 		FROM layered_configs WHERE config_id = $1
 	`, configID).Scan(&sc.ConfigID, &sc.DisplayName, &sc.LeafLayerHash, &sc.LeafWorkloadKey,
 		&sc.Tier, &startCommandJSON,
-		&sc.RunnerTTLSeconds, &sc.SessionMaxAgeSeconds, &sc.AutoPause, &sc.AutoRollout,
+		&sc.RunnerTTLSeconds, &sc.SessionMaxAgeSeconds, &sc.CheckpointIntervalSeconds, &sc.CheckpointQuietWindowSeconds, &sc.AutoPause, &sc.AutoRollout,
 		&sc.MaxConcurrentRunners, &sc.BuildSchedule, &npPreset, &npJSON,
 		&sc.CreatedAt, &sc.UpdatedAt)
 	if err == sql.ErrNoRows {
@@ -313,7 +319,7 @@ func (r *LayeredConfigRegistry) ListLayeredConfigs(ctx context.Context) ([]*Stor
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT config_id, display_name, leaf_layer_hash, leaf_workload_key,
 		       tier, start_command,
-		       runner_ttl_seconds, session_max_age_seconds, auto_pause, auto_rollout,
+		       runner_ttl_seconds, session_max_age_seconds, checkpoint_interval_seconds, checkpoint_quiet_window_seconds, auto_pause, auto_rollout,
 		       max_concurrent_runners, build_schedule, created_at, updated_at
 		FROM layered_configs ORDER BY display_name
 	`)
@@ -329,7 +335,7 @@ func (r *LayeredConfigRegistry) ListLayeredConfigs(ctx context.Context) ([]*Stor
 
 		if err := rows.Scan(&sc.ConfigID, &sc.DisplayName, &sc.LeafLayerHash, &sc.LeafWorkloadKey,
 			&sc.Tier, &startCommandJSON,
-			&sc.RunnerTTLSeconds, &sc.SessionMaxAgeSeconds, &sc.AutoPause, &sc.AutoRollout,
+			&sc.RunnerTTLSeconds, &sc.SessionMaxAgeSeconds, &sc.CheckpointIntervalSeconds, &sc.CheckpointQuietWindowSeconds, &sc.AutoPause, &sc.AutoRollout,
 			&sc.MaxConcurrentRunners, &sc.BuildSchedule, &sc.CreatedAt, &sc.UpdatedAt); err != nil {
 			return nil, err
 		}

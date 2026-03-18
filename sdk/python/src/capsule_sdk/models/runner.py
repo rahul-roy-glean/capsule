@@ -82,6 +82,19 @@ class PauseResult(CapsuleModel):
     session_id: str | None = None
     snapshot_size_bytes: int | None = None
     layer: int | None = None
+    generation: int | None = None
+    manifest_path: str | None = None
+
+
+class CheckpointResult(CapsuleModel):
+    """Result of checkpointing a runner."""
+
+    session_id: str | None = None
+    snapshot_size_bytes: int | None = None
+    layer: int | None = None
+    generation: int | None = None
+    manifest_path: str | None = None
+    running: bool = True
 
 
 class ConnectResult(CapsuleModel):

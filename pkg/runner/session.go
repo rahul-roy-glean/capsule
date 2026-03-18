@@ -10,7 +10,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
 	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
@@ -40,14 +39,18 @@ func (m *Manager) sessionBaseDir() string {
 type PauseResult struct {
 	SessionID         string `json:"session_id"`
 	Layer             int    `json:"layer"`
+	Generation        int    `json:"generation"`
 	SnapshotSizeBytes int64  `json:"snapshot_size_bytes"`
+	ManifestPath      string `json:"manifest_path,omitempty"`
 }
 
 // CheckpointResult contains the result of a CheckpointRunner operation.
 type CheckpointResult struct {
 	SessionID         string `json:"session_id"`
 	Layer             int    `json:"layer"`
+	Generation        int    `json:"generation"`
 	SnapshotSizeBytes int64  `json:"snapshot_size_bytes"`
+	ManifestPath      string `json:"manifest_path,omitempty"`
 	Running           bool   `json:"running"`
 }
 
@@ -105,7 +108,10 @@ func (m *Manager) TryAcquireExec(runnerID string) error {
 		return fmt.Errorf("runner %s is %s", runnerID, runner.State)
 	}
 
+	now := time.Now()
 	atomic.AddInt32(&runner.ActiveExecs, 1)
+	runner.LastActivityAt = now
+	runner.LastExecAt = now
 	return nil
 }
 
@@ -120,7 +126,9 @@ func (m *Manager) ReleaseExec(runnerID string) {
 
 	runner.mu.Lock()
 	atomic.AddInt32(&runner.ActiveExecs, -1)
-	runner.LastExecAt = time.Now()
+	now := time.Now()
+	runner.LastExecAt = now
+	runner.LastActivityAt = now
 	runner.mu.Unlock()
 }
 
@@ -213,16 +221,25 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 
 	// Write metadata.json
 	sessionDir := filepath.Join(m.sessionBaseDir(), sessionID)
+	generation := layerN + 1
 
-	// Load the previous metadata if it exists — we need GCSMemIndexObject and
-	// GCSDiskIndexObjects from a prior pause to use as the base for multi-pause chain dedup.
+	// Resolve the previous session head. Prefer the manifest carried by the
+	// running runner, then fall back to legacy local metadata during migration.
+	head := m.resolveSessionHead(ctx, sessionID, runner)
 	var prevGCSMemIndex string
 	var prevGCSDiskIndexObjects map[string]string
-	if prevData, readErr := os.ReadFile(filepath.Join(sessionDir, "metadata.json")); readErr == nil {
-		var prev SessionMetadata
-		if json.Unmarshal(prevData, &prev) == nil {
-			prevGCSMemIndex = prev.GCSMemIndexObject
-			prevGCSDiskIndexObjects = prev.GCSDiskIndexObjects
+	var prevManifest *snapshot.SnapshotManifest
+	if head != nil {
+		prevManifest = head.Manifest
+		if prevManifest != nil {
+			prevGCSMemIndex = prevManifest.Memory.ChunkIndexObject
+			prevGCSDiskIndexObjects = sessionDiskIndexObjectsFromManifest(prevManifest)
+		}
+		if prevGCSMemIndex == "" && head.Metadata != nil {
+			prevGCSMemIndex = head.Metadata.GCSMemIndexObject
+		}
+		if len(prevGCSDiskIndexObjects) == 0 && head.Metadata != nil {
+			prevGCSDiskIndexObjects = head.Metadata.GCSDiskIndexObjects
 		}
 	}
 
@@ -231,7 +248,7 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 		WorkloadKey:     runner.WorkloadKey,
 		RunnerID:        runnerID,
 		HostID:          m.config.HostID,
-		Layers:          layerN + 1,
+		Layers:          generation,
 		CreatedAt:       runner.CreatedAt,
 		PausedAt:        time.Now(),
 		RootfsPath:      runner.RootfsOverlay,
@@ -247,7 +264,7 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 	// GCS-backed upload: when sessionMemStore is configured, upload dirty mem
 	// diff chunks and VM state to GCS, producing a self-contained SnapshotManifest.
 	if m.sessionMemStore != nil {
-		gcsBase := fmt.Sprintf("%s/runner_state/%s", runner.WorkloadKey, runnerID)
+		gcsBase := sessionCheckpointGCSBase(sessionID, generation)
 
 		uploader := snapshot.NewSessionChunkUploader(m.sessionMemStore, m.sessionDiskStore, m.logger.Logger)
 
@@ -348,22 +365,6 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 					}
 				}
 
-				// Include non-dirty extension drives from golden metadata so the
-				// manifest is self-contained. The snapshot state references these
-				// drives, so resume needs their ChunkIndex to create FUSE disks.
-				// No chunk upload needed — just carry forward the golden index.
-				if goldenMeta != nil {
-					for driveID, extDrive := range goldenMeta.ExtensionDrives {
-						if _, already := newExtDiskIndexes[driveID]; already {
-							continue
-						}
-						if len(extDrive.Chunks) == 0 {
-							continue
-						}
-						newExtDiskIndexes[driveID] = buildExtensionDriveBaseIndex(goldenMeta, driveID)
-					}
-				}
-
 				// Upload dirty FUSE rootfs disk chunks if available.
 				var newRootfsDiskIndex *snapshot.ChunkIndex
 				if m.getDirtyRootfsDiskChunks != nil && m.sessionDiskStore != nil {
@@ -410,76 +411,30 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 					}
 				}
 
-				snapshotID := uuid.New().String()
-				man := &snapshot.SnapshotManifest{
-					Version:     "1",
-					SnapshotID:  snapshotID,
-					CreatedAt:   time.Now(),
-					WorkloadKey: runner.WorkloadKey,
-				}
-				man.Firecracker.VMStateObject = vmStateGCSPath
-				man.Memory.Mode = "chunked"
-				man.Memory.TotalSizeBytes = baseMemIndex.Region.LogicalSizeBytes
-				man.Memory.ChunkIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
-				man.Integrity.Algo = "sha256"
+				manifestResult := buildSessionManifest(
+					uploader,
+					gcsBase,
+					runner,
+					generation,
+					vmStateGCSPath,
+					newMemIndex,
+					prevManifest,
+					newExtDiskIndexes,
+					newRootfsDiskIndex,
+					goldenMeta,
+				)
 
-				// Populate rootfs disk section if dirty rootfs chunks were uploaded.
-				if newRootfsDiskIndex != nil {
-					man.Disk = snapshot.DiskSection{
-						Mode:             "chunked",
-						TotalSizeBytes:   newRootfsDiskIndex.Region.LogicalSizeBytes,
-						ChunkIndexObject: uploader.FullGCSPath(gcsBase + "/__rootfs__-disk.json"),
-					}
-				}
-
-				if len(newExtDiskIndexes) > 0 {
-					man.ExtensionDisks = make(map[string]snapshot.DiskSection)
-					for driveID, diskIdx := range newExtDiskIndexes {
-						man.ExtensionDisks[driveID] = snapshot.DiskSection{
-							Mode:             "chunked",
-							TotalSizeBytes:   diskIdx.Region.LogicalSizeBytes,
-							ChunkIndexObject: uploader.FullGCSPath(gcsBase + "/" + driveID + "-disk.json"),
-						}
-					}
-				}
-
-				// Include rootfs disk index in the extension indexes map so it gets
-				// uploaded alongside extension drive indexes by WriteManifestWithExtensions.
-				allDiskIndexes := make(map[string]*snapshot.ChunkIndex, len(newExtDiskIndexes)+1)
-				for k, v := range newExtDiskIndexes {
-					allDiskIndexes[k] = v
-				}
-				if newRootfsDiskIndex != nil {
-					allDiskIndexes["__rootfs__"] = newRootfsDiskIndex
-				}
-
-				if writeErr := uploader.WriteManifestWithExtensions(ctx, gcsBase, man, newMemIndex, allDiskIndexes); writeErr != nil {
+				if writeErr := uploader.WriteManifestWithExtensions(ctx, gcsBase, manifestResult.manifest, newMemIndex, manifestResult.diskIndexesToPut); writeErr != nil {
 					// In chunked mode, local-only fallback won't work — fail the pause.
 					m.mu.Lock()
 					runner.State = prePauseState
 					m.mu.Unlock()
 					return nil, fmt.Errorf("failed to write session manifest to GCS: %w", writeErr)
 				} else {
-					metadata.GCSManifestPath = uploader.FullGCSPath(gcsBase + "/snapshot_manifest.json")
-					metadata.GCSMemIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
-					// Carry forward previous disk index objects for drives
-					// that weren't dirty this pause so the chain is never
-					// broken. Without this, a drive dirty in pause 1 but
-					// clean in pause 2 loses its index reference, forcing
-					// a full re-upload when it's dirty again in pause 3.
-					if len(prevGCSDiskIndexObjects) > 0 || len(allDiskIndexes) > 0 {
-						if metadata.GCSDiskIndexObjects == nil {
-							metadata.GCSDiskIndexObjects = make(map[string]string)
-						}
-						for driveID, path := range prevGCSDiskIndexObjects {
-							if _, dirty := allDiskIndexes[driveID]; !dirty {
-								metadata.GCSDiskIndexObjects[driveID] = path
-							}
-						}
-						for driveID := range allDiskIndexes {
-							metadata.GCSDiskIndexObjects[driveID] = uploader.FullGCSPath(gcsBase + "/" + driveID + "-disk.json")
-						}
-					}
+					metadata.GCSManifestPath = manifestResult.manifestPath
+					metadata.GCSMemIndexObject = manifestResult.memIndexPath
+					metadata.GCSDiskIndexObjects = manifestResult.diskIndexObjects
+					runner.SessionManifestPath = manifestResult.manifestPath
 					m.logger.WithFields(logrus.Fields{
 						"runner_id":    runnerID,
 						"gcs_manifest": metadata.GCSManifestPath,
@@ -531,8 +486,10 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 	}
 	os.Remove(filepath.Join(m.config.SocketDir, runnerID+".sock"))
 	runner.State = StateSuspended
-	runner.SessionLayers = layerN + 1
+	runner.SessionLayers = generation
 	runner.SessionDir = sessionDir
+	runner.SessionManifestPath = metadata.GCSManifestPath
+	runner.LastCheckpointAt = time.Now()
 	runner.PausedAt = time.Now()
 	m.mu.Unlock()
 
@@ -546,7 +503,9 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 	return &PauseResult{
 		SessionID:         sessionID,
 		Layer:             layerN,
+		Generation:        generation,
 		SnapshotSizeBytes: snapshotSize,
+		ManifestPath:      metadata.GCSManifestPath,
 	}, nil
 }
 
@@ -614,14 +573,23 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 
 	// Write metadata.json (same format as PauseRunner but runner stays active)
 	sessionDir := filepath.Join(m.sessionBaseDir(), sessionID)
+	generation := layerN + 1
 
+	head := m.resolveSessionHead(ctx, sessionID, runner)
 	var prevGCSMemIndex string
 	var prevGCSDiskIndexObjects map[string]string
-	if prevData, readErr := os.ReadFile(filepath.Join(sessionDir, "metadata.json")); readErr == nil {
-		var prev SessionMetadata
-		if json.Unmarshal(prevData, &prev) == nil {
-			prevGCSMemIndex = prev.GCSMemIndexObject
-			prevGCSDiskIndexObjects = prev.GCSDiskIndexObjects
+	var prevManifest *snapshot.SnapshotManifest
+	if head != nil {
+		prevManifest = head.Manifest
+		if prevManifest != nil {
+			prevGCSMemIndex = prevManifest.Memory.ChunkIndexObject
+			prevGCSDiskIndexObjects = sessionDiskIndexObjectsFromManifest(prevManifest)
+		}
+		if prevGCSMemIndex == "" && head.Metadata != nil {
+			prevGCSMemIndex = head.Metadata.GCSMemIndexObject
+		}
+		if len(prevGCSDiskIndexObjects) == 0 && head.Metadata != nil {
+			prevGCSDiskIndexObjects = head.Metadata.GCSDiskIndexObjects
 		}
 	}
 
@@ -630,7 +598,7 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 		WorkloadKey:     runner.WorkloadKey,
 		RunnerID:        runnerID,
 		HostID:          m.config.HostID,
-		Layers:          layerN + 1,
+		Layers:          generation,
 		CreatedAt:       runner.CreatedAt,
 		PausedAt:        time.Now(),
 		RootfsPath:      runner.RootfsOverlay,
@@ -645,7 +613,7 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 
 	// GCS-backed upload (same logic as PauseRunner)
 	if m.sessionMemStore != nil {
-		gcsBase := fmt.Sprintf("%s/runner_state/%s", runner.WorkloadKey, runnerID)
+		gcsBase := sessionCheckpointGCSBase(sessionID, generation)
 		uploader := snapshot.NewSessionChunkUploader(m.sessionMemStore, m.sessionDiskStore, m.logger.Logger)
 
 		var baseMemIndex *snapshot.ChunkIndex
@@ -718,20 +686,6 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 					}
 				}
 
-				// Include non-dirty extension drives from golden metadata so the
-				// manifest is self-contained.
-				if goldenMeta != nil {
-					for driveID, extDrive := range goldenMeta.ExtensionDrives {
-						if _, already := newExtDiskIndexes[driveID]; already {
-							continue
-						}
-						if len(extDrive.Chunks) == 0 {
-							continue
-						}
-						newExtDiskIndexes[driveID] = buildExtensionDriveBaseIndex(goldenMeta, driveID)
-					}
-				}
-
 				// Upload rootfs disk chunks
 				var newRootfsDiskIndex *snapshot.ChunkIndex
 				if m.getDirtyRootfsDiskChunks != nil && m.sessionDiskStore != nil {
@@ -771,64 +725,26 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 					}
 				}
 
-				snapshotID := uuid.New().String()
-				man := &snapshot.SnapshotManifest{
-					Version:     "1",
-					SnapshotID:  snapshotID,
-					CreatedAt:   time.Now(),
-					WorkloadKey: runner.WorkloadKey,
-				}
-				man.Firecracker.VMStateObject = vmStateGCSPath
-				man.Memory.Mode = "chunked"
-				man.Memory.TotalSizeBytes = baseMemIndex.Region.LogicalSizeBytes
-				man.Memory.ChunkIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
-				man.Integrity.Algo = "sha256"
+				manifestResult := buildSessionManifest(
+					uploader,
+					gcsBase,
+					runner,
+					generation,
+					vmStateGCSPath,
+					newMemIndex,
+					prevManifest,
+					newExtDiskIndexes,
+					newRootfsDiskIndex,
+					goldenMeta,
+				)
 
-				if newRootfsDiskIndex != nil {
-					man.Disk = snapshot.DiskSection{
-						Mode:             "chunked",
-						TotalSizeBytes:   newRootfsDiskIndex.Region.LogicalSizeBytes,
-						ChunkIndexObject: uploader.FullGCSPath(gcsBase + "/__rootfs__-disk.json"),
-					}
-				}
-
-				if len(newExtDiskIndexes) > 0 {
-					man.ExtensionDisks = make(map[string]snapshot.DiskSection)
-					for driveID, diskIdx := range newExtDiskIndexes {
-						man.ExtensionDisks[driveID] = snapshot.DiskSection{
-							Mode:             "chunked",
-							TotalSizeBytes:   diskIdx.Region.LogicalSizeBytes,
-							ChunkIndexObject: uploader.FullGCSPath(gcsBase + "/" + driveID + "-disk.json"),
-						}
-					}
-				}
-
-				allDiskIndexes := make(map[string]*snapshot.ChunkIndex, len(newExtDiskIndexes)+1)
-				for k, v := range newExtDiskIndexes {
-					allDiskIndexes[k] = v
-				}
-				if newRootfsDiskIndex != nil {
-					allDiskIndexes["__rootfs__"] = newRootfsDiskIndex
-				}
-
-				if writeErr := uploader.WriteManifestWithExtensions(ctx, gcsBase, man, newMemIndex, allDiskIndexes); writeErr != nil {
+				if writeErr := uploader.WriteManifestWithExtensions(ctx, gcsBase, manifestResult.manifest, newMemIndex, manifestResult.diskIndexesToPut); writeErr != nil {
 					return nil, fmt.Errorf("checkpoint: failed to write manifest to GCS: %w", writeErr)
 				} else {
-					metadata.GCSManifestPath = uploader.FullGCSPath(gcsBase + "/snapshot_manifest.json")
-					metadata.GCSMemIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
-					if len(prevGCSDiskIndexObjects) > 0 || len(allDiskIndexes) > 0 {
-						if metadata.GCSDiskIndexObjects == nil {
-							metadata.GCSDiskIndexObjects = make(map[string]string)
-						}
-						for driveID, path := range prevGCSDiskIndexObjects {
-							if _, dirty := allDiskIndexes[driveID]; !dirty {
-								metadata.GCSDiskIndexObjects[driveID] = path
-							}
-						}
-						for driveID := range allDiskIndexes {
-							metadata.GCSDiskIndexObjects[driveID] = uploader.FullGCSPath(gcsBase + "/" + driveID + "-disk.json")
-						}
-					}
+					metadata.GCSManifestPath = manifestResult.manifestPath
+					metadata.GCSMemIndexObject = manifestResult.memIndexPath
+					metadata.GCSDiskIndexObjects = manifestResult.diskIndexObjects
+					runner.SessionManifestPath = manifestResult.manifestPath
 					m.logger.WithFields(logrus.Fields{
 						"runner_id":    runnerID,
 						"gcs_manifest": metadata.GCSManifestPath,
@@ -845,7 +761,8 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 
 	// Increment session layers (VM stays running)
 	m.mu.Lock()
-	runner.SessionLayers = layerN + 1
+	runner.SessionLayers = generation
+	runner.LastCheckpointAt = time.Now()
 	m.mu.Unlock()
 
 	m.logger.WithFields(logrus.Fields{
@@ -858,36 +775,108 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 	return &CheckpointResult{
 		SessionID:         sessionID,
 		Layer:             layerN,
+		Generation:        generation,
 		SnapshotSizeBytes: snapshotSize,
+		ManifestPath:      metadata.GCSManifestPath,
 		Running:           true,
 	}, nil
 }
 
+// ResumeFromCheckpoint restores a runner from a durable session head manifest.
+func (m *Manager) ResumeFromCheckpoint(ctx context.Context, sessionID, workloadKey, manifestPath string) (*Runner, error) {
+	return m.resumeFromSessionHead(ctx, sessionID, workloadKey, manifestPath)
+}
+
 // ResumeFromSession restores a runner from a session snapshot using layered UFFD.
+// It is kept as a compatibility wrapper while local metadata-based session
+// discovery is phased out.
 func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey string) (*Runner, error) {
+	head := m.resolveSessionHead(ctx, sessionID, nil)
+	manifestPath := ""
+	if head != nil {
+		manifestPath = head.ManifestPath
+	}
+	return m.resumeFromSessionHead(ctx, sessionID, workloadKey, manifestPath)
+}
+
+func (m *Manager) resumeFromSessionHead(ctx context.Context, sessionID, workloadKey, manifestPath string) (*Runner, error) {
 	sessionDir := filepath.Join(m.sessionBaseDir(), sessionID)
 
-	// Read metadata
-	metadataBytes, err := os.ReadFile(filepath.Join(sessionDir, "metadata.json"))
-	if err != nil {
-		return nil, fmt.Errorf("session %s not found: %w", sessionID, err)
+	var metadata *SessionMetadata
+	if metadataBytes, err := os.ReadFile(filepath.Join(sessionDir, "metadata.json")); err == nil {
+		var parsed SessionMetadata
+		if err := json.Unmarshal(metadataBytes, &parsed); err != nil {
+			return nil, fmt.Errorf("invalid session metadata: %w", err)
+		}
+		metadata = &parsed
+		if manifestPath == "" {
+			manifestPath = parsed.GCSManifestPath
+		}
 	}
 
-	var metadata SessionMetadata
-	if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
-		return nil, fmt.Errorf("invalid session metadata: %w", err)
+	var manifest *snapshot.SnapshotManifest
+	if manifestPath != "" && m.sessionMemStore != nil {
+		uploader := snapshot.NewSessionChunkUploader(m.sessionMemStore, m.sessionDiskStore, m.logger.Logger)
+		man, err := uploader.DownloadManifest(ctx, manifestPath)
+		if err != nil {
+			if metadata == nil {
+				return nil, fmt.Errorf("failed to download session manifest: %w", err)
+			}
+			m.logger.WithError(err).WithField("session_id", sessionID).Warn("Falling back to legacy session metadata after manifest download failure")
+		} else {
+			manifest = man
+		}
+	}
+	if manifest == nil && metadata == nil {
+		return nil, fmt.Errorf("session %s not found", sessionID)
 	}
 
-	if workloadKey != "" && metadata.WorkloadKey != workloadKey {
-		return nil, fmt.Errorf("workload_key mismatch: session has %s, requested %s", metadata.WorkloadKey, workloadKey)
+	effectiveWorkloadKey := ""
+	if manifest != nil && manifest.WorkloadKey != "" {
+		effectiveWorkloadKey = manifest.WorkloadKey
+	} else if metadata != nil {
+		effectiveWorkloadKey = metadata.WorkloadKey
+	}
+	if workloadKey != "" {
+		if effectiveWorkloadKey == "" || effectiveWorkloadKey != workloadKey {
+			return nil, fmt.Errorf("workload_key mismatch: session has %s, requested %s", effectiveWorkloadKey, workloadKey)
+		}
 	}
 
-	if metadata.Layers == 0 {
+	runtime := (*snapshot.SessionRuntime)(nil)
+	if manifest != nil {
+		runtime = manifest.Runtime
+	}
+	if runtime == nil && metadata != nil {
+		runtime = &snapshot.SessionRuntime{
+			SessionID:       metadata.SessionID,
+			Generation:      metadata.Layers,
+			RunnerID:        metadata.RunnerID,
+			VCPUs:           metadata.VCPUs,
+			MemoryMB:        metadata.MemoryMB,
+			ServicePort:     metadata.ServicePort,
+			SnapshotVersion: metadata.SnapshotVersion,
+			CreatedAt:       metadata.CreatedAt,
+			AuthConfig:      metadata.AuthConfig,
+		}
+	}
+	if runtime == nil {
+		return nil, fmt.Errorf("session %s has no runtime metadata", sessionID)
+	}
+	if runtime.Generation == 0 && metadata != nil {
+		runtime.Generation = metadata.Layers
+	}
+	if runtime.Generation == 0 {
 		return nil, fmt.Errorf("session %s has no layers", sessionID)
 	}
 
-	// Use the original runner ID from the session
-	runnerID := metadata.RunnerID
+	runnerID := runtime.RunnerID
+	if runnerID == "" && metadata != nil {
+		runnerID = metadata.RunnerID
+	}
+	if runnerID == "" {
+		return nil, fmt.Errorf("session %s has no runner id", sessionID)
+	}
 
 	// Acquire lease: atomically checks capacity, validates session uniqueness,
 	// reserves slot, and creates network namespace.
@@ -899,13 +888,10 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 
 	m.logger.WithFields(logrus.Fields{
 		"session_id":   sessionID,
-		"layers":       metadata.Layers,
-		"workload_key": metadata.WorkloadKey,
+		"layers":       runtime.Generation,
+		"workload_key": effectiveWorkloadKey,
 	}).Info("Resuming runner from session snapshot")
 
-	// Kernel path is always needed; full snapshot paths (rootfs, mem) are only
-	// needed for the local-resume fallback.  Defer GetSnapshotPaths() to the
-	// local branch so GCS-backed resumes don't fail on missing rootfs.img.
 	kernelPath, err := m.snapshotCache.GetKernelPath()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get kernel path: %w", err)
@@ -914,28 +900,20 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	tap := lease.Tap
 	nsInfo := lease.NsInfo
 
-	// Use the session's rootfs overlay (preserved during pause)
-	overlayPath := metadata.RootfsPath
+	overlayPath := ""
+	if metadata != nil {
+		overlayPath = metadata.RootfsPath
+	}
 
-	// Build the UFFD handler and state file path, using GCS-backed chunks when
-	// available (metadata.GCSManifestPath is set) or falling back to the local
-	// LayeredHandler (requires golden snapshot.mem on this host).
 	uffdSocketPath := filepath.Join(m.config.SocketDir, runnerID+"-uffd.sock")
 	extensionDrivePaths := map[string]string{}
 	var uffdHandler uffdStopper
 	var latestStateFile string
 
-	if metadata.GCSManifestPath != "" && m.sessionMemStore != nil {
-		// GCS-backed resume: download ChunkIndex, convert to ChunkedSnapshotMetadata,
-		// create a Handler that fetches pages lazily from GCS.
+	if manifest != nil && m.sessionMemStore != nil {
 		uploader := snapshot.NewSessionChunkUploader(m.sessionMemStore, m.sessionDiskStore, m.logger.Logger)
 
-		man, dlErr := uploader.DownloadManifest(ctx, metadata.GCSManifestPath)
-		if dlErr != nil {
-			return nil, fmt.Errorf("failed to download session manifest: %w", dlErr)
-		}
-
-		memIdx, dlErr := uploader.DownloadChunkIndex(ctx, man.Memory.ChunkIndexObject)
+		memIdx, dlErr := uploader.DownloadChunkIndex(ctx, manifest.Memory.ChunkIndexObject)
 		if dlErr != nil {
 			return nil, fmt.Errorf("failed to download mem chunk index: %w", dlErr)
 		}
@@ -957,10 +935,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 			return nil, fmt.Errorf("failed to start GCS UFFD handler: %w", startErr)
 		}
 
-		// Start prefetcher if a recorded access-pattern mapping exists.
-		// Phase 1 (fetch workers) begins immediately, warming the ChunkStore cache.
-		// Phase 2 (copy workers) waits for the UFFD connection, then installs pages
-		// via UFFDIO_COPY before the VM faults on them.
 		var prefetcher *uffd.Prefetcher
 		if chunkedMeta.MemPrefetchMapping != nil && len(chunkedMeta.MemPrefetchMapping.Offsets) > 0 {
 			prefetcher = uffd.NewPrefetcher(uffd.PrefetcherConfig{
@@ -977,21 +951,19 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 
 		uffdHandler = gcsHandler
 
-		// Download the VM state file locally (Firecracker requires a local path).
 		localStateDir := filepath.Join(m.config.SocketDir, "session-state")
 		if mkdirErr := os.MkdirAll(localStateDir, 0755); mkdirErr != nil {
 			gcsHandler.Stop()
 			return nil, fmt.Errorf("failed to create local state dir: %w", mkdirErr)
 		}
 		latestStateFile = filepath.Join(localStateDir, runnerID+".state")
-		if dlErr := uploader.DownloadVMState(ctx, man.Firecracker.VMStateObject, latestStateFile); dlErr != nil {
+		if dlErr := uploader.DownloadVMState(ctx, manifest.Firecracker.VMStateObject, latestStateFile); dlErr != nil {
 			gcsHandler.Stop()
 			return nil, fmt.Errorf("failed to download VM state from GCS: %w", dlErr)
 		}
 
-		// Set up FUSE disks for extension drives if the manifest includes extension disk ChunkIndexes.
 		if m.setupExtensionFUSEDisk != nil {
-			for driveID, diskSection := range man.ExtensionDisks {
+			for driveID, diskSection := range manifest.ExtensionDisks {
 				if diskSection.Mode != "chunked" || diskSection.ChunkIndexObject == "" {
 					continue
 				}
@@ -1000,7 +972,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 					gcsHandler.Stop()
 					return nil, fmt.Errorf("failed to download disk chunk index for drive %s: %w", driveID, diskDlErr)
 				}
-				// Convert ChunkIndex extents to dense ChunkRef slice for FUSE.
 				diskRefs := snapshot.ChunkIndexToRefs(diskIdx)
 				fusePath, fuseErr := m.setupExtensionFUSEDisk(runnerID, driveID, diskRefs, diskIdx.Region.LogicalSizeBytes, diskIdx.ChunkSizeBytes)
 				if fuseErr != nil {
@@ -1011,9 +982,8 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 			}
 		}
 
-		// Set up FUSE disk for rootfs if the manifest includes a rootfs disk ChunkIndex.
-		if m.setupRootfsFUSEDisk != nil && man.Disk.Mode == "chunked" && man.Disk.ChunkIndexObject != "" {
-			rootfsDiskIdx, diskDlErr := uploader.DownloadChunkIndex(ctx, man.Disk.ChunkIndexObject)
+		if m.setupRootfsFUSEDisk != nil && manifest.Disk.Mode == "chunked" && manifest.Disk.ChunkIndexObject != "" {
+			rootfsDiskIdx, diskDlErr := uploader.DownloadChunkIndex(ctx, manifest.Disk.ChunkIndexObject)
 			if diskDlErr != nil {
 				gcsHandler.Stop()
 				return nil, fmt.Errorf("failed to download rootfs disk chunk index: %w", diskDlErr)
@@ -1030,33 +1000,29 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 
 		m.logger.WithFields(logrus.Fields{
 			"session_id":  sessionID,
-			"gcs_vmstate": man.Firecracker.VMStateObject,
+			"gcs_vmstate": manifest.Firecracker.VMStateObject,
 			"rootfs":      overlayPath,
 		}).Info("Resuming from GCS-backed session (UFFD chunked)")
 	} else if m.sessionMemStore != nil {
-		// Chunked mode but no GCS manifest — the GCS upload during pause must
-		// have failed. Local resume is not possible in chunked mode because
-		// rootfs.img and snapshot.mem are not stored locally.
-		return nil, fmt.Errorf("session %s has no GCS manifest (GCS upload likely failed during pause); "+
-			"local resume is not supported in chunked mode", sessionID)
+		return nil, fmt.Errorf("session %s has no GCS manifest (GCS upload likely failed during pause); local resume is not supported in chunked mode", sessionID)
 	} else {
-		// Local fallback (non-chunked mode): LayeredHandler uses golden
-		// snapshot.mem on this host.
+		if metadata == nil {
+			return nil, fmt.Errorf("session %s has no local metadata for non-chunked resume", sessionID)
+		}
 		goldenMemPath := filepath.Join(m.config.SnapshotCachePath, "snapshot.mem")
 		if _, err := os.Stat(goldenMemPath); err != nil {
 			return nil, fmt.Errorf("golden snapshot.mem not found for local resume: %w", err)
 		}
 
-		// Build diff layer paths (oldest first).
 		var diffLayers []string
-		for i := 0; i < metadata.Layers; i++ {
+		for i := 0; i < runtime.Generation; i++ {
 			layerPath := filepath.Join(sessionDir, fmt.Sprintf("layer_%d", i), "mem_diff.sparse")
 			if _, err := os.Stat(layerPath); err == nil {
 				diffLayers = append(diffLayers, layerPath)
 			}
 		}
 
-		latestStateFile = filepath.Join(sessionDir, fmt.Sprintf("layer_%d", metadata.Layers-1), "snapshot.state")
+		latestStateFile = filepath.Join(sessionDir, fmt.Sprintf("layer_%d", runtime.Generation-1), "snapshot.state")
 
 		layeredHandler, handlerErr := uffd.NewLayeredHandler(uffd.LayeredHandlerConfig{
 			SocketPath:       uffdSocketPath,
@@ -1075,18 +1041,15 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		uffdHandler = layeredHandler
 	}
 
-	// Set up network config
 	internalIP := nsInfo.HostReachableIP
-
-	// Create VM config
 	vmCfg := firecracker.VMConfig{
 		VMID:           runnerID,
 		SocketDir:      m.config.SocketDir,
 		FirecrackerBin: m.config.FirecrackerBin,
 		KernelPath:     kernelPath,
 		RootfsPath:     overlayPath,
-		VCPUs:          metadata.VCPUs,
-		MemoryMB:       metadata.MemoryMB,
+		VCPUs:          runtime.VCPUs,
+		MemoryMB:       runtime.MemoryMB,
 		NetworkIface: &firecracker.NetworkInterface{
 			IfaceID:     "eth0",
 			HostDevName: tap.Name,
@@ -1097,16 +1060,12 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	}
 
 	vmCfg.NetNSPath = nsInfo.GetFirecrackerNetNSPath()
-
-	// Set up per-runner snapshot symlinks before creating the VM so the
-	// SnapshotDir is available for the private mount namespace.
 	snapshotDir, symlinkCleanup, symlinkErr := m.setupSnapshotSymlinks(runnerID, overlayPath, extensionDrivePaths)
 	if symlinkErr != nil {
 		uffdHandler.Stop()
 		return nil, fmt.Errorf("failed to setup snapshot symlinks: %w", symlinkErr)
 	}
 	defer symlinkCleanup()
-
 	vmCfg.SnapshotDir = snapshotDir
 
 	vm, err := firecracker.NewVM(vmCfg, m.logger.Logger)
@@ -1115,61 +1074,64 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
-	// Restore from snapshot with UFFD (paused — don't resume yet).
-	// With per-VM namespaces, tap-slot-0 already exists — no TAP rename needed.
 	restoreErr := vm.RestoreFromSnapshotWithUFFD(ctx, latestStateFile, uffdSocketPath, false)
-
 	if restoreErr != nil {
 		uffdHandler.Stop()
 		vm.Stop()
 		return nil, fmt.Errorf("failed to restore from session snapshot: %w", restoreErr)
 	}
-
-	// Clean up downloaded state file — Firecracker holds the fd open,
-	// so removing the directory entry is safe and avoids accumulation.
 	if latestStateFile != "" {
 		os.Remove(latestStateFile)
 	}
 
-	if err := m.forwardResumePorts(runnerID, metadata.ServicePort); err != nil {
+	servicePort := runtime.ServicePort
+	if err := m.forwardResumePorts(runnerID, servicePort); err != nil {
 		uffdHandler.Stop()
 		vm.Stop()
 		return nil, err
 	}
 
-	// Build runner record
 	runner := &Runner{
-		ID:              runnerID,
-		HostID:          m.config.HostID,
-		State:           StateBusy,
-		InternalIP:      internalIP,
-		TapDevice:       tap.Name,
-		MAC:             tap.MAC,
-		SnapshotVersion: metadata.SnapshotVersion,
-		WorkloadKey:     metadata.WorkloadKey,
-		Resources: Resources{
-			VCPUs:    metadata.VCPUs,
-			MemoryMB: metadata.MemoryMB,
-		},
-		CreatedAt:     metadata.CreatedAt,
-		StartedAt:     time.Now(),
-		SocketPath:    filepath.Join(m.config.SocketDir, runnerID+".sock"),
-		LogPath:       filepath.Join(m.config.LogDir, runnerID+".log"),
-		MetricsPath:   filepath.Join(m.config.LogDir, runnerID+".metrics"),
-		RootfsOverlay: overlayPath,
-		SessionID:     sessionID,
-		SessionDir:    sessionDir,
-		SessionLayers: metadata.Layers,
-		TTLSeconds:    metadata.TTLSeconds,
-		AutoPause:     metadata.AutoPause,
-		ServicePort:   metadata.ServicePort,
-		AuthConfig:    metadata.AuthConfig,
-		LastExecAt:    time.Now(),
+		ID:                  runnerID,
+		HostID:              m.config.HostID,
+		State:               StateBusy,
+		InternalIP:          internalIP,
+		TapDevice:           tap.Name,
+		MAC:                 tap.MAC,
+		SnapshotVersion:     runtime.SnapshotVersion,
+		WorkloadKey:         effectiveWorkloadKey,
+		Resources:           Resources{VCPUs: runtime.VCPUs, MemoryMB: runtime.MemoryMB},
+		CreatedAt:           runtime.CreatedAt,
+		StartedAt:           time.Now(),
+		SocketPath:          filepath.Join(m.config.SocketDir, runnerID+".sock"),
+		LogPath:             filepath.Join(m.config.LogDir, runnerID+".log"),
+		MetricsPath:         filepath.Join(m.config.LogDir, runnerID+".metrics"),
+		RootfsOverlay:       overlayPath,
+		SessionID:           sessionID,
+		SessionDir:          sessionDir,
+		SessionLayers:       runtime.Generation,
+		SessionManifestPath: manifestPath,
+		TTLSeconds: func() int {
+			if metadata != nil {
+				return metadata.TTLSeconds
+			}
+			return 0
+		}(),
+		AutoPause: func() bool {
+			if metadata != nil {
+				return metadata.AutoPause
+			}
+			return false
+		}(),
+		ServicePort:      servicePort,
+		AuthConfig:       runtime.AuthConfig,
+		LastExecAt:       time.Now(),
+		LastActivityAt:   time.Now(),
+		LastCheckpointAt: time.Now(),
 	}
 
-	// Recreate auth proxy if the paused runner had one
 	var proxy *authproxy.AuthProxy
-	if metadata.AuthConfig != nil && m.netnsNetwork != nil {
+	if runtime.AuthConfig != nil && m.netnsNetwork != nil {
 		ns, nsErr := m.netnsNetwork.GetNamespace(runnerID)
 		if nsErr != nil {
 			m.logger.WithError(nsErr).Warn("Failed to get namespace for auth proxy on resume")
@@ -1177,7 +1139,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 			hostVethIP := net.IPv4(10, 200, byte(ns.Slot), 1).String()
 			proxy, err = authproxy.NewAuthProxy(
 				runnerID,
-				*metadata.AuthConfig,
+				*runtime.AuthConfig,
 				ns.Path,
 				ns.Gateway.String(),
 				hostVethIP,
@@ -1194,7 +1156,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	}
 
 	m.mu.Lock()
-	// Remove any old suspended entry for this runner
 	delete(m.runners, runnerID)
 	m.runners[runnerID] = runner
 	m.vms[runnerID] = vm
@@ -1205,9 +1166,8 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	m.mu.Unlock()
 	lease.Commit()
 
-	// Inject MMDS data BEFORE resuming so the capsule-thaw-agent sees fresh config
 	allocReq := AllocateRequest{
-		WorkloadKey: metadata.WorkloadKey,
+		WorkloadKey: effectiveWorkloadKey,
 	}
 	mmdsData := m.buildMMDSData(ctx, runner, tap, allocReq)
 	if proxy != nil {
@@ -1219,16 +1179,11 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		m.logger.WithError(err).Warn("Failed to set MMDS data on resumed runner")
 	}
 
-	// Now resume the VM — capsule-thaw-agent will read the fresh MMDS data
 	if err := vm.Resume(ctx); err != nil {
 		m.rollbackResumedRunner(runnerID, tap.Name, vm, uffdHandler, proxy)
 		return nil, fmt.Errorf("failed to resume VM after MMDS injection: %w", err)
 	}
 
-	// Wait for the capsule-thaw-agent inside the VM to become functionally
-	// responsive. /alive can return before exec/file/log handlers are routable
-	// after snapshot restore, so use a real exec probe and fail the resume if it
-	// never recovers.
 	readyTimeout := 30 * time.Second
 	if err := m.waitForResumedRunnerReachability(ctx, internalIP.String(), readyTimeout); err != nil {
 		m.rollbackResumedRunner(runnerID, tap.Name, vm, uffdHandler, proxy)
@@ -1238,7 +1193,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	m.logger.WithFields(logrus.Fields{
 		"runner_id":  runnerID,
 		"session_id": sessionID,
-		"layers":     metadata.Layers,
+		"layers":     runtime.Generation,
 	}).Info("Runner resumed from session snapshot successfully")
 
 	return runner, nil
@@ -1390,7 +1345,9 @@ func (m *Manager) ResetTTL(runnerID string) {
 	m.mu.Lock()
 	runner, exists := m.runners[runnerID]
 	if exists {
-		runner.LastExecAt = time.Now()
+		now := time.Now()
+		runner.LastExecAt = now
+		runner.LastActivityAt = now
 	}
 	m.mu.Unlock()
 }

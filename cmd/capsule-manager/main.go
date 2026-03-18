@@ -529,6 +529,7 @@ func main() {
 	// Start heartbeat loop if control plane is configured
 	if *controlPlane != "" {
 		go heartbeatLoop(ctx, mgr, chunkedMgr, *controlPlane, *hostBootstrapToken, instanceName, zone, *grpcPort, *httpPort, logger, lifecycleMetrics)
+		go startPeriodicCheckpointLoop(ctx, mgr, *controlPlane, *hostBootstrapToken, logger)
 	}
 
 	// Wait for shutdown signal
@@ -1338,6 +1339,12 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger, lifecycleMet
 			rn = resumed
 		}
 
+		if err := mgr.TryAcquireProxyStream(runnerID); err != nil {
+			http.Error(w, "runner unavailable: "+err.Error(), http.StatusConflict)
+			return
+		}
+		defer mgr.ReleaseProxyStream(runnerID)
+
 		if rn.InternalIP == nil {
 			http.Error(w, "Runner has no internal IP", http.StatusServiceUnavailable)
 			return
@@ -1701,7 +1708,13 @@ func autoResumeIfSuspended(ctx context.Context, mgr *runner.Manager, log *logrus
 
 	result, err, _ := group.Do(runnerID, func() (interface{}, error) {
 		start := time.Now()
-		resumed, err := mgr.ResumeFromSession(ctx, rn.SessionID, rn.WorkloadKey)
+		var resumed *runner.Runner
+		var err error
+		if rn.SessionManifestPath != "" {
+			resumed, err = mgr.ResumeFromCheckpoint(ctx, rn.SessionID, rn.WorkloadKey, rn.SessionManifestPath)
+		} else {
+			resumed, err = mgr.ResumeFromSession(ctx, rn.SessionID, rn.WorkloadKey)
+		}
 		if err != nil {
 			recordSessionResumeMetrics(ctx, mgr, lifecycleMetrics, rn.SessionID, time.Since(start), fcrotel.ResultFailure, "auto_resume")
 			return nil, fmt.Errorf("auto-resume failed: %w", err)
@@ -1899,6 +1912,8 @@ func handleCheckpointRunner(w http.ResponseWriter, r *http.Request, mgr *runner.
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"session_id":          result.SessionID,
 		"layer":               result.Layer,
+		"generation":          result.Generation,
+		"manifest_path":       result.ManifestPath,
 		"snapshot_size_bytes": result.SnapshotSizeBytes,
 		"running":             result.Running,
 	})
@@ -1936,7 +1951,12 @@ func handleConnectRunner(w http.ResponseWriter, r *http.Request, mgr *runner.Man
 			return
 		}
 		start := time.Now()
-		resumed, err := mgr.ResumeFromSession(r.Context(), rn.SessionID, rn.WorkloadKey)
+		var resumed *runner.Runner
+		if rn.SessionManifestPath != "" {
+			resumed, err = mgr.ResumeFromCheckpoint(r.Context(), rn.SessionID, rn.WorkloadKey, rn.SessionManifestPath)
+		} else {
+			resumed, err = mgr.ResumeFromSession(r.Context(), rn.SessionID, rn.WorkloadKey)
+		}
 		if err != nil {
 			log.WithError(err).WithField("runner_id", runnerID).Error("Failed to resume runner")
 			recordSessionResumeMetrics(r.Context(), mgr, lifecycleMetrics, rn.SessionID, time.Since(start), fcrotel.ResultFailure, "connect_http")

@@ -227,28 +227,39 @@ func (m *mcpDeps) handlePause(ctx context.Context, _ *mcp.CallToolRequest, in Pa
 		return nil, PauseSandboxOutput{}, fmt.Errorf("pause error: %s", resp.Error)
 	}
 
-	// Update session_snapshots table
+	// Update durable session head/checkpoint state.
 	if resp.SessionId != "" && m.db != nil {
-		var networkPolicy any
-		if runner.NetworkPolicyJSON != "" {
-			networkPolicy = runner.NetworkPolicyJSON
+		generation := int(resp.Generation)
+		if generation == 0 {
+			generation = int(resp.Layer) + 1
 		}
-		_, _ = m.db.ExecContext(ctx, `
-			INSERT INTO session_snapshots (
-				session_id, runner_id, workload_key, host_id, status, layer_count, paused_at,
-				runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
-			)
-			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9)
-			ON CONFLICT (session_id) DO UPDATE SET
-				status = 'suspended',
-				layer_count = EXCLUDED.layer_count,
-				paused_at = NOW(),
-				runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
-				auto_pause = EXCLUDED.auto_pause,
-				network_policy_preset = EXCLUDED.network_policy_preset,
-				network_policy = EXCLUDED.network_policy
-		`, resp.SessionId, in.SandboxID, runner.WorkloadKey, host.ID, resp.Layer+1,
-			runner.RunnerTTLSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy)
+		_ = upsertSessionHead(ctx, m.db, SessionHeadRecord{
+			SessionID:                    resp.SessionId,
+			WorkloadKey:                  runner.WorkloadKey,
+			CurrentHostID:                host.ID,
+			CurrentRunnerID:              in.SandboxID,
+			Status:                       "suspended",
+			LatestGeneration:             generation,
+			LatestManifestPath:           resp.ManifestPath,
+			RunnerTTLSeconds:             runner.RunnerTTLSeconds,
+			AutoPause:                    runner.AutoPause,
+			CheckpointIntervalSeconds:    runner.CheckpointIntervalSeconds,
+			CheckpointQuietWindowSeconds: runner.CheckpointQuietWindowSeconds,
+			NetworkPolicyPreset:          runner.NetworkPolicyPreset,
+			NetworkPolicyJSON:            runner.NetworkPolicyJSON,
+			LastCheckpointedAt:           time.Now(),
+		})
+		_ = insertSessionCheckpoint(ctx, m.db, SessionCheckpointRecord{
+			SessionID:         resp.SessionId,
+			Generation:        generation,
+			ManifestPath:      resp.ManifestPath,
+			CheckpointKind:    "pause",
+			TriggerSource:     "mcp",
+			HostID:            host.ID,
+			RunnerID:          in.SandboxID,
+			SnapshotSizeBytes: resp.SnapshotSizeBytes,
+			CreatedAt:         time.Now(),
+		})
 	}
 
 	_ = m.hostRegistry.RemoveRunner(in.SandboxID)
@@ -267,22 +278,16 @@ func (m *mcpDeps) handleResume(ctx context.Context, _ *mcp.CallToolRequest, in R
 		return nil, ResumeSandboxOutput{}, fmt.Errorf("sandbox %s is already running, use exec_command directly", in.SandboxID)
 	}
 
-	// Look up suspended session
-	var sessionID, hostID, workloadKey, status string
-	var sessionTTL sql.NullInt64
-	var sessionAutoPause sql.NullBool
-	var sessionNPPreset sql.NullString
-	var sessionNPJSON sql.NullString
 	if m.db == nil {
 		return nil, ResumeSandboxOutput{}, fmt.Errorf("no database configured")
 	}
-	err := m.db.QueryRowContext(ctx,
-		`SELECT session_id, host_id, workload_key, status, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
-		 FROM session_snapshots WHERE runner_id = $1`,
-		in.SandboxID).Scan(&sessionID, &hostID, &workloadKey, &status, &sessionTTL, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON)
-	if err != nil || status != "suspended" {
+	head, err := getSessionHeadByRunnerID(ctx, m.db, in.SandboxID)
+	if err != nil || (head.Status != "suspended" && head.Status != "active_checkpointed") {
 		return nil, ResumeSandboxOutput{}, fmt.Errorf("no suspended session found for sandbox %s", in.SandboxID)
 	}
+	sessionID := head.SessionID
+	hostID := head.CurrentHostID
+	workloadKey := head.WorkloadKey
 
 	// Pick host to resume on
 	var resumeHost *Host
@@ -304,14 +309,18 @@ func (m *mcpDeps) handleResume(ctx context.Context, _ *mcp.CallToolRequest, in R
 
 	client := pb.NewHostAgentClient(conn)
 	resumeReq := &pb.ResumeRunnerRequest{
-		SessionId:           sessionID,
-		WorkloadKey:         workloadKey,
-		TtlSeconds:          int32(sessionTTL.Int64),
-		AutoPause:           sessionAutoPause.Valid && sessionAutoPause.Bool,
-		NetworkPolicyPreset: sessionNPPreset.String,
+		SessionId:                    sessionID,
+		WorkloadKey:                  workloadKey,
+		TtlSeconds:                   int32(head.RunnerTTLSeconds),
+		AutoPause:                    head.AutoPause,
+		NetworkPolicyPreset:          head.NetworkPolicyPreset,
+		ManifestPath:                 head.LatestManifestPath,
+		Generation:                   int32(head.LatestGeneration),
+		CheckpointIntervalSeconds:    int32(head.CheckpointIntervalSeconds),
+		CheckpointQuietWindowSeconds: int32(head.CheckpointQuietWindowSeconds),
 	}
-	if sessionNPJSON.Valid {
-		resumeReq.NetworkPolicyJson = sessionNPJSON.String
+	if head.NetworkPolicyJSON != "" {
+		resumeReq.NetworkPolicyJson = head.NetworkPolicyJSON
 	}
 	resp, err := client.ResumeRunner(ctx, resumeReq)
 	if err != nil {
@@ -327,23 +336,26 @@ func (m *mcpDeps) handleResume(ctx context.Context, _ *mcp.CallToolRequest, in R
 	}
 
 	if err := m.hostRegistry.AddRunner(ctx, &Runner{
-		ID:                  resumedRunnerID,
-		HostID:              resumeHost.ID,
-		Status:              "busy",
-		InternalIP:          resp.Runner.GetInternalIp(),
-		WorkloadKey:         workloadKey,
-		RunnerTTLSeconds:    int(sessionTTL.Int64),
-		AutoPause:           sessionAutoPause.Valid && sessionAutoPause.Bool,
-		NetworkPolicyPreset: sessionNPPreset.String,
-		NetworkPolicyJSON:   sessionNPJSON.String,
+		ID:                           resumedRunnerID,
+		HostID:                       resumeHost.ID,
+		Status:                       "busy",
+		InternalIP:                   resp.Runner.GetInternalIp(),
+		WorkloadKey:                  workloadKey,
+		RunnerTTLSeconds:             head.RunnerTTLSeconds,
+		AutoPause:                    head.AutoPause,
+		CheckpointIntervalSeconds:    head.CheckpointIntervalSeconds,
+		CheckpointQuietWindowSeconds: head.CheckpointQuietWindowSeconds,
+		NetworkPolicyPreset:          head.NetworkPolicyPreset,
+		NetworkPolicyJSON:            head.NetworkPolicyJSON,
 	}); err != nil {
 		return nil, ResumeSandboxOutput{}, fmt.Errorf("register resumed runner: %w", err)
 	}
 
-	// Update session status
-	_, _ = m.db.ExecContext(ctx,
-		`UPDATE session_snapshots SET runner_id = $1, status = 'active', host_id = $2 WHERE session_id = $3`,
-		resumedRunnerID, resumeHost.ID, sessionID)
+	head.CurrentRunnerID = resumedRunnerID
+	head.CurrentHostID = resumeHost.ID
+	head.Status = "active"
+	head.LastActivityAt = time.Now()
+	_ = upsertSessionHead(ctx, m.db, *head)
 
 	return nil, ResumeSandboxOutput{
 		Status:      "resumed",

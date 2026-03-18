@@ -1,14 +1,19 @@
 package snapshot
 
-import "time"
+import (
+	"time"
+
+	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
+)
 
 // SnapshotManifest is the top-level restore contract written during session pause.
 // It lives at {gcsBase}/snapshot_manifest.json and references all other objects.
 type SnapshotManifest struct {
-	Version     string    `json:"version"`
-	SnapshotID  string    `json:"snapshot_id"`
-	CreatedAt   time.Time `json:"created_at"`
-	WorkloadKey string    `json:"workload_key"`
+	Version     string          `json:"version"`
+	SnapshotID  string          `json:"snapshot_id"`
+	CreatedAt   time.Time       `json:"created_at"`
+	WorkloadKey string          `json:"workload_key"`
+	Runtime     *SessionRuntime `json:"runtime,omitempty"`
 	Firecracker struct {
 		VMStateObject string `json:"vmstate_object"`
 	} `json:"firecracker"`
@@ -24,6 +29,20 @@ type SnapshotManifest struct {
 	Integrity      struct {
 		Algo string `json:"algo"`
 	} `json:"integrity"`
+}
+
+// SessionRuntime contains the host-side data required to recreate a runner from
+// a session checkpoint on any host.
+type SessionRuntime struct {
+	SessionID       string                `json:"session_id"`
+	Generation      int                   `json:"generation"`
+	RunnerID        string                `json:"runner_id"`
+	VCPUs           int                   `json:"vcpus,omitempty"`
+	MemoryMB        int                   `json:"memory_mb,omitempty"`
+	ServicePort     int                   `json:"service_port,omitempty"`
+	SnapshotVersion string                `json:"snapshot_version,omitempty"`
+	CreatedAt       time.Time             `json:"created_at,omitempty"`
+	AuthConfig      *authproxy.AuthConfig `json:"auth_config,omitempty"`
 }
 
 // DiskSection describes a single disk region in a SnapshotManifest.

@@ -139,28 +139,39 @@ func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
 			continue
 		}
 
-		// Update session_snapshots (same as HandlePauseRunner).
+		// Update durable session head/checkpoint state (same as HandlePauseRunner).
 		if resp.SessionId != "" && s.scheduler.db != nil {
-			var networkPolicy any
-			if c.config.networkPolicyJSON != "" {
-				networkPolicy = c.config.networkPolicyJSON
+			generation := int(resp.Generation)
+			if generation == 0 {
+				generation = int(resp.Layer) + 1
 			}
-			_, _ = s.scheduler.db.ExecContext(ctx, `
-				INSERT INTO session_snapshots (
-					session_id, runner_id, workload_key, host_id, status, layer_count, paused_at,
-					runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
-				)
-				VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9)
-				ON CONFLICT (session_id) DO UPDATE SET
-					status = 'suspended',
-					layer_count = EXCLUDED.layer_count,
-					paused_at = NOW(),
-					runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
-					auto_pause = EXCLUDED.auto_pause,
-					network_policy_preset = EXCLUDED.network_policy_preset,
-					network_policy = EXCLUDED.network_policy
-			`, resp.SessionId, c.runnerID, c.config.workloadKey, c.hostID, resp.Layer+1,
-				c.config.ttlSeconds, c.config.autoPause, c.config.networkPolicyPreset, networkPolicy)
+			_ = upsertSessionHead(ctx, s.scheduler.db, SessionHeadRecord{
+				SessionID:                    resp.SessionId,
+				WorkloadKey:                  c.config.workloadKey,
+				CurrentHostID:                c.hostID,
+				CurrentRunnerID:              c.runnerID,
+				Status:                       "suspended",
+				LatestGeneration:             generation,
+				LatestManifestPath:           resp.ManifestPath,
+				RunnerTTLSeconds:             c.config.ttlSeconds,
+				AutoPause:                    c.config.autoPause,
+				CheckpointIntervalSeconds:    0,
+				CheckpointQuietWindowSeconds: 0,
+				NetworkPolicyPreset:          c.config.networkPolicyPreset,
+				NetworkPolicyJSON:            c.config.networkPolicyJSON,
+				LastCheckpointedAt:           time.Now(),
+			})
+			_ = insertSessionCheckpoint(ctx, s.scheduler.db, SessionCheckpointRecord{
+				SessionID:         resp.SessionId,
+				Generation:        generation,
+				ManifestPath:      resp.ManifestPath,
+				CheckpointKind:    "pause",
+				TriggerSource:     "ttl",
+				HostID:            c.hostID,
+				RunnerID:          c.runnerID,
+				SnapshotSizeBytes: resp.SnapshotSizeBytes,
+				CreatedAt:         time.Now(),
+			})
 		}
 
 		if err := s.hostRegistry.RemoveRunner(c.runnerID); err != nil {

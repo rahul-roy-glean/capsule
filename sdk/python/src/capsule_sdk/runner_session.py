@@ -15,7 +15,7 @@ from capsule_sdk.models.file import (
     FileUploadResult,
     FileWriteResult,
 )
-from capsule_sdk.models.runner import ConnectResult, ExecEvent, ExecResult, PauseResult
+from capsule_sdk.models.runner import CheckpointResult, ConnectResult, ExecEvent, ExecResult, PauseResult
 
 if TYPE_CHECKING:
     from capsule_sdk.resources.runners import Runners
@@ -87,6 +87,13 @@ class RunnerSession:
     def pause(self) -> PauseResult:
         """Pause the runner and snapshot its session."""
         result = self._runners.pause(self._runner_id)
+        if result.session_id:
+            self._session_id = result.session_id
+        return result
+
+    def checkpoint(self) -> CheckpointResult:
+        """Create a non-destructive checkpoint for the runner session."""
+        result = self._runners.checkpoint(self._runner_id)
         if result.session_id:
             self._session_id = result.session_id
         return result

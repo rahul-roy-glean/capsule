@@ -365,11 +365,13 @@ func main() {
 	httpMux.Handle("/api/v1/runners/status", instrumentAuthenticatedHandler("/api/v1/runners/status", "control_plane.runner_status", http.HandlerFunc(controlPlaneServer.HandleRunnerStatus)))
 	httpMux.Handle("/api/v1/runners/release", instrumentAuthenticatedHandler("/api/v1/runners/release", "control_plane.release_runner", http.HandlerFunc(controlPlaneServer.HandleRunnerRelease)))
 	httpMux.Handle("/api/v1/runners/pause", instrumentAuthenticatedHandler("/api/v1/runners/pause", "control_plane.pause_runner", http.HandlerFunc(controlPlaneServer.HandlePauseRunner)))
+	httpMux.Handle("/api/v1/runners/checkpoint", instrumentAuthenticatedHandler("/api/v1/runners/checkpoint", "control_plane.checkpoint_runner", http.HandlerFunc(controlPlaneServer.HandleCheckpointRunner)))
 	httpMux.Handle("/api/v1/runners/connect", instrumentAuthenticatedHandler("/api/v1/runners/connect", "control_plane.connect_runner", http.HandlerFunc(controlPlaneServer.HandleConnectRunner)))
 	httpMux.Handle("/api/v1/runners/quarantine", instrumentAuthenticatedHandler("/api/v1/runners/quarantine", "control_plane.quarantine_runner", http.HandlerFunc(controlPlaneServer.HandleQuarantineRunner)))
 	httpMux.Handle("/api/v1/runners/unquarantine", instrumentAuthenticatedHandler("/api/v1/runners/unquarantine", "control_plane.unquarantine_runner", http.HandlerFunc(controlPlaneServer.HandleUnquarantineRunner)))
 	httpMux.Handle("/api/v1/hosts", instrumentAuthenticatedHandler("/api/v1/hosts", "control_plane.get_hosts", http.HandlerFunc(controlPlaneServer.HandleGetHosts)))
 	httpMux.Handle("/api/v1/hosts/heartbeat", instrumentAuthenticatedHandler("/api/v1/hosts/heartbeat", "control_plane.host_heartbeat", http.HandlerFunc(controlPlaneServer.HandleHostHeartbeat)))
+	httpMux.Handle("/api/v1/hosts/checkpoints", instrumentAuthenticatedHandler("/api/v1/hosts/checkpoints", "control_plane.host_checkpoint_update", http.HandlerFunc(controlPlaneServer.HandleHostCheckpointUpdate)))
 	httpMux.Handle("/api/v1/snapshots", instrumentAuthenticatedHandler("/api/v1/snapshots", "control_plane.get_snapshots", http.HandlerFunc(controlPlaneServer.HandleGetSnapshots)))
 	// Layered config registry endpoints
 	httpMux.Handle("/api/v1/layered-configs/", instrumentAuthenticatedHandler("/api/v1/layered-configs/", "control_plane.layered_configs", http.HandlerFunc(layeredConfigRegistry.HandleLayeredConfigs)))
@@ -543,7 +545,7 @@ func authMiddleware(apiToken, hostToken string, next http.Handler) http.Handler 
 
 		var required string
 		switch {
-		case r.URL.Path == "/api/v1/hosts/heartbeat":
+		case r.URL.Path == "/api/v1/hosts/heartbeat", r.URL.Path == "/api/v1/hosts/checkpoints":
 			required = hostToken
 		case strings.HasPrefix(r.URL.Path, "/api/v1/"):
 			required = apiToken
@@ -816,16 +818,12 @@ func (s *ControlPlaneServer) HandleRunnerStatus(w http.ResponseWriter, r *http.R
 
 	runner, err := s.hostRegistry.GetRunner(runnerID)
 	if err != nil {
-		// Check session_snapshots for suspended sessions
-		var status string
-		scanErr := s.scheduler.db.QueryRowContext(r.Context(),
-			`SELECT status FROM session_snapshots WHERE runner_id = $1`, runnerID).Scan(&status)
-		if scanErr == nil && status == "suspended" {
+		if head, headErr := getSessionHeadByRunnerID(r.Context(), s.scheduler.db, runnerID); headErr == nil && (head.Status == "suspended" || head.Status == "active_checkpointed") {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			json.NewEncoder(w).Encode(map[string]string{
 				"runner_id": runnerID,
-				"status":    "suspended",
+				"status":    head.Status,
 			})
 			return
 		}
@@ -978,29 +976,43 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Update session_snapshots table
+	// Update durable session head/checkpoint state.
 	if resp.SessionId != "" {
-		var networkPolicy any
-		if runner.NetworkPolicyJSON != "" {
-			networkPolicy = runner.NetworkPolicyJSON
+		generation := int(resp.Generation)
+		if generation == 0 {
+			generation = int(resp.Layer) + 1
 		}
-		if _, dbErr := s.scheduler.db.ExecContext(pauseCtx, `
-			INSERT INTO session_snapshots (
-				session_id, runner_id, workload_key, host_id, status, layer_count, paused_at,
-				runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
-			)
-			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9)
-			ON CONFLICT (session_id) DO UPDATE SET
-				status = 'suspended',
-				layer_count = EXCLUDED.layer_count,
-				paused_at = NOW(),
-				runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
-				auto_pause = EXCLUDED.auto_pause,
-				network_policy_preset = EXCLUDED.network_policy_preset,
-				network_policy = EXCLUDED.network_policy
-		`, resp.SessionId, req.RunnerID, runner.WorkloadKey, host.ID, resp.Layer+1,
-			runner.RunnerTTLSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy); dbErr != nil {
-			s.logger.WithError(dbErr).WithField("session_id", resp.SessionId).Error("Failed to update session_snapshots table")
+		headRec := SessionHeadRecord{
+			SessionID:                    resp.SessionId,
+			WorkloadKey:                  runner.WorkloadKey,
+			CurrentHostID:                host.ID,
+			CurrentRunnerID:              req.RunnerID,
+			Status:                       "suspended",
+			LatestGeneration:             generation,
+			LatestManifestPath:           resp.ManifestPath,
+			RunnerTTLSeconds:             runner.RunnerTTLSeconds,
+			AutoPause:                    runner.AutoPause,
+			CheckpointIntervalSeconds:    runner.CheckpointIntervalSeconds,
+			CheckpointQuietWindowSeconds: runner.CheckpointQuietWindowSeconds,
+			NetworkPolicyPreset:          runner.NetworkPolicyPreset,
+			NetworkPolicyJSON:            runner.NetworkPolicyJSON,
+			LastCheckpointedAt:           time.Now(),
+		}
+		if dbErr := upsertSessionHead(pauseCtx, s.scheduler.db, headRec); dbErr != nil {
+			s.logger.WithError(dbErr).WithField("session_id", resp.SessionId).Error("Failed to upsert session head")
+		}
+		if dbErr := insertSessionCheckpoint(pauseCtx, s.scheduler.db, SessionCheckpointRecord{
+			SessionID:         resp.SessionId,
+			Generation:        generation,
+			ManifestPath:      resp.ManifestPath,
+			CheckpointKind:    "pause",
+			TriggerSource:     "api",
+			HostID:            host.ID,
+			RunnerID:          req.RunnerID,
+			SnapshotSizeBytes: resp.SnapshotSizeBytes,
+			CreatedAt:         time.Now(),
+		}); dbErr != nil {
+			s.logger.WithError(dbErr).WithField("session_id", resp.SessionId).Error("Failed to insert session checkpoint")
 		}
 	}
 
@@ -1018,6 +1030,8 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 		"session_id":          resp.SessionId,
 		"snapshot_size_bytes": resp.SnapshotSizeBytes,
 		"layer":               resp.Layer,
+		"generation":          resp.Generation,
+		"manifest_path":       resp.ManifestPath,
 	})
 }
 
@@ -1044,21 +1058,18 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 
 	runner, err := s.hostRegistry.GetRunner(req.RunnerID)
 	if err != nil {
-		// Check if suspended in session_snapshots
-		var sessionID, hostID, workloadKey string
-		var status string
-		var sessionTTL sql.NullInt64
-		var sessionAutoPause sql.NullBool
-		var sessionNPPreset sql.NullString
-		var sessionNPJSON sql.NullString
-		scanErr := s.scheduler.db.QueryRowContext(r.Context(),
-			`SELECT session_id, host_id, workload_key, status, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
-			 FROM session_snapshots WHERE runner_id = $1`,
-			req.RunnerID).Scan(&sessionID, &hostID, &workloadKey, &status, &sessionTTL, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON)
-		if scanErr != nil || status != "suspended" {
+		head, headErr := getSessionHeadByRunnerID(r.Context(), s.scheduler.db, req.RunnerID)
+		if headErr != nil {
 			http.Error(w, "runner not found", http.StatusNotFound)
 			return
 		}
+		if head.Status != "suspended" && head.Status != "active_checkpointed" {
+			http.Error(w, "runner not found", http.StatusNotFound)
+			return
+		}
+		sessionID := head.SessionID
+		hostID := head.CurrentHostID
+		workloadKey := head.WorkloadKey
 
 		// Pick the host to resume on. Prefer the original host unless it's
 		// draining/terminating or unreachable — in that case, fall back to
@@ -1096,14 +1107,18 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 
 		client := pb.NewHostAgentClient(conn)
 		resumeReq := &pb.ResumeRunnerRequest{
-			SessionId:           sessionID,
-			WorkloadKey:         workloadKey,
-			TtlSeconds:          int32(sessionTTL.Int64),
-			AutoPause:           sessionAutoPause.Valid && sessionAutoPause.Bool,
-			NetworkPolicyPreset: sessionNPPreset.String,
+			SessionId:                    sessionID,
+			WorkloadKey:                  workloadKey,
+			TtlSeconds:                   int32(head.RunnerTTLSeconds),
+			AutoPause:                    head.AutoPause,
+			NetworkPolicyPreset:          head.NetworkPolicyPreset,
+			ManifestPath:                 head.LatestManifestPath,
+			Generation:                   int32(head.LatestGeneration),
+			CheckpointIntervalSeconds:    int32(head.CheckpointIntervalSeconds),
+			CheckpointQuietWindowSeconds: int32(head.CheckpointQuietWindowSeconds),
 		}
-		if sessionNPJSON.Valid {
-			resumeReq.NetworkPolicyJson = sessionNPJSON.String
+		if head.NetworkPolicyJSON != "" {
+			resumeReq.NetworkPolicyJson = head.NetworkPolicyJSON
 		}
 		// Use a detached context so the GCS-backed resume completes even if
 		// the HTTP client disconnects (same rationale as HandlePauseRunner).
@@ -1128,24 +1143,27 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 		}
 
 		if err := s.hostRegistry.AddRunner(r.Context(), &Runner{
-			ID:                  resumedRunnerID,
-			HostID:              resumeHost.ID,
-			Status:              "busy",
-			InternalIP:          resp.Runner.GetInternalIp(),
-			WorkloadKey:         workloadKey,
-			RunnerTTLSeconds:    int(sessionTTL.Int64),
-			AutoPause:           sessionAutoPause.Valid && sessionAutoPause.Bool,
-			NetworkPolicyPreset: sessionNPPreset.String,
-			NetworkPolicyJSON:   sessionNPJSON.String,
+			ID:                           resumedRunnerID,
+			HostID:                       resumeHost.ID,
+			Status:                       "busy",
+			InternalIP:                   resp.Runner.GetInternalIp(),
+			WorkloadKey:                  workloadKey,
+			RunnerTTLSeconds:             head.RunnerTTLSeconds,
+			AutoPause:                    head.AutoPause,
+			CheckpointIntervalSeconds:    head.CheckpointIntervalSeconds,
+			CheckpointQuietWindowSeconds: head.CheckpointQuietWindowSeconds,
+			NetworkPolicyPreset:          head.NetworkPolicyPreset,
+			NetworkPolicyJSON:            head.NetworkPolicyJSON,
 		}); err != nil {
 			http.Error(w, "failed to register resumed runner", http.StatusInternalServerError)
 			return
 		}
 
-		// Update session status and host assignment
-		_, _ = s.scheduler.db.ExecContext(r.Context(),
-			`UPDATE session_snapshots SET runner_id = $1, status = 'active', host_id = $2 WHERE session_id = $3`,
-			resumedRunnerID, resumeHost.ID, sessionID)
+		head.CurrentRunnerID = resumedRunnerID
+		head.CurrentHostID = resumeHost.ID
+		head.Status = "active"
+		head.LastActivityAt = time.Now()
+		_ = upsertSessionHead(r.Context(), s.scheduler.db, *head)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)

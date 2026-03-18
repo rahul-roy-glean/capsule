@@ -49,6 +49,48 @@ func TestSnapshotManifest_JSONRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSnapshotManifest_RuntimeRoundTrip(t *testing.T) {
+	createdAt := time.Now().UTC().Truncate(time.Second)
+	m := SnapshotManifest{
+		Version:     "1",
+		SnapshotID:  "runtime-test",
+		CreatedAt:   createdAt,
+		WorkloadKey: "wk123",
+		Runtime: &SessionRuntime{
+			SessionID:       "sess-1",
+			Generation:      7,
+			RunnerID:        "runner-1",
+			VCPUs:           4,
+			MemoryMB:        8192,
+			ServicePort:     8080,
+			SnapshotVersion: "snap-v2",
+			CreatedAt:       createdAt,
+		},
+	}
+
+	data, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+
+	var decoded SnapshotManifest
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	if decoded.Runtime == nil {
+		t.Fatal("Runtime should round-trip")
+	}
+	if decoded.Runtime.SessionID != "sess-1" {
+		t.Errorf("Runtime.SessionID = %q, want %q", decoded.Runtime.SessionID, "sess-1")
+	}
+	if decoded.Runtime.Generation != 7 {
+		t.Errorf("Runtime.Generation = %d, want 7", decoded.Runtime.Generation)
+	}
+	if decoded.Runtime.RunnerID != "runner-1" {
+		t.Errorf("Runtime.RunnerID = %q, want %q", decoded.Runtime.RunnerID, "runner-1")
+	}
+}
+
 func TestSnapshotManifest_DiskOmittedWhenEmpty(t *testing.T) {
 	m := SnapshotManifest{Version: "1"}
 	m.Memory.Mode = "chunked"
