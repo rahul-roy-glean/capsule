@@ -19,7 +19,6 @@ use_custom_host_image  = true
 
 # MicroVM configuration
 microvm_subnet       = "172.16.0.0/24"
-max_runners_per_host = 4
 idle_runners_target  = 2
 chunk_cache_size_gb  = 2
 mem_cache_size_gb    = 2

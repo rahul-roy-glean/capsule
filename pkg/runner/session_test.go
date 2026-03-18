@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -571,16 +570,12 @@ func TestResumeFromSession_Draining(t *testing.T) {
 	}
 }
 
-func TestResumeFromSession_AtCapacity(t *testing.T) {
+func TestResumeFromSession_WhenDraining(t *testing.T) {
 	tmpDir := t.TempDir()
 	m := newTestManager(func(m *Manager) {
 		m.config.SessionDir = tmpDir
-		m.config.MaxRunners = 2
 	})
-
-	// Fill with active runners
-	m.runners["r1"] = &Runner{ID: "r1", State: StateIdle}
-	m.runners["r2"] = &Runner{ID: "r2", State: StateBusy}
+	m.draining = true
 
 	sessDir := filepath.Join(tmpDir, "sess-1")
 	os.MkdirAll(sessDir, 0755)
@@ -590,52 +585,8 @@ func TestResumeFromSession_AtCapacity(t *testing.T) {
 
 	_, err := m.ResumeFromSession(context.Background(), "sess-1", "")
 	if err == nil {
-		t.Error("ResumeFromSession should fail at capacity")
+		t.Error("ResumeFromSession should fail when draining")
 	}
-}
-
-func TestResumeFromSession_SuspendedNotCountedForCapacity(t *testing.T) {
-	tmpDir := t.TempDir()
-	m := newTestManager(func(m *Manager) {
-		m.config.SessionDir = tmpDir
-		m.config.MaxRunners = 2
-	})
-
-	sessDir := filepath.Join(tmpDir, "sess-1")
-	os.MkdirAll(sessDir, 0755)
-	meta := SessionMetadata{SessionID: "sess-1", WorkloadKey: "abc", RunnerID: "r3", Layers: 1}
-	data, _ := json.Marshal(meta)
-	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
-
-	// Case 1: Two active runners → should be rejected at capacity
-	m.runners["r1"] = &Runner{ID: "r1", State: StateIdle}
-	m.runners["r2"] = &Runner{ID: "r2", State: StateBusy}
-
-	_, err := m.ResumeFromSession(context.Background(), "sess-1", "")
-	if err == nil {
-		t.Fatal("Expected error with 2 active runners")
-	}
-	if !strings.Contains(err.Error(), "at capacity") {
-		t.Errorf("Expected capacity error with 2 active runners, got: %v", err)
-	}
-
-	// Case 2: One active + one suspended → should pass capacity check
-	// (will fail later on snapshotCache, but capacity check should pass)
-	m.runners["r2"].State = StateSuspended
-
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				// Expected: nil pointer on snapshotCache.GetSnapshotPaths()
-				// This proves we got PAST the capacity check.
-				t.Logf("Got expected panic past capacity check: %v", r)
-			}
-		}()
-		_, err = m.ResumeFromSession(context.Background(), "sess-1", "")
-		if err != nil && strings.Contains(err.Error(), "at capacity") {
-			t.Error("Suspended runners should not count toward capacity")
-		}
-	}()
 }
 
 func TestResumeFromSession_DuplicateActiveSession(t *testing.T) {

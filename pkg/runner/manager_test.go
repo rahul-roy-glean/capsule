@@ -16,7 +16,7 @@ func newTestManager(opts ...func(*Manager)) *Manager {
 	logger := logrus.New()
 	logger.SetLevel(logrus.DebugLevel)
 	m := &Manager{
-		config:          HostConfig{MaxRunners: 4, HostID: "test-host", Environment: "test"},
+		config:          HostConfig{HostID: "test-host", Environment: "test"},
 		runners:         make(map[string]*Runner),
 		vms:             make(map[string]*firecracker.VM),
 		slotToRunner:    make(map[int]string),
@@ -54,7 +54,7 @@ func TestFindAvailableSlot_Partial(t *testing.T) {
 
 func TestFindAvailableSlot_Full(t *testing.T) {
 	m := newTestManager()
-	for i := 0; i < m.config.MaxRunners; i++ {
+	for i := 0; i < maxNetworkSlots; i++ {
 		m.slotToRunner[i] = fmt.Sprintf("runner-%d", i)
 	}
 
@@ -114,7 +114,6 @@ func TestIsDraining(t *testing.T) {
 
 func TestGetStatus_Counting(t *testing.T) {
 	m := newTestManager()
-	m.config.MaxRunners = 10
 
 	m.runners["r1"] = &Runner{ID: "r1", State: StateIdle}
 	m.runners["r2"] = &Runner{ID: "r2", State: StateBusy}
@@ -243,18 +242,20 @@ func TestListRunners_Empty(t *testing.T) {
 }
 
 func TestCanAddRunner(t *testing.T) {
-	m := newTestManager()
-	m.config.MaxRunners = 2
+	m := newTestManager(func(m *Manager) {
+		m.config.TotalCPUMillicores = 4000
+		m.config.TotalMemoryMB = 8192
+	})
 
-	if !m.CanAddRunner(0, 0) {
+	if !m.CanAddRunner(2, 4096) {
 		t.Error("CanAddRunner() should be true for empty manager")
 	}
 
-	m.runners["r1"] = &Runner{ID: "r1"}
-	m.runners["r2"] = &Runner{ID: "r2"}
+	m.runners["r1"] = &Runner{ID: "r1", Resources: Resources{VCPUs: 2, MemoryMB: 4096}}
+	m.runners["r2"] = &Runner{ID: "r2", Resources: Resources{VCPUs: 2, MemoryMB: 4096}}
 
-	if m.CanAddRunner(0, 0) {
-		t.Error("CanAddRunner() should be false at capacity")
+	if m.CanAddRunner(2, 4096) {
+		t.Error("CanAddRunner() should be false when resources exhausted")
 	}
 }
 
@@ -268,8 +269,10 @@ func TestCanAddRunner_Draining(t *testing.T) {
 }
 
 func TestCanAddRunner_DrainingEvenWithCapacity(t *testing.T) {
-	m := newTestManager()
-	m.config.MaxRunners = 10
+	m := newTestManager(func(m *Manager) {
+		m.config.TotalCPUMillicores = 16000
+		m.config.TotalMemoryMB = 32768
+	})
 	m.draining = true
 
 	if m.CanAddRunner(0, 0) {
@@ -470,25 +473,17 @@ func TestIdempotentAllocationWaitsForLeader(t *testing.T) {
 	}
 }
 
-func TestAcquireBringupLeaseCountsPendingReservations(t *testing.T) {
-	m := newTestManager(func(m *Manager) {
-		m.config.MaxRunners = 1
-	})
+func TestAcquireBringupLeaseReleaseCycle(t *testing.T) {
+	m := newTestManager()
 
 	lease, err := m.AcquireBringupLease("runner-1", "")
 	if err != nil {
 		t.Fatalf("first AcquireBringupLease() error = %v", err)
 	}
-	if m.CanAddRunner(0, 0) {
-		t.Fatal("CanAddRunner() should be false while a lease is held")
-	}
-	if _, err := m.AcquireBringupLease("runner-2", ""); err == nil {
-		t.Fatal("second AcquireBringupLease() should fail at capacity")
-	}
 
 	lease.Release()
 
-	lease2, err := m.AcquireBringupLease("runner-3", "")
+	lease2, err := m.AcquireBringupLease("runner-2", "")
 	if err != nil {
 		t.Fatalf("AcquireBringupLease() after release error = %v", err)
 	}
@@ -507,15 +502,20 @@ func TestDrainBlocksAllocation(t *testing.T) {
 	}
 }
 
-func TestCanAddRunner_AtCapacity(t *testing.T) {
-	m := newTestManager()
-	m.config.MaxRunners = 4
+func TestCanAddRunner_AtResourceCapacity(t *testing.T) {
+	m := newTestManager(func(m *Manager) {
+		m.config.TotalCPUMillicores = 8000
+		m.config.TotalMemoryMB = 16384
+	})
 	for i := 0; i < 4; i++ {
-		m.runners[fmt.Sprintf("runner-%d", i)] = &Runner{ID: fmt.Sprintf("runner-%d", i)}
+		m.runners[fmt.Sprintf("runner-%d", i)] = &Runner{
+			ID:        fmt.Sprintf("runner-%d", i),
+			Resources: Resources{VCPUs: 2, MemoryMB: 4096},
+		}
 	}
 
-	if m.CanAddRunner(0, 0) {
-		t.Error("Manager at capacity should not accept new runners")
+	if m.CanAddRunner(2, 4096) {
+		t.Error("Manager at resource capacity should not accept new runners")
 	}
 }
 

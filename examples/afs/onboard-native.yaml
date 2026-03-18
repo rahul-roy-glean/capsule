@@ -4,7 +4,6 @@ platform:
   zone: "us-central1-a"
 
 microvm:
-  max_per_host: 32
   idle_target: 4
 
 hosts:

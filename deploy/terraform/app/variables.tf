@@ -76,12 +76,6 @@ variable "microvm_subnet" {
   default     = "172.16.0.0/24"
 }
 
-variable "max_runners_per_host" {
-  description = "Maximum number of microVMs (runners) per host"
-  type        = number
-  default     = 4
-}
-
 variable "idle_runners_target" {
   description = "Target number of idle runners to maintain per host"
   type        = number

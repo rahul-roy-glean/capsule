@@ -43,7 +43,6 @@ import (
 var (
 	grpcPort           = flag.Int("grpc-port", 50051, "gRPC server port")
 	httpPort           = flag.Int("http-port", 8080, "HTTP server port (health/metrics)")
-	maxRunners         = flag.Int("max-runners", 16, "Maximum runners per host")
 	idleTarget         = flag.Int("idle-target", 2, "Target number of idle runners")
 	firecrackerBin     = flag.String("firecracker-bin", "/usr/local/bin/firecracker", "Path to firecracker binary")
 	socketDir          = flag.String("socket-dir", "/var/run/firecracker", "Directory for VM sockets")
@@ -308,7 +307,6 @@ func main() {
 		HostID:            hostID,
 		InstanceName:      instanceName,
 		Zone:              zone,
-		MaxRunners:        *maxRunners,
 		IdleTarget:        *idleTarget,
 		FirecrackerBin:    *firecrackerBin,
 		SocketDir:         *socketDir,

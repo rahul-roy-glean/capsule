@@ -60,7 +60,7 @@ func main() {
 		fmt.Printf("  Region:       %s\n", cfg.Platform.Region)
 		fmt.Printf("  Zone:         %s\n", cfg.Platform.Zone)
 		fmt.Printf("  Max Hosts:    %d\n", cfg.Hosts.MaxCount)
-		fmt.Printf("  Max VMs/Host: %d\n", cfg.MicroVM.MaxPerHost)
+		fmt.Printf("  Idle Target:  %d\n", cfg.MicroVM.IdleTarget)
 		os.Exit(0)
 	}
 

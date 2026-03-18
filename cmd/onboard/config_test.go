@@ -53,9 +53,6 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	if cfg.MicroVM.MemoryMB != 8192 {
 		t.Errorf("MemoryMB = %d, want default %d", cfg.MicroVM.MemoryMB, 8192)
 	}
-	if cfg.MicroVM.MaxPerHost != 16 {
-		t.Errorf("MaxPerHost = %d, want default %d", cfg.MicroVM.MaxPerHost, 16)
-	}
 	if cfg.MicroVM.IdleTarget != 2 {
 		t.Errorf("IdleTarget = %d, want default %d", cfg.MicroVM.IdleTarget, 2)
 	}
