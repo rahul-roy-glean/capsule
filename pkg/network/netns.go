@@ -210,7 +210,7 @@ func detectDefaultRouteIface() string {
 		return ""
 	}
 	for _, r := range routes {
-		if r.Dst == nil { // default route
+		if isDefaultRoute(r) {
 			link, err := netlink.LinkByIndex(r.LinkIndex)
 			if err != nil {
 				continue
@@ -219,6 +219,16 @@ func detectDefaultRouteIface() string {
 		}
 	}
 	return ""
+}
+
+// isDefaultRoute returns true if the route is a default route (0.0.0.0/0).
+// netlink v1.3.0+ always populates Dst (never nil), so we also check for /0 prefix.
+func isDefaultRoute(r netlink.Route) bool {
+	if r.Dst == nil {
+		return true
+	}
+	ones, bits := r.Dst.Mask.Size()
+	return ones == 0 && bits > 0
 }
 
 func addIPTablesRuleIfMissing(binary string, checkArgs, addArgs []string) error {

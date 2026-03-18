@@ -24,6 +24,7 @@ func newTestManager(opts ...func(*Manager)) *Manager {
 		pendingSessions: make(map[string]string),
 		uffdHandlers:    make(map[string]uffdStopper),
 		authProxies:     make(map[string]*authproxy.AuthProxy),
+		stopCh:          make(chan struct{}),
 		logger:          logger.WithField("test", true),
 	}
 	for _, opt := range opts {

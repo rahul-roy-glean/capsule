@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/vishvananda/netlink"
 )
 
 func TestConfigureHostVethSysctlsSetsLooseRPFilter(t *testing.T) {
@@ -118,5 +120,50 @@ func TestResolveExternalIfaceConfiguredUsesMatchingDefaultRoute(t *testing.T) {
 	}
 	if got != "ens4" {
 		t.Fatalf("resolveExternalIface(ens4) = %q, want %q", got, "ens4")
+	}
+}
+
+func TestIsDefaultRoute(t *testing.T) {
+	tests := []struct {
+		name  string
+		route netlink.Route
+		want  bool
+	}{
+		{
+			name:  "nil Dst is default",
+			route: netlink.Route{Dst: nil},
+			want:  true,
+		},
+		{
+			name: "0.0.0.0/0 is default (netlink v1.3.0+)",
+			route: netlink.Route{Dst: &net.IPNet{
+				IP:   net.IPv4zero,
+				Mask: net.CIDRMask(0, 32),
+			}},
+			want: true,
+		},
+		{
+			name: "10.128.0.1/32 is not default",
+			route: netlink.Route{Dst: &net.IPNet{
+				IP:   net.ParseIP("10.128.0.1"),
+				Mask: net.CIDRMask(32, 32),
+			}},
+			want: false,
+		},
+		{
+			name: "172.17.0.0/16 is not default",
+			route: netlink.Route{Dst: &net.IPNet{
+				IP:   net.ParseIP("172.17.0.0"),
+				Mask: net.CIDRMask(16, 32),
+			}},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isDefaultRoute(tt.route); got != tt.want {
+				t.Errorf("isDefaultRoute() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

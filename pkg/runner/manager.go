@@ -54,6 +54,7 @@ type Manager struct {
 	// runnerToSlot is the reverse mapping for quick lookup during cleanup.
 	runnerToSlot map[string]int
 	draining     bool
+	stopCh       chan struct{}
 	mu           sync.RWMutex
 	logger       *logrus.Entry
 
@@ -153,6 +154,7 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 		pendingSessions: make(map[string]string),
 		policyEnforcers: make(map[string]*network.PolicyEnforcer),
 		authProxies:     make(map[string]*authproxy.AuthProxy),
+		stopCh:          make(chan struct{}),
 		logger:          logger.WithField("component", "runner-manager"),
 	}
 
@@ -160,8 +162,13 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
-		for range ticker.C {
-			m.cleanupRecentRequests()
+		for {
+			select {
+			case <-ticker.C:
+				m.cleanupRecentRequests()
+			case <-m.stopCh:
+				return
+			}
 		}
 	}()
 
@@ -1265,6 +1272,13 @@ func (m *Manager) PauseSessionRunners(ctx context.Context) (int, error) {
 
 // Close shuts down the manager and all runners
 func (m *Manager) Close() error {
+	// Stop the cleanup goroutine before acquiring the lock to avoid deadlock.
+	select {
+	case <-m.stopCh:
+	default:
+		close(m.stopCh)
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
