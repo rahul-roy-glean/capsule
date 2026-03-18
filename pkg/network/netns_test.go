@@ -4,6 +4,8 @@
 package network
 
 import (
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -48,5 +50,73 @@ func TestConfigureHostVethSysctlsMissingInterface(t *testing.T) {
 
 	if err := configureHostVethSysctls("veth-missing-h"); err == nil {
 		t.Fatal("configureHostVethSysctls() error = nil, want non-nil")
+	}
+}
+
+func TestResolveExternalIfaceAutoUsesDefaultRoute(t *testing.T) {
+	oldInterfaceByName := netInterfaceByName
+	oldDefaultRouteIfaceFn := defaultRouteIfaceFn
+	t.Cleanup(func() {
+		netInterfaceByName = oldInterfaceByName
+		defaultRouteIfaceFn = oldDefaultRouteIfaceFn
+	})
+
+	netInterfaceByName = func(name string) (*net.Interface, error) {
+		if name != "ens4" {
+			return nil, fmt.Errorf("unexpected interface lookup: %s", name)
+		}
+		return &net.Interface{Name: "ens4"}, nil
+	}
+	defaultRouteIfaceFn = func() string { return "ens4" }
+
+	got, err := resolveExternalIface("auto", nil)
+	if err != nil {
+		t.Fatalf("resolveExternalIface(auto) error = %v", err)
+	}
+	if got != "ens4" {
+		t.Fatalf("resolveExternalIface(auto) = %q, want %q", got, "ens4")
+	}
+}
+
+func TestResolveExternalIfaceConfiguredMismatchReturnsError(t *testing.T) {
+	oldInterfaceByName := netInterfaceByName
+	oldDefaultRouteIfaceFn := defaultRouteIfaceFn
+	t.Cleanup(func() {
+		netInterfaceByName = oldInterfaceByName
+		defaultRouteIfaceFn = oldDefaultRouteIfaceFn
+	})
+
+	netInterfaceByName = func(name string) (*net.Interface, error) {
+		return &net.Interface{Name: name}, nil
+	}
+	defaultRouteIfaceFn = func() string { return "ens4" }
+
+	if _, err := resolveExternalIface("eth0", nil); err == nil {
+		t.Fatal("resolveExternalIface(eth0) error = nil, want mismatch error")
+	}
+}
+
+func TestResolveExternalIfaceConfiguredUsesMatchingDefaultRoute(t *testing.T) {
+	oldInterfaceByName := netInterfaceByName
+	oldDefaultRouteIfaceFn := defaultRouteIfaceFn
+	t.Cleanup(func() {
+		netInterfaceByName = oldInterfaceByName
+		defaultRouteIfaceFn = oldDefaultRouteIfaceFn
+	})
+
+	netInterfaceByName = func(name string) (*net.Interface, error) {
+		if name != "ens4" {
+			return nil, fmt.Errorf("unexpected interface lookup: %s", name)
+		}
+		return &net.Interface{Name: "ens4"}, nil
+	}
+	defaultRouteIfaceFn = func() string { return "ens4" }
+
+	got, err := resolveExternalIface("ens4", nil)
+	if err != nil {
+		t.Fatalf("resolveExternalIface(ens4) error = %v", err)
+	}
+	if got != "ens4" {
+		t.Fatalf("resolveExternalIface(ens4) = %q, want %q", got, "ens4")
 	}
 }

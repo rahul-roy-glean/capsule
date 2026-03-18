@@ -53,7 +53,7 @@ var (
 	snapshotCache      = flag.String("snapshot-cache", "/mnt/data/snapshots", "Local snapshot cache path")
 	quarantineDir      = flag.String("quarantine-dir", "/mnt/data/quarantine", "Directory to store quarantined runner manifests and debug metadata")
 	microVMSubnet      = flag.String("microvm-subnet", "172.16.0.0/24", "Subnet for microVMs")
-	extInterface       = flag.String("ext-interface", "eth0", "External network interface")
+	extInterface       = flag.String("ext-interface", "auto", "External network interface (or \"auto\" to detect from the default route)")
 	bridgeName         = flag.String("bridge-name", "fcbr0", "Bridge name for microVMs")
 	environment        = flag.String("environment", "dev", "Environment name")
 	controlPlane       = flag.String("control-plane", "", "Control plane address")
