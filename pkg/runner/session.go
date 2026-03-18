@@ -164,6 +164,7 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 		return nil, fmt.Errorf("runner %s has active execs, cannot pause", runnerID)
 	}
 
+	prePauseState := runner.State
 	runner.State = StatePausing
 	sessionID := runner.SessionID
 	layerN := runner.SessionLayers
@@ -179,7 +180,7 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 	layerDir := filepath.Join(m.sessionBaseDir(), sessionID, fmt.Sprintf("layer_%d", layerN))
 	if err := os.MkdirAll(layerDir, 0755); err != nil {
 		m.mu.Lock()
-		runner.State = StateIdle
+		runner.State = prePauseState
 		m.mu.Unlock()
 		return nil, fmt.Errorf("failed to create session layer dir: %w", err)
 	}
@@ -191,7 +192,7 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 	diffStart := time.Now()
 	if err := vm.CreateDiffSnapshot(ctx, stateFile, memDiffFile); err != nil {
 		m.mu.Lock()
-		runner.State = StateIdle
+		runner.State = prePauseState
 		m.mu.Unlock()
 		return nil, fmt.Errorf("failed to create diff snapshot: %w", err)
 	}
@@ -293,7 +294,7 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 			// In chunked mode, local-only fallback won't work (no rootfs.img or
 			// snapshot.mem on disk), so a GCS upload failure is fatal for the pause.
 			m.mu.Lock()
-			runner.State = StateIdle
+			runner.State = prePauseState
 			m.mu.Unlock()
 			return nil, fmt.Errorf("failed to upload session memory chunks to GCS: %w", err)
 		} else {
@@ -311,7 +312,7 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 			if uploadErr := uploader.UploadVMState(ctx, stateFile, vmStateGCSPath); uploadErr != nil {
 				// In chunked mode, local-only fallback won't work — fail the pause.
 				m.mu.Lock()
-				runner.State = StateIdle
+				runner.State = prePauseState
 				m.mu.Unlock()
 				return nil, fmt.Errorf("failed to upload VM state to GCS: %w", uploadErr)
 			} else {
@@ -456,7 +457,7 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 				if writeErr := uploader.WriteManifestWithExtensions(ctx, gcsBase, man, newMemIndex, allDiskIndexes); writeErr != nil {
 					// In chunked mode, local-only fallback won't work — fail the pause.
 					m.mu.Lock()
-					runner.State = StateIdle
+					runner.State = prePauseState
 					m.mu.Unlock()
 					return nil, fmt.Errorf("failed to write session manifest to GCS: %w", writeErr)
 				} else {
@@ -1150,7 +1151,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 	runner := &Runner{
 		ID:              runnerID,
 		HostID:          m.config.HostID,
-		State:           StateIdle,
+		State:           StateBusy,
 		InternalIP:      internalIP,
 		TapDevice:       tap.Name,
 		MAC:             tap.MAC,

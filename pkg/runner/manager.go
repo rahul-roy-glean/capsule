@@ -746,7 +746,7 @@ func (m *Manager) UnquarantineRunner(ctx context.Context, runnerID string, opts 
 		}
 		if len(errs) == 0 {
 			if prevState == "" {
-				prevState = StateIdle
+				prevState = StateBusy
 			}
 			rr.State = prevState
 		}

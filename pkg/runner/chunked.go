@@ -890,7 +890,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		return nil, fmt.Errorf("unexpected VM implementation type %T", vmIface)
 	}
 
-	runner.State = StateIdle
+	runner.State = StateBusy
 	runner.StartedAt = time.Now()
 
 	if err := cm.registerAllocatedRunner(runnerID, runner, vm, fuseDisk, extensionFUSEDisks, uffdHandler, proxy); err != nil {
