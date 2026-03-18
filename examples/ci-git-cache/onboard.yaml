@@ -6,7 +6,6 @@ platform:
 microvm:
   vcpus: 4
   memory_mb: 8192
-  max_per_host: 16
   idle_target: 2
 
 hosts:

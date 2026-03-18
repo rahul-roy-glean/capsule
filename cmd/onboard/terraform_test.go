@@ -12,7 +12,7 @@ func TestGenerateTFVars_Bootstrap(t *testing.T) {
 	cfg := &Config{
 		Platform:           PlatformConfig{GCPProject: "test-project", Region: "us-central1", Zone: "us-central1-a", Environment: "prod", AdminCIDRs: []string{"203.0.113.10/32"}},
 		Hosts:              HostsConfig{MachineType: "n2-standard-64", MinCount: 2, MaxCount: 20, DataDiskGB: 500, ChunkCacheSizeGB: 8, MemCacheSizeGB: 8},
-		MicroVM:            MicroVMConfig{MaxPerHost: 16, IdleTarget: 2, VCPUs: 4, MemoryMB: 8192},
+		MicroVM:            MicroVMConfig{IdleTarget: 2, VCPUs: 4, MemoryMB: 8192},
 		ResolvedDBPassword: "secret",
 	}
 
@@ -65,7 +65,7 @@ func TestGenerateTFVars_Finalize(t *testing.T) {
 	cfg := &Config{
 		Platform:                PlatformConfig{GCPProject: "test-project", Region: "us-central1", Zone: "us-central1-a", Environment: "prod", AdminCIDRs: []string{"203.0.113.10/32"}},
 		Hosts:                   HostsConfig{MachineType: "n2-standard-64", MinCount: 2, MaxCount: 20, DataDiskGB: 500, ChunkCacheSizeGB: 8, MemCacheSizeGB: 8},
-		MicroVM:                 MicroVMConfig{MaxPerHost: 16, IdleTarget: 2, VCPUs: 4, MemoryMB: 8192},
+		MicroVM:                 MicroVMConfig{IdleTarget: 2, VCPUs: 4, MemoryMB: 8192},
 		Session:                 SessionConfig{Enabled: true},
 		ResolvedDBPassword:      "secret",
 		ResolvedControlPlaneURL: "http://10.0.0.5:8080",
@@ -98,7 +98,7 @@ func TestGenerateTFVars_AllFields(t *testing.T) {
 	cfg := &Config{
 		Platform:                PlatformConfig{GCPProject: "proj", Region: "eu-west1", Zone: "eu-west1-c", Environment: "staging", AdminCIDRs: []string{"203.0.113.20/32"}},
 		Hosts:                   HostsConfig{MachineType: "c2-standard-60", MinCount: 3, MaxCount: 10, DataDiskGB: 200, ChunkCacheSizeGB: 4, MemCacheSizeGB: 4},
-		MicroVM:                 MicroVMConfig{MaxPerHost: 8, IdleTarget: 1, VCPUs: 2, MemoryMB: 4096},
+		MicroVM:                 MicroVMConfig{IdleTarget: 1, VCPUs: 2, MemoryMB: 4096},
 		Session:                 SessionConfig{Enabled: true},
 		ResolvedDBPassword:      "secret",
 		ResolvedControlPlaneURL: "http://10.0.0.5:8080",
@@ -130,7 +130,6 @@ func TestGenerateTFVars_AllFields(t *testing.T) {
 		{"host_data_disk_size_gb", `host_data_disk_size_gb = 200`},
 		{"chunk_cache_size_gb", `chunk_cache_size_gb = 4`},
 		{"mem_cache_size_gb", `mem_cache_size_gb = 4`},
-		{"max_runners_per_host", `max_runners_per_host = 8`},
 		{"idle_runners_target", `idle_runners_target = 1`},
 		{"use_custom_host_image", `use_custom_host_image = true`},
 		{"db_password", `db_password = "secret"`},
@@ -148,7 +147,7 @@ func TestGenerateTFVars_DefaultDir(t *testing.T) {
 	cfg := &Config{
 		Platform:           PlatformConfig{GCPProject: "test", AdminCIDRs: []string{"203.0.113.30/32"}},
 		Hosts:              HostsConfig{MachineType: "n2-standard-64", MinCount: 1, MaxCount: 1, DataDiskGB: 100},
-		MicroVM:            MicroVMConfig{MaxPerHost: 1, IdleTarget: 1, VCPUs: 1, MemoryMB: 1024},
+		MicroVM:            MicroVMConfig{IdleTarget: 1, VCPUs: 1, MemoryMB: 1024},
 		ResolvedDBPassword: "secret",
 	}
 
