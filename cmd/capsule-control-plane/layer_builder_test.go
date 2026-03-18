@@ -483,9 +483,9 @@ func TestLayerBuilder_CheckRefreshSchedules_LayerDue(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"config_id", "layer_hash", "refresh_interval", "current_version",
 			"init_commands", "refresh_commands", "drives", "all_chain_drives",
-			"last_completed", "has_active_build",
+			"last_completed", "has_active_build", "base_image", "runner_user",
 		}).AddRow("cfg-1", layerHash, "1h", "v1", "[]", "[]", "[]", "[]",
-			lastCompleted, false))
+			lastCompleted, false, "", ""))
 
 	// Enqueue refresh build
 	mock.ExpectExec(`INSERT INTO snapshot_builds`).
@@ -518,9 +518,9 @@ func TestLayerBuilder_CheckRefreshSchedules_ActiveBuildSkipped(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"config_id", "layer_hash", "refresh_interval", "current_version",
 			"init_commands", "refresh_commands", "drives", "all_chain_drives",
-			"last_completed", "has_active_build",
+			"last_completed", "has_active_build", "base_image", "runner_user",
 		}).AddRow("cfg-1", layerHash, "1h", "v1", "[]", "[]", "[]", "[]",
-			lastCompleted, true)) // has_active_build = true
+			lastCompleted, true, "", "")) // has_active_build = true
 
 	// No INSERT should happen
 
@@ -543,9 +543,9 @@ func TestLayerBuilder_CheckRefreshSchedules_NotYetDue(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"config_id", "layer_hash", "refresh_interval", "current_version",
 			"init_commands", "refresh_commands", "drives", "all_chain_drives",
-			"last_completed", "has_active_build",
+			"last_completed", "has_active_build", "base_image", "runner_user",
 		}).AddRow("cfg-1", layerHash, "1h", "v1", "[]", "[]", "[]", "[]",
-			lastCompleted, false))
+			lastCompleted, false, "", ""))
 
 	// No INSERT should happen
 
@@ -565,9 +565,9 @@ func TestLayerBuilder_CheckRefreshSchedules_InvalidInterval(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"config_id", "layer_hash", "refresh_interval", "current_version",
 			"init_commands", "refresh_commands", "drives", "all_chain_drives",
-			"last_completed", "has_active_build",
+			"last_completed", "has_active_build", "base_image", "runner_user",
 		}).AddRow("cfg-1", layerHash, "not-a-duration", "v1", "[]", "[]", "[]", "[]",
-			time.Now().Add(-2*time.Hour), false))
+			time.Now().Add(-2*time.Hour), false, "", ""))
 
 	// Invalid interval → skipped, no INSERT
 
@@ -590,9 +590,9 @@ func TestLayerBuilder_CheckRefreshSchedules_ChildRebuildsEnqueued(t *testing.T) 
 		WillReturnRows(sqlmock.NewRows([]string{
 			"config_id", "layer_hash", "refresh_interval", "current_version",
 			"init_commands", "refresh_commands", "drives", "all_chain_drives",
-			"last_completed", "has_active_build",
+			"last_completed", "has_active_build", "base_image", "runner_user",
 		}).AddRow("cfg-1", parentHash, "1h", "v1", "[]", `["echo refresh"]`, "[]", "[]",
-			lastCompleted, false))
+			lastCompleted, false, "", ""))
 
 	// Parent refresh build
 	mock.ExpectExec(`INSERT INTO snapshot_builds`).
