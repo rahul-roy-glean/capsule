@@ -182,7 +182,6 @@ type HostConfig struct {
 	HostID            string
 	InstanceName      string
 	Zone              string
-	MaxRunners        int
 	IdleTarget        int
 	FirecrackerBin    string
 	SocketDir         string

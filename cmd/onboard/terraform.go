@@ -199,7 +199,6 @@ func generateTFVars(cfg *Config, finalize bool, targetDir ...string) (string, er
 	addInt("mem_cache_size_gb", cfg.Hosts.MemCacheSizeGB)
 
 	// --- MicroVMs ---
-	addInt("max_runners_per_host", cfg.MicroVM.MaxPerHost)
 	addInt("idle_runners_target", cfg.MicroVM.IdleTarget)
 
 	// --- Snapshots & networking ---

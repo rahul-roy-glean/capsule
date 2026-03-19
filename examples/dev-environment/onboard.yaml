@@ -6,7 +6,6 @@ platform:
 microvm:
   vcpus: 4
   memory_mb: 8192
-  max_per_host: 16
   # Dev environments are session-bound; no anonymous idle pool needed.
   idle_target: 0
 

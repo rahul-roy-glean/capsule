@@ -121,7 +121,6 @@ MGR_CMD="$REPO_ROOT/bin/capsule-manager \
   --workspace-dir=/tmp/fc-dev/workspaces \
   --log-dir=$LOG_DIR \
   --control-plane=http://localhost:8080 \
-  --max-runners=8 \
   --idle-target=0 \
   --log-level=debug"
 

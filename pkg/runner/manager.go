@@ -54,6 +54,7 @@ type Manager struct {
 	// runnerToSlot is the reverse mapping for quick lookup during cleanup.
 	runnerToSlot map[string]int
 	draining     bool
+	stopCh       chan struct{}
 	mu           sync.RWMutex
 	logger       *logrus.Entry
 
@@ -156,6 +157,7 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 		pendingSessions: make(map[string]string),
 		policyEnforcers: make(map[string]*network.PolicyEnforcer),
 		authProxies:     make(map[string]*authproxy.AuthProxy),
+		stopCh:          make(chan struct{}),
 		logger:          logger.WithField("component", "runner-manager"),
 	}
 
@@ -163,8 +165,13 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
-		for range ticker.C {
-			m.cleanupRecentRequests()
+		for {
+			select {
+			case <-ticker.C:
+				m.cleanupRecentRequests()
+			case <-m.stopCh:
+				return
+			}
 		}
 	}()
 
@@ -301,18 +308,6 @@ func (m *Manager) AcquireBringupLease(runnerID, sessionID string) (*bringupLease
 	if m.draining {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("host is draining")
-	}
-
-	// Count active runners (exclude suspended — they don't consume VM resources)
-	activeCount := 0
-	for _, r := range m.runners {
-		if r.State != StateSuspended {
-			activeCount++
-		}
-	}
-	if activeCount+m.pendingAllocations >= m.config.MaxRunners {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("host at capacity: %d/%d runners", activeCount+m.pendingAllocations, m.config.MaxRunners)
 	}
 
 	// Validate session uniqueness against both registered and pending runners
@@ -968,10 +963,15 @@ func (m *Manager) cleanupRunner(runnerID, tapDevice, overlayPath string) {
 	os.Remove(socketPath)
 }
 
-// findAvailableSlot finds the first available TAP slot for snapshot restore.
+// maxNetworkSlots is the maximum number of network slots (veth /30 subnets)
+// available per host. Each slot maps to a 10.200.{slot}.0/30 subnet, capped
+// at 256 by the single-octet encoding.
+const maxNetworkSlots = 256
+
+// findAvailableSlot finds the first available network slot for snapshot restore.
 // Returns -1 if no slots are available.
 func (m *Manager) findAvailableSlot() int {
-	for i := 0; i < m.config.MaxRunners; i++ {
+	for i := 0; i < maxNetworkSlots; i++ {
 		if _, inUse := m.slotToRunner[i]; !inUse {
 			return i
 		}
@@ -1172,16 +1172,16 @@ type ManagerStatus struct {
 }
 
 // CanAddRunner checks if a new runner with the given resources can be added.
-// It checks both the hard MaxRunners cap and actual host resource capacity.
+// It checks draining state and actual host resource capacity.
 func (m *Manager) CanAddRunner(vcpus, memoryMB int) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	if m.draining || len(m.runners)+m.pendingAllocations >= m.config.MaxRunners {
+	if m.draining {
 		return false
 	}
 
-	// If host doesn't report total resources, fall back to slot check
+	// If host doesn't report total resources, assume capacity is available
 	if m.config.TotalCPUMillicores == 0 {
 		return true
 	}
@@ -1268,6 +1268,13 @@ func (m *Manager) PauseSessionRunners(ctx context.Context) (int, error) {
 
 // Close shuts down the manager and all runners
 func (m *Manager) Close() error {
+	// Stop the cleanup goroutine before acquiring the lock to avoid deadlock.
+	select {
+	case <-m.stopCh:
+	default:
+		close(m.stopCh)
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

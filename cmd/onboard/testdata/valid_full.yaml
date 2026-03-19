@@ -6,7 +6,6 @@ platform:
 microvm:
   vcpus: 8
   memory_mb: 16384
-  max_per_host: 8
   idle_target: 4
 hosts:
   machine_type: n2-standard-128

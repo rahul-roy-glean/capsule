@@ -8,7 +8,6 @@ platform:
 microvm:
   vcpus: 8
   memory_mb: 16384          # 16GB — room for model weights in RAM
-  max_per_host: 8
   idle_target: 4            # Keep 4 warm VMs per host for low-latency cold starts
 
 hosts:

@@ -56,7 +56,6 @@ type PlatformConfig struct {
 type MicroVMConfig struct {
 	VCPUs      int `yaml:"vcpus"`
 	MemoryMB   int `yaml:"memory_mb"`
-	MaxPerHost int `yaml:"max_per_host"`
 	IdleTarget int `yaml:"idle_target"`
 }
 
@@ -185,9 +184,6 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.MicroVM.MemoryMB == 0 {
 		cfg.MicroVM.MemoryMB = 8192
-	}
-	if cfg.MicroVM.MaxPerHost == 0 {
-		cfg.MicroVM.MaxPerHost = 16
 	}
 	if cfg.MicroVM.IdleTarget == 0 {
 		cfg.MicroVM.IdleTarget = 2

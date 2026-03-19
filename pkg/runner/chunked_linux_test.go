@@ -76,7 +76,6 @@ func (f *fakeChunkedVM) SetMMDSData(ctx context.Context, data interface{}) error
 
 func TestAcquireBringupLeaseConcurrentUniqueSlots(t *testing.T) {
 	cm := newTestChunkedManager()
-	cm.config.MaxRunners = 2
 
 	type result struct {
 		slot int
@@ -116,18 +115,17 @@ func TestAcquireBringupLeaseConcurrentUniqueSlots(t *testing.T) {
 		slots = append(slots, res.slot)
 	}
 
-	if failures != 1 {
-		t.Fatalf("expected 1 reservation failure at capacity, got %d", failures)
+	if failures != 0 {
+		t.Fatalf("expected 0 reservation failures, got %d", failures)
 	}
 	sort.Ints(slots)
-	if len(slots) != 2 || slots[0] != 0 || slots[1] != 1 {
-		t.Fatalf("expected successful reservations for slots [0 1], got %v", slots)
+	if len(slots) != 3 || slots[0] != 0 || slots[1] != 1 || slots[2] != 2 {
+		t.Fatalf("expected successful reservations for slots [0 1 2], got %v", slots)
 	}
 }
 
 func TestBringupLeaseReleaseAllowsReuse(t *testing.T) {
 	cm := newTestChunkedManager()
-	cm.config.MaxRunners = 2
 
 	lease1, err := cm.AcquireBringupLease("runner-1", "")
 	if err != nil {
@@ -238,7 +236,6 @@ func TestCleanupChunkedRunnerRemovesArtifacts(t *testing.T) {
 
 func TestBringupLeaseReleaseCleansUpSlot(t *testing.T) {
 	cm := newTestChunkedManager()
-	cm.config.MaxRunners = 4
 
 	lease, err := cm.AcquireBringupLease("runner-1", "")
 	if err != nil {
