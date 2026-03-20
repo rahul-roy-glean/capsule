@@ -19,9 +19,8 @@ use_custom_host_image  = true
 
 # MicroVM configuration
 microvm_subnet       = "172.16.0.0/24"
-idle_runners_target  = 2
-chunk_cache_size_gb  = 2
-mem_cache_size_gb    = 2
+chunk_cache_size_gb  = 0
+mem_cache_size_gb    = 0
 
 # Telemetry
 enable_otel_collector = true  # Deploy OTel Collector in GKE; ILB IP auto-wired to hosts

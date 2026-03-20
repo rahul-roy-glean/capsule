@@ -76,12 +76,6 @@ variable "microvm_subnet" {
   default     = "172.16.0.0/24"
 }
 
-variable "idle_runners_target" {
-  description = "Target number of idle runners to maintain per host"
-  type        = number
-  default     = 2
-}
-
 variable "chunk_cache_size_gb" {
   description = "Size in GB of the on-disk LRU chunk cache for FUSE-backed disks"
   type        = number
