@@ -508,6 +508,7 @@ type tokenUpdateRequest struct {
 	Provider  string    `json:"provider"`
 	Token     string    `json:"token"`
 	ExpiresAt time.Time `json:"expires_at"`
+	TokenType string    `json:"token_type,omitempty"` // for providers accepting multiple token types (e.g., "user", "bot")
 }
 
 func (p *AuthProxy) handleUpdateToken(w http.ResponseWriter, r *http.Request) {
@@ -524,6 +525,18 @@ func (p *AuthProxy) handleUpdateToken(w http.ResponseWriter, r *http.Request) {
 
 	for _, prov := range p.providers {
 		if prov.Name() == req.Provider {
+			// Try typed token receiver first (supports multiple token types).
+			if req.TokenType != "" {
+				if typed, ok := prov.(TypedTokenReceiver); ok {
+					if err := typed.UpdateTypedToken(req.TokenType, req.Token, req.ExpiresAt); err != nil {
+						http.Error(w, err.Error(), http.StatusInternalServerError)
+						return
+					}
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+			}
+			// Fall back to simple token receiver.
 			if receiver, ok := prov.(TokenReceiver); ok {
 				if err := receiver.UpdateToken(req.Token, req.ExpiresAt); err != nil {
 					http.Error(w, err.Error(), http.StatusInternalServerError)

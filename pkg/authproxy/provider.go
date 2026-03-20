@@ -21,6 +21,12 @@ type TokenReceiver interface {
 	UpdateToken(token string, expiresAt time.Time) error
 }
 
+// TypedTokenReceiver is optionally implemented by providers that accept
+// multiple named token types (e.g., "user" and "bot" tokens for GitHub).
+type TypedTokenReceiver interface {
+	UpdateTypedToken(tokenType, token string, expiresAt time.Time) error
+}
+
 // MetadataHandler is optionally implemented by providers that serve their own
 // HTTP API (e.g., GCP metadata endpoint) instead of injecting into proxied requests.
 type MetadataHandler interface {
