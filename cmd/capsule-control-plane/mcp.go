@@ -331,6 +331,7 @@ func (m *mcpDeps) handleResume(ctx context.Context, _ *mcp.CallToolRequest, in R
 		HostID:              resumeHost.ID,
 		Status:              "busy",
 		InternalIP:          resp.Runner.GetInternalIp(),
+		SessionID:           sessionID,
 		WorkloadKey:         workloadKey,
 		RunnerTTLSeconds:    int(sessionTTL.Int64),
 		AutoPause:           sessionAutoPause.Valid && sessionAutoPause.Bool,

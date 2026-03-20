@@ -232,6 +232,7 @@ type AllocateRunnerResponse struct {
 	InternalIP  string
 	SessionID   string
 	Resumed     bool
+	Attached    bool
 	Error       string
 }
 
@@ -336,6 +337,29 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		"request_id":   req.RequestID,
 		"workload_key": req.WorkloadKey,
 	}).Info("Allocating runner")
+
+	if req.SessionID != "" {
+		existing, err := s.hostRegistry.FindRunnerBySessionID(req.SessionID)
+		if err == nil && existing != nil && existing.Status != "suspended" && existing.Status != "terminated" {
+			if req.WorkloadKey != "" && existing.WorkloadKey != "" && existing.WorkloadKey != req.WorkloadKey {
+				failureReason = "session_workload_mismatch"
+				retErr = fmt.Errorf("session %s is already bound to workload_key %s (requested %s)", req.SessionID, existing.WorkloadKey, req.WorkloadKey)
+				return nil, retErr
+			}
+			host, hostErr := s.hostRegistry.GetHost(existing.HostID)
+			if hostErr == nil && host.Status == "ready" && time.Since(host.LastHeartbeat) < 60*time.Second {
+				allocatedResp = &AllocateRunnerResponse{
+					RunnerID:    existing.ID,
+					HostID:      existing.HostID,
+					HostAddress: host.HTTPAddress,
+					InternalIP:  existing.InternalIP,
+					SessionID:   req.SessionID,
+					Attached:    true,
+				}
+				return allocatedResp, nil
+			}
+		}
+	}
 
 	// Derive repo slug for multi-repo support
 	workloadKey := req.WorkloadKey
@@ -815,6 +839,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 				HostID:              h.ID,
 				InternalIP:          resp.Runner.InternalIp,
 				Status:              "busy",
+				SessionID:           resp.GetSessionId(),
 				WorkloadKey:         workloadKey,
 				RunnerTTLSeconds:    runnerTTLSeconds,
 				AutoPause:           autoPause,
@@ -824,6 +849,30 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 				ReservedMemoryMB:    tier.MemoryMB,
 			}); err != nil {
 				s.logger.WithError(err).Warn("Failed to register runner in control plane registry")
+			}
+		}
+		if resp.GetSessionId() != "" && s.db != nil {
+			var networkPolicy any
+			if effectiveNPJSON != "" {
+				networkPolicy = effectiveNPJSON
+			}
+			if _, dbErr := s.db.ExecContext(ctx, `
+				INSERT INTO session_snapshots (
+					session_id, runner_id, workload_key, host_id, status, layer_count,
+					runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
+				)
+				VALUES ($1, $2, $3, $4, 'active', 0, $5, $6, $7, $8)
+				ON CONFLICT (session_id) DO UPDATE SET
+					runner_id = EXCLUDED.runner_id,
+					workload_key = EXCLUDED.workload_key,
+					host_id = EXCLUDED.host_id,
+					status = 'active',
+					runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
+					auto_pause = EXCLUDED.auto_pause,
+					network_policy_preset = EXCLUDED.network_policy_preset,
+					network_policy = EXCLUDED.network_policy
+			`, resp.GetSessionId(), resp.Runner.GetId(), workloadKey, h.ID, runnerTTLSeconds, autoPause, effectiveNPPreset, networkPolicy); dbErr != nil {
+				s.logger.WithError(dbErr).WithField("session_id", resp.GetSessionId()).Warn("Failed to upsert active session row")
 			}
 		}
 		s.hostRegistry.releasePendingReservation(h.ID, effectiveCPU, effectiveMemoryMB)

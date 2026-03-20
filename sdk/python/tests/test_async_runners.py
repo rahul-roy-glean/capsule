@@ -118,6 +118,61 @@ class TestAsyncRunners:
 
         asyncio.run(run())
 
+    def test_connect_by_session_id(self, runners: AsyncRunners, http_client: AsyncHttpClient) -> None:
+        resp_data = {
+            "status": "connected",
+            "runner_id": "r-1",
+            "host_address": "10.0.0.2:8080",
+            "session_id": "s-1",
+        }
+        mock_resp = httpx.Response(200, json=resp_data)
+
+        async def run() -> None:
+            with patch.object(http_client._client, "request", AsyncMock(return_value=mock_resp)) as request:
+                result = await runners.connect(session_id="s-1")
+            assert result.session_id == "s-1"
+            assert request.await_args.kwargs["json"] == {"session_id": "s-1"}
+
+        asyncio.run(run())
+
+    def test_attach_session(self, runners: AsyncRunners, http_client: AsyncHttpClient) -> None:
+        resp_data = {
+            "status": "connected",
+            "runner_id": "r-77",
+            "host_address": "10.0.0.9:8080",
+            "session_id": "s-77",
+        }
+        mock_resp = httpx.Response(200, json=resp_data)
+
+        async def run() -> None:
+            with patch.object(http_client._client, "request", AsyncMock(return_value=mock_resp)):
+                session = await runners.attach_session("s-77")
+            assert session.runner_id == "r-77"
+            assert session.session_id == "s-77"
+
+        asyncio.run(run())
+
+    def test_fork(self, runners: AsyncRunners, http_client: AsyncHttpClient) -> None:
+        resp_data = {
+            "runner_id": "r-fork",
+            "host_id": "h-1",
+            "host_address": "10.0.0.5:8080",
+            "session_id": "s-fork",
+            "parent_session_id": "s-1",
+            "source_runner_id": "r-1",
+        }
+        mock_resp = httpx.Response(201, json=resp_data)
+
+        async def run() -> None:
+            with patch.object(http_client._client, "request", AsyncMock(return_value=mock_resp)) as request:
+                result = await runners.fork("r-1")
+            assert result.runner_id == "r-fork"
+            assert result.session_id == "s-fork"
+            assert runners._host_cache["r-fork"] == "10.0.0.5:8080"
+            assert request.await_args.args[1] == "/api/v1/sessions/fork"
+
+        asyncio.run(run())
+
     def test_wait_ready_raises_on_terminal_status(self, runners: AsyncRunners) -> None:
         async def run() -> None:
             terminal = RunnerStatus(runner_id="r-1", status="terminated")

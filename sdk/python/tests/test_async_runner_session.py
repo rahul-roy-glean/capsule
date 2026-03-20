@@ -4,7 +4,7 @@ import asyncio
 from unittest.mock import AsyncMock
 
 from capsule_sdk.async_runner_session import AsyncRunnerSession
-from capsule_sdk.models.runner import ConnectResult, ExecEvent, ExecResult, PauseResult
+from capsule_sdk.models.runner import ConnectResult, ExecEvent, ExecResult, ForkSessionResponse, PauseResult
 from capsule_sdk.resources.async_runners import AsyncRunners
 
 
@@ -57,6 +57,24 @@ class TestAsyncRunnerSession:
             resumed = await session.resume()
             assert resumed.status == "resumed"
             assert session.runner_id == "r-2"
+
+        asyncio.run(run())
+
+    def test_fork(self) -> None:
+        runners = AsyncMock(spec=AsyncRunners)
+        runners.set_host_cache = lambda *_: None  # type: ignore[method-assign]
+        runners.fork.return_value = ForkSessionResponse(
+            runner_id="r-fork",
+            host_address="10.0.0.9:8080",
+            session_id="s-fork",
+        )
+        session = AsyncRunnerSession(runners, "r-1")
+
+        async def run() -> None:
+            forked = await session.fork()
+            runners.fork.assert_awaited_once_with("r-1")
+            assert forked.runner_id == "r-fork"
+            assert forked.session_id == "s-fork"
 
         asyncio.run(run())
 

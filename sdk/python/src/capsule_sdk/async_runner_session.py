@@ -80,6 +80,15 @@ class AsyncRunnerSession:
             self._runner_id = result.runner_id
         return result
 
+    async def fork(self) -> AsyncRunnerSession:
+        result = await self._runners.fork(self._runner_id)
+        return AsyncRunnerSession(
+            self._runners,
+            result.runner_id,
+            host_address=result.host_address,
+            session_id=result.session_id,
+        )
+
     async def release(self) -> bool:
         if self._released:
             return True

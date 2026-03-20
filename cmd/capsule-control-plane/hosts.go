@@ -47,6 +47,7 @@ type Host struct {
 type HostRunnerInfo struct {
 	RunnerID    string
 	State       string
+	SessionID   string
 	WorkloadKey string
 	IdleSince   time.Time // zero if not idle or never executed
 }
@@ -57,6 +58,7 @@ type Runner struct {
 	HostID              string
 	Status              string
 	InternalIP          string
+	SessionID           string
 	JobID               string
 	WorkloadKey         string
 	RunnerTTLSeconds    int
@@ -376,20 +378,21 @@ func (hr *HostRegistry) AddRunner(ctx context.Context, runner *Runner) error {
 
 	if hr.db != nil {
 		_, err := hr.db.ExecContext(ctx, `
-			INSERT INTO runners (id, host_id, status, internal_ip, job_id, workload_key,
+			INSERT INTO runners (id, host_id, status, internal_ip, session_id, job_id, workload_key,
 				runner_ttl_seconds, auto_pause, network_policy_preset, network_policy)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 			ON CONFLICT (id) DO UPDATE SET
 				host_id = EXCLUDED.host_id,
 				status = EXCLUDED.status,
 				internal_ip = EXCLUDED.internal_ip,
+				session_id = EXCLUDED.session_id,
 				job_id = EXCLUDED.job_id,
 				workload_key = EXCLUDED.workload_key,
 				runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
 				auto_pause = EXCLUDED.auto_pause,
 				network_policy_preset = EXCLUDED.network_policy_preset,
 				network_policy = EXCLUDED.network_policy
-		`, runner.ID, runner.HostID, runner.Status, runner.InternalIP, runner.JobID, runner.WorkloadKey,
+		`, runner.ID, runner.HostID, runner.Status, runner.InternalIP, runner.SessionID, runner.JobID, runner.WorkloadKey,
 			runner.RunnerTTLSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy)
 		if err != nil {
 			return err
@@ -410,6 +413,36 @@ func (hr *HostRegistry) GetRunner(runnerID string) (*Runner, error) {
 		return nil, fmt.Errorf("runner not found: %s", runnerID)
 	}
 	return runner, nil
+}
+
+// FindRunnerBySessionID returns the live runner bound to a session, if any.
+func (hr *HostRegistry) FindRunnerBySessionID(sessionID string) (*Runner, error) {
+	hr.mu.RLock()
+	defer hr.mu.RUnlock()
+
+	for _, runner := range hr.runners {
+		if runner.SessionID == sessionID {
+			return runner, nil
+		}
+	}
+	for _, host := range hr.hosts {
+		for _, info := range host.RunnerInfos {
+			if info.SessionID != sessionID {
+				continue
+			}
+			if runner, ok := hr.runners[info.RunnerID]; ok {
+				return runner, nil
+			}
+			return &Runner{
+				ID:          info.RunnerID,
+				HostID:      host.ID,
+				Status:      info.State,
+				SessionID:   info.SessionID,
+				WorkloadKey: info.WorkloadKey,
+			}, nil
+		}
+	}
+	return nil, fmt.Errorf("runner not found for session: %s", sessionID)
 }
 
 // RemoveRunner removes a runner from the registry

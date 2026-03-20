@@ -83,6 +83,7 @@ type Runner struct {
 type RunnerHeartbeatInfo struct {
 	RunnerID    string `json:"runner_id"`
 	State       State  `json:"state"`
+	SessionID   string `json:"session_id,omitempty"`
 	WorkloadKey string `json:"workload_key"`
 	IdleSince   string `json:"idle_since,omitempty"` // RFC3339; set when idle and LastExecAt is non-zero
 }
@@ -116,6 +117,7 @@ type MMDSData struct {
 	Latest struct {
 		Meta struct {
 			RunnerID     string            `json:"runner_id"`
+			SessionID    string            `json:"session_id,omitempty"`
 			HostID       string            `json:"host_id"`
 			InstanceName string            `json:"instance_name,omitempty"`
 			Environment  string            `json:"environment"`

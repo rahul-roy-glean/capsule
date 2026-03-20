@@ -140,6 +140,49 @@ class TestRunners:
         assert result.host_address == "10.0.0.2:8080"
         assert runners._host_cache["r-1"] == "10.0.0.2:8080"
 
+    def test_connect_by_session_id(self, runners: Runners, http_client: HttpClient) -> None:
+        resp_data = {
+            "status": "connected",
+            "runner_id": "r-1",
+            "host_address": "10.0.0.2:8080",
+            "session_id": "s-1",
+        }
+        mock_resp = httpx.Response(200, json=resp_data)
+        with patch.object(http_client._client, "request", return_value=mock_resp) as request:
+            result = runners.connect(session_id="s-1")
+        assert result.session_id == "s-1"
+        assert request.call_args.kwargs["json"] == {"session_id": "s-1"}
+
+    def test_attach_session(self, runners: Runners, http_client: HttpClient) -> None:
+        resp_data = {
+            "status": "connected",
+            "runner_id": "r-77",
+            "host_address": "10.0.0.9:8080",
+            "session_id": "s-77",
+        }
+        mock_resp = httpx.Response(200, json=resp_data)
+        with patch.object(http_client._client, "request", return_value=mock_resp):
+            session = runners.attach_session("s-77")
+        assert session.runner_id == "r-77"
+        assert session.session_id == "s-77"
+
+    def test_fork(self, runners: Runners, http_client: HttpClient) -> None:
+        resp_data = {
+            "runner_id": "r-fork",
+            "host_id": "h-1",
+            "host_address": "10.0.0.5:8080",
+            "session_id": "s-fork",
+            "parent_session_id": "s-1",
+            "source_runner_id": "r-1",
+        }
+        mock_resp = httpx.Response(201, json=resp_data)
+        with patch.object(http_client._client, "request", return_value=mock_resp) as request:
+            result = runners.fork("r-1")
+        assert result.runner_id == "r-fork"
+        assert result.session_id == "s-fork"
+        assert runners._host_cache["r-fork"] == "10.0.0.5:8080"
+        assert request.call_args.args[1] == "/api/v1/sessions/fork"
+
     def test_resolve_host_uses_cache(self, runners: Runners) -> None:
         runners._host_cache["r-1"] = "cached-host:8080"
         host = runners._resolve_host("r-1")

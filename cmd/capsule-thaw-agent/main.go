@@ -155,6 +155,7 @@ type MMDSData struct {
 	Latest struct {
 		Meta struct {
 			RunnerID     string `json:"runner_id"`
+			SessionID    string `json:"session_id,omitempty"`
 			HostID       string `json:"host_id"`
 			InstanceName string `json:"instance_name,omitempty"`
 			Environment  string `json:"environment"`
@@ -703,6 +704,7 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 			var inner struct {
 				Meta struct {
 					RunnerID     string `json:"runner_id"`
+					SessionID    string `json:"session_id,omitempty"`
 					HostID       string `json:"host_id"`
 					InstanceName string `json:"instance_name,omitempty"`
 					Environment  string `json:"environment"`

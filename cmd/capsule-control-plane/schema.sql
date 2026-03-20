@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS runners (
     host_id UUID REFERENCES hosts(id) ON DELETE CASCADE,
     status VARCHAR(32) DEFAULT 'pending' CHECK (status IN ('pending', 'booting', 'initializing', 'idle', 'busy', 'draining', 'quarantined', 'retiring', 'terminated')),
     internal_ip VARCHAR(45),
+    session_id VARCHAR(255),
     job_id VARCHAR(255),
     workload_key VARCHAR(16),
     runner_ttl_seconds INT DEFAULT 0,
@@ -70,6 +71,9 @@ CREATE TABLE IF NOT EXISTS version_assignments (
 -- Session snapshots: tracks session pause/resume state
 CREATE TABLE IF NOT EXISTS session_snapshots (
     session_id VARCHAR(255) PRIMARY KEY,
+    parent_session_id VARCHAR(255),
+    forked_from_runner_id VARCHAR(255),
+    forked_at TIMESTAMP WITH TIME ZONE,
     workload_key VARCHAR(16) NOT NULL,
     host_id VARCHAR(255) NOT NULL,
     runner_id VARCHAR(255) NOT NULL,
@@ -193,6 +197,7 @@ CREATE INDEX IF NOT EXISTS idx_hosts_instance_name ON hosts(instance_name);
 
 CREATE INDEX IF NOT EXISTS idx_runners_host ON runners(host_id);
 CREATE INDEX IF NOT EXISTS idx_runners_status ON runners(status);
+CREATE INDEX IF NOT EXISTS idx_runners_session ON runners(session_id);
 CREATE INDEX IF NOT EXISTS idx_runners_job ON runners(job_id);
 
 CREATE INDEX IF NOT EXISTS idx_snapshots_status ON snapshots(status);
@@ -218,6 +223,7 @@ CREATE INDEX IF NOT EXISTS idx_layered_configs_leaf_wk ON layered_configs(leaf_w
 CREATE INDEX IF NOT EXISTS idx_layered_configs_leaf_hash ON layered_configs(leaf_layer_hash);
 
 CREATE INDEX IF NOT EXISTS idx_session_snapshots_workload ON session_snapshots(workload_key);
+CREATE INDEX IF NOT EXISTS idx_session_snapshots_parent ON session_snapshots(parent_session_id);
 
 CREATE INDEX IF NOT EXISTS idx_snapshot_tags_workload ON snapshot_tags(workload_key);
 

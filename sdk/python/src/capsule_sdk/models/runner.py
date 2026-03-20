@@ -63,6 +63,7 @@ class AllocateRunnerResponse(CapsuleModel):
     internal_ip: str | None = None
     session_id: str | None = None
     resumed: bool = False
+    attached: bool = False
     request_id: str | None = None
 
 
@@ -90,6 +91,21 @@ class ConnectResult(CapsuleModel):
     status: str
     runner_id: str
     host_address: str | None = None
+    session_id: str | None = None
+
+
+class ForkSessionResponse(CapsuleModel):
+    """Result of forking a live session into a new runner/session."""
+
+    runner_id: str
+    host_id: str | None = None
+    host_address: str | None = None
+    internal_ip: str | None = None
+    session_id: str
+    resumed: bool = True
+    attached: bool = False
+    parent_session_id: str | None = None
+    source_runner_id: str | None = None
 
 
 class RunnerListResponse(CapsuleModel):

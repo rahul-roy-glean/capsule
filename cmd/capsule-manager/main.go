@@ -1289,6 +1289,15 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger, lifecycleMet
 			return
 		}
 
+		// Handle /api/v1/runners/{id}/fork (checkpoint + fork session lineage)
+		if forkParts := strings.SplitN(suffix, "/fork", 2); len(forkParts) == 2 && forkParts[1] == "" {
+			runnerID := forkParts[0]
+			runnerID = strings.TrimSuffix(runnerID, "/")
+			setManagerRoute(w, "/api/v1/runners/:id/fork", "capsule_manager.runner_fork")
+			handleForkRunner(w, r, mgr, log, runnerID)
+			return
+		}
+
 		// Handle /api/v1/runners/{id}/connect (extend TTL or resume)
 		if connectParts := strings.SplitN(suffix, "/connect", 2); len(connectParts) == 2 && connectParts[1] == "" {
 			runnerID := connectParts[0]
@@ -1923,6 +1932,45 @@ func handleCheckpointRunner(w http.ResponseWriter, r *http.Request, mgr *runner.
 		"layer":               result.Layer,
 		"snapshot_size_bytes": result.SnapshotSizeBytes,
 		"running":             result.Running,
+	})
+}
+
+// handleForkRunner handles POST /api/v1/runners/{id}/fork.
+// It checkpoints the live runner and materializes a forkable session lineage.
+func handleForkRunner(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		SessionID string `json:"session_id"`
+		RunnerID  string `json:"runner_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.SessionID == "" || req.RunnerID == "" {
+		http.Error(w, "session_id and runner_id are required", http.StatusBadRequest)
+		return
+	}
+
+	meta, err := mgr.ForkRunnerSession(r.Context(), runnerID, req.SessionID, req.RunnerID)
+	if err != nil {
+		log.WithError(err).WithField("runner_id", runnerID).Error("Failed to fork runner session")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"session_id":        meta.SessionID,
+		"runner_id":         meta.RunnerID,
+		"source_session_id": meta.ParentSessionID,
+		"layer":             meta.Layers,
 	})
 }
 
