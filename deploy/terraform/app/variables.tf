@@ -85,13 +85,13 @@ variable "idle_runners_target" {
 variable "chunk_cache_size_gb" {
   description = "Size in GB of the on-disk LRU chunk cache for FUSE-backed disks"
   type        = number
-  default     = 2
+  default     = 0
 }
 
 variable "mem_cache_size_gb" {
   description = "Size in GB of the in-memory LRU chunk cache for UFFD page fault handling"
   type        = number
-  default     = 2
+  default     = 0
 }
 
 variable "host_log_level" {

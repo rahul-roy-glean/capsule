@@ -17,12 +17,14 @@ import (
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
+	"golang.org/x/sys/unix"
 
 	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
 	"github.com/rahul-roy-glean/capsule/pkg/firecracker"
 	"github.com/rahul-roy-glean/capsule/pkg/fuse"
 	"github.com/rahul-roy-glean/capsule/pkg/network"
 	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
+	"github.com/rahul-roy-glean/capsule/pkg/tiers"
 	"github.com/rahul-roy-glean/capsule/pkg/uffd"
 )
 
@@ -131,10 +133,33 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 
 	// Setup chunked snapshot infrastructure if enabled
 	if cfg.UseChunkedSnapshots {
+		// Compute auto cache size from host resources and expected runner capacity.
+		// We estimate max runners the host can support (CPU-limited, default tier),
+		// reserve RAM for those VMs + OS overhead, and split the remainder equally
+		// between disk and memory caches.
+		const osOverheadBytes = 4 * 1024 * 1024 * 1024 // 4GB for OS/kernel/system
+		autoCacheSize := int64(2 * 1024 * 1024 * 1024) // 2GB fallback
+		var sysinfo unix.Sysinfo_t
+		if err := unix.Sysinfo(&sysinfo); err == nil && sysinfo.Totalram > 0 {
+			totalRAM := int64(sysinfo.Totalram)
+			defaultTier := tiers.All[tiers.DefaultTier]
+			effectiveCPU := tiers.EffectiveCPUMillicores(defaultTier)
+			if cfg.HostConfig.TotalCPUMillicores > 0 && effectiveCPU > 0 {
+				maxRunners := int64(cfg.HostConfig.TotalCPUMillicores) / int64(effectiveCPU)
+				reservedForVMs := maxRunners * int64(defaultTier.MemoryMB) * 1024 * 1024
+				cacheable := totalRAM - reservedForVMs - osOverheadBytes
+				if cacheable > 0 {
+					autoCacheSize = cacheable / 2 // split between disk + mem caches
+				}
+			} else {
+				autoCacheSize = totalRAM / 8 // 12.5% fallback when CPU info unavailable
+			}
+		}
+
 		// Disk chunk store (FUSE rootfs + seed) — larger cache for sequential disk reads
 		diskCacheSize := cfg.ChunkCacheSizeBytes
 		if diskCacheSize <= 0 {
-			diskCacheSize = 8 * 1024 * 1024 * 1024 // 8GB default
+			diskCacheSize = autoCacheSize
 		}
 
 		chunkStore, err := snapshot.NewChunkStore(ctx, snapshot.ChunkStoreConfig{
@@ -157,7 +182,7 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 		// isolation is critical for latency.
 		memCacheSize := cfg.MemCacheSizeBytes
 		if memCacheSize <= 0 {
-			memCacheSize = 2 * 1024 * 1024 * 1024 // 2GB default
+			memCacheSize = autoCacheSize
 		}
 
 		memChunkStore, err := snapshot.NewChunkStore(ctx, snapshot.ChunkStoreConfig{

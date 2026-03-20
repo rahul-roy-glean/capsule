@@ -43,7 +43,6 @@ import (
 var (
 	grpcPort           = flag.Int("grpc-port", 50051, "gRPC server port")
 	httpPort           = flag.Int("http-port", 8080, "HTTP server port (health/metrics)")
-	idleTarget         = flag.Int("idle-target", 2, "Target number of idle runners")
 	firecrackerBin     = flag.String("firecracker-bin", "/usr/local/bin/firecracker", "Path to firecracker binary")
 	socketDir          = flag.String("socket-dir", "/var/run/firecracker", "Directory for VM sockets")
 	workspaceDir       = flag.String("workspace-dir", "/mnt/data/workspaces", "Directory for workspaces")
@@ -62,8 +61,8 @@ var (
 	gcpProject = flag.String("gcp-project", "", "GCP project")
 
 	// Chunked snapshot flags (BuildBuddy-style lazy loading)
-	chunkCacheSizeGB = flag.Int("chunk-cache-size-gb", 2, "Size in GB of disk chunk LRU cache (FUSE)")
-	memCacheSizeGB   = flag.Int("mem-cache-size-gb", 2, "Size in GB of memory chunk LRU cache (UFFD)")
+	chunkCacheSizeGB = flag.Int("chunk-cache-size-gb", 0, "Size in GB of disk chunk LRU cache (FUSE). 0 = 12.5% of host memory")
+	memCacheSizeGB   = flag.Int("mem-cache-size-gb", 0, "Size in GB of memory chunk LRU cache (UFFD). 0 = 12.5% of host memory")
 	memBackend       = flag.String("mem-backend", "chunked", "Memory restore backend: 'chunked' (UFFD lazy loading, default) or 'file' (download full snapshot.mem at startup). Overrides the backend recorded in snapshot metadata.")
 	gcsPrefix        = flag.String("gcs-prefix", "v1", "Top-level prefix for all GCS paths (e.g. 'v1'). Set to empty string to disable.")
 )
@@ -307,7 +306,6 @@ func main() {
 		HostID:            hostID,
 		InstanceName:      instanceName,
 		Zone:              zone,
-		IdleTarget:        *idleTarget,
 		FirecrackerBin:    *firecrackerBin,
 		SocketDir:         *socketDir,
 		WorkspaceDir:      *workspaceDir,
@@ -498,7 +496,7 @@ func main() {
 	}()
 
 	// Start autoscaler loop
-	go autoscaleLoop(ctx, mgr, chunkedMgr, *idleTarget, logger, autoscaleInstruments{
+	go autoscaleLoop(ctx, mgr, chunkedMgr, logger, autoscaleInstruments{
 		hostAttrs:       metric.WithAttributes(fcrotel.AttrHostID.String(instanceName)),
 		vmAllocCounter:  vmAllocCounter,
 		vmBootHist:      vmBootHist,
@@ -701,8 +699,7 @@ type autoscaleInstruments struct {
 	cacheHitRatio   metric.Float64Gauge
 }
 
-func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, idleTarget int, logger *logrus.Logger, instruments autoscaleInstruments) {
-	_ = idleTarget // reserved for future use
+func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, logger *logrus.Logger, instruments autoscaleInstruments) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 

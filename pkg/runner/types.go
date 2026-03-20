@@ -171,7 +171,6 @@ type HostConfig struct {
 	HostID            string
 	InstanceName      string
 	Zone              string
-	IdleTarget        int
 	FirecrackerBin    string
 	SocketDir         string
 	WorkspaceDir      string
