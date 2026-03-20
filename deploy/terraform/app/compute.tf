@@ -70,7 +70,6 @@ resource "google_compute_instance_template" "firecracker_host" {
     environment             = local.infra.environment
     control-plane           = local.control_plane_addr
     host-bootstrap-token    = var.host_bootstrap_token
-    idle-target             = var.idle_runners_target
     chunk-cache-size-gb     = var.chunk_cache_size_gb
     mem-cache-size-gb       = var.mem_cache_size_gb
     otel-collector-endpoint = local.otel_collector_addr
@@ -150,9 +149,7 @@ resource "google_compute_instance_template" "firecracker_host" {
 LOGROTATE
 
     # Get microVM configuration from metadata
-    IDLE_TARGET=$(curl -sf -H "Metadata-Flavor: Google" \
-      http://metadata.google.internal/computeMetadata/v1/instance/attributes/idle-target || echo "2")
-    CONTROL_PLANE=$(curl -sf -H "Metadata-Flavor: Google" \
+    CONTROL_PLANE=$(curl -sf -H "Metadata-Flavor: Google"\
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/control-plane || echo "")
     HOST_BOOTSTRAP_TOKEN=$(curl -sf -H "Metadata-Flavor: Google" \
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/host-bootstrap-token || echo "")
@@ -194,7 +191,6 @@ SERVICE
       http://metadata.google.internal/computeMetadata/v1/instance/attributes/log-level || echo "info")
     EXEC_START="/usr/local/bin/capsule-manager"
     EXEC_START="$EXEC_START --log-level=$LOG_LEVEL"
-    EXEC_START="$EXEC_START --idle-target=$IDLE_TARGET"
     EXEC_START="$EXEC_START --snapshot-cache=/mnt/data/snapshots"
     EXEC_START="$EXEC_START --workspace-dir=/mnt/data/workspaces"
 
@@ -236,7 +232,7 @@ $([ -n "$ENV_LINES" ] && echo -e "$ENV_LINES")
 OVERRIDE
 
     # Reload and restart capsule-manager service with new config
-    echo "Starting capsule-manager with: idle-target=$IDLE_TARGET, chunk-cache-gb=$CHUNK_CACHE_SIZE_GB, mem-cache-gb=$MEM_CACHE_SIZE_GB"
+    echo "Starting capsule-manager with: chunk-cache-gb=$CHUNK_CACHE_SIZE_GB, mem-cache-gb=$MEM_CACHE_SIZE_GB"
     systemctl daemon-reload
     systemctl enable capsule-manager
     systemctl restart capsule-manager
