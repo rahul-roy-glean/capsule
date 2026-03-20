@@ -91,11 +91,11 @@ func (p *githubAppProvider) InjectCredentials(req *http.Request) error {
 
 	isAPI := strings.Contains(host, "api.github.com")
 
-	if isAPI {
-	} else {
-		if len(p.repos) > 0 && !p.matchesRepo(req) {
-			return nil
-		}
+	// Repo-level isolation: block credential injection for requests targeting
+	// repos not in the configured allow list. Applies to both github.com and
+	// api.github.com so that API calls cannot escape the repo boundary.
+	if len(p.repos) > 0 && !p.matchesRepo(req) {
+		return nil
 	}
 
 	token, err := p.getToken()
