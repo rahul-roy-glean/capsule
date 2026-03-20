@@ -150,6 +150,10 @@ type SymlinkState struct {
 
 var globalSymlinkState = &SymlinkState{}
 
+var runIPRouteCommand = func(args ...string) error {
+	return exec.Command("ip", args...).Run()
+}
+
 // MMDSData represents the data structure from MMDS
 type MMDSData struct {
 	Latest struct {
@@ -934,27 +938,11 @@ func configureNetwork(data *MMDSData) error {
 			}
 		}
 
-		// Check default route via /proc/net/route (no ip command needed)
-		// Format: Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
-		// Default route has Destination=00000000
 		if net.Gateway != "" {
 			routeData, routeErr := os.ReadFile("/proc/net/route")
 			log.WithFields(logrus.Fields{"routes": string(routeData), "err": routeErr}).Info("configureNetwork: /proc/net/route")
-			hasDefaultRoute := false
-			if routeErr == nil {
-				for _, line := range strings.Split(string(routeData), "\n") {
-					fields := strings.Fields(line)
-					if len(fields) >= 3 && fields[1] == "00000000" {
-						hasDefaultRoute = true
-						break
-					}
-				}
-			}
-			if hasDefaultRoute {
-				log.Info("configureNetwork: default route already exists")
-			} else {
-				log.WithField("gateway", net.Gateway).Warn("configureNetwork: no default route found, trying to add via ip command")
-				exec.Command("ip", "route", "add", "default", "via", net.Gateway).Run()
+			if err := ensureDefaultRoute(iface, net.Gateway); err != nil {
+				return err
 			}
 		} else {
 			log.Warn("configureNetwork: no gateway in MMDS data!")
@@ -1014,11 +1002,11 @@ func configureNetwork(data *MMDSData) error {
 		return fmt.Errorf("failed to bring interface up: %w", err)
 	}
 
-	// Add default route
+	// Normalize the default route even on first boot so later resume paths only
+	// have one place to keep route repair behavior aligned.
 	if net.Gateway != "" {
-		exec.Command("ip", "route", "del", "default").Run()
-		if err := exec.Command("ip", "route", "add", "default", "via", net.Gateway).Run(); err != nil {
-			return fmt.Errorf("failed to add default route: %w", err)
+		if err := ensureDefaultRoute(iface, net.Gateway); err != nil {
+			return err
 		}
 	}
 
@@ -1038,6 +1026,24 @@ func configureNetwork(data *MMDSData) error {
 		"mac":       net.MAC,
 	}).Info("Network configured")
 
+	return nil
+}
+
+func ensureDefaultRoute(iface, gateway string) error {
+	if gateway == "" {
+		return nil
+	}
+
+	// Snapshot restore can leave the interface IP intact while the default route
+	// is missing or points at the old slot's gateway. Always replace it with the
+	// MMDS-provided route so host-proxied traffic can return through the new TAP.
+	if err := runIPRouteCommand("route", "replace", "default", "via", gateway, "dev", iface); err != nil {
+		return fmt.Errorf("failed to ensure default route via %s on %s: %w", gateway, iface, err)
+	}
+	log.WithFields(logrus.Fields{
+		"iface":   iface,
+		"gateway": gateway,
+	}).Info("configureNetwork: ensured default route")
 	return nil
 }
 

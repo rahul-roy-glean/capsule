@@ -186,6 +186,10 @@ message AllocateRunnerRequest {
   string snapshot_tag = 16;       // optional: named tag to resolve snapshot version
   string network_policy_preset = 17; // optional: named preset (e.g., "restricted-egress", "agent-sandbox")
   string network_policy_json = 18;   // optional: full NetworkPolicy as JSON (overrides preset)
+  int32 checkpoint_interval_seconds = 19;     // periodic checkpoint cadence for long-lived sessions (0 = disabled)
+  int32 checkpoint_quiet_window_seconds = 20; // minimum quiet time before periodic checkpoints
+  string resume_manifest_path = 21;           // authoritative session head manifest for cross-host resume
+  int32 session_generation = 22;              // authoritative session generation for cross-host resume
 }
 
 // AllocateRunnerResponse
@@ -318,6 +322,8 @@ message PauseRunnerResponse {
   string session_id = 3;
   int64 snapshot_size_bytes = 4;
   int32 layer = 5;
+  int32 generation = 6;
+  string manifest_path = 7;
 }
 
 message ResumeRunnerRequest {
@@ -327,6 +333,10 @@ message ResumeRunnerRequest {
   bool auto_pause = 4;
   string network_policy_preset = 5;
   string network_policy_json = 6;
+  string manifest_path = 7;
+  int32 generation = 8;
+  int32 checkpoint_interval_seconds = 9;
+  int32 checkpoint_quiet_window_seconds = 10;
 }
 
 message ResumeRunnerResponse {

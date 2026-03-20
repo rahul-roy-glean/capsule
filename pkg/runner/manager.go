@@ -105,6 +105,9 @@ type Manager struct {
 	// registered in m.runners. Prevents two concurrent ResumeFromSession calls
 	// for the same session from both passing the uniqueness check.
 	pendingSessions map[string]string // sessionID → runnerID
+	// Test seams for session resume networking/readiness behavior.
+	forwardPortFn      func(runnerID string, port int) error
+	waitForExecReadyFn func(ctx context.Context, ip string, timeout time.Duration) error
 }
 
 type QuarantineOptions struct {

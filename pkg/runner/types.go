@@ -69,13 +69,20 @@ type Runner struct {
 	PausedAt time.Time `json:"paused_at,omitempty"`
 
 	// Session pause/resume fields
-	SessionID     string    `json:"session_id,omitempty"`
-	TTLSeconds    int       `json:"ttl_seconds,omitempty"`
-	AutoPause     bool      `json:"auto_pause,omitempty"`
-	LastExecAt    time.Time `json:"last_exec_at,omitempty"`
-	ActiveExecs   int32     `json:"active_execs,omitempty"`
-	SessionDir    string    `json:"session_dir,omitempty"`
-	SessionLayers int       `json:"session_layers,omitempty"`
+	SessionID                    string    `json:"session_id,omitempty"`
+	TTLSeconds                   int       `json:"ttl_seconds,omitempty"`
+	AutoPause                    bool      `json:"auto_pause,omitempty"`
+	LastExecAt                   time.Time `json:"last_exec_at,omitempty"`
+	LastActivityAt               time.Time `json:"last_activity_at,omitempty"`
+	ActiveExecs                  int32     `json:"active_execs,omitempty"`
+	ActiveProxyStreams           int32     `json:"active_proxy_streams,omitempty"`
+	SessionDir                   string    `json:"session_dir,omitempty"`
+	SessionLayers                int       `json:"session_layers,omitempty"`
+	SessionManifestPath          string    `json:"session_manifest_path,omitempty"`
+	LastCheckpointAt             time.Time `json:"last_checkpoint_at,omitempty"`
+	CheckpointIntervalSeconds    int       `json:"checkpoint_interval_seconds,omitempty"`
+	CheckpointQuietWindowSeconds int       `json:"checkpoint_quiet_window_seconds,omitempty"`
+	CheckpointInFlight           bool      `json:"checkpoint_in_flight,omitempty"`
 }
 
 // RunnerHeartbeatInfo is a lightweight per-runner status included in host
@@ -96,19 +103,23 @@ type Resources struct {
 
 // AllocateRequest represents a request to allocate a runner
 type AllocateRequest struct {
-	RequestID           string
-	WorkloadKey         string // Workload key identifying which snapshot to use for this runner
-	SnapshotVersion     string // Explicit snapshot version; skips current-pointer.json lookup when set
-	Resources           Resources
-	Labels              map[string]string
-	StartCommand        *snapshot.StartCommand // Optional: user service to start inside the VM
-	SessionID           string                 // optional: bind to session for pause/resume
-	TTLSeconds          int                    // idle timeout from snapshot config
-	AutoPause           bool                   // pause on TTL vs destroy
-	SnapshotTag         string                 // optional: named tag to resolve snapshot version
-	NetworkPolicyPreset string                 // optional: named preset (e.g., "restricted-egress")
-	NetworkPolicy       *network.NetworkPolicy // optional: full policy override
-	AuthConfig          *authproxy.AuthConfig  // optional: auth proxy configuration
+	RequestID                    string
+	WorkloadKey                  string // Workload key identifying which snapshot to use for this runner
+	SnapshotVersion              string // Explicit snapshot version; skips current-pointer.json lookup when set
+	Resources                    Resources
+	Labels                       map[string]string
+	StartCommand                 *snapshot.StartCommand // Optional: user service to start inside the VM
+	SessionID                    string                 // optional: bind to session for pause/resume
+	TTLSeconds                   int                    // idle timeout from snapshot config
+	AutoPause                    bool                   // pause on TTL vs destroy
+	CheckpointIntervalSeconds    int                    // periodic checkpoint cadence (0 = disabled)
+	CheckpointQuietWindowSeconds int                    // required quiet window before periodic checkpoint
+	ResumeManifestPath           string                 // authoritative session head manifest for resume
+	SessionGeneration            int                    // authoritative session generation for resume
+	SnapshotTag                  string                 // optional: named tag to resolve snapshot version
+	NetworkPolicyPreset          string                 // optional: named preset (e.g., "restricted-egress")
+	NetworkPolicy                *network.NetworkPolicy // optional: full policy override
+	AuthConfig                   *authproxy.AuthConfig  // optional: auth proxy configuration
 }
 
 // MMDSData represents data to inject into the microVM via MMDS

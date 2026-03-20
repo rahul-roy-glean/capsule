@@ -31,6 +31,7 @@ from capsule_sdk.models.file import (
 from capsule_sdk.models.layered_config import CreateConfigResponse, LayeredConfigDetail, StoredLayeredConfig
 from capsule_sdk.models.runner import (
     AllocateRunnerResponse,
+    CheckpointResult,
     ConnectResult,
     ExecEvent,
     PauseResult,
@@ -188,6 +189,10 @@ class Runners:
     def pause(self, runner_id: str) -> PauseResult:
         data = self._http.post("/api/v1/runners/pause", json_body={"runner_id": runner_id})
         return PauseResult.model_validate(data)
+
+    def checkpoint(self, runner_id: str) -> CheckpointResult:
+        data = self._http.post("/api/v1/runners/checkpoint", json_body={"runner_id": runner_id})
+        return CheckpointResult.model_validate(data)
 
     def connect(self, runner_id: str) -> ConnectResult:
         data = self._http.post("/api/v1/runners/connect", json_body={"runner_id": runner_id})
@@ -357,7 +362,7 @@ class Runners:
             | ResolvedWorkloadRef
         ),
         *,
-        tag: str = "stable",
+        tag: str = "",
         request_id: str | None = None,
         labels: dict[str, str] | None = None,
         session_id: str | None = None,

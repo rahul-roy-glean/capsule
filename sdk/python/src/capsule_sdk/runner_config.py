@@ -41,6 +41,8 @@ class RunnerConfig:
     _tier: str | None = field(default=None, repr=False)
     _auto_rollout: bool | None = field(default=None, repr=False)
     _session_max_age_seconds: int | None = field(default=None, repr=False)
+    _checkpoint_interval_seconds: int | None = field(default=None, repr=False)
+    _checkpoint_quiet_window_seconds: int | None = field(default=None, repr=False)
     _rootfs_size_gb: int | None = field(default=None, repr=False)
     _runner_user: str | None = field(default=None, repr=False)
     _workspace_size_gb: int | None = field(default=None, repr=False)
@@ -80,6 +82,12 @@ class RunnerConfig:
 
     def with_session_max_age(self, seconds: int) -> RunnerConfig:
         return replace(self, _session_max_age_seconds=seconds)
+
+    def with_checkpoint_interval(self, seconds: int) -> RunnerConfig:
+        return replace(self, _checkpoint_interval_seconds=seconds)
+
+    def with_checkpoint_quiet_window(self, seconds: int) -> RunnerConfig:
+        return replace(self, _checkpoint_quiet_window_seconds=seconds)
 
     def with_rootfs_size_gb(self, size_gb: int) -> RunnerConfig:
         return replace(self, _rootfs_size_gb=size_gb)
@@ -131,6 +139,10 @@ class RunnerConfig:
             config["auto_rollout"] = self._auto_rollout
         if self._session_max_age_seconds is not None:
             config["session_max_age_seconds"] = self._session_max_age_seconds
+        if self._checkpoint_interval_seconds is not None:
+            config["checkpoint_interval_seconds"] = self._checkpoint_interval_seconds
+        if self._checkpoint_quiet_window_seconds is not None:
+            config["checkpoint_quiet_window_seconds"] = self._checkpoint_quiet_window_seconds
         if self._rootfs_size_gb is not None:
             config["rootfs_size_gb"] = self._rootfs_size_gb
         if self._runner_user is not None:

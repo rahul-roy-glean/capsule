@@ -346,10 +346,14 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	var tierName string
 	var startCmd *snapshot.StartCommand
 	var runnerTTLSeconds int
+	var checkpointIntervalSeconds int
+	var checkpointQuietWindowSeconds int
 	var autoPause bool
 	var configNetworkPolicyPreset string
 	var configNetworkPolicyJSON string
 	var resumeFromSessionConfig bool
+	var resumeManifestPath string
+	var sessionGeneration int
 	var authConfigJSON string
 	if workloadKey != "" {
 		var wc *WorkloadConfig
@@ -360,6 +364,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			tierName = wc.Tier
 			startCmd = wc.StartCommand
 			runnerTTLSeconds = wc.RunnerTTLSeconds
+			checkpointIntervalSeconds = wc.CheckpointIntervalSeconds
+			checkpointQuietWindowSeconds = wc.CheckpointQuietWindowSeconds
 			autoPause = wc.AutoPause
 			configNetworkPolicyPreset = wc.NetworkPolicyPreset
 			configNetworkPolicyJSON = wc.NetworkPolicyJSON
@@ -380,20 +386,22 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			var startCommandJSON sql.NullString
 			var tierCol sql.NullString
 			var ttlCol sql.NullInt64
+			var checkpointIntervalCol sql.NullInt64
+			var checkpointQuietWindowCol sql.NullInt64
 			var autoPauseCol sql.NullBool
 			var npPreset sql.NullString
 			var npJSON sql.NullString
 			var configJSON sql.NullString
 
-			err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, start_command, tier, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, config_json FROM layered_configs WHERE leaf_workload_key = $1 ORDER BY created_at DESC LIMIT 1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON, &configJSON)
+			err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, start_command, tier, runner_ttl_seconds, checkpoint_interval_seconds, checkpoint_quiet_window_seconds, auto_pause, network_policy_preset, network_policy, config_json FROM layered_configs WHERE leaf_workload_key = $1 ORDER BY created_at DESC LIMIT 1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &checkpointIntervalCol, &checkpointQuietWindowCol, &autoPauseCol, &npPreset, &npJSON, &configJSON)
 			if err != nil {
 				// Fallback: workload_key may be from a previous config version (draining).
 				err = s.db.QueryRowContext(ctx, `
-					SELECT lc.max_concurrent_runners, lc.start_command, lc.tier, lc.runner_ttl_seconds, lc.auto_pause, lc.network_policy_preset, lc.network_policy, lc.config_json
+					SELECT lc.max_concurrent_runners, lc.start_command, lc.tier, lc.runner_ttl_seconds, lc.checkpoint_interval_seconds, lc.checkpoint_quiet_window_seconds, lc.auto_pause, lc.network_policy_preset, lc.network_policy, lc.config_json
 					FROM config_workload_keys cwk
 					JOIN layered_configs lc ON lc.config_id = cwk.config_id
 					WHERE cwk.leaf_workload_key = $1
-					ORDER BY lc.created_at DESC LIMIT 1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON, &configJSON)
+					ORDER BY lc.created_at DESC LIMIT 1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &checkpointIntervalCol, &checkpointQuietWindowCol, &autoPauseCol, &npPreset, &npJSON, &configJSON)
 			}
 			if err == nil {
 				if tierCol.Valid && tierCol.String != "" {
@@ -418,6 +426,12 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 				}
 				if ttlCol.Valid {
 					runnerTTLSeconds = int(ttlCol.Int64)
+				}
+				if checkpointIntervalCol.Valid {
+					checkpointIntervalSeconds = int(checkpointIntervalCol.Int64)
+				}
+				if checkpointQuietWindowCol.Valid {
+					checkpointQuietWindowSeconds = int(checkpointQuietWindowCol.Int64)
 				}
 				if autoPauseCol.Valid {
 					autoPause = autoPauseCol.Bool
@@ -470,31 +484,18 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// mutable layered-config defaults by workload key.
 	var sessionHostID string
 	if req.SessionID != "" && s.db != nil {
-		var status string
-		var sessionTTL sql.NullInt64
-		var sessionAutoPause sql.NullBool
-		var sessionNPPreset sql.NullString
-		var sessionNPJSON sql.NullString
-		err := s.db.QueryRowContext(ctx,
-			`SELECT host_id, status, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
-			 FROM session_snapshots WHERE session_id = $1`,
-			req.SessionID).Scan(&sessionHostID, &status, &sessionTTL, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON)
-		if err == nil && status == "suspended" && sessionHostID != "" {
+		head, err := getSessionHeadBySessionID(ctx, s.db, req.SessionID)
+		if err == nil && (head.Status == "suspended" || head.Status == "active_checkpointed") && head.CurrentHostID != "" {
+			sessionHostID = head.CurrentHostID
 			resumeFromSessionConfig = true
-			if sessionTTL.Valid {
-				runnerTTLSeconds = int(sessionTTL.Int64)
-			} else {
-				runnerTTLSeconds = 0
-			}
-			autoPause = sessionAutoPause.Valid && sessionAutoPause.Bool
-			configNetworkPolicyPreset = ""
-			if sessionNPPreset.Valid {
-				configNetworkPolicyPreset = sessionNPPreset.String
-			}
-			configNetworkPolicyJSON = ""
-			if sessionNPJSON.Valid {
-				configNetworkPolicyJSON = sessionNPJSON.String
-			}
+			runnerTTLSeconds = head.RunnerTTLSeconds
+			autoPause = head.AutoPause
+			configNetworkPolicyPreset = head.NetworkPolicyPreset
+			configNetworkPolicyJSON = head.NetworkPolicyJSON
+			checkpointIntervalSeconds = head.CheckpointIntervalSeconds
+			checkpointQuietWindowSeconds = head.CheckpointQuietWindowSeconds
+			resumeManifestPath = head.LatestManifestPath
+			sessionGeneration = head.LatestGeneration
 		}
 	}
 
@@ -638,12 +639,16 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		}
 	}
 	protoReq := &pb.AllocateRunnerRequest{
-		RequestId:   req.RequestID,
-		Labels:      req.Labels,
-		WorkloadKey: workloadKey,
-		SessionId:   req.SessionID,
-		TtlSeconds:  int32(runnerTTLSeconds),
-		AutoPause:   autoPause,
+		RequestId:                    req.RequestID,
+		Labels:                       req.Labels,
+		WorkloadKey:                  workloadKey,
+		SessionId:                    req.SessionID,
+		TtlSeconds:                   int32(runnerTTLSeconds),
+		AutoPause:                    autoPause,
+		CheckpointIntervalSeconds:    int32(checkpointIntervalSeconds),
+		CheckpointQuietWindowSeconds: int32(checkpointQuietWindowSeconds),
+		ResumeManifestPath:           resumeManifestPath,
+		SessionGeneration:            int32(sessionGeneration),
 	}
 	if effectiveNPPreset != "" || effectiveNPJSON != "" {
 		if protoReq.Labels == nil {
@@ -811,17 +816,19 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		// Success — register runner and return
 		if resp.Runner != nil {
 			if err := s.hostRegistry.AddRunner(ctx, &Runner{
-				ID:                  resp.Runner.Id,
-				HostID:              h.ID,
-				InternalIP:          resp.Runner.InternalIp,
-				Status:              "busy",
-				WorkloadKey:         workloadKey,
-				RunnerTTLSeconds:    runnerTTLSeconds,
-				AutoPause:           autoPause,
-				NetworkPolicyPreset: effectiveNPPreset,
-				NetworkPolicyJSON:   effectiveNPJSON,
-				ReservedCPU:         effectiveCPU,
-				ReservedMemoryMB:    tier.MemoryMB,
+				ID:                           resp.Runner.Id,
+				HostID:                       h.ID,
+				InternalIP:                   resp.Runner.InternalIp,
+				Status:                       "busy",
+				WorkloadKey:                  workloadKey,
+				RunnerTTLSeconds:             runnerTTLSeconds,
+				AutoPause:                    autoPause,
+				CheckpointIntervalSeconds:    checkpointIntervalSeconds,
+				CheckpointQuietWindowSeconds: checkpointQuietWindowSeconds,
+				NetworkPolicyPreset:          effectiveNPPreset,
+				NetworkPolicyJSON:            effectiveNPJSON,
+				ReservedCPU:                  effectiveCPU,
+				ReservedMemoryMB:             tier.MemoryMB,
 			}); err != nil {
 				s.logger.WithError(err).Warn("Failed to register runner in control plane registry")
 			}
@@ -1014,10 +1021,13 @@ func (s *Scheduler) ReleaseRunner(ctx context.Context, runnerID string, destroy 
 		return err
 	}
 
-	// Clean up session_snapshots row so stale entries don't accumulate.
+	// Clean up session state rows so stale active entries don't accumulate.
 	if s.db != nil {
 		if _, dbErr := s.db.ExecContext(ctx, `DELETE FROM session_snapshots WHERE runner_id = $1`, runnerID); dbErr != nil {
 			s.logger.WithError(dbErr).WithField("runner_id", runnerID).Warn("Failed to clean up session_snapshots on release")
+		}
+		if _, dbErr := s.db.ExecContext(ctx, `DELETE FROM session_heads WHERE current_runner_id = $1 AND status IN ('active', 'active_checkpointed')`, runnerID); dbErr != nil {
+			s.logger.WithError(dbErr).WithField("runner_id", runnerID).Warn("Failed to clean up session_heads on release")
 		}
 	}
 

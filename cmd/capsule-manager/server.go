@@ -53,14 +53,18 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 	}
 
 	allocReq := runner.AllocateRequest{
-		RequestID:           req.RequestId,
-		Labels:              req.Labels,
-		WorkloadKey:         req.WorkloadKey,
-		SnapshotVersion:     req.SnapshotVersion,
-		SessionID:           req.SessionId,
-		TTLSeconds:          int(req.TtlSeconds),
-		AutoPause:           req.AutoPause,
-		NetworkPolicyPreset: req.NetworkPolicyPreset,
+		RequestID:                    req.RequestId,
+		Labels:                       req.Labels,
+		WorkloadKey:                  req.WorkloadKey,
+		SnapshotVersion:              req.SnapshotVersion,
+		SessionID:                    req.SessionId,
+		TTLSeconds:                   int(req.TtlSeconds),
+		AutoPause:                    req.AutoPause,
+		CheckpointIntervalSeconds:    int(req.CheckpointIntervalSeconds),
+		CheckpointQuietWindowSeconds: int(req.CheckpointQuietWindowSeconds),
+		ResumeManifestPath:           req.ResumeManifestPath,
+		SessionGeneration:            int(req.SessionGeneration),
+		NetworkPolicyPreset:          req.NetworkPolicyPreset,
 	}
 
 	// Extract network policy from labels (control plane packs them here
@@ -124,10 +128,11 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 			}
 		}
 
-		// Try to resume from session snapshot
-		if s.manager.SessionExists(allocReq.SessionID) {
+		// Prefer the authoritative manifest path for cross-host resume. During
+		// migration we still fall back to legacy local session discovery.
+		if allocReq.ResumeManifestPath != "" {
 			resumeStart := time.Now()
-			r, err = s.manager.ResumeFromSession(ctx, allocReq.SessionID, allocReq.WorkloadKey)
+			r, err = s.manager.ResumeFromCheckpoint(ctx, allocReq.SessionID, allocReq.WorkloadKey, allocReq.ResumeManifestPath)
 			resumeDuration := time.Since(resumeStart)
 
 			if err == nil {
@@ -135,9 +140,9 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 				recordSessionResumeMetrics(ctx, s.manager, s.lifecycleMetrics, allocReq.SessionID, resumeDuration, fcrotel.ResultSuccess, "allocate")
 				recordAllocationMetrics(ctx, s.lifecycleMetrics, resumeDuration, fcrotel.ResultSuccess, "session_resume")
 			} else {
-				s.logger.WithError(err).Warn("Failed to resume from session, falling back to fresh allocation")
+				s.logger.WithError(err).Warn("Failed to resume from authoritative session head, falling back to fresh allocation")
 				recordSessionResumeMetrics(ctx, s.manager, s.lifecycleMetrics, allocReq.SessionID, resumeDuration, fcrotel.ResultFailure, "allocate")
-				err = nil // Reset error for fresh allocation
+				err = nil
 			}
 		}
 	}
@@ -165,6 +170,14 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 	// Freeze TTL config on the runner for both fresh allocations and resumes.
 	r.TTLSeconds = allocReq.TTLSeconds
 	r.AutoPause = allocReq.AutoPause
+	r.CheckpointIntervalSeconds = allocReq.CheckpointIntervalSeconds
+	r.CheckpointQuietWindowSeconds = allocReq.CheckpointQuietWindowSeconds
+	if allocReq.ResumeManifestPath != "" && r.SessionManifestPath == "" {
+		r.SessionManifestPath = allocReq.ResumeManifestPath
+	}
+	if allocReq.SessionGeneration > 0 && r.SessionLayers == 0 {
+		r.SessionLayers = allocReq.SessionGeneration
+	}
 	if allocReq.AuthConfig != nil {
 		r.AuthConfig = allocReq.AuthConfig
 	}
@@ -336,6 +349,8 @@ func (s *HostAgentServer) PauseRunner(ctx context.Context, req *pb.PauseRunnerRe
 		SessionId:         result.SessionID,
 		SnapshotSizeBytes: result.SnapshotSizeBytes,
 		Layer:             int32(result.Layer),
+		Generation:        int32(result.Generation),
+		ManifestPath:      result.ManifestPath,
 	}, nil
 }
 
@@ -347,7 +362,13 @@ func (s *HostAgentServer) ResumeRunner(ctx context.Context, req *pb.ResumeRunner
 		"workload_key": req.WorkloadKey,
 	}).Info("ResumeRunner request")
 
-	r, err := s.manager.ResumeFromSession(ctx, req.SessionId, req.WorkloadKey)
+	var r *runner.Runner
+	var err error
+	if req.ManifestPath != "" {
+		r, err = s.manager.ResumeFromCheckpoint(ctx, req.SessionId, req.WorkloadKey, req.ManifestPath)
+	} else {
+		r, err = s.manager.ResumeFromSession(ctx, req.SessionId, req.WorkloadKey)
+	}
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to resume runner")
 		recordSessionResumeMetrics(ctx, s.manager, s.lifecycleMetrics, req.SessionId, time.Since(start), fcrotel.ResultFailure, "resume_rpc")
@@ -359,6 +380,14 @@ func (s *HostAgentServer) ResumeRunner(ctx context.Context, req *pb.ResumeRunner
 	// Reapply the persisted TTL/network policy carried by the control plane.
 	r.TTLSeconds = int(req.TtlSeconds)
 	r.AutoPause = req.AutoPause
+	r.CheckpointIntervalSeconds = int(req.CheckpointIntervalSeconds)
+	r.CheckpointQuietWindowSeconds = int(req.CheckpointQuietWindowSeconds)
+	if req.Generation > 0 {
+		r.SessionLayers = int(req.Generation)
+	}
+	if req.ManifestPath != "" {
+		r.SessionManifestPath = req.ManifestPath
+	}
 
 	allocReq := runner.AllocateRequest{
 		RequestID:           "resume-" + req.SessionId,
