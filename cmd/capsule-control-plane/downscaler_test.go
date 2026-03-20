@@ -87,19 +87,50 @@ func TestComputeAutoscaleDecision_ScaleDownPicksNewestLowestXi(t *testing.T) {
 	}
 }
 
-func TestComputeAutoscaleDecision_ScaleDownExcludesNewestFromMinXi(t *testing.T) {
+func TestComputeAutoscaleDecision_ScaleDownExcludesUnsettledFromMinXi(t *testing.T) {
 	now := time.Now()
-	// The oldest host has high utilization, a new empty host just joined.
-	// Without excluding newest, min(Xi)=0.0 would always trigger scale-down.
-	// But the point is: the *newest* host is excluded from the threshold check.
+	// h-old has utilization above settlingThreshold (20%), h-new is at 0%.
+	// Without excluding unsettled hosts, min(Xi)=0.0 would always trigger
+	// scale-down. Hosts below 20% utilization are excluded.
 	hosts := []*Host{
-		makeHost("h-old", 600, 1000, now.Add(-2*time.Hour)), // Xi=0.6
-		makeHost("h-new", 0, 1000, now),                     // Xi=0.0 (newest, excluded)
+		makeHost("h-old", 600, 1000, now.Add(-2*time.Hour)), // Xi=0.6, settled (>=20%)
+		makeHost("h-new", 0, 1000, now),                     // Xi=0.0, unsettled (<20%)
 	}
 	d := computeAutoscaleDecision(hosts, 0.9, 0.5, 0)
-	// min(Xi) excluding newest = 0.6 >= 0.5 → no scale-down
+	// min(Xi) of settled hosts = 0.6 >= 0.5 → no scale-down
 	if d.action != scaleActionNone {
-		t.Fatalf("expected scaleActionNone (newest excluded), got %d", d.action)
+		t.Fatalf("expected scaleActionNone (unsettled excluded), got %d", d.action)
+	}
+}
+
+func TestComputeAutoscaleDecision_ScaleDownExcludesMultipleUnsettledHosts(t *testing.T) {
+	now := time.Now()
+	// Multiple hosts below settlingThreshold. Only h-old is settled.
+	hosts := []*Host{
+		makeHost("h-old", 600, 1000, now.Add(-1*time.Hour)),    // Xi=0.6, settled
+		makeHost("h-new1", 0, 1000, now.Add(-2*time.Minute)),   // Xi=0.0, unsettled
+		makeHost("h-new2", 0, 1000, now.Add(-1*time.Minute)),   // Xi=0.0, unsettled
+		makeHost("h-new3", 50, 1000, now.Add(-30*time.Second)), // Xi=0.05, unsettled
+	}
+	d := computeAutoscaleDecision(hosts, 0.9, 0.5, 0)
+	// Only h-old is settled, min(Xi) = 0.6 >= 0.5 → no scale-down
+	if d.action != scaleActionNone {
+		t.Fatalf("expected scaleActionNone when multiple unsettled hosts excluded, got %d", d.action)
+	}
+}
+
+func TestComputeAutoscaleDecision_ScaleDownAllUnsettledFallsThrough(t *testing.T) {
+	now := time.Now()
+	// All hosts are below settlingThreshold — genuine over-provisioning.
+	// Should still allow scale-down using all hosts.
+	hosts := []*Host{
+		makeHost("h1", 100, 1000, now.Add(-1*time.Hour)), // Xi=0.1
+		makeHost("h2", 50, 1000, now.Add(-2*time.Hour)),  // Xi=0.05
+	}
+	d := computeAutoscaleDecision(hosts, 0.9, 0.5, 0)
+	// No settled hosts → use all hosts. min(Xi)=0.05 < 0.5 → scale down.
+	if d.action != scaleActionDown {
+		t.Fatalf("expected scaleActionDown when all hosts genuinely underutilized, got %d", d.action)
 	}
 }
 
