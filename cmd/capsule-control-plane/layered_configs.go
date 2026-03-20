@@ -176,6 +176,62 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 		}
 	}
 
+	// Delete stale config_layer_settings for this config
+	// (layers no longer in the new chain)
+	if len(layers) > 0 {
+		args := []any{configID}
+		placeholders := make([]string, len(layers))
+		for i, l := range layers {
+			placeholders[i] = fmt.Sprintf("$%d", i+2)
+			args = append(args, l.LayerHash)
+		}
+		tx.ExecContext(ctx, fmt.Sprintf(
+			`DELETE FROM config_layer_settings WHERE config_id = $1 AND layer_hash NOT IN (%s)`,
+			strings.Join(placeholders, ",")),
+			args...)
+	}
+
+	// Deactivate orphaned layers and cancel their builds when the config's
+	// layers change. Must run after the stale config_layer_settings DELETE
+	// above so the refCount query doesn't find this config's own stale rows.
+	if oldLeafWK.Valid && oldLeafWK.String != "" && oldLeafWK.String != leafWorkloadKey {
+		var oldCfgJSON string
+		if tx.QueryRowContext(ctx, `SELECT config_json FROM layered_configs WHERE config_id = $1`, configID).Scan(&oldCfgJSON) == nil {
+			var oldCfg snapshot.LayeredConfig
+			if json.Unmarshal([]byte(oldCfgJSON), &oldCfg) == nil {
+				oldLayers := snapshot.MaterializeLayers(&oldCfg)
+				for _, oldLayer := range oldLayers {
+					// Skip layers that are in the new chain
+					inNew := false
+					for _, newLayer := range layers {
+						if newLayer.LayerHash == oldLayer.LayerHash {
+							inNew = true
+							break
+						}
+					}
+					if inNew {
+						continue
+					}
+					// Check if still referenced by any other config
+					var refCount int
+					tx.QueryRowContext(ctx, `
+						SELECT COUNT(*) FROM config_layer_settings
+						WHERE layer_hash = $1 AND config_id != $2`,
+						oldLayer.LayerHash, configID).Scan(&refCount)
+					if refCount == 0 {
+						tx.ExecContext(ctx, `UPDATE snapshot_layers SET status='inactive', current_version=NULL WHERE layer_hash=$1`, oldLayer.LayerHash)
+						tx.ExecContext(ctx, `UPDATE snapshot_builds SET status='cancelled' WHERE layer_hash=$1 AND status IN ('queued','waiting_parent','running')`, oldLayer.LayerHash)
+						r.logger.WithFields(logrus.Fields{
+							"layer_hash": oldLayer.LayerHash[:16],
+							"layer_name": oldLayer.Name,
+							"config_id":  configID,
+						}).Info("Deactivated orphaned layer and cancelled builds on config update")
+					}
+				}
+			}
+		}
+	}
+
 	// If workload_key changed, drain old and activate new
 	if oldLeafWK.Valid && oldLeafWK.String != "" && oldLeafWK.String != leafWorkloadKey {
 		_, err = tx.ExecContext(ctx,

@@ -1075,7 +1075,11 @@ func (s *LayerBuildScheduler) checkRefreshSchedules(ctx context.Context) {
 		                 ORDER BY completed_at DESC LIMIT 1), '') AS base_image,
 		       COALESCE((SELECT runner_user FROM snapshot_builds
 		                 WHERE config_id = cls.config_id AND status = 'completed' AND runner_user != ''
-		                 ORDER BY completed_at DESC LIMIT 1), '') AS runner_user
+		                 ORDER BY completed_at DESC LIMIT 1), '') AS runner_user,
+		       sl.parent_layer_hash,
+		       EXISTS(SELECT 1 FROM snapshot_builds
+		              WHERE layer_hash = sl.parent_layer_hash
+		              AND status IN ('queued','waiting_parent','running')) AS parent_has_active_build
 		FROM config_layer_settings cls
 		JOIN snapshot_layers sl ON cls.layer_hash = sl.layer_hash
 		WHERE cls.refresh_interval != '' AND cls.refresh_interval != 'on_push'
@@ -1086,7 +1090,19 @@ func (s *LayerBuildScheduler) checkRefreshSchedules(ctx context.Context) {
 	}
 	defer rows.Close()
 
+	type dueLayer struct {
+		configID, layerHash, refreshInterval string
+		currentVersion                       sql.NullString
+		initCmdsJSON, refreshCmdsJSON        string
+		drivesJSON, allChainDrivesJSON       string
+		baseImage, runnerUser                string
+		parentLayerHash                      sql.NullString
+	}
+
 	now := time.Now()
+	var dueLayers []dueLayer
+
+	// First pass: collect all due layers
 	for rows.Next() {
 		var configID, layerHash, refreshInterval string
 		var currentVersion sql.NullString
@@ -1094,12 +1110,20 @@ func (s *LayerBuildScheduler) checkRefreshSchedules(ctx context.Context) {
 		var lastCompleted sql.NullTime
 		var hasActiveBuild bool
 		var baseImage, runnerUser string
+		var parentLayerHash sql.NullString
+		var parentHasActiveBuild bool
 		if err := rows.Scan(&configID, &layerHash, &refreshInterval, &currentVersion,
 			&initCmdsJSON, &refreshCmdsJSON, &drivesJSON, &allChainDrivesJSON,
-			&lastCompleted, &hasActiveBuild, &baseImage, &runnerUser); err != nil {
+			&lastCompleted, &hasActiveBuild, &baseImage, &runnerUser,
+			&parentLayerHash, &parentHasActiveBuild); err != nil {
 			continue
 		}
 		if hasActiveBuild {
+			continue
+		}
+		// Skip child layers whose parent has an active build in progress;
+		// the parent's onBuildComplete cascade will handle them.
+		if parentHasActiveBuild {
 			continue
 		}
 
@@ -1112,9 +1136,38 @@ func (s *LayerBuildScheduler) checkRefreshSchedules(ctx context.Context) {
 			continue
 		}
 
+		dueLayers = append(dueLayers, dueLayer{
+			configID: configID, layerHash: layerHash, refreshInterval: refreshInterval,
+			currentVersion: currentVersion,
+			initCmdsJSON:   initCmdsJSON, refreshCmdsJSON: refreshCmdsJSON,
+			drivesJSON: drivesJSON, allChainDrivesJSON: allChainDrivesJSON,
+			baseImage: baseImage, runnerUser: runnerUser,
+			parentLayerHash: parentLayerHash,
+		})
+	}
+
+	// Build lookup set of due (configID, layerHash) pairs
+	dueSet := make(map[string]bool, len(dueLayers))
+	for _, dl := range dueLayers {
+		dueSet[dl.configID+":"+dl.layerHash] = true
+	}
+
+	// Second pass: enqueue only layers whose parent is NOT also due
+	// (the parent's enqueueChildRebuilds cascade will handle children)
+	for _, dl := range dueLayers {
+		if dl.parentLayerHash.Valid && dl.parentLayerHash.String != "" &&
+			dueSet[dl.configID+":"+dl.parentLayerHash.String] {
+			s.logger.WithFields(logrus.Fields{
+				"layer_hash": dl.layerHash[:16],
+				"config_id":  dl.configID,
+				"parent":     dl.parentLayerHash.String[:16],
+			}).Debug("Skipping child refresh — parent also due, will cascade")
+			continue
+		}
+
 		// Enqueue a refresh build for this layer with self-contained columns
 		// and old_layer_hash/old_layer_version set to preserve extension drives [M3]
-		version := fmt.Sprintf("v%s-%s-%s", now.Format("20060102-150405"), layerHash[:8], fmt.Sprintf("%04d", now.Nanosecond()/1e5))
+		version := fmt.Sprintf("v%s-%s-%s", now.Format("20060102-150405"), dl.layerHash[:8], fmt.Sprintf("%04d", now.Nanosecond()/1e5))
 		s.db.ExecContext(ctx, `
 			INSERT INTO snapshot_builds (layer_hash, version, status, build_type, config_id,
 				old_layer_hash, old_layer_version,
@@ -1122,19 +1175,19 @@ func (s *LayerBuildScheduler) checkRefreshSchedules(ctx context.Context) {
 				base_image, runner_user)
 			VALUES ($1, $2, 'queued', 'refresh', $3, $4, $5, $6, $7, $8, $9, $10, $11)
 			ON CONFLICT (layer_hash, version) DO NOTHING
-		`, layerHash, version, configID,
-			sql.NullString{String: layerHash, Valid: true}, currentVersion,
-			initCmdsJSON, refreshCmdsJSON, drivesJSON, allChainDrivesJSON,
-			baseImage, runnerUser)
+		`, dl.layerHash, version, dl.configID,
+			sql.NullString{String: dl.layerHash, Valid: true}, dl.currentVersion,
+			dl.initCmdsJSON, dl.refreshCmdsJSON, dl.drivesJSON, dl.allChainDrivesJSON,
+			dl.baseImage, dl.runnerUser)
 
 		s.logger.WithFields(logrus.Fields{
-			"layer_hash": layerHash[:16],
-			"config_id":  configID,
-			"interval":   refreshInterval,
+			"layer_hash": dl.layerHash[:16],
+			"config_id":  dl.configID,
+			"interval":   dl.refreshInterval,
 		}).Info("Refresh schedule triggered")
 
 		// Cascade: enqueue init builds for all children (scoped by config)
-		s.enqueueChildRebuilds(ctx, layerHash, configID)
+		s.enqueueChildRebuilds(ctx, dl.layerHash, dl.configID)
 	}
 }
 

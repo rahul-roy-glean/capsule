@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -484,8 +485,10 @@ func TestLayerBuilder_CheckRefreshSchedules_LayerDue(t *testing.T) {
 			"config_id", "layer_hash", "refresh_interval", "current_version",
 			"init_commands", "refresh_commands", "drives", "all_chain_drives",
 			"last_completed", "has_active_build", "base_image", "runner_user",
+			"parent_layer_hash", "parent_has_active_build",
 		}).AddRow("cfg-1", layerHash, "1h", "v1", "[]", "[]", "[]", "[]",
-			lastCompleted, false, "", ""))
+			lastCompleted, false, "", "",
+			nil, false))
 
 	// Enqueue refresh build
 	mock.ExpectExec(`INSERT INTO snapshot_builds`).
@@ -519,8 +522,10 @@ func TestLayerBuilder_CheckRefreshSchedules_ActiveBuildSkipped(t *testing.T) {
 			"config_id", "layer_hash", "refresh_interval", "current_version",
 			"init_commands", "refresh_commands", "drives", "all_chain_drives",
 			"last_completed", "has_active_build", "base_image", "runner_user",
+			"parent_layer_hash", "parent_has_active_build",
 		}).AddRow("cfg-1", layerHash, "1h", "v1", "[]", "[]", "[]", "[]",
-			lastCompleted, true, "", "")) // has_active_build = true
+			lastCompleted, true, "", "",
+			nil, false)) // has_active_build = true
 
 	// No INSERT should happen
 
@@ -544,8 +549,10 @@ func TestLayerBuilder_CheckRefreshSchedules_NotYetDue(t *testing.T) {
 			"config_id", "layer_hash", "refresh_interval", "current_version",
 			"init_commands", "refresh_commands", "drives", "all_chain_drives",
 			"last_completed", "has_active_build", "base_image", "runner_user",
+			"parent_layer_hash", "parent_has_active_build",
 		}).AddRow("cfg-1", layerHash, "1h", "v1", "[]", "[]", "[]", "[]",
-			lastCompleted, false, "", ""))
+			lastCompleted, false, "", "",
+			nil, false))
 
 	// No INSERT should happen
 
@@ -566,8 +573,10 @@ func TestLayerBuilder_CheckRefreshSchedules_InvalidInterval(t *testing.T) {
 			"config_id", "layer_hash", "refresh_interval", "current_version",
 			"init_commands", "refresh_commands", "drives", "all_chain_drives",
 			"last_completed", "has_active_build", "base_image", "runner_user",
+			"parent_layer_hash", "parent_has_active_build",
 		}).AddRow("cfg-1", layerHash, "not-a-duration", "v1", "[]", "[]", "[]", "[]",
-			time.Now().Add(-2*time.Hour), false, "", ""))
+			time.Now().Add(-2*time.Hour), false, "", "",
+			nil, false))
 
 	// Invalid interval → skipped, no INSERT
 
@@ -591,8 +600,10 @@ func TestLayerBuilder_CheckRefreshSchedules_ChildRebuildsEnqueued(t *testing.T) 
 			"config_id", "layer_hash", "refresh_interval", "current_version",
 			"init_commands", "refresh_commands", "drives", "all_chain_drives",
 			"last_completed", "has_active_build", "base_image", "runner_user",
+			"parent_layer_hash", "parent_has_active_build",
 		}).AddRow("cfg-1", parentHash, "1h", "v1", "[]", `["echo refresh"]`, "[]", "[]",
-			lastCompleted, false, "", ""))
+			lastCompleted, false, "", "",
+			nil, false))
 
 	// Parent refresh build
 	mock.ExpectExec(`INSERT INTO snapshot_builds`).
@@ -1245,6 +1256,257 @@ func TestIsAllChainDrivesStale_MatchingHash(t *testing.T) {
 	if result {
 		t.Error("expected stale=false for matching hash, got true")
 	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// --- 14. RegisterLayeredConfig: stale config_layer_settings cleanup ---
+
+func newTestRegistry(t *testing.T) (*LayeredConfigRegistry, sqlmock.Sqlmock) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create sqlmock: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	logger := logrus.New()
+	logger.SetLevel(logrus.PanicLevel)
+	r := &LayeredConfigRegistry{
+		db:     db,
+		logger: logger.WithField("component", "test"),
+	}
+	return r, mock
+}
+
+func TestRegisterLayeredConfig_DeletesStaleConfigLayerSettings(t *testing.T) {
+	r, mock := newTestRegistry(t)
+	ctx := context.Background()
+
+	cfg := &snapshot.LayeredConfig{
+		DisplayName: "test-cfg",
+		BaseImage:   "ubuntu:22.04",
+		Layers: []snapshot.LayerDef{
+			{Name: "app", InitCommands: []snapshot.SnapshotCommand{{Type: "shell", Args: []string{"echo hi"}}}},
+		},
+	}
+
+	layers := snapshot.MaterializeLayers(cfg)
+	if len(layers) == 0 {
+		t.Fatal("expected at least one layer")
+	}
+
+	mock.ExpectBegin()
+
+	// Read old workload_key (new config, no old key)
+	mock.ExpectQuery(`SELECT leaf_workload_key FROM config_workload_keys`).
+		WithArgs("test-cfg").
+		WillReturnRows(sqlmock.NewRows([]string{"leaf_workload_key"}))
+
+	// Insert layers (2: _platform + app)
+	for range layers {
+		mock.ExpectExec(`INSERT INTO snapshot_layers`).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec(`INSERT INTO config_layer_settings`).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+
+	// DELETE stale config_layer_settings (key assertion for this test)
+	mock.ExpectExec(`DELETE FROM config_layer_settings`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Upsert config_workload_keys
+	mock.ExpectExec(`INSERT INTO config_workload_keys`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Upsert layered_configs
+	mock.ExpectExec(`INSERT INTO layered_configs`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	mock.ExpectCommit()
+
+	_, _, err := r.RegisterLayeredConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestRegisterLayeredConfig_CancelsOrphanedBuildsOnUpdate(t *testing.T) {
+	r, mock := newTestRegistry(t)
+	ctx := context.Background()
+
+	// New config with a different init command (produces a different layer hash)
+	cfg := &snapshot.LayeredConfig{
+		DisplayName: "test-cfg",
+		BaseImage:   "ubuntu:22.04",
+		Layers: []snapshot.LayerDef{
+			{Name: "app", InitCommands: []snapshot.SnapshotCommand{{Type: "shell", Args: []string{"echo new"}}}},
+		},
+	}
+
+	newLayers := snapshot.MaterializeLayers(cfg)
+	newLeafWK := snapshot.ComputeLeafWorkloadKey(newLayers[len(newLayers)-1].LayerHash)
+
+	// Old config had a different init command, so different leaf_workload_key
+	oldCfg := &snapshot.LayeredConfig{
+		DisplayName: "test-cfg",
+		BaseImage:   "ubuntu:22.04",
+		Layers: []snapshot.LayerDef{
+			{Name: "app", InitCommands: []snapshot.SnapshotCommand{{Type: "shell", Args: []string{"echo old"}}}},
+		},
+	}
+	oldLayers := snapshot.MaterializeLayers(oldCfg)
+	oldLeafWK := snapshot.ComputeLeafWorkloadKey(oldLayers[len(oldLayers)-1].LayerHash)
+	// The old user layer hash (the one that will be orphaned)
+	oldUserLayerHash := oldLayers[len(oldLayers)-1].LayerHash
+
+	// Sanity check: old and new must differ
+	if oldLeafWK == newLeafWK {
+		t.Fatal("test setup error: old and new leaf workload keys must differ")
+	}
+
+	oldCfgJSON, _ := json.Marshal(oldCfg)
+
+	mock.ExpectBegin()
+
+	// Read old workload_key (returns old value)
+	mock.ExpectQuery(`SELECT leaf_workload_key FROM config_workload_keys`).
+		WithArgs("test-cfg").
+		WillReturnRows(sqlmock.NewRows([]string{"leaf_workload_key"}).AddRow(oldLeafWK))
+
+	// Insert new layers (2 layers: _platform + app)
+	for range newLayers {
+		mock.ExpectExec(`INSERT INTO snapshot_layers`).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec(`INSERT INTO config_layer_settings`).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+
+	// DELETE stale config_layer_settings
+	mock.ExpectExec(`DELETE FROM config_layer_settings`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Orphan cleanup: read old config_json
+	mock.ExpectQuery(`SELECT config_json FROM layered_configs WHERE config_id`).
+		WithArgs("test-cfg").
+		WillReturnRows(sqlmock.NewRows([]string{"config_json"}).AddRow(string(oldCfgJSON)))
+
+	// Old _platform layer is in new chain → skipped
+	// Old user layer is NOT in new chain → check refCount
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM config_layer_settings`).
+		WithArgs(oldUserLayerHash, "test-cfg").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	// Deactivate orphaned user layer
+	mock.ExpectExec(`UPDATE snapshot_layers SET status='inactive'`).
+		WithArgs(oldUserLayerHash).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Cancel active builds for orphaned user layer
+	mock.ExpectExec(`UPDATE snapshot_builds SET status='cancelled'`).
+		WithArgs(oldUserLayerHash).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Drain old workload key
+	mock.ExpectExec(`UPDATE config_workload_keys SET status = 'draining'`).
+		WithArgs("test-cfg").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Upsert new workload key
+	mock.ExpectExec(`INSERT INTO config_workload_keys`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Upsert layered_configs
+	mock.ExpectExec(`INSERT INTO layered_configs`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	mock.ExpectCommit()
+
+	_, _, err := r.RegisterLayeredConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// --- 15. checkRefreshSchedules: skip child when parent also due ---
+
+func TestLayerBuilder_CheckRefreshSchedules_SkipsChildWhenParentAlsoDue(t *testing.T) {
+	s, mock := newTestScheduler(t)
+	ctx := context.Background()
+	parentHash := "parent1234567890abcdef1234567890"
+	childHash := "child01234567890abcdef1234567890"
+
+	lastCompleted := time.Now().Add(-2 * time.Hour)
+
+	// Both parent and child are due for refresh
+	mock.ExpectQuery(`SELECT cls.config_id, cls.layer_hash`).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"config_id", "layer_hash", "refresh_interval", "current_version",
+			"init_commands", "refresh_commands", "drives", "all_chain_drives",
+			"last_completed", "has_active_build", "base_image", "runner_user",
+			"parent_layer_hash", "parent_has_active_build",
+		}).
+			AddRow("cfg-1", parentHash, "1h", "v1", "[]", `["echo refresh"]`, "[]", "[]",
+				lastCompleted, false, "", "",
+				nil, false). // parent has no parent
+			AddRow("cfg-1", childHash, "1h", "v2", "[]", `["echo refresh"]`, "[]", "[]",
+				lastCompleted, false, "", "",
+				parentHash, false)) // child's parent is also due
+
+	// Only parent should get a refresh build enqueued (child is skipped)
+	mock.ExpectExec(`INSERT INTO snapshot_builds`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Parent cascades to children via enqueueChildRebuilds
+	mock.ExpectQuery(`WITH RECURSIVE descendants AS`).
+		WithArgs(parentHash, "cfg-1").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"layer_hash", "parent_layer_hash",
+			"init_commands", "drives", "current_version",
+			"refresh_commands", "all_chain_drives",
+		}).AddRow(childHash, parentHash, "[]", "[]", "v2", `["echo refresh"]`, "[]"))
+
+	// Child rebuild via cascade: sibling reattach lookup (has current_version + refresh → refresh type)
+	mock.ExpectExec(`INSERT INTO snapshot_builds`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	s.checkRefreshSchedules(ctx)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestLayerBuilder_CheckRefreshSchedules_SkipsChildWhenParentHasActiveBuild(t *testing.T) {
+	s, mock := newTestScheduler(t)
+	ctx := context.Background()
+	childHash := "child01234567890abcdef1234567890"
+	parentHash := "parent1234567890abcdef1234567890"
+
+	lastCompleted := time.Now().Add(-2 * time.Hour)
+
+	// Child is due for refresh but parent has an active build
+	mock.ExpectQuery(`SELECT cls.config_id, cls.layer_hash`).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"config_id", "layer_hash", "refresh_interval", "current_version",
+			"init_commands", "refresh_commands", "drives", "all_chain_drives",
+			"last_completed", "has_active_build", "base_image", "runner_user",
+			"parent_layer_hash", "parent_has_active_build",
+		}).AddRow("cfg-1", childHash, "1h", "v1", "[]", `["echo refresh"]`, "[]", "[]",
+			lastCompleted, false, "", "",
+			parentHash, true)) // parent_has_active_build = true
+
+	// No INSERT should happen — child skipped because parent has active build
+
+	s.checkRefreshSchedules(ctx)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
