@@ -432,6 +432,11 @@ type autoscaleDecision struct {
 	reason      string
 }
 
+// settlingThreshold is the minimum utilization (20%) a host must reach before
+// it counts toward the scale-down min(Xi) calculation. Hosts below this are
+// still filling up with runners and would drag down min(Xi) prematurely.
+const settlingThreshold = 0.2
+
 // computeAutoscaleDecision is the pure decision logic for scale-up / scale-down.
 // It examines ready hosts' CPU utilization to decide what to do.
 func computeAutoscaleDecision(readyHosts []*Host, scaleUpThreshold, scaleDownThreshold float64, allocFailures int64) autoscaleDecision {
@@ -476,15 +481,26 @@ func computeAutoscaleDecision(readyHosts []*Host, scaleUpThreshold, scaleDownThr
 		return autoscaleDecision{action: scaleActionNone, reason: "too few hosts to scale down"}
 	}
 
-	// Sort by CreatedAt ascending (oldest first).
-	sort.Slice(utils, func(i, j int) bool {
-		return utils[i].host.CreatedAt.Before(utils[j].host.CreatedAt)
-	})
+	// Separate hosts into "settled" (reached settlingThreshold) and
+	// "warming" (still filling up with runners). Only settled hosts
+	// participate in the min(Xi) check so that newly-added hosts
+	// don't cause premature scale-down.
+	var settled []hostUtil
+	for _, u := range utils {
+		if u.xi >= settlingThreshold {
+			settled = append(settled, u)
+		}
+	}
 
-	// min(Xi) excluding the newest host (last after sort).
-	excludeNewest := utils[:len(utils)-1]
-	minXi := excludeNewest[0].xi
-	for _, u := range excludeNewest[1:] {
+	// If no host has reached the settling threshold, all are genuinely
+	// underutilized — use all hosts for the decision (don't block scale-down).
+	candidates := settled
+	if len(candidates) == 0 {
+		candidates = utils
+	}
+
+	minXi := candidates[0].xi
+	for _, u := range candidates[1:] {
 		if u.xi < minXi {
 			minXi = u.xi
 		}
@@ -494,7 +510,7 @@ func computeAutoscaleDecision(readyHosts []*Host, scaleUpThreshold, scaleDownThr
 		return autoscaleDecision{action: scaleActionNone, reason: "utilization above scale-down threshold"}
 	}
 
-	// Pick the newest host with the lowest Xi.
+	// Pick the newest host with the lowest Xi as drain victim.
 	sort.Slice(utils, func(i, j int) bool {
 		if !utils[i].host.CreatedAt.Equal(utils[j].host.CreatedAt) {
 			return utils[i].host.CreatedAt.After(utils[j].host.CreatedAt)
