@@ -327,6 +327,9 @@ message ResumeRunnerRequest {
   bool auto_pause = 4;
   string network_policy_preset = 5;
   string network_policy_json = 6;
+  // runner_id is the original runner ID from the paused session.
+  // Used to locate session metadata in GCS for cross-host resume.
+  string runner_id = 7;
 }
 
 message ResumeRunnerResponse {

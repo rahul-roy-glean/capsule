@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel/attribute"
@@ -332,9 +333,15 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		}()
 	}
 
+	// Ensure every allocation has a session_id for pause/resume support.
+	if req.SessionID == "" {
+		req.SessionID = uuid.New().String()
+	}
+
 	s.logger.WithFields(logrus.Fields{
 		"request_id":   req.RequestID,
 		"workload_key": req.WorkloadKey,
+		"session_id":   req.SessionID,
 	}).Info("Allocating runner")
 
 	// Derive repo slug for multi-repo support

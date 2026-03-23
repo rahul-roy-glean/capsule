@@ -651,6 +651,41 @@ func (u *SessionChunkUploader) prefixedPath(path string) string {
 	return path
 }
 
+// UploadSessionMetadata uploads session metadata JSON to the runner_state path
+// in GCS, enabling cross-host resume without local metadata.json.
+func (u *SessionChunkUploader) UploadSessionMetadata(ctx context.Context, workloadKey, runnerID string, data []byte) error {
+	if u.gcsClient == nil {
+		return fmt.Errorf("GCS client not configured")
+	}
+
+	objPath := u.prefixedPath(fmt.Sprintf("%s/runner_state/%s/session_metadata.json", workloadKey, runnerID))
+	bucket := u.gcsClient.Bucket(u.gcsBucket)
+	w := bucket.Object(objPath).NewWriter(ctx)
+	w.ContentType = "application/json"
+	if _, err := w.Write(data); err != nil {
+		w.Close()
+		return fmt.Errorf("write session metadata: %w", err)
+	}
+	return w.Close()
+}
+
+// DownloadSessionMetadata downloads session metadata JSON from the runner_state
+// path in GCS, using workloadKey and runnerID to locate the file.
+func (u *SessionChunkUploader) DownloadSessionMetadata(ctx context.Context, workloadKey, runnerID string) ([]byte, error) {
+	if u.gcsClient == nil {
+		return nil, fmt.Errorf("GCS client not configured")
+	}
+
+	objPath := u.prefixedPath(fmt.Sprintf("%s/runner_state/%s/session_metadata.json", workloadKey, runnerID))
+	bucket := u.gcsClient.Bucket(u.gcsBucket)
+	reader, err := bucket.Object(objPath).NewReader(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open session metadata %s: %w", objPath, err)
+	}
+	defer reader.Close()
+	return io.ReadAll(reader)
+}
+
 // FullGCSPath returns the full GCS object path (with prefix) for a relative path.
 // This is the path callers should store in metadata for later retrieval.
 func (u *SessionChunkUploader) FullGCSPath(relativePath string) string {
