@@ -1101,6 +1101,7 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 			TtlSeconds:          int32(sessionTTL.Int64),
 			AutoPause:           sessionAutoPause.Valid && sessionAutoPause.Bool,
 			NetworkPolicyPreset: sessionNPPreset.String,
+			RunnerId:            req.RunnerID,
 		}
 		if sessionNPJSON.Valid {
 			resumeReq.NetworkPolicyJson = sessionNPJSON.String

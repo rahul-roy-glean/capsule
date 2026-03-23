@@ -127,7 +127,7 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		// Try to resume from session snapshot
 		if s.manager.SessionExists(allocReq.SessionID) {
 			resumeStart := time.Now()
-			r, err = s.manager.ResumeFromSession(ctx, allocReq.SessionID, allocReq.WorkloadKey)
+			r, err = s.manager.ResumeFromSession(ctx, allocReq.SessionID, allocReq.WorkloadKey, "")
 			resumeDuration := time.Since(resumeStart)
 
 			if err == nil {
@@ -347,7 +347,7 @@ func (s *HostAgentServer) ResumeRunner(ctx context.Context, req *pb.ResumeRunner
 		"workload_key": req.WorkloadKey,
 	}).Info("ResumeRunner request")
 
-	r, err := s.manager.ResumeFromSession(ctx, req.SessionId, req.WorkloadKey)
+	r, err := s.manager.ResumeFromSession(ctx, req.SessionId, req.WorkloadKey, req.RunnerId)
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to resume runner")
 		recordSessionResumeMetrics(ctx, s.manager, s.lifecycleMetrics, req.SessionId, time.Since(start), fcrotel.ResultFailure, "resume_rpc")

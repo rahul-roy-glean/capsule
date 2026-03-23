@@ -519,6 +519,14 @@ func (n *NetNSNetwork) CreateNamespaceForVM(vmID string, slot int) (*VMNamespace
 		"iptables", "-t", "nat", "-A", "POSTROUTING",
 		"-s", subnetCIDR, "-o", vethVM, "-j", "MASQUERADE").Run()
 
+	// 6e2. MASQUERADE for DNAT'd inbound traffic: packets arriving from veth
+	// and forwarded to the bridge still carry the host veth source IP
+	// (10.200.x.1), which the guest has no route back to. Rewrite the source
+	// to the bridge IP (172.16.0.1) so replies traverse the bridge correctly.
+	exec.Command("ip", "netns", "exec", nsName,
+		"iptables", "-t", "nat", "-A", "POSTROUTING",
+		"-o", innerBridgeName, "-j", "MASQUERADE").Run()
+
 	// 6f. FORWARD: allow bridge -> veth outbound
 	exec.Command("ip", "netns", "exec", nsName,
 		"iptables", "-A", "FORWARD",

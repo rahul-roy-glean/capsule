@@ -309,6 +309,7 @@ func (m *mcpDeps) handleResume(ctx context.Context, _ *mcp.CallToolRequest, in R
 		TtlSeconds:          int32(sessionTTL.Int64),
 		AutoPause:           sessionAutoPause.Valid && sessionAutoPause.Bool,
 		NetworkPolicyPreset: sessionNPPreset.String,
+		RunnerId:            in.SandboxID,
 	}
 	if sessionNPJSON.Valid {
 		resumeReq.NetworkPolicyJson = sessionNPJSON.String

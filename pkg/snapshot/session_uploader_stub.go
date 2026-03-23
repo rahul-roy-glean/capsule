@@ -59,6 +59,16 @@ func (u *SessionChunkUploader) DownloadManifest(ctx context.Context, gcsObjectPa
 	return nil, fmt.Errorf("SessionChunkUploader: DownloadManifest not supported on non-Linux platforms")
 }
 
+// UploadSessionMetadata is a stub.
+func (u *SessionChunkUploader) UploadSessionMetadata(ctx context.Context, workloadKey, runnerID string, data []byte) error {
+	return fmt.Errorf("SessionChunkUploader: UploadSessionMetadata not supported on non-Linux platforms")
+}
+
+// DownloadSessionMetadata is a stub.
+func (u *SessionChunkUploader) DownloadSessionMetadata(ctx context.Context, workloadKey, runnerID string) ([]byte, error) {
+	return nil, fmt.Errorf("SessionChunkUploader: DownloadSessionMetadata not supported on non-Linux platforms")
+}
+
 // FullGCSPath is a stub — returns the path unchanged.
 func (u *SessionChunkUploader) FullGCSPath(relativePath string) string {
 	return relativePath

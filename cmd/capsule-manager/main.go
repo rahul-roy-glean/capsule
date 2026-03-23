@@ -1696,7 +1696,7 @@ func autoResumeIfSuspended(ctx context.Context, mgr *runner.Manager, log *logrus
 
 	result, err, _ := group.Do(runnerID, func() (interface{}, error) {
 		start := time.Now()
-		resumed, err := mgr.ResumeFromSession(ctx, rn.SessionID, rn.WorkloadKey)
+		resumed, err := mgr.ResumeFromSession(ctx, rn.SessionID, rn.WorkloadKey, runnerID)
 		if err != nil {
 			recordSessionResumeMetrics(ctx, mgr, lifecycleMetrics, rn.SessionID, time.Since(start), fcrotel.ResultFailure, "auto_resume")
 			return nil, fmt.Errorf("auto-resume failed: %w", err)
@@ -1955,7 +1955,7 @@ func handleConnectRunner(w http.ResponseWriter, r *http.Request, mgr *runner.Man
 			return
 		}
 		start := time.Now()
-		resumed, err := mgr.ResumeFromSession(r.Context(), rn.SessionID, rn.WorkloadKey)
+		resumed, err := mgr.ResumeFromSession(r.Context(), rn.SessionID, rn.WorkloadKey, runnerID)
 		if err != nil {
 			log.WithError(err).WithField("runner_id", runnerID).Error("Failed to resume runner")
 			recordSessionResumeMetrics(r.Context(), mgr, lifecycleMetrics, rn.SessionID, time.Since(start), fcrotel.ResultFailure, "connect_http")

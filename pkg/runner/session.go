@@ -494,6 +494,14 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 		m.logger.WithError(err).Warn("Failed to write session metadata")
 	}
 
+	// Upload metadata to GCS for cross-host resume.
+	if m.sessionMemStore != nil && metadata.GCSManifestPath != "" {
+		uploader := snapshot.NewSessionChunkUploader(m.sessionMemStore, m.sessionDiskStore, m.logger.Logger)
+		if uploadErr := uploader.UploadSessionMetadata(ctx, runner.WorkloadKey, runnerID, metadataBytes); uploadErr != nil {
+			m.logger.WithError(uploadErr).Warn("Failed to upload session metadata to GCS")
+		}
+	}
+
 	// Stop VM and clean up resources (but NOT the rootfs overlay or extension drives — session needs them)
 	vm.Stop()
 
@@ -844,6 +852,14 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 		m.logger.WithError(err).Warn("Failed to write checkpoint metadata")
 	}
 
+	// Upload metadata to GCS for cross-host resume.
+	if m.sessionMemStore != nil && metadata.GCSManifestPath != "" {
+		uploader := snapshot.NewSessionChunkUploader(m.sessionMemStore, m.sessionDiskStore, m.logger.Logger)
+		if uploadErr := uploader.UploadSessionMetadata(ctx, runner.WorkloadKey, runnerID, metadataBytes); uploadErr != nil {
+			m.logger.WithError(uploadErr).Warn("Failed to upload checkpoint metadata to GCS")
+		}
+	}
+
 	// Increment session layers (VM stays running)
 	m.mu.Lock()
 	runner.SessionLayers = layerN + 1
@@ -865,12 +881,30 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 }
 
 // ResumeFromSession restores a runner from a session snapshot using layered UFFD.
-func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey string) (*Runner, error) {
+// runnerID is optional — when provided (cross-host resume via RPC), it enables
+// downloading session metadata from GCS if not found locally.
+func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey, runnerID string) (*Runner, error) {
 	sessionDir := filepath.Join(m.sessionBaseDir(), sessionID)
 
-	// Read metadata
+	// Read metadata — try local disk first, fall back to GCS for cross-host resume.
 	metadataBytes, err := os.ReadFile(filepath.Join(sessionDir, "metadata.json"))
-	if err != nil {
+	if err != nil && m.sessionMemStore != nil && runnerID != "" && workloadKey != "" {
+		// Local metadata not found — try downloading from GCS (cross-host resume).
+		uploader := snapshot.NewSessionChunkUploader(m.sessionMemStore, m.sessionDiskStore, m.logger.Logger)
+		gcsData, dlErr := uploader.DownloadSessionMetadata(ctx, workloadKey, runnerID)
+		if dlErr != nil {
+			return nil, fmt.Errorf("session %s not found locally or in GCS: local=%w, gcs=%v", sessionID, err, dlErr)
+		}
+		metadataBytes = gcsData
+		m.logger.WithField("session_id", sessionID).Info("Downloaded session metadata from GCS (cross-host resume)")
+		// Create local session dir and cache metadata for the rest of the resume flow.
+		if mkErr := os.MkdirAll(sessionDir, 0755); mkErr != nil {
+			return nil, fmt.Errorf("failed to create session dir: %w", mkErr)
+		}
+		if writeErr := os.WriteFile(filepath.Join(sessionDir, "metadata.json"), metadataBytes, 0644); writeErr != nil {
+			m.logger.WithError(writeErr).Warn("Failed to cache session metadata locally")
+		}
+	} else if err != nil {
 		return nil, fmt.Errorf("session %s not found: %w", sessionID, err)
 	}
 
@@ -887,8 +921,8 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey 
 		return nil, fmt.Errorf("session %s has no layers", sessionID)
 	}
 
-	// Use the original runner ID from the session
-	runnerID := metadata.RunnerID
+	// Always use the runner ID from session metadata (authoritative source).
+	runnerID = metadata.RunnerID
 
 	// Acquire lease: atomically checks capacity, validates session uniqueness,
 	// reserves slot, and creates network namespace.
