@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from capsule_sdk._config import ConnectionConfig
 from capsule_sdk._http import HttpClient
+from capsule_sdk.resources.hosts import Hosts
 from capsule_sdk.resources.layered_configs import LayeredConfigs
 from capsule_sdk.resources.runners import Runners
 from capsule_sdk.resources.snapshots import Snapshots
@@ -34,6 +35,7 @@ class CapsuleClient:
         self._layered_configs = LayeredConfigs(self._http)
         self.runners = Runners(self._http, layered_configs=self._layered_configs)
         self.snapshots = Snapshots(self._http)
+        self.hosts = Hosts(self._http)
         self.runner_configs = RunnerConfigs(self._layered_configs)
         self.workloads = Workloads(self._layered_configs, self.runners)
 

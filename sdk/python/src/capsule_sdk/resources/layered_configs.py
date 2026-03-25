@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, cast  # noqa: F401 — Any used in tag methods
 
 from capsule_sdk._errors import CapsuleConflict, CapsuleNotFound
 from capsule_sdk._http import HttpClient
@@ -10,6 +10,8 @@ from capsule_sdk.models.layered_config import (
     LayeredConfigDetail,
     LayeredConfigListResponse,
     RefreshResponse,
+    SnapshotTag,
+    SnapshotTagListResponse,
     StoredLayeredConfig,
 )
 from capsule_sdk.models.workload import ResolvedWorkloadRef
@@ -65,6 +67,45 @@ class LayeredConfigs:
             f"/api/v1/layered-configs/{config_id}/layers/{layer_name}/refresh",
         )
         return RefreshResponse.model_validate(data)
+
+    # -- Snapshot tag management -----------------------------------------------
+
+    def list_tags(self, workload_key: str) -> list[SnapshotTag]:
+        """List all snapshot tags for a workload key."""
+        data = self._http.get(f"/api/v1/layered-configs/{workload_key}/tags")
+        return SnapshotTagListResponse.model_validate(data).tags
+
+    def get_tag(self, workload_key: str, tag: str) -> SnapshotTag:
+        """Get a specific snapshot tag."""
+        data = self._http.get(f"/api/v1/layered-configs/{workload_key}/tags/{tag}")
+        return SnapshotTag.model_validate(data)
+
+    def create_tag(
+        self,
+        workload_key: str,
+        tag: str,
+        version: str,
+        *,
+        description: str | None = None,
+    ) -> SnapshotTag:
+        """Create or update a snapshot tag."""
+        body: dict[str, Any] = {"tag": tag, "version": version}
+        if description is not None:
+            body["description"] = description
+        data = self._http.post(f"/api/v1/layered-configs/{workload_key}/tags", json_body=body)
+        return SnapshotTag.model_validate(data)
+
+    def delete_tag(self, workload_key: str, tag: str) -> None:
+        """Delete a snapshot tag."""
+        self._http.delete(f"/api/v1/layered-configs/{workload_key}/tags/{tag}")
+
+    def promote_tag(self, workload_key: str, tag: str) -> dict[str, Any]:
+        """Promote a tagged snapshot version to active fleet-wide."""
+        data = self._http.post(
+            f"/api/v1/layered-configs/{workload_key}/promote",
+            json_body={"tag": tag},
+        )
+        return dict(data)  # type: ignore[arg-type]
 
     def resolve_workload_ref(
         self,

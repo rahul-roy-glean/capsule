@@ -48,24 +48,24 @@ class TestFileDownload:
 
 class TestFileUpload:
     def test_upload_bytes(self, session: RunnerSession, runners: Runners) -> None:
-        with patch.object(runners, "file_upload", return_value=FileUploadResult(success=True)) as mock:
+        with patch.object(runners, "file_upload", return_value=FileUploadResult(bytes_written=9)) as mock:
             result = session.upload("/workspace/file.bin", b"raw bytes")
-        assert result.success is True
+        assert result.bytes_written == 9
         mock.assert_called_once_with("r-1", "/workspace/file.bin", b"raw bytes", mode="overwrite", perm=None)
 
     def test_upload_str(self, session: RunnerSession, runners: Runners) -> None:
-        with patch.object(runners, "file_upload", return_value=FileUploadResult(success=True)) as mock:
+        with patch.object(runners, "file_upload", return_value=FileUploadResult(bytes_written=11)) as mock:
             session.upload("/workspace/file.txt", "hello world")
         mock.assert_called_once_with("r-1", "/workspace/file.txt", b"hello world", mode="overwrite", perm=None)
 
     def test_upload_with_mode_and_perm(self, session: RunnerSession, runners: Runners) -> None:
-        with patch.object(runners, "file_upload", return_value=FileUploadResult(success=True)) as mock:
+        with patch.object(runners, "file_upload", return_value=FileUploadResult(bytes_written=4)) as mock:
             session.upload("/workspace/file.txt", b"data", mode="append", perm="0644")
         mock.assert_called_once_with("r-1", "/workspace/file.txt", b"data", mode="append", perm="0644")
 
     def test_upload_delegates_to_http(self, runners: Runners, http_client: HttpClient) -> None:
         runners._host_cache["r-1"] = "10.0.0.1:8080"
-        with patch.object(http_client, "post_bytes", return_value={"success": True}) as mock:
+        with patch.object(http_client, "post_bytes", return_value={"path": "/tmp/f.txt", "bytes_written": 4}) as mock:
             result = runners.file_upload("r-1", "/tmp/f.txt", b"data", mode="overwrite", perm="0755")
         mock.assert_called_once_with(
             "/api/v1/runners/r-1/files/upload",
@@ -73,11 +73,12 @@ class TestFileUpload:
             base_url="http://10.0.0.1:8080",
             params={"path": "/tmp/f.txt", "mode": "overwrite", "perm": "0755"},
         )
-        assert result.success is True
+        assert result.bytes_written == 4
+        assert result.path == "/tmp/f.txt"
 
     def test_upload_no_perm(self, runners: Runners, http_client: HttpClient) -> None:
         runners._host_cache["r-1"] = "10.0.0.1:8080"
-        with patch.object(http_client, "post_bytes", return_value={"success": True}) as mock:
+        with patch.object(http_client, "post_bytes", return_value={"path": "/tmp/f.txt", "bytes_written": 4}) as mock:
             runners.file_upload("r-1", "/tmp/f.txt", b"data")
         mock.assert_called_once_with(
             "/api/v1/runners/r-1/files/upload",
@@ -116,13 +117,13 @@ class TestFileRead:
 
 class TestFileWrite:
     def test_write_file(self, session: RunnerSession, runners: Runners) -> None:
-        with patch.object(runners, "file_write", return_value=FileWriteResult(success=True)) as mock:
+        with patch.object(runners, "file_write", return_value=FileWriteResult(bytes_written=7)) as mock:
             result = session.write_file("/workspace/out.txt", "content")
-        assert result.success is True
+        assert result.bytes_written == 7
         mock.assert_called_once_with("r-1", "/workspace/out.txt", "content", mode="overwrite")
 
     def test_write_file_append(self, session: RunnerSession, runners: Runners) -> None:
-        with patch.object(runners, "file_write", return_value=FileWriteResult(success=True)) as mock:
+        with patch.object(runners, "file_write", return_value=FileWriteResult(bytes_written=5)) as mock:
             session.write_file("/workspace/log.txt", "line\n", mode="append")
         mock.assert_called_once_with("r-1", "/workspace/log.txt", "line\n", mode="append")
 

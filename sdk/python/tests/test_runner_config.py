@@ -153,17 +153,17 @@ class TestRunnerConfigs:
         assert result.status == "build_enqueued"
 
     def test_build_force(self, runner_configs: RunnerConfigs, http_client: HttpClient) -> None:
-        build_data = {"config_id": "c1", "status": "build_enqueued", "force": "true"}
+        build_data = {"config_id": "c1", "status": "build_enqueued", "force": True, "enqueued": 1}
         mock_resp = httpx.Response(202, json=build_data)
         with patch.object(http_client._client, "request", return_value=mock_resp):
             result = runner_configs.build("c1", force=True)
         assert isinstance(result, BuildResponse)
-        assert result.force == "true"
+        assert result.force is True
 
     def test_build_clean(self, runner_configs: RunnerConfigs, http_client: HttpClient) -> None:
-        build_data = {"config_id": "c1", "status": "build_enqueued", "clean": "true"}
+        build_data = {"config_id": "c1", "status": "build_enqueued", "clean": True, "enqueued": 1}
         mock_resp = httpx.Response(202, json=build_data)
         with patch.object(http_client._client, "request", return_value=mock_resp):
             result = runner_configs.build("c1", clean=True)
         assert isinstance(result, BuildResponse)
-        assert result.clean == "true"
+        assert result.clean is True

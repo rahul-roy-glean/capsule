@@ -16,7 +16,7 @@ from capsule_sdk.models.file import (
     FileUploadResult,
     FileWriteResult,
 )
-from capsule_sdk.models.runner import ConnectResult, ExecEvent, ExecResult, PauseResult
+from capsule_sdk.models.runner import CheckpointResult, ConnectResult, ExecEvent, ExecResult, PauseResult
 
 if TYPE_CHECKING:
     from capsule_sdk.resources.async_runners import AsyncRunners
@@ -177,6 +177,14 @@ class AsyncRunnerSession:
 
     async def mkdir(self, path: str) -> FileMkdirResult:
         return await self._runners.file_mkdir(self._runner_id, path)
+
+    async def checkpoint(self) -> CheckpointResult:
+        """Non-destructively checkpoint the runner; VM keeps running."""
+        return await self._runners.checkpoint(self._runner_id)
+
+    async def service_logs(self) -> bytes:
+        """Fetch the start_command service logs from the runner."""
+        return await self._runners.service_logs(self._runner_id)
 
     async def quarantine(self, *, reason: str | None = None) -> dict[str, Any]:
         return await self._runners.quarantine(self._runner_id, reason=reason)

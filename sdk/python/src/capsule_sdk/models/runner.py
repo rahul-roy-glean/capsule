@@ -35,7 +35,9 @@ class Runner(CapsuleModel):
 
     runner_id: str | None = None
     host_id: str | None = None
+    host_name: str | None = None
     host_address: str | None = None
+    workload_key: str | None = None
     status: str | None = None
     internal_ip: str | None = None
     session_id: str | None = None
@@ -116,6 +118,15 @@ class ExecEvent(CapsuleModel):
     code: int | None = None
     message: str | None = None
     ts: str | None = None
+
+
+class CheckpointResult(CapsuleModel):
+    """Result of checkpointing a runner (non-destructive snapshot; VM keeps running)."""
+
+    session_id: str | None = None
+    snapshot_size_bytes: int | None = None
+    layer: int | None = None
+    running: bool | None = None
 
 
 class ExecResult(CapsuleModel):

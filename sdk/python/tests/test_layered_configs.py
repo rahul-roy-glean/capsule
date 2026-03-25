@@ -89,20 +89,21 @@ class TestLayeredConfigs:
             lc.delete("c1")  # should not raise
 
     def test_build(self, lc: LayeredConfigs, http_client: HttpClient) -> None:
-        resp_data = {"config_id": "c1", "status": "build_enqueued", "force": "false"}
+        resp_data = {"config_id": "c1", "status": "build_enqueued", "force": False, "enqueued": 2}
         mock_resp = httpx.Response(202, json=resp_data)
         with patch.object(http_client._client, "request", return_value=mock_resp):
             result = lc.build("c1")
         assert isinstance(result, BuildResponse)
         assert result.status == "build_enqueued"
+        assert result.enqueued == 2
 
     def test_build_clean(self, lc: LayeredConfigs, http_client: HttpClient) -> None:
-        resp_data = {"config_id": "c1", "status": "build_enqueued", "clean": "true"}
+        resp_data = {"config_id": "c1", "status": "build_enqueued", "clean": True, "enqueued": 1}
         mock_resp = httpx.Response(202, json=resp_data)
         with patch.object(http_client._client, "request", return_value=mock_resp):
             result = lc.build("c1", clean=True)
         assert isinstance(result, BuildResponse)
-        assert result.clean == "true"
+        assert result.clean is True
 
     def test_refresh_layer(self, lc: LayeredConfigs, http_client: HttpClient) -> None:
         resp_data = {"config_id": "c1", "layer_name": "deps", "status": "refresh_enqueued"}

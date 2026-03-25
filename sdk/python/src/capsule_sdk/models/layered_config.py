@@ -111,8 +111,9 @@ class BuildResponse(CapsuleModel):
 
     config_id: str
     status: str | None = None
-    force: str | None = None
-    clean: str | None = None
+    enqueued: int | None = None
+    force: bool | None = None
+    clean: bool | None = None
 
 
 class RefreshResponse(CapsuleModel):
@@ -127,4 +128,21 @@ class LayeredConfigListResponse(CapsuleModel):
     """Response from listing layered configs."""
 
     configs: list[StoredLayeredConfig] = Field(default_factory=_empty_configs)
+    count: int | None = None
+
+
+class SnapshotTag(CapsuleModel):
+    """A named snapshot version tag."""
+
+    tag: str
+    workload_key: str
+    version: str
+    description: str | None = None
+    created_at: str | None = None
+
+
+class SnapshotTagListResponse(CapsuleModel):
+    """Response from listing snapshot tags."""
+
+    tags: list[SnapshotTag] = Field(default_factory=list)
     count: int | None = None

@@ -15,26 +15,30 @@ class FileEntry(CapsuleModel):
     is_dir: bool | None = None
     size: int | None = None
     mode: str | None = None
+    mod_time: str | None = None
 
 
 class FileReadResult(CapsuleModel):
     content: str | None = None
     encoding: str | None = None
     size: int | None = None
+    path: str | None = None
+    base64: bool | None = None
 
 
 class FileWriteResult(CapsuleModel):
-    success: bool | None = None
+    path: str | None = None
     bytes_written: int | None = None
 
 
 class FileUploadResult(CapsuleModel):
-    success: bool | None = None
+    path: str | None = None
     bytes_written: int | None = None
 
 
 class FileListResult(CapsuleModel):
     entries: list[FileEntry] = Field(default_factory=_empty_entries)
+    path: str | None = None
 
 
 class FileStatResult(CapsuleModel):
@@ -42,12 +46,16 @@ class FileStatResult(CapsuleModel):
     size: int | None = None
     mode: str | None = None
     is_dir: bool | None = None
+    name: str | None = None
+    path: str | None = None
+    mod_time: str | None = None
 
 
 class FileRemoveResult(CapsuleModel):
-    success: bool | None = None
     removed: bool | None = None
+    path: str | None = None
 
 
 class FileMkdirResult(CapsuleModel):
-    success: bool | None = None
+    created: bool | None = None
+    path: str | None = None

@@ -33,6 +33,7 @@ from capsule_sdk.models.file import (
 from capsule_sdk.models.layered_config import CreateConfigResponse, LayeredConfigDetail, StoredLayeredConfig
 from capsule_sdk.models.runner import (
     AllocateRunnerResponse,
+    CheckpointResult,
     ConnectResult,
     ExecEvent,
     PauseResult,
@@ -561,6 +562,33 @@ class AsyncRunners:
             self._host_cache[result.runner_id] = result.host_address
             return self._ensure_scheme(result.host_address)
         raise CapsuleServiceUnavailable(f"No host address available for runner {runner_id}")
+
+    async def checkpoint(self, runner_id: str) -> CheckpointResult:
+        """Create a non-destructive checkpoint snapshot of a runner.
+
+        Unlike :meth:`pause`, the VM keeps running after a checkpoint.
+        The returned ``session_id`` can be used to resume from this
+        point later.
+        """
+        host = await self._resolve_host(runner_id)
+        data = await self._http.post_to_host(
+            f"/api/v1/runners/{runner_id}/checkpoint",
+            json_body=None,
+            base_url=host,
+        )
+        return CheckpointResult.model_validate(data)
+
+    async def service_logs(self, runner_id: str, *, follow: bool = False) -> bytes:
+        """Fetch the start_command service logs from a runner."""
+        host = await self._resolve_host(runner_id)
+        params: dict[str, str] = {}
+        if follow:
+            params["follow"] = "true"
+        return await self._http.get_bytes(
+            f"/api/v1/runners/{runner_id}/service-logs",
+            base_url=host,
+            params=params if params else None,
+        )
 
     async def _exec_with_host_retry(self, runner_id: str, body: dict[str, Any]) -> AsyncIterator[ExecEvent]:
         host = await self._resolve_host(runner_id)

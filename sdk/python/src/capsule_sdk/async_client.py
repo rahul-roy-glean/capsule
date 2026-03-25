@@ -3,6 +3,7 @@ from __future__ import annotations
 from capsule_sdk._config import ConnectionConfig
 from capsule_sdk._http_async import AsyncHttpClient
 from capsule_sdk.async_runner_config import AsyncRunnerConfigs
+from capsule_sdk.resources.async_hosts import AsyncHosts
 from capsule_sdk.resources.async_layered_configs import AsyncLayeredConfigs
 from capsule_sdk.resources.async_runners import AsyncRunners
 from capsule_sdk.resources.async_snapshots import AsyncSnapshots
@@ -34,6 +35,7 @@ class AsyncCapsuleClient:
         self._layered_configs = AsyncLayeredConfigs(self._http)
         self.runners = AsyncRunners(self._http, layered_configs=self._layered_configs)
         self.snapshots = AsyncSnapshots(self._http)
+        self.hosts = AsyncHosts(self._http)
         self.runner_configs = AsyncRunnerConfigs(self._layered_configs)
         self.workloads = AsyncWorkloads(self._layered_configs, self.runners)
 

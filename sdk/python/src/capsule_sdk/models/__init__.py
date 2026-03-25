@@ -9,6 +9,7 @@ from capsule_sdk.models.file import (
     FileUploadResult,
     FileWriteResult,
 )
+from capsule_sdk.models.host import Host, HostListResponse
 from capsule_sdk.models.layered_config import (
     BuildResponse,
     CreateConfigResponse,
@@ -19,11 +20,14 @@ from capsule_sdk.models.layered_config import (
     LayeredConfigListResponse,
     LayerStatus,
     RefreshResponse,
+    SnapshotTag,
+    SnapshotTagListResponse,
     StoredLayeredConfig,
 )
 from capsule_sdk.models.runner import (
     AllocateRunnerRequest,
     AllocateRunnerResponse,
+    CheckpointResult,
     ConnectResult,
     ExecEvent,
     ExecRequest,
@@ -41,6 +45,7 @@ __all__ = [
     "AllocateRunnerResponse",
     "CapsuleModel",
     "BuildResponse",
+    "CheckpointResult",
     "ConnectResult",
     "CreateConfigResponse",
     "DriveSpec",
@@ -55,6 +60,8 @@ __all__ = [
     "FileStatResult",
     "FileUploadResult",
     "FileWriteResult",
+    "Host",
+    "HostListResponse",
     "LayerDef",
     "LayeredConfigListResponse",
     "LayerStatus",
@@ -69,6 +76,8 @@ __all__ = [
     "RunnerStatus",
     "Snapshot",
     "SnapshotListResponse",
+    "SnapshotTag",
+    "SnapshotTagListResponse",
     "StoredLayeredConfig",
     "WorkloadSummary",
 ]
