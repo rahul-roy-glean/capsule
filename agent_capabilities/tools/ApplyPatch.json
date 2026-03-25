@@ -1,0 +1,18 @@
+{
+  "namespace": "functions",
+  "name": "ApplyPatch",
+  "target_channel": "commentary",
+  "description": "Edits a single file using a structured patch format.",
+  "input_type": "freeform_patch",
+  "parameters": {
+    "patch_text": {
+      "type": "string",
+      "required": true,
+      "description": "Patch using the Begin Patch / End Patch grammar."
+    }
+  },
+  "notes": [
+    "Only one file operation per call.",
+    "Must use exact patch grammar with Add File or Update File headers."
+  ]
+}

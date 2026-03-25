@@ -1,0 +1,19 @@
+{
+  "namespace": "functions",
+  "name": "WebSearch",
+  "target_channel": "commentary",
+  "description": "Searches the web for current information.",
+  "input_type": "json",
+  "parameters": {
+    "search_term": {
+      "type": "string",
+      "required": true,
+      "description": "Specific search query."
+    },
+    "explanation": {
+      "type": "string",
+      "required": false,
+      "description": "Why the search is being run."
+    }
+  }
+}

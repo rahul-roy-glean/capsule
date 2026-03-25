@@ -1,0 +1,14 @@
+{
+  "namespace": "functions",
+  "name": "WebFetch",
+  "target_channel": "commentary",
+  "description": "Fetches a webpage and returns it as readable markdown.",
+  "input_type": "json",
+  "parameters": {
+    "url": {
+      "type": "string",
+      "required": true,
+      "description": "Fully formed URL to fetch."
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "namespace": "functions",
+  "name": "Glob",
+  "target_channel": "commentary",
+  "description": "Searches for files matching a glob pattern.",
+  "input_type": "json",
+  "parameters": {
+    "target_directory": {
+      "type": "string",
+      "required": false,
+      "description": "Absolute directory to search; defaults to workspace root."
+    },
+    "glob_pattern": {
+      "type": "string",
+      "required": true,
+      "description": "Glob pattern to match recursively."
+    }
+  }
+}

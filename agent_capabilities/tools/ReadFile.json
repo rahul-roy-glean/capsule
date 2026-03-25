@@ -1,0 +1,24 @@
+{
+  "namespace": "functions",
+  "name": "ReadFile",
+  "target_channel": "commentary",
+  "description": "Reads a file from local filesystem, including text, images, and PDFs.",
+  "input_type": "json",
+  "parameters": {
+    "path": {
+      "type": "string",
+      "required": true,
+      "description": "Absolute path to the file."
+    },
+    "offset": {
+      "type": "integer",
+      "required": false,
+      "description": "1-indexed starting line; negative counts from end."
+    },
+    "limit": {
+      "type": "integer",
+      "required": false,
+      "description": "Maximum number of lines to read."
+    }
+  }
+}

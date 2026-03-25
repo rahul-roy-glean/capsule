@@ -1,0 +1,42 @@
+{
+  "namespace": "functions",
+  "name": "TodoWrite",
+  "target_channel": "commentary",
+  "description": "Creates or updates the task todo list.",
+  "input_type": "json",
+  "parameters": {
+    "merge": {
+      "type": "boolean",
+      "required": true,
+      "description": "Merge with existing todos or replace them entirely."
+    },
+    "todos": {
+      "type": "array",
+      "required": true,
+      "description": "List of todo items.",
+      "items": {
+        "id": {
+          "type": "string",
+          "required": true
+        },
+        "content": {
+          "type": "string",
+          "required": true
+        },
+        "status": {
+          "type": "string",
+          "required": true,
+          "enum": [
+            "pending",
+            "in_progress",
+            "completed",
+            "cancelled"
+          ]
+        }
+      }
+    }
+  },
+  "notes": [
+    "At most one todo should be in_progress at a time."
+  ]
+}

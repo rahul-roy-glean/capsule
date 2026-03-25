@@ -1,0 +1,14 @@
+{
+  "namespace": "functions",
+  "name": "ListMcpResources",
+  "target_channel": "commentary",
+  "description": "Lists available resources from configured MCP servers.",
+  "input_type": "json",
+  "parameters": {
+    "server": {
+      "type": "string",
+      "required": false,
+      "description": "Optional MCP server identifier filter."
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "namespace": "multi_tool_use",
+  "name": "parallel",
+  "target_channel": "commentary",
+  "description": "Runs multiple developer tools in parallel when they are independent.",
+  "input_type": "json",
+  "parameters": {
+    "tool_uses": {
+      "type": "array",
+      "required": true,
+      "description": "Array of independent tool calls to execute concurrently.",
+      "items": {
+        "recipient_name": {
+          "type": "string",
+          "required": true,
+          "description": "Fully qualified developer tool name, e.g. functions.ReadFile."
+        },
+        "parameters": {
+          "type": "object",
+          "required": true,
+          "description": "Arguments for that tool call."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "namespace": "functions",
+  "name": "Subagent",
+  "target_channel": "commentary",
+  "description": "Launches a specialized subagent for complex autonomous tasks.",
+  "input_type": "json",
+  "parameters": {
+    "description": {
+      "type": "string",
+      "required": true,
+      "description": "Short 3-5 word summary of the task."
+    },
+    "prompt": {
+      "type": "string",
+      "required": true,
+      "description": "Detailed instructions for the subagent."
+    },
+    "model": {
+      "type": "string",
+      "required": false,
+      "enum": [
+        "fast"
+      ],
+      "description": "Optional model choice."
+    },
+    "resume": {
+      "type": "string",
+      "required": false,
+      "description": "Existing agent ID to resume."
+    },
+    "readonly": {
+      "type": "boolean",
+      "required": false,
+      "description": "Whether the subagent is read-only."
+    },
+    "subagent_type": {
+      "type": "string",
+      "required": false,
+      "enum": [
+        "generalPurpose",
+        "explore",
+        "best-of-n-runner"
+      ],
+      "description": "Subagent specialization."
+    },
+    "attachments": {
+      "type": "array",
+      "required": false,
+      "description": "Optional attached video file paths.",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

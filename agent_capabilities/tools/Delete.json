@@ -1,0 +1,14 @@
+{
+  "namespace": "functions",
+  "name": "Delete",
+  "target_channel": "commentary",
+  "description": "Deletes a file at the specified absolute path.",
+  "input_type": "json",
+  "parameters": {
+    "path": {
+      "type": "string",
+      "required": true,
+      "description": "Absolute path of the file to delete."
+    }
+  }
+}

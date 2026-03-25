@@ -1,0 +1,39 @@
+{
+  "namespace": "functions",
+  "name": "Shell",
+  "target_channel": "commentary",
+  "description": "Executes a shell command in a persistent terminal session.",
+  "input_type": "json",
+  "parameters": {
+    "command": {
+      "type": "string",
+      "required": true,
+      "description": "Shell command to execute."
+    },
+    "working_directory": {
+      "type": "string",
+      "required": false,
+      "description": "Absolute working directory; defaults to current shell cwd."
+    },
+    "timeout": {
+      "type": "integer",
+      "required": false,
+      "description": "Timeout in milliseconds, max 600000."
+    },
+    "description": {
+      "type": "string",
+      "required": false,
+      "description": "Short 5-10 word description of the command."
+    },
+    "is_background": {
+      "type": "boolean",
+      "required": false,
+      "description": "Whether to run the command in the background."
+    }
+  },
+  "notes": [
+    "Shell state persists across calls.",
+    "Use dedicated file/search tools instead of shell for reading/searching files when possible.",
+    "Quote paths containing spaces."
+  ]
+}

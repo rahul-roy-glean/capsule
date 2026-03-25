@@ -1,0 +1,74 @@
+{
+  "namespace": "functions",
+  "name": "rg",
+  "target_channel": "commentary",
+  "description": "Searches workspace contents with ripgrep respecting ignore files.",
+  "input_type": "json",
+  "parameters": {
+    "pattern": {
+      "type": "string",
+      "required": true,
+      "description": "Regex pattern to search for."
+    },
+    "path": {
+      "type": "string",
+      "required": false,
+      "description": "File or directory path to search in."
+    },
+    "glob": {
+      "type": "string",
+      "required": false,
+      "description": "Glob filter for files."
+    },
+    "output_mode": {
+      "type": "string",
+      "required": false,
+      "enum": [
+        "content",
+        "files_with_matches",
+        "count"
+      ],
+      "description": "Return matching content, paths, or counts."
+    },
+    "-B": {
+      "type": "integer",
+      "required": false,
+      "description": "Lines of context before each match."
+    },
+    "-A": {
+      "type": "integer",
+      "required": false,
+      "description": "Lines of context after each match."
+    },
+    "-C": {
+      "type": "integer",
+      "required": false,
+      "description": "Lines of context before and after each match."
+    },
+    "-i": {
+      "type": "boolean",
+      "required": false,
+      "description": "Case-insensitive search."
+    },
+    "type": {
+      "type": "string",
+      "required": false,
+      "description": "rg file type filter."
+    },
+    "head_limit": {
+      "type": "number",
+      "required": false,
+      "description": "Maximum number of results returned."
+    },
+    "offset": {
+      "type": "number",
+      "required": false,
+      "description": "Skip first N results."
+    },
+    "multiline": {
+      "type": "boolean",
+      "required": false,
+      "description": "Enable multiline matching."
+    }
+  }
+}

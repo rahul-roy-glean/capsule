@@ -1,0 +1,54 @@
+{
+  "namespace": "functions",
+  "name": "EditNotebook",
+  "target_channel": "commentary",
+  "description": "Edits or inserts a Jupyter notebook cell.",
+  "input_type": "json",
+  "parameters": {
+    "target_notebook": {
+      "type": "string",
+      "required": true,
+      "description": "Path to the notebook file."
+    },
+    "cell_idx": {
+      "type": "integer",
+      "required": true,
+      "description": "Zero-based target cell index."
+    },
+    "is_new_cell": {
+      "type": "boolean",
+      "required": true,
+      "description": "Whether to create a new cell."
+    },
+    "cell_language": {
+      "type": "string",
+      "required": true,
+      "enum": [
+        "python",
+        "markdown",
+        "javascript",
+        "typescript",
+        "r",
+        "sql",
+        "shell",
+        "raw",
+        "other"
+      ],
+      "description": "Language of the cell."
+    },
+    "old_string": {
+      "type": "string",
+      "required": true,
+      "description": "Exact existing cell content to replace, or empty for new cells."
+    },
+    "new_string": {
+      "type": "string",
+      "required": true,
+      "description": "Replacement or new cell content."
+    }
+  },
+  "notes": [
+    "Must provide all required fields in the documented argument order.",
+    "For edits, old_string should include enough context to identify a unique occurrence."
+  ]
+}

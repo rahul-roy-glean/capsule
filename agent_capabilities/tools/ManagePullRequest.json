@@ -1,0 +1,46 @@
+{
+  "namespace": "functions",
+  "name": "ManagePullRequest",
+  "target_channel": "commentary",
+  "description": "Creates or updates a pull request for the current repository.",
+  "input_type": "json",
+  "parameters": {
+    "action": {
+      "type": "string",
+      "required": true,
+      "enum": [
+        "create_pr",
+        "update_pr"
+      ],
+      "description": "Whether to create or update a PR."
+    },
+    "title": {
+      "type": "string",
+      "required": false,
+      "description": "PR title."
+    },
+    "body": {
+      "type": "string",
+      "required": false,
+      "description": "PR body/description."
+    },
+    "base_branch": {
+      "type": "string",
+      "required": false,
+      "description": "Target base branch."
+    },
+    "draft": {
+      "type": "boolean",
+      "required": false,
+      "description": "Create draft PR; defaults to true for creation."
+    },
+    "pr_url": {
+      "type": "string",
+      "required": false,
+      "description": "PR URL to update."
+    }
+  },
+  "notes": [
+    "Changes must be committed and pushed before creating a PR."
+  ]
+}

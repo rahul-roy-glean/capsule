@@ -1,0 +1,24 @@
+{
+  "namespace": "functions",
+  "name": "FetchMcpResource",
+  "target_channel": "commentary",
+  "description": "Reads a specific MCP resource and can optionally download it to disk.",
+  "input_type": "json",
+  "parameters": {
+    "server": {
+      "type": "string",
+      "required": true,
+      "description": "MCP server identifier."
+    },
+    "uri": {
+      "type": "string",
+      "required": true,
+      "description": "Resource URI."
+    },
+    "downloadPath": {
+      "type": "string",
+      "required": false,
+      "description": "Relative workspace path to save the resource to."
+    }
+  }
+}
