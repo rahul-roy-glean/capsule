@@ -141,8 +141,12 @@ class SnapshotTag(CapsuleModel):
     created_at: str | None = None
 
 
+def _empty_tags() -> list[SnapshotTag]:
+    return []
+
+
 class SnapshotTagListResponse(CapsuleModel):
     """Response from listing snapshot tags."""
 
-    tags: list[SnapshotTag] = Field(default_factory=list)
+    tags: list[SnapshotTag] = Field(default_factory=_empty_tags)
     count: int | None = None
