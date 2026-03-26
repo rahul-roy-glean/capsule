@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -207,6 +208,11 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 		if resp, err := http.DefaultClient.Do(req); err != nil {
 			m.logger.WithError(err).Warn("Pause: failed to sync guest filesystems (thaw-agent unreachable)")
 		} else {
+			// The /exec endpoint streams ndjson — we must drain the body
+			// to wait for the sync command to actually complete. Without
+			// this, resp.Body.Close() returns immediately after headers
+			// arrive and the snapshot races with the still-running sync.
+			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 			m.logger.Info("Pause: guest filesystem sync complete")
 		}
