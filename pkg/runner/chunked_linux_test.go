@@ -558,6 +558,7 @@ func TestRestoreAndActivateRunnerUsesLongerDefaultReadyTimeout(t *testing.T) {
 		"/tmp/uffd.sock",
 		false,
 		map[string]string{},
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("restoreAndActivateRunner() error = %v", err)
