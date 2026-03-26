@@ -26,6 +26,8 @@ from capsule_sdk.models.workload import WorkloadSummary
 from capsule_sdk.resources.async_runners import AsyncRunners
 from capsule_sdk.resources.async_snapshots import AsyncSnapshots
 from capsule_sdk.resources.async_workloads import AsyncWorkloads
+from capsule_sdk.resources.runners import Runners
+from capsule_sdk.resources.snapshots import Snapshots
 from capsule_sdk.resources.workloads import Workloads
 from capsule_sdk.runner_config import RunnerConfig, RunnerConfigs
 from capsule_sdk.runner_session import RunnerSession
@@ -54,7 +56,9 @@ __all__ = [
     "CapsuleTimeoutError",
     "RunnerConfig",
     "RunnerConfigs",
+    "Runners",
     "RunnerSession",
+    "Snapshots",
     "WorkloadSummary",
     "Workloads",
     "__version__",
