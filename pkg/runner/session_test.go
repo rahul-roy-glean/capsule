@@ -138,16 +138,18 @@ func TestResetTTL_NonexistentRunner(t *testing.T) {
 
 func TestSessionMetadata_JSON(t *testing.T) {
 	meta := SessionMetadata{
-		SessionID:   "sess-abc",
-		WorkloadKey: "chunk123",
-		RunnerID:    "runner-1",
-		HostID:      "host-1",
-		Layers:      2,
-		CreatedAt:   time.Now().Truncate(time.Second),
-		PausedAt:    time.Now().Truncate(time.Second),
-		RootfsPath:  "/tmp/overlay.img",
-		TTLSeconds:  30,
-		AutoPause:   true,
+		SessionID:            "sess-abc",
+		WorkloadKey:          "chunk123",
+		RunnerID:             "runner-1",
+		HostID:               "host-1",
+		Layers:               2,
+		CreatedAt:            time.Now().Truncate(time.Second),
+		PausedAt:             time.Now().Truncate(time.Second),
+		RootfsPath:           "/tmp/overlay.img",
+		TTLSeconds:           30,
+		AutoPause:            true,
+		SessionMaxAgeSeconds: 3600,
+		SessionMaxAgeConfigured: true,
 	}
 
 	data, err := json.Marshal(meta)
@@ -171,6 +173,12 @@ func TestSessionMetadata_JSON(t *testing.T) {
 	}
 	if !decoded.AutoPause {
 		t.Error("AutoPause should be true")
+	}
+	if decoded.SessionMaxAgeSeconds != 3600 {
+		t.Errorf("SessionMaxAgeSeconds = %d, want 3600", decoded.SessionMaxAgeSeconds)
+	}
+	if !decoded.SessionMaxAgeConfigured {
+		t.Error("SessionMaxAgeConfigured should be true")
 	}
 	if decoded.RootfsPath != "/tmp/overlay.img" {
 		t.Errorf("RootfsPath = %q, want %q", decoded.RootfsPath, "/tmp/overlay.img")

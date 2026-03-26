@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	pb "github.com/rahul-roy-glean/capsule/api/proto/runner"
 	"github.com/rahul-roy-glean/capsule/pkg/runner"
 )
 
@@ -154,5 +155,35 @@ func TestRunnerToProto_NilIP(t *testing.T) {
 	}
 	if proto.State.String() != "RUNNER_STATE_SUSPENDED" {
 		t.Errorf("State = %q, want RUNNER_STATE_SUSPENDED", proto.State.String())
+	}
+}
+
+func TestApplyInternalAllocateLabels_SessionMaxAge(t *testing.T) {
+	req := &pb.AllocateRunnerRequest{
+		Labels: map[string]string{
+			sessionMaxAgeLabelKey: "7200",
+		},
+	}
+	allocReq := &runner.AllocateRequest{}
+	if err := applyInternalAllocateLabels(req, allocReq); err != nil {
+		t.Fatalf("applyInternalAllocateLabels() error = %v", err)
+	}
+	if allocReq.SessionMaxAgeSeconds != 7200 {
+		t.Fatalf("SessionMaxAgeSeconds = %d, want 7200", allocReq.SessionMaxAgeSeconds)
+	}
+	if !allocReq.SessionMaxAgeConfigured {
+		t.Fatal("SessionMaxAgeConfigured should be true")
+	}
+}
+
+func TestApplyInternalAllocateLabels_InvalidSessionMaxAge(t *testing.T) {
+	req := &pb.AllocateRunnerRequest{
+		Labels: map[string]string{
+			sessionMaxAgeLabelKey: "not-a-number",
+		},
+	}
+	allocReq := &runner.AllocateRequest{}
+	if err := applyInternalAllocateLabels(req, allocReq); err == nil {
+		t.Fatal("expected invalid session max age to return error")
 	}
 }

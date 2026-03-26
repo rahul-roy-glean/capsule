@@ -69,13 +69,15 @@ type Runner struct {
 	PausedAt time.Time `json:"paused_at,omitempty"`
 
 	// Session pause/resume fields
-	SessionID     string    `json:"session_id,omitempty"`
-	TTLSeconds    int       `json:"ttl_seconds,omitempty"`
-	AutoPause     bool      `json:"auto_pause,omitempty"`
-	LastExecAt    time.Time `json:"last_exec_at,omitempty"`
-	ActiveExecs   int32     `json:"active_execs,omitempty"`
-	SessionDir    string    `json:"session_dir,omitempty"`
-	SessionLayers int       `json:"session_layers,omitempty"`
+	SessionID               string    `json:"session_id,omitempty"`
+	TTLSeconds              int       `json:"ttl_seconds,omitempty"`
+	AutoPause               bool      `json:"auto_pause,omitempty"`
+	SessionMaxAgeSeconds    int       `json:"session_max_age_seconds,omitempty"`
+	SessionMaxAgeConfigured bool      `json:"session_max_age_configured,omitempty"`
+	LastExecAt              time.Time `json:"last_exec_at,omitempty"`
+	ActiveExecs             int32     `json:"active_execs,omitempty"`
+	SessionDir              string    `json:"session_dir,omitempty"`
+	SessionLayers           int       `json:"session_layers,omitempty"`
 }
 
 // RunnerHeartbeatInfo is a lightweight per-runner status included in host
@@ -96,19 +98,21 @@ type Resources struct {
 
 // AllocateRequest represents a request to allocate a runner
 type AllocateRequest struct {
-	RequestID           string
-	WorkloadKey         string // Workload key identifying which snapshot to use for this runner
-	SnapshotVersion     string // Explicit snapshot version; skips current-pointer.json lookup when set
-	Resources           Resources
-	Labels              map[string]string
-	StartCommand        *snapshot.StartCommand // Optional: user service to start inside the VM
-	SessionID           string                 // optional: bind to session for pause/resume
-	TTLSeconds          int                    // idle timeout from snapshot config
-	AutoPause           bool                   // pause on TTL vs destroy
-	SnapshotTag         string                 // optional: named tag to resolve snapshot version
-	NetworkPolicyPreset string                 // optional: named preset (e.g., "restricted-egress")
-	NetworkPolicy       *network.NetworkPolicy // optional: full policy override
-	AuthConfig          *authproxy.AuthConfig  // optional: auth proxy configuration
+	RequestID               string
+	WorkloadKey             string // Workload key identifying which snapshot to use for this runner
+	SnapshotVersion         string // Explicit snapshot version; skips current-pointer.json lookup when set
+	Resources               Resources
+	Labels                  map[string]string
+	StartCommand            *snapshot.StartCommand // Optional: user service to start inside the VM
+	SessionID               string                 // optional: bind to session for pause/resume
+	TTLSeconds              int                    // idle timeout from snapshot config
+	AutoPause               bool                   // pause on TTL vs destroy
+	SessionMaxAgeSeconds    int                    // max age for paused session retention on host
+	SessionMaxAgeConfigured bool                   // true when SessionMaxAgeSeconds came from explicit config
+	SnapshotTag             string                 // optional: named tag to resolve snapshot version
+	NetworkPolicyPreset     string                 // optional: named preset (e.g., "restricted-egress")
+	NetworkPolicy           *network.NetworkPolicy // optional: full policy override
+	AuthConfig              *authproxy.AuthConfig  // optional: auth proxy configuration
 }
 
 // MMDSData represents data to inject into the microVM via MMDS
@@ -182,6 +186,27 @@ type HostConfig struct {
 	// SessionDir is the base directory for session snapshot storage (pause/resume).
 	// Defaults to {SnapshotCachePath}/../sessions (e.g. /mnt/data/sessions).
 	SessionDir string
+	// SessionSweepInterval controls how often the host janitor scans local
+	// session artifacts. Zero disables janitor sweeps.
+	SessionSweepInterval time.Duration
+	// SessionDefaultMaxAge is the fallback retention for local session data when
+	// a session does not record an explicit max age.
+	SessionDefaultMaxAge time.Duration
+	// SessionStateMaxAge is the maximum age for temporary state files downloaded
+	// into SocketDir/session-state during cross-host resume.
+	SessionStateMaxAge time.Duration
+	// ChunkCacheMaxBytes caps the on-disk chunk cache under SnapshotCachePath/chunks.
+	// Zero disables chunk cache pruning.
+	ChunkCacheMaxBytes int64
+	// ChunkCacheLowWatermark controls how far pruning reduces the on-disk chunk
+	// cache once ChunkCacheMaxBytes is exceeded. Values should be between 0 and 1.
+	ChunkCacheLowWatermark float64
+	// LogMaxAge is the retention for per-runner log, console, and metrics files
+	// in LogDir. Zero disables log retention sweeps.
+	LogMaxAge time.Duration
+	// QuarantineMaxAge is the retention for inactive quarantine directories.
+	// Zero disables quarantine retention sweeps.
+	QuarantineMaxAge time.Duration
 	// WorkloadKey identifies which snapshot this host should use (hash of snapshot commands).
 	WorkloadKey      string
 	Environment      string

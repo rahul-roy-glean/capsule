@@ -41,6 +41,7 @@ func TestAllCountersHaveDescriptions(t *testing.T) {
 		E2ECanarySuccess, E2ECanaryFailure,
 		ChunkFetchBytes, ChunkSingleflightDedup, ChunkNegCacheHits,
 		NetworkBytesTx, NetworkBytesRx,
+		HostGCBytesReclaimed, HostGCFilesRemoved,
 	}
 	for _, name := range counters {
 		if _, ok := counterDescriptions[name]; !ok {
@@ -63,6 +64,7 @@ func TestAllGaugesHaveDescriptions(t *testing.T) {
 		PoolRunners, PoolMemoryUsed, PoolMemoryMax,
 		SnapshotSize, SnapshotAge,
 		HostGCSSyncBytes, HostUptime, CacheArtifactSize, NetworkConnections,
+		HostGCSessionsBytes, HostGCSessionStateBytes, HostGCChunkCacheBytes, HostGCLogBytes, HostGCQuarantineBytes,
 	}
 	for _, name := range gauges {
 		if _, ok := gaugeDescriptions[name]; !ok {

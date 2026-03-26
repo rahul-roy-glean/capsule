@@ -156,6 +156,46 @@ func TestBringupLeaseReleaseAllowsReuse(t *testing.T) {
 	lease3.Release()
 }
 
+func TestReleaseRunnerChunked_CleansSessionDir(t *testing.T) {
+	cm := newTestChunkedManager()
+	cm.netnsNetwork = &network.NetNSNetwork{}
+
+	workspaceDir := t.TempDir()
+	socketDir := t.TempDir()
+	sessionDir := t.TempDir()
+	cm.config.WorkspaceDir = workspaceDir
+	cm.config.SocketDir = socketDir
+	cm.config.SessionDir = sessionDir
+
+	runnerID := "runner-1"
+	sessionID := "sess-1"
+	cm.runners[runnerID] = &Runner{
+		ID:        runnerID,
+		SessionID: sessionID,
+	}
+
+	if err := os.MkdirAll(filepath.Join(workspaceDir, runnerID), 0755); err != nil {
+		t.Fatalf("MkdirAll workspace: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(socketDir, runnerID+".sock"), []byte("sock"), 0644); err != nil {
+		t.Fatalf("WriteFile socket: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(sessionDir, sessionID, "layer_0"), 0755); err != nil {
+		t.Fatalf("MkdirAll session: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionDir, sessionID, "metadata.json"), []byte(`{"session_id":"sess-1","layers":1}`), 0644); err != nil {
+		t.Fatalf("WriteFile metadata: %v", err)
+	}
+
+	if err := cm.ReleaseRunnerChunked(context.Background(), runnerID, false); err != nil {
+		t.Fatalf("ReleaseRunnerChunked() error = %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(sessionDir, sessionID)); !os.IsNotExist(err) {
+		t.Fatalf("session dir still exists after release, err=%v", err)
+	}
+}
+
 func TestRegisterAllocatedRunnerPublishesResources(t *testing.T) {
 	cm := newTestChunkedManager()
 
@@ -461,5 +501,66 @@ func TestRestoreAndActivateRunnerFallsBackToColdBoot(t *testing.T) {
 		if action == "resume" {
 			t.Fatalf("fallback cold boot path should not call resume; actions=%v", actions)
 		}
+	}
+}
+
+func TestRestoreAndActivateRunnerUsesLongerDefaultReadyTimeout(t *testing.T) {
+	cm := newTestChunkedManager()
+
+	actions := []string{}
+	vm := &fakeChunkedVM{actions: &actions}
+	var gotTimeout time.Duration
+	cm.newVMFn = func(cfg firecracker.VMConfig, logger *logrus.Logger) (chunkedVM, error) {
+		return vm, nil
+	}
+	cm.setupChunkedSymlinksFn = func(runnerID, rootfsPath string, extensionDrivePaths map[string]string) (string, func(), error) {
+		return "/tmp/snapshot-test", func() {}, nil
+	}
+	cm.forwardPortFn = func(runnerID string, port int) error { return nil }
+	cm.waitForReadyFn = func(ctx context.Context, ip string, timeout time.Duration) error {
+		gotTimeout = timeout
+		actions = append(actions, "ready")
+		return nil
+	}
+
+	_, subnet, _ := net.ParseCIDR("10.0.0.0/24")
+	tap := &network.TapDevice{
+		Name:    "tap0",
+		IP:      net.IPv4(10, 0, 0, 2),
+		Gateway: net.IPv4(10, 0, 0, 1),
+		Subnet:  subnet,
+		MAC:     "02:fc:0a:00:00:02",
+	}
+	netns := &network.VMNamespace{
+		Slot:    7,
+		Path:    "/tmp/netns",
+		Gateway: net.IPv4(10, 0, 0, 1),
+	}
+	runner := &Runner{
+		ID:         "runner-1",
+		HostID:     "host-1",
+		InternalIP: net.IPv4(10, 0, 0, 2),
+		Resources:  Resources{VCPUs: 2, MemoryMB: 2048},
+	}
+
+	_, _, err := cm.restoreAndActivateRunner(
+		context.Background(),
+		"runner-1",
+		AllocateRequest{},
+		runner,
+		netns,
+		tap,
+		firecracker.VMConfig{VMID: "runner-1", RootfsPath: "/tmp/rootfs.img"},
+		"/tmp/state",
+		"",
+		"/tmp/uffd.sock",
+		false,
+		map[string]string{},
+	)
+	if err != nil {
+		t.Fatalf("restoreAndActivateRunner() error = %v", err)
+	}
+	if gotTimeout != 30*time.Second {
+		t.Fatalf("ready timeout = %s, want %s", gotTimeout, 30*time.Second)
 	}
 }

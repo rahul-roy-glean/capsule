@@ -41,22 +41,29 @@ import (
 )
 
 var (
-	grpcPort           = flag.Int("grpc-port", 50051, "gRPC server port")
-	httpPort           = flag.Int("http-port", 8080, "HTTP server port (health/metrics)")
-	firecrackerBin     = flag.String("firecracker-bin", "/usr/local/bin/firecracker", "Path to firecracker binary")
-	socketDir          = flag.String("socket-dir", "/var/run/firecracker", "Directory for VM sockets")
-	workspaceDir       = flag.String("workspace-dir", "/mnt/data/workspaces", "Directory for workspaces")
-	logDir             = flag.String("log-dir", "/var/log/firecracker", "Directory for VM logs")
-	snapshotBucket     = flag.String("snapshot-bucket", "", "GCS bucket for snapshots")
-	snapshotCache      = flag.String("snapshot-cache", "/mnt/data/snapshots", "Local snapshot cache path")
-	quarantineDir      = flag.String("quarantine-dir", "/mnt/data/quarantine", "Directory to store quarantined runner manifests and debug metadata")
-	microVMSubnet      = flag.String("microvm-subnet", "172.16.0.0/24", "Subnet for microVMs")
-	extInterface       = flag.String("ext-interface", "auto", "External network interface (or \"auto\" to detect from the default route)")
-	bridgeName         = flag.String("bridge-name", "fcbr0", "Bridge name for microVMs")
-	environment        = flag.String("environment", "dev", "Environment name")
-	controlPlane       = flag.String("control-plane", "", "Control plane address")
-	hostBootstrapToken = flag.String("host-bootstrap-token", "", "Bearer token for authenticated host heartbeats")
-	logLevel           = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+	grpcPort               = flag.Int("grpc-port", 50051, "gRPC server port")
+	httpPort               = flag.Int("http-port", 8080, "HTTP server port (health/metrics)")
+	firecrackerBin         = flag.String("firecracker-bin", "/usr/local/bin/firecracker", "Path to firecracker binary")
+	socketDir              = flag.String("socket-dir", "/var/run/firecracker", "Directory for VM sockets")
+	workspaceDir           = flag.String("workspace-dir", "/mnt/data/workspaces", "Directory for workspaces")
+	logDir                 = flag.String("log-dir", "/var/log/firecracker", "Directory for VM logs")
+	snapshotBucket         = flag.String("snapshot-bucket", "", "GCS bucket for snapshots")
+	snapshotCache          = flag.String("snapshot-cache", "/mnt/data/snapshots", "Local snapshot cache path")
+	quarantineDir          = flag.String("quarantine-dir", "/mnt/data/quarantine", "Directory to store quarantined runner manifests and debug metadata")
+	sessionSweepInterval   = flag.Duration("gc-session-sweep-interval", runner.DefaultSessionSweepInterval, "How often to sweep local session artifacts")
+	sessionDefaultMaxAge   = flag.Duration("gc-session-default-max-age", runner.DefaultSessionMaxAge, "Fallback retention for local session directories")
+	sessionStateMaxAge     = flag.Duration("gc-session-state-max-age", runner.DefaultSessionStateMaxAge, "Retention for SocketDir/session-state temp files")
+	chunkCacheMaxBytes     = flag.Int64("gc-chunk-cache-max-bytes", 0, "Maximum size of the on-disk chunk cache under snapshot-cache/chunks (0 disables pruning)")
+	chunkCacheLowWatermark = flag.Float64("gc-chunk-cache-low-watermark", runner.DefaultChunkCacheLowWatermark, "Target fraction to prune the on-disk chunk cache down to after it exceeds the max")
+	logMaxAge              = flag.Duration("gc-log-max-age", runner.DefaultLogMaxAge, "Retention for inactive runner logs in log-dir")
+	quarantineMaxAge       = flag.Duration("gc-quarantine-max-age", runner.DefaultQuarantineMaxAge, "Retention for inactive quarantine directories")
+	microVMSubnet          = flag.String("microvm-subnet", "172.16.0.0/24", "Subnet for microVMs")
+	extInterface           = flag.String("ext-interface", "auto", "External network interface (or \"auto\" to detect from the default route)")
+	bridgeName             = flag.String("bridge-name", "fcbr0", "Bridge name for microVMs")
+	environment            = flag.String("environment", "dev", "Environment name")
+	controlPlane           = flag.String("control-plane", "", "Control plane address")
+	hostBootstrapToken     = flag.String("host-bootstrap-token", "", "Bearer token for authenticated host heartbeats")
+	logLevel               = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 
 	gcpProject = flag.String("gcp-project", "", "GCP project")
 
@@ -303,19 +310,26 @@ func main() {
 
 	// Create runner manager config
 	cfg := runner.HostConfig{
-		HostID:            hostID,
-		InstanceName:      instanceName,
-		Zone:              zone,
-		FirecrackerBin:    *firecrackerBin,
-		SocketDir:         *socketDir,
-		WorkspaceDir:      *workspaceDir,
-		LogDir:            *logDir,
-		SnapshotBucket:    *snapshotBucket,
-		SnapshotCachePath: *snapshotCache,
-		QuarantineDir:     *quarantineDir,
-		Environment:       *environment,
-		ControlPlaneAddr:  *controlPlane,
-		GCPProject:        gcpProjectVal,
+		HostID:                 hostID,
+		InstanceName:           instanceName,
+		Zone:                   zone,
+		FirecrackerBin:         *firecrackerBin,
+		SocketDir:              *socketDir,
+		WorkspaceDir:           *workspaceDir,
+		LogDir:                 *logDir,
+		SnapshotBucket:         *snapshotBucket,
+		SnapshotCachePath:      *snapshotCache,
+		QuarantineDir:          *quarantineDir,
+		SessionSweepInterval:   *sessionSweepInterval,
+		SessionDefaultMaxAge:   *sessionDefaultMaxAge,
+		SessionStateMaxAge:     *sessionStateMaxAge,
+		ChunkCacheMaxBytes:     *chunkCacheMaxBytes,
+		ChunkCacheLowWatermark: *chunkCacheLowWatermark,
+		LogMaxAge:              *logMaxAge,
+		QuarantineMaxAge:       *quarantineMaxAge,
+		Environment:            *environment,
+		ControlPlaneAddr:       *controlPlane,
+		GCPProject:             gcpProjectVal,
 	}
 
 	// Enable cloud-backed session chunks using the snapshot bucket.
@@ -404,6 +418,13 @@ func main() {
 	chunkFetchesGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedChunkFetches))
 	diskReadsGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedDiskReads))
 	diskWritesGauge, _ := meter.Int64Gauge(string(fcrotel.ChunkedDiskWrites))
+	gcSessionsBytesGauge, _ := fcrotel.NewGauge(meter, fcrotel.HostGCSessionsBytes)
+	gcSessionStateBytesGauge, _ := fcrotel.NewGauge(meter, fcrotel.HostGCSessionStateBytes)
+	gcChunkCacheBytesGauge, _ := fcrotel.NewGauge(meter, fcrotel.HostGCChunkCacheBytes)
+	gcLogBytesGauge, _ := fcrotel.NewGauge(meter, fcrotel.HostGCLogBytes)
+	gcQuarantineBytesGauge, _ := fcrotel.NewGauge(meter, fcrotel.HostGCQuarantineBytes)
+	gcBytesReclaimedCounter, _ := fcrotel.NewCounter(meter, fcrotel.HostGCBytesReclaimed)
+	gcFilesRemovedCounter, _ := fcrotel.NewCounter(meter, fcrotel.HostGCFilesRemoved)
 
 	// Heartbeat
 	hbLatencyHist, _ := fcrotel.NewHistogram(meter, fcrotel.HostHeartbeatLatency)
@@ -497,29 +518,36 @@ func main() {
 
 	// Start autoscaler loop
 	go autoscaleLoop(ctx, mgr, chunkedMgr, logger, autoscaleInstruments{
-		hostAttrs:       metric.WithAttributes(fcrotel.AttrHostID.String(instanceName)),
-		vmAllocCounter:  vmAllocCounter,
-		vmBootHist:      vmBootHist,
-		hostCPUTotal:    hostCPUTotalGauge,
-		hostCPUUsed:     hostCPUUsedGauge,
-		hostMemTotal:    hostMemTotalGauge,
-		hostMemUsed:     hostMemUsedGauge,
-		hostRunnersIdle: hostRunnersIdleGauge,
-		hostRunnersBusy: hostRunnersBusyGauge,
-		diskCacheSize:   diskCacheSizeGauge,
-		diskCacheMax:    diskCacheMaxGauge,
-		diskCacheItems:  diskCacheItemsGauge,
-		memCacheSize:    memCacheSizeGauge,
-		memCacheMax:     memCacheMaxGauge,
-		memCacheItems:   memCacheItemsGauge,
-		pageFaults:      pageFaultsGauge,
-		cacheHits:       cacheHitsGauge,
-		cacheMisses:     cacheMissesGauge,
-		chunkFetches:    chunkFetchesGauge,
-		diskReads:       diskReadsGauge,
-		diskWrites:      diskWritesGauge,
-		dirtyChunks:     dirtyChunksGauge,
-		cacheHitRatio:   cacheHitRatioGauge,
+		hostAttrs:           metric.WithAttributes(fcrotel.AttrHostID.String(instanceName)),
+		vmAllocCounter:      vmAllocCounter,
+		vmBootHist:          vmBootHist,
+		hostCPUTotal:        hostCPUTotalGauge,
+		hostCPUUsed:         hostCPUUsedGauge,
+		hostMemTotal:        hostMemTotalGauge,
+		hostMemUsed:         hostMemUsedGauge,
+		hostRunnersIdle:     hostRunnersIdleGauge,
+		hostRunnersBusy:     hostRunnersBusyGauge,
+		diskCacheSize:       diskCacheSizeGauge,
+		diskCacheMax:        diskCacheMaxGauge,
+		diskCacheItems:      diskCacheItemsGauge,
+		memCacheSize:        memCacheSizeGauge,
+		memCacheMax:         memCacheMaxGauge,
+		memCacheItems:       memCacheItemsGauge,
+		pageFaults:          pageFaultsGauge,
+		cacheHits:           cacheHitsGauge,
+		cacheMisses:         cacheMissesGauge,
+		chunkFetches:        chunkFetchesGauge,
+		diskReads:           diskReadsGauge,
+		diskWrites:          diskWritesGauge,
+		dirtyChunks:         dirtyChunksGauge,
+		cacheHitRatio:       cacheHitRatioGauge,
+		gcSessionsBytes:     gcSessionsBytesGauge,
+		gcSessionStateBytes: gcSessionStateBytesGauge,
+		gcChunkCacheBytes:   gcChunkCacheBytesGauge,
+		gcLogBytes:          gcLogBytesGauge,
+		gcQuarantineBytes:   gcQuarantineBytesGauge,
+		gcBytesReclaimed:    gcBytesReclaimedCounter,
+		gcFilesRemoved:      gcFilesRemovedCounter,
 	})
 
 	// Start heartbeat loop if control plane is configured
@@ -674,29 +702,36 @@ func managerAPILoggingMiddleware(logger *logrus.Logger, next http.Handler) http.
 
 // autoscaleInstruments holds OTel instruments used by the autoscale loop.
 type autoscaleInstruments struct {
-	hostAttrs       metric.MeasurementOption // host_id attribute for all recordings
-	vmAllocCounter  metric.Int64Counter
-	vmBootHist      metric.Float64Histogram
-	hostCPUTotal    metric.Int64Gauge
-	hostCPUUsed     metric.Int64Gauge
-	hostMemTotal    metric.Int64Gauge
-	hostMemUsed     metric.Int64Gauge
-	hostRunnersIdle metric.Int64UpDownCounter
-	hostRunnersBusy metric.Int64UpDownCounter
-	diskCacheSize   metric.Int64Gauge
-	diskCacheMax    metric.Int64Gauge
-	diskCacheItems  metric.Int64Gauge
-	memCacheSize    metric.Int64Gauge
-	memCacheMax     metric.Int64Gauge
-	memCacheItems   metric.Int64Gauge
-	pageFaults      metric.Int64Gauge
-	cacheHits       metric.Int64Gauge
-	cacheMisses     metric.Int64Gauge
-	chunkFetches    metric.Int64Gauge
-	diskReads       metric.Int64Gauge
-	diskWrites      metric.Int64Gauge
-	dirtyChunks     metric.Int64Gauge
-	cacheHitRatio   metric.Float64Gauge
+	hostAttrs           metric.MeasurementOption // host_id attribute for all recordings
+	vmAllocCounter      metric.Int64Counter
+	vmBootHist          metric.Float64Histogram
+	hostCPUTotal        metric.Int64Gauge
+	hostCPUUsed         metric.Int64Gauge
+	hostMemTotal        metric.Int64Gauge
+	hostMemUsed         metric.Int64Gauge
+	hostRunnersIdle     metric.Int64UpDownCounter
+	hostRunnersBusy     metric.Int64UpDownCounter
+	diskCacheSize       metric.Int64Gauge
+	diskCacheMax        metric.Int64Gauge
+	diskCacheItems      metric.Int64Gauge
+	memCacheSize        metric.Int64Gauge
+	memCacheMax         metric.Int64Gauge
+	memCacheItems       metric.Int64Gauge
+	pageFaults          metric.Int64Gauge
+	cacheHits           metric.Int64Gauge
+	cacheMisses         metric.Int64Gauge
+	chunkFetches        metric.Int64Gauge
+	diskReads           metric.Int64Gauge
+	diskWrites          metric.Int64Gauge
+	dirtyChunks         metric.Int64Gauge
+	cacheHitRatio       metric.Float64Gauge
+	gcSessionsBytes     metric.Int64Gauge
+	gcSessionStateBytes metric.Int64Gauge
+	gcChunkCacheBytes   metric.Int64Gauge
+	gcLogBytes          metric.Int64Gauge
+	gcQuarantineBytes   metric.Int64Gauge
+	gcBytesReclaimed    metric.Int64Counter
+	gcFilesRemoved      metric.Int64Counter
 }
 
 func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.ChunkedManager, logger *logrus.Logger, instruments autoscaleInstruments) {
@@ -705,6 +740,9 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 
 	// Track previous values of UpDownCounters to compute deltas
 	var prevIdle, prevBusy int
+	prevGCStats := mgr.GCMetricsSnapshot()
+	lastGCUsage := mgr.CollectGCUsage()
+	lastGCUsageSampledAt := time.Now()
 
 	for {
 		select {
@@ -753,8 +791,39 @@ func autoscaleLoop(ctx context.Context, mgr *runner.Manager, chunkedMgr *runner.
 			if totalLookups := cs.MemCacheHits + cs.MemCacheMisses; totalLookups > 0 {
 				instruments.cacheHitRatio.Record(ctx, float64(cs.MemCacheHits)/float64(totalLookups), ha)
 			}
+
+			gcStats := mgr.GCMetricsSnapshot()
+			recordGCMetricDeltas(ctx, instruments, gcStats, prevGCStats)
+			prevGCStats = gcStats
+
+			if time.Since(lastGCUsageSampledAt) >= 30*time.Second {
+				lastGCUsage = mgr.CollectGCUsage()
+				lastGCUsageSampledAt = time.Now()
+			}
+			instruments.gcSessionsBytes.Record(ctx, lastGCUsage.SessionsBytes, ha)
+			instruments.gcSessionStateBytes.Record(ctx, lastGCUsage.SessionStateBytes, ha)
+			instruments.gcChunkCacheBytes.Record(ctx, lastGCUsage.ChunkCacheBytes, ha)
+			instruments.gcLogBytes.Record(ctx, lastGCUsage.LogBytes, ha)
+			instruments.gcQuarantineBytes.Record(ctx, lastGCUsage.QuarantineBytes, ha)
 		}
 	}
+}
+
+func recordGCMetricDeltas(ctx context.Context, instruments autoscaleInstruments, curr, prev runner.GCMetricsSnapshot) {
+	recordGCMetricDelta := func(artifactClass string, currTotals, prevTotals runner.GCStatTotals) {
+		if delta := currTotals.BytesReclaimed - prevTotals.BytesReclaimed; delta > 0 {
+			instruments.gcBytesReclaimed.Add(ctx, delta, metric.WithAttributes(fcrotel.AttrArtifactClass.String(artifactClass)))
+		}
+		if delta := currTotals.FilesRemoved - prevTotals.FilesRemoved; delta > 0 {
+			instruments.gcFilesRemoved.Add(ctx, delta, metric.WithAttributes(fcrotel.AttrArtifactClass.String(artifactClass)))
+		}
+	}
+
+	recordGCMetricDelta("sessions", curr.Sessions, prev.Sessions)
+	recordGCMetricDelta("session_state", curr.SessionState, prev.SessionState)
+	recordGCMetricDelta("chunk_cache", curr.ChunkCache, prev.ChunkCache)
+	recordGCMetricDelta("logs", curr.Logs, prev.Logs)
+	recordGCMetricDelta("quarantine", curr.Quarantine, prev.Quarantine)
 }
 
 type hostHeartbeatRequest struct {

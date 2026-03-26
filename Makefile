@@ -9,7 +9,7 @@
 .PHONY: sdk-python-lint sdk-python-test sdk-python-typecheck sdk-python-check sdk-python-e2e
 .PHONY: dev-build dev-snapshot dev-stack dev-test-snapshot-builder dev-test-multi-pause-dedup dev-stop
 .PHONY: dev-test-gcs-pause-resume
-.PHONY: dev-test-file-ops dev-test-pty dev-test-checkpoint
+.PHONY: dev-test-file-ops dev-test-pty dev-test-checkpoint dev-test-host-gc
 .PHONY: dev-test-auto-resume
 .PHONY: dev-agent-rootfs dev-agent-snapshot dev-test-agent-sessions dev-run-agent-e2e
 .PHONY: dev-setup dev-provision
@@ -365,6 +365,7 @@ help:
 	@echo "  dev-test-pty         - Run E2E PTY terminal test (WS3)"
 	@echo "  dev-test-checkpoint  - Run E2E checkpoint test (WS4, needs GCS)"
 	@echo "  dev-test-auto-resume - Run E2E auto-resume test (WS5, needs GCS)"
+	@echo "  dev-test-host-gc     - Run host garbage-collection smoke test"
 	@echo "  dev-agent-snapshot   - Provision the AI agent snapshot"
 	@echo "  dev-run-agent-e2e    - Convenience wrapper: provision snapshot + run agent tests"
 	@echo "  dev-stop             - Stop the stack"
@@ -449,6 +450,10 @@ dev-test-checkpoint:
 # Run E2E auto-resume test (WS5)
 dev-test-auto-resume:
 	bash dev/test-auto-resume.sh
+
+# Run host GC smoke test
+dev-test-host-gc:
+	bash dev/test-host-gc.sh
 
 # AI Agent Sandbox E2E tests
 dev-agent-rootfs:

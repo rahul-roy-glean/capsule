@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -105,6 +106,20 @@ type Manager struct {
 	// registered in m.runners. Prevents two concurrent ResumeFromSession calls
 	// for the same session from both passing the uniqueness check.
 	pendingSessions map[string]string // sessionID → runnerID
+	gcStats         hostGCStats
+}
+
+type gcArtifactStats struct {
+	bytesReclaimed atomic.Int64
+	filesRemoved   atomic.Int64
+}
+
+type hostGCStats struct {
+	sessions     gcArtifactStats
+	sessionState gcArtifactStats
+	chunkCache   gcArtifactStats
+	logs         gcArtifactStats
+	quarantine   gcArtifactStats
 }
 
 type QuarantineOptions struct {
@@ -171,6 +186,8 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 			}
 		}
 	}()
+
+	m.startArtifactJanitor()
 
 	return m, nil
 }

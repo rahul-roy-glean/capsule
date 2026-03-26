@@ -1683,6 +1683,90 @@ resource "google_monitoring_dashboard" "chunked_runtime" {
               yAxis = { label = "MB" }
             }
           }
+        },
+        {
+          xPos   = 6
+          yPos   = 14
+          width  = 6
+          height = 4
+          widget = {
+            title = "Host GC Current Bytes"
+            xyChart = {
+              dataSets = [
+                for metric_name in ["sessions", "session_state", "chunk_cache", "logs", "quarantine"] : {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/host.gc.${metric_name}.bytes\" AND metric.label.service_name=\"${local.mgr_service}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_MAX"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = replace(metric_name, "_", " ")
+                  plotType       = "LINE"
+                }
+              ]
+              yAxis = { label = "bytes" }
+            }
+          }
+        },
+        # Row 6: GC reclaim activity
+        {
+          yPos   = 18
+          width  = 6
+          height = 4
+          widget = {
+            title = "Host GC Bytes Reclaimed / Min"
+            xyChart = {
+              dataSets = [
+                for artifact_class in ["sessions", "session_state", "chunk_cache", "logs", "quarantine"] : {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/host.gc.bytes_reclaimed\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.artifact_class=\"${artifact_class}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = replace(artifact_class, "_", " ")
+                  plotType       = "LINE"
+                }
+              ]
+              yAxis = { label = "bytes/min" }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 18
+          width  = 6
+          height = 4
+          widget = {
+            title = "Host GC Files Removed / Min"
+            xyChart = {
+              dataSets = [
+                for artifact_class in ["sessions", "session_state", "chunk_cache", "logs", "quarantine"] : {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.metric_prefix}/host.gc.files_removed\" AND metric.label.service_name=\"${local.mgr_service}\" AND metric.label.artifact_class=\"${artifact_class}\""
+                      aggregation = {
+                        alignmentPeriod    = "60s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_SUM"
+                      }
+                    }
+                  }
+                  legendTemplate = replace(artifact_class, "_", " ")
+                  plotType       = "LINE"
+                }
+              ]
+              yAxis = { label = "files/min" }
+            }
+          }
         }
       ]
     }

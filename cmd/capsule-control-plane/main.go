@@ -987,19 +987,20 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 		if _, dbErr := s.scheduler.db.ExecContext(pauseCtx, `
 			INSERT INTO session_snapshots (
 				session_id, runner_id, workload_key, host_id, status, layer_count, paused_at,
-				runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
+				runner_ttl_seconds, session_max_age_seconds, auto_pause, network_policy_preset, network_policy
 			)
-			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9)
+			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9, $10)
 			ON CONFLICT (session_id) DO UPDATE SET
 				status = 'suspended',
 				layer_count = EXCLUDED.layer_count,
 				paused_at = NOW(),
 				runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
+				session_max_age_seconds = EXCLUDED.session_max_age_seconds,
 				auto_pause = EXCLUDED.auto_pause,
 				network_policy_preset = EXCLUDED.network_policy_preset,
 				network_policy = EXCLUDED.network_policy
 		`, resp.SessionId, req.RunnerID, runner.WorkloadKey, host.ID, resp.Layer+1,
-			runner.RunnerTTLSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy); dbErr != nil {
+			runner.RunnerTTLSeconds, runner.SessionMaxAgeSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy); dbErr != nil {
 			s.logger.WithError(dbErr).WithField("session_id", resp.SessionId).Error("Failed to update session_snapshots table")
 		}
 	}
@@ -1048,13 +1049,14 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 		var sessionID, hostID, workloadKey string
 		var status string
 		var sessionTTL sql.NullInt64
+		var sessionMaxAge sql.NullInt64
 		var sessionAutoPause sql.NullBool
 		var sessionNPPreset sql.NullString
 		var sessionNPJSON sql.NullString
 		scanErr := s.scheduler.db.QueryRowContext(r.Context(),
-			`SELECT session_id, host_id, workload_key, status, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
+			`SELECT session_id, host_id, workload_key, status, runner_ttl_seconds, session_max_age_seconds, auto_pause, network_policy_preset, network_policy
 			 FROM session_snapshots WHERE runner_id = $1`,
-			req.RunnerID).Scan(&sessionID, &hostID, &workloadKey, &status, &sessionTTL, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON)
+			req.RunnerID).Scan(&sessionID, &hostID, &workloadKey, &status, &sessionTTL, &sessionMaxAge, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON)
 		if scanErr != nil || status != "suspended" {
 			http.Error(w, "runner not found", http.StatusNotFound)
 			return
@@ -1129,15 +1131,16 @@ func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.
 		}
 
 		if err := s.hostRegistry.AddRunner(r.Context(), &Runner{
-			ID:                  resumedRunnerID,
-			HostID:              resumeHost.ID,
-			Status:              "busy",
-			InternalIP:          resp.Runner.GetInternalIp(),
-			WorkloadKey:         workloadKey,
-			RunnerTTLSeconds:    int(sessionTTL.Int64),
-			AutoPause:           sessionAutoPause.Valid && sessionAutoPause.Bool,
-			NetworkPolicyPreset: sessionNPPreset.String,
-			NetworkPolicyJSON:   sessionNPJSON.String,
+			ID:                   resumedRunnerID,
+			HostID:               resumeHost.ID,
+			Status:               "busy",
+			InternalIP:           resp.Runner.GetInternalIp(),
+			WorkloadKey:          workloadKey,
+			RunnerTTLSeconds:     int(sessionTTL.Int64),
+			SessionMaxAgeSeconds: int(sessionMaxAge.Int64),
+			AutoPause:            sessionAutoPause.Valid && sessionAutoPause.Bool,
+			NetworkPolicyPreset:  sessionNPPreset.String,
+			NetworkPolicyJSON:    sessionNPJSON.String,
 		}); err != nil {
 			http.Error(w, "failed to register resumed runner", http.StatusInternalServerError)
 			return

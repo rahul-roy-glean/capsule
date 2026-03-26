@@ -4,8 +4,10 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -58,7 +60,7 @@ type ChunkedManager struct {
 	// "chunked" forces UFFD, "file" forces file-backed, "" uses metadata.
 	memBackend string
 
-	// readyTimeout is the max wait time for capsule-thaw-agent health check
+	// readyTimeout is the max wait time for the post-restore readiness probe.
 	readyTimeout time.Duration
 
 	// cachePopulateGroup deduplicates concurrent downloads of the same local
@@ -98,10 +100,9 @@ type ChunkedManagerConfig struct {
 	// snapshot metadata says, allowing rollback without rebuilding snapshots.
 	MemBackend string
 
-	// ReadyTimeout is the maximum time to wait for the capsule-thaw-agent health
-	// endpoint to return HTTP 200 after VM restore. If the agent doesn't
-	// become healthy within this window the VM is killed and the allocation
-	// fails (default 10s).
+	// ReadyTimeout is the maximum time to wait for the capsule-thaw-agent exec
+	// probe after VM restore. If the agent doesn't become usable within this
+	// window the VM is killed and the allocation fails (default 30s).
 	ReadyTimeout time.Duration
 
 	// GCSPrefix is the top-level prefix for all GCS paths (e.g. "v1").
@@ -410,7 +411,7 @@ func (cm *ChunkedManager) waitForRunnerReady(ctx context.Context, ip string, tim
 	if cm.waitForReadyFn != nil {
 		return cm.waitForReadyFn(ctx, ip, timeout)
 	}
-	return cm.waitForThawAgent(ctx, ip, timeout)
+	return cm.waitForThawAgentExec(ctx, ip, timeout)
 }
 
 func (cm *ChunkedManager) forwardRunnerPort(runnerID string, port int) error {
@@ -558,7 +559,7 @@ func (cm *ChunkedManager) restoreAndActivateRunner(
 
 	readyTimeout := cm.readyTimeout
 	if readyTimeout <= 0 {
-		readyTimeout = 10 * time.Second
+		readyTimeout = 30 * time.Second
 	}
 	if err := cm.waitForRunnerReady(ctx, runner.InternalIP.String(), readyTimeout); err != nil {
 		cm.chunkedLogger.WithError(err).WithField("runner_id", runnerID).Error("Thaw-agent failed ready check, killing VM")
@@ -845,7 +846,9 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		LogPath:         filepath.Join(cm.config.LogDir, runnerID+".log"),
 		MetricsPath:     filepath.Join(cm.config.LogDir, runnerID+".metrics"),
 		// FUSE disk provides the rootfs via lazy loading
-		RootfsOverlay: fuseDisk.DiskImagePath(),
+		RootfsOverlay:           fuseDisk.DiskImagePath(),
+		SessionMaxAgeSeconds:    req.SessionMaxAgeSeconds,
+		SessionMaxAgeConfigured: req.SessionMaxAgeConfigured,
 	}
 	if req.StartCommand != nil {
 		runner.ServicePort = req.StartCommand.Port
@@ -1034,6 +1037,12 @@ func (cm *ChunkedManager) ReleaseRunnerChunked(ctx context.Context, runnerID str
 	os.RemoveAll(filepath.Join(cm.config.WorkspaceDir, runnerID))
 	os.Remove(filepath.Join(cm.config.SocketDir, runnerID+".sock"))
 	os.Remove(filepath.Join(cm.config.SocketDir, runnerID+".uffd.sock"))
+	os.Remove(filepath.Join(cm.config.SocketDir, runnerID+"-uffd.sock"))
+	if runner.SessionID != "" {
+		if err := cm.CleanupSession(runner.SessionID); err != nil {
+			cm.chunkedLogger.WithError(err).WithField("session_id", runner.SessionID).Warn("Failed to clean up session dir")
+		}
+	}
 
 	return nil
 }
@@ -1271,6 +1280,57 @@ func (cm *ChunkedManager) waitForThawAgent(ctx context.Context, ip string, timeo
 	}
 
 	return fmt.Errorf("capsule-thaw-agent at %s did not become ready within %v", aliveURL, timeout)
+}
+
+// waitForThawAgentExec probes the capsule-thaw-agent with a trivial exec until
+// it responds successfully. This is more reliable after snapshot restore than
+// /alive because it exercises the same handler the host-side exec proxy uses.
+func (cm *ChunkedManager) waitForThawAgentExec(ctx context.Context, ip string, timeout time.Duration) error {
+	execURL := fmt.Sprintf("http://%s:%d/exec", ip, snapshot.ThawAgentDebugPort)
+	client := &http.Client{Timeout: 5 * time.Second}
+	deadline := time.Now().Add(timeout)
+	payload := []byte(`{"command":["echo","ready"],"timeout_seconds":3}`)
+	lastDetail := "no response"
+
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, execURL, bytes.NewReader(payload))
+		if err != nil {
+			return fmt.Errorf("create exec probe request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err == nil {
+			respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			if readErr != nil {
+				lastDetail = fmt.Sprintf("http %d read error: %v", resp.StatusCode, readErr)
+			} else {
+				body := string(respBody)
+				if resp.StatusCode == http.StatusOK && strings.Contains(body, "ready") {
+					return nil
+				}
+				if len(body) > 200 {
+					body = body[:200] + "..."
+				}
+				lastDetail = fmt.Sprintf("http %d body=%q", resp.StatusCode, body)
+			}
+		} else {
+			lastDetail = err.Error()
+		}
+
+		select {
+		case <-time.After(500 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	return fmt.Errorf("capsule-thaw-agent exec probe at %s not ready after %s (last=%s)", execURL, timeout, lastDetail)
 }
 
 // GetChunkedMetadata returns the loaded chunked snapshot metadata (may be nil).

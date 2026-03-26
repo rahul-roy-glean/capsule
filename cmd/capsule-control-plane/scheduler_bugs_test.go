@@ -47,6 +47,22 @@ func TestProtoAllocateRequest_TTLFieldsPresent(t *testing.T) {
 	}
 }
 
+func TestSetInternalAllocateLabels_IncludesSessionMaxAge(t *testing.T) {
+	labels := setInternalAllocateLabels(nil, 3600)
+	if got := labels[sessionMaxAgeLabelKey]; got != "3600" {
+		t.Fatalf("labels[%q] = %q, want 3600", sessionMaxAgeLabelKey, got)
+	}
+
+	existing := map[string]string{"keep": "me"}
+	got := setInternalAllocateLabels(existing, 0)
+	if got[sessionMaxAgeLabelKey] != "0" {
+		t.Fatalf("labels[%q] = %q, want 0", sessionMaxAgeLabelKey, got[sessionMaxAgeLabelKey])
+	}
+	if got["keep"] != "me" {
+		t.Fatalf("existing label lost, got=%v", got)
+	}
+}
+
 // TestSchedulerSelectsReadyHostsOnly verifies that the scheduler
 // only considers hosts in 'ready' status for allocation.
 func TestSchedulerSelectsReadyHostsOnly(t *testing.T) {
