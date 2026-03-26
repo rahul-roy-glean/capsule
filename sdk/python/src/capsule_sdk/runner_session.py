@@ -15,7 +15,7 @@ from capsule_sdk.models.file import (
     FileUploadResult,
     FileWriteResult,
 )
-from capsule_sdk.models.runner import ConnectResult, ExecEvent, ExecResult, PauseResult
+from capsule_sdk.models.runner import ExecEvent, ExecResult, PauseResult
 
 if TYPE_CHECKING:
     from capsule_sdk.resources.runners import Runners
@@ -25,12 +25,12 @@ class RunnerSession:
     """High-level handle for an allocated runner.
 
     Wraps a ``runner_id`` and provides ergonomic methods for exec, shell,
-    pause, resume, and release. Supports context-manager usage for automatic
+    pause, and release. Supports context-manager usage for automatic
     release on exit.
 
     Usage::
 
-        with client.runners.from_config("my-workload", tag="stable") as r:
+        with client.runners.from_config("my-workload") as r:
             r.exec("python", "-c", "print('hello')")
             with r.shell() as sh:
                 sh.send("ls\\n")
@@ -89,14 +89,6 @@ class RunnerSession:
         result = self._runners.pause(self._runner_id)
         if result.session_id:
             self._session_id = result.session_id
-        return result
-
-    def resume(self) -> ConnectResult:
-        """Reconnect to the runner (extends TTL or resumes from suspend)."""
-        previous_runner_id = self._runner_id
-        result = self._runners.connect(previous_runner_id)
-        if result.runner_id != previous_runner_id:
-            self._runner_id = result.runner_id
         return result
 
     def release(self) -> bool:

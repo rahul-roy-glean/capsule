@@ -90,6 +90,15 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		allocReq.AuthConfig = &ac
 	}
 
+	// Extract base image migration info from labels (control plane packs them
+	// when it detects a workload_key mismatch on session resume).
+	if v, ok := req.Labels["_migrate_from_workload_key"]; ok && v != "" {
+		allocReq.MigrateFromWorkloadKey = v
+	}
+	if v, ok := req.Labels["_migrate_from_runner_id"]; ok && v != "" {
+		allocReq.MigrateFromRunnerID = v
+	}
+
 	if req.Resources != nil {
 		allocReq.Resources = runner.Resources{
 			VCPUs:    int(req.Resources.Vcpus),
@@ -111,8 +120,10 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 	var err error
 	var resumed bool
 
-	// Session-aware allocation: if session_id is provided, try to resume
-	if allocReq.SessionID != "" {
+	// Session-aware allocation: if session_id is provided, try to resume.
+	// When migration labels are present, skip normal resume and go to fresh
+	// allocation (AllocateRunnerChunked handles migration internally).
+	if allocReq.SessionID != "" && allocReq.MigrateFromWorkloadKey == "" {
 		// Check if there's already a running runner for this session
 		if existing := s.manager.FindRunnerBySessionID(allocReq.SessionID); existing != nil {
 			if existing.State != runner.StateSuspended {
@@ -140,6 +151,13 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 				err = nil // Reset error for fresh allocation
 			}
 		}
+	} else if allocReq.MigrateFromWorkloadKey != "" {
+		s.logger.WithFields(logrus.Fields{
+			"session_id":                allocReq.SessionID,
+			"migrate_from_workload_key": allocReq.MigrateFromWorkloadKey,
+			"migrate_from_runner_id":    allocReq.MigrateFromRunnerID,
+			"new_workload_key":          allocReq.WorkloadKey,
+		}).Info("Base image migration: routing to fresh allocation with drive overrides")
 	}
 
 	// Fresh allocation if not resumed from session
@@ -317,7 +335,7 @@ func (s *HostAgentServer) PauseRunner(ctx context.Context, req *pb.PauseRunnerRe
 	s.logger.WithField("runner_id", req.RunnerId).Info("PauseRunner request")
 
 	start := time.Now()
-	result, err := s.manager.PauseRunner(ctx, req.RunnerId)
+	result, err := s.manager.PauseRunner(ctx, req.RunnerId, req.SyncFs)
 	duration := time.Since(start)
 
 	if err != nil {

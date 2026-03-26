@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS session_snapshots (
     auto_pause BOOLEAN DEFAULT false,
     network_policy_preset VARCHAR(64),
     network_policy JSONB,
+    config_id VARCHAR(255),
     paused_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -175,17 +176,6 @@ CREATE TABLE IF NOT EXISTS layered_configs (
     updated_at             TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- snapshot_tags: named aliases for snapshot versions
-CREATE TABLE IF NOT EXISTS snapshot_tags (
-    tag           VARCHAR(64) NOT NULL,
-    workload_key  VARCHAR(16) NOT NULL,
-    version       VARCHAR(255) NOT NULL,
-    description   TEXT DEFAULT '',
-    created_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    PRIMARY KEY (tag, workload_key)
-);
-
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_hosts_status ON hosts(status);
 CREATE INDEX IF NOT EXISTS idx_hosts_heartbeat ON hosts(last_heartbeat);
@@ -280,3 +270,4 @@ COMMENT ON TABLE snapshot_tags IS 'Named aliases for snapshot versions (e.g., st
 -- Migrations (idempotent)
 ALTER TABLE snapshot_layers ADD COLUMN IF NOT EXISTS build_artifact_hash VARCHAR(64) DEFAULT '';
 ALTER TABLE snapshot_layers ADD COLUMN IF NOT EXISTS all_chain_drives_hash VARCHAR(64) DEFAULT '';
+ALTER TABLE session_snapshots ADD COLUMN IF NOT EXISTS config_id VARCHAR(255);

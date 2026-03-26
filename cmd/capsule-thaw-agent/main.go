@@ -177,8 +177,9 @@ type MMDSData struct {
 		Snapshot struct {
 			Version string `json:"version"`
 		} `json:"snapshot"`
-		Drives []snapshot.DriveSpec `json:"drives,omitempty"`
-		Exec   struct {
+		Drives        []snapshot.DriveSpec `json:"drives,omitempty"`
+		RemountDrives bool                 `json:"remount_drives,omitempty"`
+		Exec          struct {
 			Command    []string          `json:"command,omitempty"`
 			Env        map[string]string `json:"env,omitempty"`
 			WorkingDir string            `json:"working_dir,omitempty"`
@@ -573,6 +574,14 @@ func main() {
 	go startHealthServer(mmdsData)
 	log.Info("Health server started in background")
 
+	// Configure auth proxy if provided (needed for fresh boot and cold boot
+	// fallback — warmup mode handles this separately).
+	if mmdsData.Latest.Proxy.Address != "" {
+		if _, proxyErr := configureAuthProxy(mmdsData); proxyErr != nil {
+			log.WithError(proxyErr).Warn("Failed to configure auth proxy")
+		}
+	}
+
 	// Run start_command if configured (before CI registration)
 	if len(mmdsData.Latest.StartCommand.Command) > 0 {
 		setStep("start_command")
@@ -610,6 +619,16 @@ func main() {
 }
 
 func resolveDevice(defaultDev string, label string) string {
+	// Use blkid to resolve label → device path. This is more reliable than
+	// /dev/disk/by-label/ symlinks which depend on udev (may not exist on
+	// fresh boot).
+	if label != "" {
+		if out, err := exec.Command("blkid", "-L", label).Output(); err == nil {
+			if dev := strings.TrimSpace(string(out)); dev != "" {
+				return dev
+			}
+		}
+	}
 	// Prefer by-label path if present.
 	byLabel := filepath.Join("/dev/disk/by-label", label)
 	if _, err := os.Stat(byLabel); err == nil {
@@ -620,6 +639,8 @@ func resolveDevice(defaultDev string, label string) string {
 }
 
 // mountExtensionDrives mounts all extension drives declared in MMDS.
+// When RemountDrives is set (base image migration), force unmount+remount
+// even if already mounted — the golden snapshot's page cache is stale.
 func mountExtensionDrives(data *MMDSData) {
 	for _, drive := range data.Latest.Drives {
 		if drive.MountPath == "" {
@@ -635,13 +656,31 @@ func mountExtensionDrives(data *MMDSData) {
 			log.WithError(err).WithField("drive", drive.DriveID).Warn("Failed to create mount dir")
 			continue
 		}
-		// Skip if already mounted
+		// If already mounted: skip normally, but force-remount on migration
 		if exec.Command("mountpoint", "-q", drive.MountPath).Run() == nil {
-			continue
+			if !data.Latest.RemountDrives {
+				continue
+			}
+			log.WithFields(logrus.Fields{"label": label, "mount_path": drive.MountPath}).Info("Migration: force-remounting drive (page cache is stale from golden snapshot)")
+			exec.Command("umount", "-f", drive.MountPath).Run()
 		}
 		opts := "ro"
 		if !drive.ReadOnly {
 			opts = "rw"
+		}
+		// Run e2fsck before mount: extension drives from a prior snapshot may
+		// have dirty ext4 journals. Use -y to auto-fix all errors (including
+		// journal issues from unclean shutdown during pause).
+		devBytes, _ := exec.Command("blkid", "-L", label).Output()
+		devPath := strings.TrimSpace(string(devBytes))
+		if devPath != "" {
+			if out, err := exec.Command("e2fsck", "-y", devPath).CombinedOutput(); err != nil {
+				log.WithError(err).WithFields(logrus.Fields{
+					"label": label, "device": devPath,
+				}).Warnf("e2fsck returned non-zero (output: %s)", string(out))
+			} else {
+				log.WithFields(logrus.Fields{"label": label, "device": devPath}).Debug("e2fsck completed")
+			}
 		}
 		if output, err := exec.Command("mount", "-o", opts, dev, drive.MountPath).CombinedOutput(); err != nil {
 			log.WithError(err).WithFields(logrus.Fields{
@@ -725,8 +764,9 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 				Snapshot struct {
 					Version string `json:"version"`
 				} `json:"snapshot"`
-				Drives []snapshot.DriveSpec `json:"drives,omitempty"`
-				Exec   struct {
+				Drives        []snapshot.DriveSpec `json:"drives,omitempty"`
+				RemountDrives bool                 `json:"remount_drives,omitempty"`
+				Exec          struct {
 					Command    []string          `json:"command,omitempty"`
 					Env        map[string]string `json:"env,omitempty"`
 					WorkingDir string            `json:"working_dir,omitempty"`
@@ -1151,6 +1191,38 @@ func watchForSnapshotRestore() {
 				log.WithField("new_ip", newData.Latest.Network.IP).Info("Network reconfigured after snapshot restore")
 			}
 		}
+
+		// Base image migration: if RemountDrives is set, the FUSE-backed
+		// extension drives now serve session data but the kernel's VFS/ext4
+		// caches still reflect the golden snapshot's (empty) filesystem.
+		// drop_caches alone doesn't clear ext4's internal metadata (inodes,
+		// dentries, block bitmaps). We must umount+mount to force ext4 to
+		// re-read everything from the FUSE-backed block device.
+		if newData.Latest.RemountDrives {
+			log.Info("Migration detected after snapshot restore: remounting extension drives")
+			// Find all ext4 mounts on /dev/vd* (extension drives)
+			mountsData, _ := os.ReadFile("/proc/mounts")
+			for _, line := range strings.Split(string(mountsData), "\n") {
+				fields := strings.Fields(line)
+				if len(fields) < 3 {
+					continue
+				}
+				dev, mountPath, fsType := fields[0], fields[1], fields[2]
+				if fsType != "ext4" || !strings.HasPrefix(dev, "/dev/vd") || dev == "/dev/vda" {
+					continue
+				}
+				log.WithFields(logrus.Fields{"device": dev, "mount_path": mountPath}).Info("Migration: remounting extension drive")
+				if out, err := exec.Command("umount", "-f", mountPath).CombinedOutput(); err != nil {
+					log.WithError(err).WithField("output", string(out)).Warn("Migration: umount failed, trying lazy umount")
+					exec.Command("umount", "-l", mountPath).Run()
+				}
+				if out, err := exec.Command("mount", dev, mountPath).CombinedOutput(); err != nil {
+					log.WithError(err).WithField("output", string(out)).Error("Migration: mount failed after umount")
+				} else {
+					log.WithFields(logrus.Fields{"device": dev, "mount_path": mountPath}).Info("Migration: drive remounted successfully")
+				}
+			}
+		}
 	}
 }
 
@@ -1295,6 +1367,60 @@ func signalReady() error {
 // the VM resumes with frozen filesystems — any I/O (including umount, stat,
 // chown) blocks indefinitely in D state until we unfreeze.
 // This must be called BEFORE any filesystem access after a snapshot restore.
+// ensureBlockDeviceNodes ensures /dev nodes exist for all block devices.
+// Alpine-like images in Firecracker may not have udev/mdev running, so
+// /dev/vdX nodes won't exist even though the kernel sees the devices.
+// We first try `mdev -s` (Alpine's device manager), then fall back to
+// scanning /sys/block/* and creating nodes manually.
+func ensureBlockDeviceNodes() {
+	// Try mdev -s first — it's Alpine's lightweight udev replacement and
+	// will create device nodes for all kernel-known devices.
+	if out, err := exec.Command("mdev", "-s").CombinedOutput(); err != nil {
+		log.WithError(err).Debugf("mdev -s failed (output: %s), falling back to manual scan", string(out))
+	} else {
+		log.Info("Ran mdev -s to populate device nodes")
+	}
+
+	// Scan /sys/block for any block device missing a /dev node.
+	entries, err := filepath.Glob("/sys/block/*")
+	if err != nil {
+		log.WithError(err).Warn("Failed to glob /sys/block")
+		return
+	}
+	for _, sysPath := range entries {
+		devName := filepath.Base(sysPath)
+		devPath := "/dev/" + devName
+		if _, err := os.Stat(devPath); err == nil {
+			continue // already exists
+		}
+		// Read major:minor from /sys/block/<dev>/dev
+		devNumBytes, err := os.ReadFile(sysPath + "/dev")
+		if err != nil {
+			log.WithError(err).WithField("device", devName).Warn("Failed to read device numbers")
+			continue
+		}
+		parts := strings.SplitN(strings.TrimSpace(string(devNumBytes)), ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		major, err1 := strconv.ParseUint(parts[0], 10, 32)
+		minor, err2 := strconv.ParseUint(parts[1], 10, 32)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		dev := int(major*256 + minor)
+		if err := syscall.Mknod(devPath, syscall.S_IFBLK|0660, dev); err != nil {
+			log.WithError(err).WithField("device", devPath).Warn("Failed to create block device node")
+		} else {
+			log.WithFields(logrus.Fields{"device": devPath, "major": major, "minor": minor}).Info("Created block device node")
+		}
+	}
+
+	// Log all block devices found for debugging
+	devEntries, _ := filepath.Glob("/dev/vd*")
+	log.WithField("devices", devEntries).Info("Block devices in /dev after ensureBlockDeviceNodes")
+}
+
 func thawFrozenFilesystems() {
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
@@ -1323,6 +1449,11 @@ func thawFrozenFilesystems() {
 // are always needed regardless of which user commands were specified.
 func runWarmupMode(data *MMDSData) error {
 	thawFrozenFilesystems()
+
+	// Ensure block device nodes exist for virtio-blk drives. Alpine-like images
+	// inside Firecracker don't run udev/mdev automatically, so /dev/vdX nodes
+	// may not exist even though the kernel sees the devices in /sys/block/.
+	ensureBlockDeviceNodes()
 
 	// Mount extension drives. On reattach, the block device may have been swapped
 	// (old layer's data replaces the parent's empty drive). If the drive is already

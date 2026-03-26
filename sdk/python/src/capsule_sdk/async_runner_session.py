@@ -16,7 +16,7 @@ from capsule_sdk.models.file import (
     FileUploadResult,
     FileWriteResult,
 )
-from capsule_sdk.models.runner import ConnectResult, ExecEvent, ExecResult, PauseResult
+from capsule_sdk.models.runner import ExecEvent, ExecResult, PauseResult
 
 if TYPE_CHECKING:
     from capsule_sdk.resources.async_runners import AsyncRunners
@@ -71,13 +71,6 @@ class AsyncRunnerSession:
         result = await self._runners.pause(self._runner_id)
         if result.session_id:
             self._session_id = result.session_id
-        return result
-
-    async def resume(self) -> ConnectResult:
-        previous_runner_id = self._runner_id
-        result = await self._runners.connect(previous_runner_id)
-        if result.runner_id != previous_runner_id:
-            self._runner_id = result.runner_id
         return result
 
     async def release(self) -> bool:

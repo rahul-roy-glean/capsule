@@ -31,7 +31,6 @@ from capsule_sdk.models.file import (
 from capsule_sdk.models.layered_config import CreateConfigResponse, LayeredConfigDetail, StoredLayeredConfig
 from capsule_sdk.models.runner import (
     AllocateRunnerResponse,
-    ConnectResult,
     ExecEvent,
     PauseResult,
     Runner,
@@ -96,7 +95,6 @@ class Runners:
         request_id: str | None = None,
         labels: dict[str, str] | None = None,
         session_id: str | None = None,
-        snapshot_tag: str | None = None,
         network_policy_preset: str | None = None,
         network_policy_json: str | None = None,
         startup_timeout: float | None = None,
@@ -115,8 +113,6 @@ class Runners:
             body["labels"] = labels
         if session_id:
             body["session_id"] = session_id
-        if snapshot_tag:
-            body["snapshot_tag"] = snapshot_tag
         if network_policy_preset:
             body["network_policy_preset"] = network_policy_preset
         if network_policy_json:
@@ -188,13 +184,6 @@ class Runners:
     def pause(self, runner_id: str) -> PauseResult:
         data = self._http.post("/api/v1/runners/pause", json_body={"runner_id": runner_id})
         return PauseResult.model_validate(data)
-
-    def connect(self, runner_id: str) -> ConnectResult:
-        data = self._http.post("/api/v1/runners/connect", json_body={"runner_id": runner_id})
-        result = ConnectResult.model_validate(data)
-        if result.host_address:
-            self._host_cache[result.runner_id] = result.host_address
-        return result
 
     def quarantine(
         self,
@@ -296,7 +285,6 @@ class Runners:
         request_id: str | None = None,
         labels: dict[str, str] | None = None,
         session_id: str | None = None,
-        snapshot_tag: str | None = None,
         network_policy_preset: str | None = None,
         network_policy_json: str | None = None,
         startup_timeout: float | None = None,
@@ -313,7 +301,6 @@ class Runners:
             request_id=request_id,
             labels=labels,
             session_id=session_id,
-            snapshot_tag=snapshot_tag,
             network_policy_preset=network_policy_preset,
             network_policy_json=network_policy_json,
             startup_timeout=max(deadline - time.monotonic(), 0.0),
@@ -357,7 +344,6 @@ class Runners:
             | ResolvedWorkloadRef
         ),
         *,
-        tag: str = "stable",
         request_id: str | None = None,
         labels: dict[str, str] | None = None,
         session_id: str | None = None,
@@ -367,11 +353,11 @@ class Runners:
         wait_ready: bool = True,
         poll_interval: float = 2.0,
     ) -> RunnerSession:
-        """Allocate a runner from a runner config tag and return a RunnerSession handle.
+        """Allocate a runner from a runner config and return a RunnerSession handle.
 
         Usage::
 
-            with client.runners.from_config("my-workload", tag="stable") as r:
+            with client.runners.from_config("my-workload") as r:
                 r.exec("python", "-c", "print(42)")
         """
         if wait_ready:
@@ -380,7 +366,6 @@ class Runners:
                 request_id=request_id,
                 labels=labels,
                 session_id=session_id,
-                snapshot_tag=tag,
                 network_policy_preset=network_policy_preset,
                 network_policy_json=network_policy_json,
                 startup_timeout=startup_timeout,
@@ -392,7 +377,6 @@ class Runners:
             request_id=request_id,
             labels=labels,
             session_id=session_id,
-            snapshot_tag=tag,
             network_policy_preset=network_policy_preset,
             network_policy_json=network_policy_json,
             startup_timeout=startup_timeout,
@@ -580,9 +564,9 @@ class Runners:
     def _resolve_host(self, runner_id: str) -> str:
         if runner_id in self._host_cache:
             return self._ensure_scheme(self._host_cache[runner_id])
-        result = self.connect(runner_id)
+        result = self.status(runner_id)
         if result.host_address:
-            self._host_cache[runner_id] = result.host_address
+            self._host_cache[result.runner_id] = result.host_address
             return self._ensure_scheme(result.host_address)
         raise CapsuleServiceUnavailable(f"No host address available for runner {runner_id}")
 

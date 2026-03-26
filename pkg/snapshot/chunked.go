@@ -1309,6 +1309,8 @@ func (b *ChunkedSnapshotBuilder) BuildChunkedSnapshot(ctx context.Context, paths
 				Chunks:    driveChunks,
 				ReadOnly:  spec.ReadOnly,
 				SizeBytes: driveSize,
+				Label:     spec.Label,
+				MountPath: spec.MountPath,
 			}
 		}
 	}

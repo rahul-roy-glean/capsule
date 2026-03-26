@@ -49,7 +49,6 @@ class AllocateRunnerRequest(CapsuleModel):
     request_id: str | None = None
     labels: dict[str, str] | None = None
     session_id: str | None = None
-    snapshot_tag: str | None = None
     network_policy_preset: str | None = None
     network_policy_json: str | None = None
 
@@ -82,14 +81,6 @@ class PauseResult(CapsuleModel):
     session_id: str | None = None
     snapshot_size_bytes: int | None = None
     layer: int | None = None
-
-
-class ConnectResult(CapsuleModel):
-    """Result of connecting to a runner."""
-
-    status: str
-    runner_id: str
-    host_address: str | None = None
 
 
 class RunnerListResponse(CapsuleModel):

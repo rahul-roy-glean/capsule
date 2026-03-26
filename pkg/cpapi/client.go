@@ -35,7 +35,6 @@ type AllocateRequest struct {
 	WorkloadKey         string            `json:"workload_key"`
 	Labels              map[string]string `json:"labels,omitempty"`
 	SessionID           string            `json:"session_id,omitempty"`
-	SnapshotTag         string            `json:"snapshot_tag,omitempty"`
 	NetworkPolicyPreset string            `json:"network_policy_preset,omitempty"`
 	NetworkPolicyJSON   string            `json:"network_policy_json,omitempty"`
 }

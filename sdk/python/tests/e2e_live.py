@@ -152,17 +152,16 @@ def test_sdk_live_e2e() -> None:
                 assert pause.success is True
                 assert runner.session_id
 
-                previous_runner_id = runner.runner_id
-                resumed = runner.resume()
-                assert resumed.status in {"connected", "resumed"}
-                assert runner.runner_id == resumed.runner_id
-                assert runner.runner_id
-                if resumed.status == "resumed":
-                    # A restore may keep the same runner_id or allocate a fresh one.
-                    # The SDK contract is that the session follows the returned ID.
-                    assert runner.runner_id in {previous_runner_id, resumed.runner_id}
+                # Resume is done via allocate with session_id (not via the removed connect endpoint).
+                # Re-allocate using the same session_id to resume.
+                resumed_alloc = client.runners.allocate(
+                    workload,
+                    session_id=runner.session_id,
+                    startup_timeout=120.0,
+                )
+                assert resumed_alloc.runner_id
 
-                resumed_status = client.runners.wait_ready(runner.runner_id, timeout=120.0, poll_interval=2.0)
+                resumed_status = client.runners.wait_ready(resumed_alloc.runner_id, timeout=120.0, poll_interval=2.0)
                 assert resumed_status.status == "ready"
 
                 resumed_exec = runner.exec_collect("sh", "-lc", "printf resumed")

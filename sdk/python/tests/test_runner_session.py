@@ -72,27 +72,6 @@ class TestRunnerSession:
         assert result.success is True
         assert session.session_id == "s-new"
 
-    def test_resume(self, runners: Runners, http_client: HttpClient) -> None:
-        resp_data = {"status": "connected", "runner_id": "r-1", "host_address": "10.0.0.2:8080"}
-        mock_resp = httpx.Response(200, json=resp_data)
-        session = RunnerSession(runners, "r-1")
-        with patch.object(http_client._client, "request", return_value=mock_resp):
-            result = session.resume()
-        assert result.status == "connected"
-        assert session.runner_id == "r-1"
-        assert runners._host_cache["r-1"] == "10.0.0.2:8080"
-
-    def test_resume_updates_runner_id_after_restore(self, runners: Runners, http_client: HttpClient) -> None:
-        resp_data = {"status": "resumed", "runner_id": "r-2", "host_address": "10.0.0.2:8080"}
-        mock_resp = httpx.Response(201, json=resp_data)
-        session = RunnerSession(runners, "r-1")
-        with patch.object(http_client._client, "request", return_value=mock_resp):
-            result = session.resume()
-        assert result.status == "resumed"
-        assert result.runner_id == "r-2"
-        assert session.runner_id == "r-2"
-        assert runners._host_cache["r-2"] == "10.0.0.2:8080"
-
     def test_shell(self, runners: Runners) -> None:
         runners._host_cache["r-1"] = "10.0.0.1:8080"
         session = RunnerSession(runners, "r-1")

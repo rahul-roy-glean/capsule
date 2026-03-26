@@ -15,7 +15,7 @@ from capsule_sdk._errors import (
 )
 from capsule_sdk._http import HttpClient
 from capsule_sdk.models.layered_config import CreateConfigResponse
-from capsule_sdk.models.runner import AllocateRunnerResponse, ConnectResult, PauseResult, RunnerStatus
+from capsule_sdk.models.runner import AllocateRunnerResponse, PauseResult, RunnerStatus
 from capsule_sdk.models.workload import ResolvedWorkloadRef
 from capsule_sdk.resources.layered_configs import LayeredConfigs
 from capsule_sdk.resources.runners import Runners
@@ -130,15 +130,6 @@ class TestRunners:
         assert isinstance(result, PauseResult)
         assert result.success is True
         assert result.layer == 2
-
-    def test_connect(self, runners: Runners, http_client: HttpClient) -> None:
-        resp_data = {"status": "connected", "runner_id": "r-1", "host_address": "10.0.0.2:8080"}
-        mock_resp = httpx.Response(200, json=resp_data)
-        with patch.object(http_client._client, "request", return_value=mock_resp):
-            result = runners.connect("r-1")
-        assert isinstance(result, ConnectResult)
-        assert result.host_address == "10.0.0.2:8080"
-        assert runners._host_cache["r-1"] == "10.0.0.2:8080"
 
     def test_resolve_host_uses_cache(self, runners: Runners) -> None:
         runners._host_cache["r-1"] = "cached-host:8080"

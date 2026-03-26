@@ -4,7 +4,7 @@ import asyncio
 from unittest.mock import AsyncMock
 
 from capsule_sdk.async_runner_session import AsyncRunnerSession
-from capsule_sdk.models.runner import ConnectResult, ExecEvent, ExecResult, PauseResult
+from capsule_sdk.models.runner import ExecEvent, ExecResult, PauseResult
 from capsule_sdk.resources.async_runners import AsyncRunners
 
 
@@ -43,20 +43,16 @@ class TestAsyncRunnerSession:
 
         asyncio.run(run())
 
-    def test_pause_and_resume(self) -> None:
+    def test_pause(self) -> None:
         runners = AsyncMock(spec=AsyncRunners)
         runners.set_host_cache = lambda *_: None  # type: ignore[method-assign]
         runners.pause.return_value = PauseResult(success=True, session_id="s-new")
-        runners.connect.return_value = ConnectResult(status="resumed", runner_id="r-2", host_address="10.0.0.2:8080")
         session = AsyncRunnerSession(runners, "r-1")
 
         async def run() -> None:
             result = await session.pause()
             assert result.success is True
             assert session.session_id == "s-new"
-            resumed = await session.resume()
-            assert resumed.status == "resumed"
-            assert session.runner_id == "r-2"
 
         asyncio.run(run())
 

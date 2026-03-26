@@ -33,7 +33,6 @@ from capsule_sdk.models.file import (
 from capsule_sdk.models.layered_config import CreateConfigResponse, LayeredConfigDetail, StoredLayeredConfig
 from capsule_sdk.models.runner import (
     AllocateRunnerResponse,
-    ConnectResult,
     ExecEvent,
     PauseResult,
     Runner,
@@ -94,7 +93,6 @@ class AsyncRunners:
         request_id: str | None = None,
         labels: dict[str, str] | None = None,
         session_id: str | None = None,
-        snapshot_tag: str | None = None,
         network_policy_preset: str | None = None,
         network_policy_json: str | None = None,
         startup_timeout: float | None = None,
@@ -113,8 +111,6 @@ class AsyncRunners:
             body["labels"] = labels
         if session_id:
             body["session_id"] = session_id
-        if snapshot_tag:
-            body["snapshot_tag"] = snapshot_tag
         if network_policy_preset:
             body["network_policy_preset"] = network_policy_preset
         if network_policy_json:
@@ -186,13 +182,6 @@ class AsyncRunners:
     async def pause(self, runner_id: str) -> PauseResult:
         data = await self._http.post("/api/v1/runners/pause", json_body={"runner_id": runner_id})
         return PauseResult.model_validate(data)
-
-    async def connect(self, runner_id: str) -> ConnectResult:
-        data = await self._http.post("/api/v1/runners/connect", json_body={"runner_id": runner_id})
-        result = ConnectResult.model_validate(data)
-        if result.host_address:
-            self._host_cache[result.runner_id] = result.host_address
-        return result
 
     async def quarantine(
         self,
@@ -293,7 +282,6 @@ class AsyncRunners:
         request_id: str | None = None,
         labels: dict[str, str] | None = None,
         session_id: str | None = None,
-        snapshot_tag: str | None = None,
         network_policy_preset: str | None = None,
         network_policy_json: str | None = None,
         startup_timeout: float | None = None,
@@ -310,7 +298,6 @@ class AsyncRunners:
             request_id=request_id,
             labels=labels,
             session_id=session_id,
-            snapshot_tag=snapshot_tag,
             network_policy_preset=network_policy_preset,
             network_policy_json=network_policy_json,
             startup_timeout=max(deadline - time.monotonic(), 0.0),
@@ -354,7 +341,6 @@ class AsyncRunners:
             | ResolvedWorkloadRef
         ),
         *,
-        tag: str = "stable",
         request_id: str | None = None,
         labels: dict[str, str] | None = None,
         session_id: str | None = None,
@@ -370,7 +356,6 @@ class AsyncRunners:
                 request_id=request_id,
                 labels=labels,
                 session_id=session_id,
-                snapshot_tag=tag,
                 network_policy_preset=network_policy_preset,
                 network_policy_json=network_policy_json,
                 startup_timeout=startup_timeout,
@@ -382,7 +367,6 @@ class AsyncRunners:
             request_id=request_id,
             labels=labels,
             session_id=session_id,
-            snapshot_tag=tag,
             network_policy_preset=network_policy_preset,
             network_policy_json=network_policy_json,
             startup_timeout=startup_timeout,
@@ -556,7 +540,7 @@ class AsyncRunners:
     async def _resolve_host(self, runner_id: str) -> str:
         if runner_id in self._host_cache:
             return self._ensure_scheme(self._host_cache[runner_id])
-        result = await self.connect(runner_id)
+        result = await self.status(runner_id)
         if result.host_address:
             self._host_cache[result.runner_id] = result.host_address
             return self._ensure_scheme(result.host_address)

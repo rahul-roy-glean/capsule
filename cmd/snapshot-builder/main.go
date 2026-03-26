@@ -699,6 +699,12 @@ func run(logger *logrus.Logger) error {
 			if chunkedMeta.ExtensionDrives == nil {
 				chunkedMeta.ExtensionDrives = make(map[string]snapshot.ExtensionDrive)
 			}
+			// Build a lookup from driveID → DriveSpec so FUSE-tracked drives
+			// can inherit Label/MountPath for MMDS propagation.
+			driveSpecByID := make(map[string]snapshot.DriveSpec, len(newDrives))
+			for _, d := range newDrives {
+				driveSpecByID[d.DriveID] = d
+			}
 			for driveID, chunks := range incrementalExtChunks {
 				var totalSize int64
 				for _, c := range chunks {
@@ -706,10 +712,13 @@ func run(logger *logrus.Logger) error {
 						totalSize = end
 					}
 				}
+				spec := driveSpecByID[driveID]
 				chunkedMeta.ExtensionDrives[driveID] = snapshot.ExtensionDrive{
 					Chunks:    chunks,
 					ReadOnly:  false,
 					SizeBytes: totalSize,
+					Label:     spec.Label,
+					MountPath: spec.MountPath,
 				}
 			}
 		}
@@ -745,6 +754,8 @@ func run(logger *logrus.Logger) error {
 				Chunks:    chunks,
 				ReadOnly:  d.ReadOnly,
 				SizeBytes: stat.Size(),
+				Label:     d.Label,
+				MountPath: d.MountPath,
 			}
 		}
 

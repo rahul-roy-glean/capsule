@@ -21,7 +21,6 @@ type LayeredConfigRegistry struct {
 	snapshotManager *SnapshotManager
 	layerBuilder    *LayerBuildScheduler
 	configCache     *ConfigCache
-	tagRegistry     *SnapshotTagRegistry
 	logger          *logrus.Entry
 }
 
@@ -66,13 +65,14 @@ type StoredLayeredConfig struct {
 
 // LayerStatus is the status of a single layer in a layered config.
 type LayerStatus struct {
-	Name           string `json:"name"`
-	LayerHash      string `json:"layer_hash"`
-	Status         string `json:"status"`
-	CurrentVersion string `json:"current_version,omitempty"`
-	Depth          int    `json:"depth"`
-	BuildStatus    string `json:"build_status,omitempty"`
-	BuildVersion   string `json:"build_version,omitempty"`
+	Name              string `json:"name"`
+	LayerHash         string `json:"layer_hash"`
+	Status            string `json:"status"`
+	CurrentVersion    string `json:"current_version,omitempty"`
+	Depth             int    `json:"depth"`
+	BuildStatus       string `json:"build_status,omitempty"`
+	BuildVersion      string `json:"build_version,omitempty"`
+	BuildInstanceName string `json:"build_instance_name,omitempty"`
 }
 
 // RegisterLayeredConfig validates, materializes, and stores a layered config.
@@ -109,6 +109,21 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 	cfgJSON, err := json.Marshal(cfg)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	// Validate structural compatibility: if this config_id already exists,
+	// only base_image and runtime settings are allowed to change. Structural
+	// changes (layer count, names, init_commands, drives, tier) require a new config_id.
+	var existingCfgJSON sql.NullString
+	r.db.QueryRowContext(ctx,
+		`SELECT config_json FROM layered_configs WHERE config_id = $1`, configID).Scan(&existingCfgJSON)
+	if existingCfgJSON.Valid && existingCfgJSON.String != "" {
+		var oldCfg snapshot.LayeredConfig
+		if err := json.Unmarshal([]byte(existingCfgJSON.String), &oldCfg); err == nil {
+			if err := snapshot.ConfigStructurallyEqual(&oldCfg, cfg); err != nil {
+				return "", "", fmt.Errorf("config_id %q already registered; only base_image and runtime settings can change (%s). Create a new config_id for structural changes", configID, err)
+			}
+		}
 	}
 
 	r.logger.WithFields(logrus.Fields{
@@ -420,7 +435,7 @@ func (r *LayeredConfigRegistry) GetLayerStatuses(ctx context.Context, configID s
 		SELECT c.layer_hash,
 		       cls.config_name,
 		       c.depth, c.status, c.current_version,
-		       sb.status, sb.version
+		       sb.status, sb.version, sb.instance_name
 		FROM chain c
 		JOIN config_layer_settings cls ON cls.layer_hash = c.layer_hash AND cls.config_id = $2
 		LEFT JOIN snapshot_builds sb ON sb.layer_hash = c.layer_hash
@@ -435,8 +450,8 @@ func (r *LayeredConfigRegistry) GetLayerStatuses(ctx context.Context, configID s
 	var statuses []LayerStatus
 	for rows.Next() {
 		var ls LayerStatus
-		var status, currentVersion, buildStatus, buildVersion sql.NullString
-		if err := rows.Scan(&ls.LayerHash, &ls.Name, &ls.Depth, &status, &currentVersion, &buildStatus, &buildVersion); err != nil {
+		var status, currentVersion, buildStatus, buildVersion, buildInstanceName sql.NullString
+		if err := rows.Scan(&ls.LayerHash, &ls.Name, &ls.Depth, &status, &currentVersion, &buildStatus, &buildVersion, &buildInstanceName); err != nil {
 			continue
 		}
 		if status.Valid {
@@ -452,6 +467,9 @@ func (r *LayeredConfigRegistry) GetLayerStatuses(ctx context.Context, configID s
 		}
 		if buildVersion.Valid {
 			ls.BuildVersion = buildVersion.String
+		}
+		if buildInstanceName.Valid {
+			ls.BuildInstanceName = buildInstanceName.String
 		}
 		statuses = append(statuses, ls)
 	}
@@ -606,25 +624,6 @@ func (r *LayeredConfigRegistry) HandleLayeredConfigs(w http.ResponseWriter, req 
 		return
 	}
 
-	// Route /{wk}/tags, /{wk}/tags/{tag}, /{wk}/promote to tag registry
-	parts := strings.SplitN(path, "/", 3)
-	if len(parts) >= 2 && r.tagRegistry != nil {
-		wk := parts[0]
-		sub := parts[1]
-		if sub == "tags" {
-			subpath := ""
-			if len(parts) == 3 {
-				subpath = parts[2]
-			}
-			r.tagRegistry.HandleTags(w, req, wk, subpath)
-			return
-		}
-		if sub == "promote" {
-			r.handlePromote(w, req, wk)
-			return
-		}
-	}
-
 	switch req.Method {
 	case http.MethodGet:
 		r.handleGetLayeredConfig(w, req)
@@ -633,53 +632,6 @@ func (r *LayeredConfigRegistry) HandleLayeredConfigs(w http.ResponseWriter, req 
 	default:
 		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
-}
-
-// handlePromote promotes a tagged version to active, updating snapshot status
-// and version assignments so hosts converge to the new version.
-func (r *LayeredConfigRegistry) handlePromote(w http.ResponseWriter, req *http.Request, workloadKey string) {
-	if req.Method != http.MethodPost {
-		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	var body struct {
-		Tag string `json:"tag"`
-	}
-	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if body.Tag == "" {
-		writeAPIError(w, http.StatusBadRequest, "tag is required")
-		return
-	}
-	version, err := r.tagRegistry.PromoteTag(req.Context(), workloadKey, body.Tag)
-	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			writeAPIError(w, http.StatusNotFound, err.Error())
-		} else {
-			writeAPIError(w, http.StatusInternalServerError, err.Error())
-		}
-		return
-	}
-
-	// Activate the snapshot and assign the version fleet-wide so hosts converge.
-	if r.snapshotManager != nil {
-		if err := r.snapshotManager.SetActiveSnapshotForKey(req.Context(), workloadKey, version); err != nil {
-			r.logger.WithError(err).Warn("promote: failed to set active snapshot")
-		}
-		if err := r.snapshotManager.AssignVersion(req.Context(), workloadKey, nil, version); err != nil {
-			r.logger.WithError(err).Warn("promote: failed to assign version")
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"workload_key": workloadKey,
-		"tag":          body.Tag,
-		"version":      version,
-		"status":       "promoted",
-	})
 }
 
 func (r *LayeredConfigRegistry) handleCreateLayeredConfig(w http.ResponseWriter, req *http.Request) {
