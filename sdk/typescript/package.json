@@ -1,0 +1,60 @@
+{
+  "name": "capsule-sdk",
+  "version": "0.1.0-alpha.1",
+  "description": "TypeScript SDK for Capsule",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/rahul-roy-glean/capsule",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rahul-roy-glean/capsule.git",
+    "directory": "sdk/typescript"
+  },
+  "bugs": {
+    "url": "https://github.com/rahul-roy-glean/capsule/issues"
+  },
+  "sideEffects": false,
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc --noEmit && tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --exclude tests/contract.test.ts",
+    "test:contract": "vitest run tests/contract.test.ts"
+  },
+  "keywords": [
+    "capsule",
+    "sdk",
+    "typescript",
+    "javascript",
+    "runner",
+    "sandbox"
+  ],
+  "dependencies": {
+    "js-yaml": "^4.1.1",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^25.5.0",
+    "@types/ws": "^8.18.1",
+    "tsup": "^8.5.1",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.2"
+  }
+}

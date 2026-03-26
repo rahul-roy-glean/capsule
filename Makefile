@@ -7,6 +7,7 @@
 .PHONY: capsule-manager capsule-control-plane snapshot-builder capsule-thaw-agent
 .PHONY: test-unit test-race test-cover test-integration test-all check
 .PHONY: sdk-python-lint sdk-python-test sdk-python-typecheck sdk-python-check sdk-python-e2e
+.PHONY: sdk-typescript-typecheck sdk-typescript-build sdk-typescript-test sdk-typescript-check
 .PHONY: dev-build dev-snapshot dev-stack dev-test-snapshot-builder dev-test-multi-pause-dedup dev-stop
 .PHONY: dev-test-gcs-pause-resume
 .PHONY: dev-test-file-ops dev-test-pty dev-test-checkpoint dev-test-host-gc
@@ -483,3 +484,16 @@ sdk-python-check: sdk-python-lint sdk-python-typecheck sdk-python-test
 
 sdk-python-e2e:
 	cd sdk/python && python -m pytest tests/e2e_live.py -v
+
+# ── TypeScript SDK ─────────────────────────────────────────────────────────
+sdk-typescript-typecheck:
+	cd sdk/typescript && npm run typecheck
+
+sdk-typescript-build:
+	cd sdk/typescript && npm run build
+
+sdk-typescript-test:
+	cd sdk/typescript && npm test
+
+sdk-typescript-check: sdk-typescript-typecheck sdk-typescript-build sdk-typescript-test
+	@echo "TypeScript SDK checks passed"

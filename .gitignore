@@ -102,5 +102,7 @@ deploy/terraform/.terraform/
 
 sdk/python/dist
 sdk/python/.venv/
+sdk/typescript/dist
+sdk/typescript/node_modules/
 
 scratch
