@@ -939,11 +939,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 	}
 
 	if workloadKey != "" && metadata.WorkloadKey != workloadKey {
-		m.logger.WithFields(logrus.Fields{
-			"session_id":             sessionID,
-			"session_workload_key":   metadata.WorkloadKey,
-			"requested_workload_key": workloadKey,
-		}).Warn("workload_key mismatch between session and request (migration may be in progress)")
+		return nil, fmt.Errorf("session %s workload_key mismatch: session=%q, request=%q", sessionID, metadata.WorkloadKey, workloadKey)
 	}
 
 	if metadata.Layers == 0 {

@@ -99,6 +99,9 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		allocReq.MigrateFromRunnerID = v
 	}
 
+	allocReq.RunnerID = req.RunnerId
+	allocReq.Resume = req.Resume
+
 	if req.Resources != nil {
 		allocReq.Resources = runner.Resources{
 			VCPUs:    int(req.Resources.Vcpus),
@@ -135,10 +138,10 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 			}
 		}
 
-		// Try to resume from session snapshot
-		if s.manager.SessionExists(allocReq.SessionID) {
+		// Try to resume from session snapshot (control plane signals intent via Resume flag)
+		if allocReq.Resume {
 			resumeStart := time.Now()
-			r, err = s.manager.ResumeFromSession(ctx, allocReq.SessionID, allocReq.WorkloadKey, "")
+			r, err = s.manager.ResumeFromSession(ctx, allocReq.SessionID, allocReq.WorkloadKey, allocReq.RunnerID)
 			resumeDuration := time.Since(resumeStart)
 
 			if err == nil {

@@ -358,6 +358,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	var sessionNPJSON sql.NullString
 	var migrateFromWorkloadKey string // set when base image migration is needed
 	var migrateFromRunnerID string
+	var resumeRunnerID string // runner ID for cross-host session resume
 	if req.SessionID != "" && s.db != nil {
 		var status string
 		var sessionWorkloadKey sql.NullString
@@ -369,6 +370,9 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			req.SessionID).Scan(&sessionHostID, &status, &sessionWorkloadKey, &sessionTTL, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON, &sessionConfigID, &sessionRunnerID)
 		if err == nil && status == "suspended" && sessionHostID != "" {
 			resumeFromSessionConfig = true
+			if sessionRunnerID.Valid && sessionRunnerID.String != "" {
+				resumeRunnerID = sessionRunnerID.String
+			}
 
 			// Check for base image migration: if config_id is known, look up
 			// the current active workload_key and compare.
@@ -722,6 +726,12 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		}
 		protoReq.Labels["_migrate_from_workload_key"] = migrateFromWorkloadKey
 		protoReq.Labels["_migrate_from_runner_id"] = migrateFromRunnerID
+	}
+	// Pass cross-host session resume info as proper proto fields so the host
+	// agent can skip the local SessionExists() check and use GCS fallback.
+	if resumeFromSessionConfig && migrateFromWorkloadKey == "" && resumeRunnerID != "" {
+		protoReq.RunnerId = resumeRunnerID
+		protoReq.Resume = true
 	}
 	protoReq.Resources = &pb.Resources{
 		Vcpus:    int32(tier.VCPUs),

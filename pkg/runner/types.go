@@ -109,6 +109,9 @@ type AllocateRequest struct {
 	NetworkPolicy       *network.NetworkPolicy // optional: full policy override
 	AuthConfig          *authproxy.AuthConfig  // optional: auth proxy configuration
 
+	RunnerID string // original runner ID for session resume (from control plane)
+	Resume   bool   // true when control plane wants host to attempt session resume
+
 	// Base image migration: when set, the host agent does a fresh boot from the
 	// new golden snapshot but overrides extension drives with the session's data.
 	MigrateFromWorkloadKey string // old session's workload key (for GCS path construction)

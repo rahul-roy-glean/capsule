@@ -187,6 +187,8 @@ message AllocateRunnerRequest {
   reserved "snapshot_tag";
   string network_policy_preset = 17; // optional: named preset (e.g., "restricted-egress", "agent-sandbox")
   string network_policy_json = 18;   // optional: full NetworkPolicy as JSON (overrides preset)
+  string runner_id = 19;              // original runner ID for session resume (enables GCS-backed cross-host resume)
+  bool resume = 20;                   // true when control plane wants host to attempt session resume
 }
 
 // AllocateRunnerResponse
