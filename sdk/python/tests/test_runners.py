@@ -213,7 +213,7 @@ class TestRunners:
     def test_from_config_uses_allocate_ready_by_default(self, runners: Runners) -> None:
         session = RunnerSession(runners, "r-42", host_address="10.0.0.1:8080", session_id="s-1", request_id="req-1")
         with patch.object(runners, "allocate_ready", return_value=session) as allocate_ready:
-            result = runners.from_config("my-workload", tag="stable")
+            result = runners.from_config("my-workload")
         assert result is session
         allocate_ready.assert_called_once()
 

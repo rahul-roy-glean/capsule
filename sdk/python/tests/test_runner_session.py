@@ -206,7 +206,7 @@ class TestFromConfig:
             request_id="req-1",
         )
         with patch.object(runners, "allocate_ready", return_value=ready_session):
-            session = runners.from_config("my-workload", tag="stable")
+            session = runners.from_config("my-workload")
         assert isinstance(session, RunnerSession)
         assert session.runner_id == "r-42"
         assert session.session_id == "s-1"
@@ -216,5 +216,5 @@ class TestFromConfig:
     def test_from_config_with_labels(self, runners: Runners, http_client: HttpClient) -> None:
         ready_session = RunnerSession(runners, "r-99", host_address="h:8080")
         with patch.object(runners, "allocate_ready", return_value=ready_session) as allocate_ready:
-            runners.from_config("wk-1", tag="dev", labels={"env": "ci"})
+            runners.from_config("wk-1", labels={"env": "ci"})
         assert allocate_ready.call_args.kwargs["labels"] == {"env": "ci"}
