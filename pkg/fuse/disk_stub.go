@@ -55,6 +55,9 @@ func (d *ChunkedDisk) DirtyChunkCount() int {
 	return 0
 }
 
+// ResetDirtyChunks is a stub
+func (d *ChunkedDisk) ResetDirtyChunks() {}
+
 // Stats is a stub
 func (d *ChunkedDisk) Stats() DiskStats {
 	return DiskStats{}

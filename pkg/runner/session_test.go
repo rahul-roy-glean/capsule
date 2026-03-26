@@ -14,7 +14,7 @@ func TestPauseRunner_NoSessionID(t *testing.T) {
 	m := newTestManager()
 	m.runners["r1"] = &Runner{ID: "r1", State: StateIdle}
 
-	_, err := m.PauseRunner(context.Background(), "r1")
+	_, err := m.PauseRunner(context.Background(), "r1", false)
 	if err == nil {
 		t.Error("PauseRunner should fail without session_id")
 	}
@@ -26,7 +26,7 @@ func TestPauseRunner_NoSessionID(t *testing.T) {
 func TestPauseRunner_NotFound(t *testing.T) {
 	m := newTestManager()
 
-	_, err := m.PauseRunner(context.Background(), "nonexistent")
+	_, err := m.PauseRunner(context.Background(), "nonexistent", false)
 	if err == nil {
 		t.Error("PauseRunner should fail for nonexistent runner")
 	}
@@ -36,7 +36,7 @@ func TestPauseRunner_AlreadySuspended(t *testing.T) {
 	m := newTestManager()
 	m.runners["r1"] = &Runner{ID: "r1", State: StateSuspended, SessionID: "sess-1"}
 
-	_, err := m.PauseRunner(context.Background(), "r1")
+	_, err := m.PauseRunner(context.Background(), "r1", false)
 	if err == nil {
 		t.Error("PauseRunner should fail for already suspended runner")
 	}
@@ -46,7 +46,7 @@ func TestPauseRunner_AlreadyPausing(t *testing.T) {
 	m := newTestManager()
 	m.runners["r1"] = &Runner{ID: "r1", State: StatePausing, SessionID: "sess-1"}
 
-	_, err := m.PauseRunner(context.Background(), "r1")
+	_, err := m.PauseRunner(context.Background(), "r1", false)
 	if err == nil {
 		t.Error("PauseRunner should fail for runner already pausing")
 	}
@@ -58,7 +58,7 @@ func TestPauseRunner_ActiveExecs(t *testing.T) {
 	atomic.StoreInt32(&r.ActiveExecs, 2)
 	m.runners["r1"] = r
 
-	_, err := m.PauseRunner(context.Background(), "r1")
+	_, err := m.PauseRunner(context.Background(), "r1", false)
 	if err == nil {
 		t.Error("PauseRunner should fail when runner has active execs")
 	}
@@ -72,7 +72,7 @@ func TestPauseRunner_NoVM(t *testing.T) {
 	m.runners["r1"] = &Runner{ID: "r1", State: StateIdle, SessionID: "sess-1"}
 	// No VM in m.vms
 
-	_, err := m.PauseRunner(context.Background(), "r1")
+	_, err := m.PauseRunner(context.Background(), "r1", false)
 	if err == nil {
 		t.Error("PauseRunner should fail when VM not found")
 	}

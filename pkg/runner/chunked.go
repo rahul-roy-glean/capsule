@@ -434,6 +434,7 @@ func (cm *ChunkedManager) restoreAndActivateRunner(
 	uffdSocketPath string,
 	useFileBackedMem bool,
 	extensionDrivePaths map[string]string,
+	driveSpecs []snapshot.DriveSpec,
 ) (chunkedVM, *authproxy.AuthProxy, error) {
 	// Set up per-runner snapshot symlinks before creating the VM so the
 	// SnapshotDir is available for the private mount namespace.
@@ -455,7 +456,14 @@ func (cm *ChunkedManager) restoreAndActivateRunner(
 	}
 
 	var restoreErr error
-	if useFileBackedMem {
+	freshBoot := req.MigrateFromWorkloadKey != ""
+
+	if freshBoot {
+		cm.chunkedLogger.WithField("runner_id", runnerID).Info("Migration: fresh boot (skipping snapshot restore)")
+		if err := vm.Start(ctx); err != nil {
+			return nil, nil, fmt.Errorf("migration fresh boot failed: %w", err)
+		}
+	} else if useFileBackedMem {
 		cm.chunkedLogger.WithFields(logrus.Fields{
 			"runner_id": runnerID,
 			"snapshot":  restoreStatePath,
@@ -473,6 +481,7 @@ func (cm *ChunkedManager) restoreAndActivateRunner(
 
 	if restoreErr != nil {
 		cm.chunkedLogger.WithError(restoreErr).Warn("UFFD restore failed, trying cold boot fallback")
+		freshBoot = true
 		vm.Stop()
 
 		vm, err = cm.newVM(vmCfg)
@@ -507,6 +516,9 @@ func (cm *ChunkedManager) restoreAndActivateRunner(
 	}
 
 	mmdsData := cm.buildMMDSData(ctx, runner, tap, req)
+	// Populate MMDS Drives so the thaw-agent can mount extension drives on
+	// fresh boot (migration) and cold boot fallback.
+	mmdsData.Latest.Drives = driveSpecs
 	if proxy != nil {
 		mmdsData.Latest.Proxy.Address = proxy.ProxyAddress()
 		mmdsData.Latest.Proxy.CACertPEM = string(proxy.CACertPEM)
@@ -539,7 +551,7 @@ func (cm *ChunkedManager) restoreAndActivateRunner(
 		return nil, proxy, fmt.Errorf("failed to set MMDS data: %w", err)
 	}
 
-	if restoreErr == nil {
+	if !freshBoot {
 		if err := vm.Resume(ctx); err != nil {
 			vm.Stop()
 			return nil, proxy, fmt.Errorf("failed to resume VM after MMDS injection: %w", err)
@@ -559,6 +571,9 @@ func (cm *ChunkedManager) restoreAndActivateRunner(
 
 	readyTimeout := cm.readyTimeout
 	if readyTimeout <= 0 {
+		readyTimeout = 30 * time.Second
+	}
+	if req.MigrateFromWorkloadKey != "" {
 		readyTimeout = 30 * time.Second
 	}
 	if err := cm.waitForRunnerReady(ctx, runner.InternalIP.String(), readyTimeout); err != nil {
@@ -589,7 +604,10 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	// Derive workload key — the request must always carry one (resolved upstream).
 	workloadKey := req.WorkloadKey
 
-	runnerID := uuid.New().String()
+	runnerID := req.MigrateFromRunnerID
+	if runnerID == "" {
+		runnerID = uuid.New().String()
+	}
 	cm.chunkedLogger.WithField("runner_id", runnerID).Info("Allocating runner with chunked snapshot")
 
 	// Acquire lease: atomically checks capacity, reserves slot, and creates
@@ -615,6 +633,57 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	if meta == nil || cm.chunkStore == nil {
 		retErr = fmt.Errorf("chunked snapshots not available: meta=%v, chunkStore=%v", meta != nil, cm.chunkStore != nil)
 		return nil, retErr
+	}
+
+	// Base image migration: when migration fields are set, download the old
+	// session's extension drive ChunkIndexes from GCS and override the golden
+	// metadata's extension drives with the session's data. This gives us a
+	// fresh boot (new rootfs, new memory) but with the user's extension drive
+	// data preserved from their paused session.
+	if req.MigrateFromWorkloadKey != "" && req.MigrateFromRunnerID != "" && cm.sessionMemStore != nil {
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"runner_id":           runnerID,
+			"migrate_from_wk":     req.MigrateFromWorkloadKey,
+			"migrate_from_runner": req.MigrateFromRunnerID,
+			"new_wk":              workloadKey,
+		}).Info("Base image migration: downloading session extension drives")
+
+		uploader := snapshot.NewSessionChunkUploader(cm.sessionMemStore, cm.sessionDiskStore, cm.logger.Logger)
+
+		// Construct the session manifest path using the old workload_key/runner_id
+		gcsBase := fmt.Sprintf("%s/runner_state/%s", req.MigrateFromWorkloadKey, req.MigrateFromRunnerID)
+		manifestPath := uploader.FullGCSPath(gcsBase + "/snapshot_manifest.json")
+
+		sessionMan, dlErr := uploader.DownloadManifest(ctx, manifestPath)
+		if dlErr != nil {
+			cm.chunkedLogger.WithError(dlErr).Warn("Migration: failed to download session manifest, proceeding with golden drives (user data will be lost)")
+		} else {
+			// Override golden extension drives with session's extension drive data.
+			for driveID, diskSection := range sessionMan.ExtensionDisks {
+				if diskSection.Mode != "chunked" || diskSection.ChunkIndexObject == "" {
+					continue
+				}
+				diskIdx, diskDlErr := uploader.DownloadChunkIndex(ctx, diskSection.ChunkIndexObject)
+				if diskDlErr != nil {
+					cm.chunkedLogger.WithError(diskDlErr).WithField("drive_id", driveID).Warn("Migration: failed to download extension drive ChunkIndex, keeping golden drive")
+					continue
+				}
+				// Convert ChunkIndex extents to dense ChunkRef slice.
+				// The session disk index is the fully merged result (golden base
+				// + dirty), so it can replace the golden drive chunks directly.
+				diskRefs := snapshot.ChunkIndexToRefs(diskIdx)
+				if goldenDrive, ok := meta.ExtensionDrives[driveID]; ok {
+					goldenDrive.Chunks = diskRefs
+					meta.ExtensionDrives[driveID] = goldenDrive
+					cm.chunkedLogger.WithFields(logrus.Fields{
+						"drive_id": driveID,
+						"chunks":   len(diskRefs),
+					}).Info("Migration: overrode golden extension drive with session data")
+				} else {
+					cm.chunkedLogger.WithField("drive_id", driveID).Warn("Migration: session has extension drive not in golden metadata, skipping")
+				}
+			}
+		}
 	}
 
 	startTime := time.Now()
@@ -713,8 +782,24 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		}
 	}
 
+	// Build driveSpecs from metadata so MMDS can tell the thaw-agent where
+	// to mount extension drives (needed for fresh boot and cold boot fallback).
+	var driveSpecs []snapshot.DriveSpec
+	for driveID, ext := range meta.ExtensionDrives {
+		driveSpecs = append(driveSpecs, snapshot.DriveSpec{
+			DriveID:   driveID,
+			Label:     ext.Label,
+			MountPath: ext.MountPath,
+			ReadOnly:  ext.ReadOnly,
+			SizeGB:    int(ext.SizeBytes / (1024 * 1024 * 1024)),
+		})
+	}
+
+	isMigration := req.MigrateFromWorkloadKey != ""
+
 	// Setup memory backend: flag overrides metadata when set, otherwise fall
 	// back to metadata-based detection (MemFilePath set → file, else chunked).
+	// Migration skips memory entirely — fresh boot doesn't use snapshot restore.
 	useFileBackedMem := meta.MemFilePath != ""
 	if cm.memBackend == "file" {
 		useFileBackedMem = true
@@ -723,7 +808,9 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	}
 	var uffdSocketPath string
 
-	if useFileBackedMem {
+	if isMigration {
+		cm.chunkedLogger.WithField("runner_id", runnerID).Info("Migration: skipping memory setup (fresh boot)")
+	} else if useFileBackedMem {
 		localMemPath, err = cm.ensureLocalMemFile(ctx, runnerID, workloadKey, meta)
 		if err != nil {
 			return nil, err
@@ -799,13 +886,14 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 
 	// Eagerly fetch the VM state (CPU/device state) from the ChunkStore.
 	// This is small (~100KB) and required as a local file for Firecracker restore.
+	// Migration skips this — fresh boot doesn't use snapshot restore.
 	snapshotDir := filepath.Join(cm.config.WorkspaceDir, runnerID, "snapshot")
 	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create snapshot dir: %w", err)
 	}
 
 	localStatePath := filepath.Join(snapshotDir, "snapshot.state")
-	if meta.StateHash != "" {
+	if !isMigration && meta.StateHash != "" {
 		stateData, err := cm.chunkStore.GetChunk(ctx, meta.StateHash)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch vmstate chunk: %w", err)
@@ -906,6 +994,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		uffdSocketPath,
 		useFileBackedMem,
 		extensionDrivePaths,
+		driveSpecs,
 	)
 	if err != nil {
 		return nil, err

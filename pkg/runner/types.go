@@ -113,6 +113,14 @@ type AllocateRequest struct {
 	NetworkPolicyPreset     string                 // optional: named preset (e.g., "restricted-egress")
 	NetworkPolicy           *network.NetworkPolicy // optional: full policy override
 	AuthConfig              *authproxy.AuthConfig  // optional: auth proxy configuration
+
+	RunnerID string // original runner ID for session resume (from control plane)
+	Resume   bool   // true when control plane wants host to attempt session resume
+
+	// Base image migration: when set, the host agent does a fresh boot from the
+	// new golden snapshot but overrides extension drives with the session's data.
+	MigrateFromWorkloadKey string // old session's workload key (for GCS path construction)
+	MigrateFromRunnerID    string // old session's runner ID (for GCS path construction)
 }
 
 // MMDSData represents data to inject into the microVM via MMDS
@@ -156,7 +164,13 @@ type MMDSData struct {
 		// Drives lists extension drives to mount inside the VM.
 		// Populated from DriveSpec metadata in the snapshot.
 		Drives []snapshot.DriveSpec `json:"drives,omitempty"`
-		Warmup struct {
+		// RemountDrives tells the thaw-agent to force-remount extension drives
+		// even if they are already mounted. Used during base image migration:
+		// the golden snapshot's VM state has stale page-cache entries for the
+		// old (empty) ext4, so the kernel must re-read from the FUSE-backed
+		// block device that now serves the session's data.
+		RemountDrives bool `json:"remount_drives,omitempty"`
+		Warmup        struct {
 			Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
 		} `json:"warmup,omitempty"`
 		Proxy struct {

@@ -297,13 +297,11 @@ func main() {
 		snapshotManager.builderServiceAccount = v
 	}
 	configCache := NewConfigCache(db, logger)
-	tagRegistry := NewSnapshotTagRegistry(db, logger)
-	scheduler := NewScheduler(hostRegistry, db, snapshotManager, tagRegistry, logger)
+	scheduler := NewScheduler(hostRegistry, db, snapshotManager, logger)
 	scheduler.SetConfigCache(configCache)
 	scheduler.SetOTel(otelClient, sessionResumeRoutingCounter, cpAllocationCounter, cpAllocationLatencyHist, cpPlacementCounter)
 	layeredConfigRegistry := NewLayeredConfigRegistry(db, snapshotManager, logger)
 	layeredConfigRegistry.SetConfigCache(configCache)
-	layeredConfigRegistry.tagRegistry = tagRegistry
 	layerBuildScheduler := NewLayerBuildScheduler(db, snapshotManager, logger, 4)
 	layeredConfigRegistry.SetLayerBuilder(layerBuildScheduler)
 
@@ -365,7 +363,6 @@ func main() {
 	httpMux.Handle("/api/v1/runners/status", instrumentAuthenticatedHandler("/api/v1/runners/status", "control_plane.runner_status", http.HandlerFunc(controlPlaneServer.HandleRunnerStatus)))
 	httpMux.Handle("/api/v1/runners/release", instrumentAuthenticatedHandler("/api/v1/runners/release", "control_plane.release_runner", http.HandlerFunc(controlPlaneServer.HandleRunnerRelease)))
 	httpMux.Handle("/api/v1/runners/pause", instrumentAuthenticatedHandler("/api/v1/runners/pause", "control_plane.pause_runner", http.HandlerFunc(controlPlaneServer.HandlePauseRunner)))
-	httpMux.Handle("/api/v1/runners/connect", instrumentAuthenticatedHandler("/api/v1/runners/connect", "control_plane.connect_runner", http.HandlerFunc(controlPlaneServer.HandleConnectRunner)))
 	httpMux.Handle("/api/v1/runners/quarantine", instrumentAuthenticatedHandler("/api/v1/runners/quarantine", "control_plane.quarantine_runner", http.HandlerFunc(controlPlaneServer.HandleQuarantineRunner)))
 	httpMux.Handle("/api/v1/runners/unquarantine", instrumentAuthenticatedHandler("/api/v1/runners/unquarantine", "control_plane.unquarantine_runner", http.HandlerFunc(controlPlaneServer.HandleUnquarantineRunner)))
 	httpMux.Handle("/api/v1/hosts", instrumentAuthenticatedHandler("/api/v1/hosts", "control_plane.get_hosts", http.HandlerFunc(controlPlaneServer.HandleGetHosts)))
@@ -735,7 +732,6 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		WorkloadKey         string            `json:"workload_key"`
 		Labels              map[string]string `json:"labels"`
 		SessionID           string            `json:"session_id"`
-		SnapshotTag         string            `json:"snapshot_tag"`
 		NetworkPolicyPreset string            `json:"network_policy_preset"`
 		NetworkPolicyJSON   string            `json:"network_policy_json"`
 	}
@@ -766,7 +762,6 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		Source:              "api",
 		Labels:              req.Labels,
 		SessionID:           req.SessionID,
-		SnapshotTag:         req.SnapshotTag,
 		NetworkPolicyPreset: req.NetworkPolicyPreset,
 		NetworkPolicyJSON:   req.NetworkPolicyJSON,
 	})
@@ -775,7 +770,9 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		w.Header().Set("Content-Type", "application/json")
 		// Return 429 for transient capacity errors so clients can retry
 		// with backoff, and 503 for other failures.
-		if strings.Contains(err.Error(), "no host with sufficient capacity") ||
+		if strings.Contains(err.Error(), "not found") {
+			w.WriteHeader(http.StatusNotFound)
+		} else if strings.Contains(err.Error(), "no host with sufficient capacity") ||
 			strings.Contains(err.Error(), "no available hosts") {
 			w.Header().Set("Retry-After", "2")
 			w.WriteHeader(http.StatusTooManyRequests)
@@ -917,6 +914,7 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 
 	var req struct {
 		RunnerID string `json:"runner_id"`
+		SyncFS   bool   `json:"sync_fs"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -928,6 +926,8 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 	}
 
 	s.logger.WithField("runner_id", req.RunnerID).Info("Pause runner request")
+
+	syncFS := req.SyncFS || r.URL.Query().Get("sync") == "true"
 
 	runner, err := s.hostRegistry.GetRunner(req.RunnerID)
 	if err != nil {
@@ -942,7 +942,7 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 
 	// If host is draining/terminating, session runners are already being
 	// proactively paused by the host agent — return 503 so the client retries
-	// via /connect which will resume on a new host.
+	// via /allocate with session_id which will resume on a new host.
 	if host.Status == "draining" || host.Status == "terminating" {
 		w.Header().Set("Retry-After", "5")
 		w.Header().Set("Content-Type", "application/json")
@@ -966,7 +966,7 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 	// GCS chunk upload which can exceed that.
 	pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer pauseCancel()
-	resp, err := client.PauseRunner(pauseCtx, &pb.PauseRunnerRequest{RunnerId: req.RunnerID})
+	resp, err := client.PauseRunner(pauseCtx, &pb.PauseRunnerRequest{RunnerId: req.RunnerID, SyncFs: syncFS})
 	if err != nil {
 		http.Error(w, "pause failed: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -984,12 +984,18 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 		if runner.NetworkPolicyJSON != "" {
 			networkPolicy = runner.NetworkPolicyJSON
 		}
+		// Derive config_id from the workload_key for migration support.
+		var configID sql.NullString
+		s.scheduler.db.QueryRowContext(pauseCtx,
+			`SELECT config_id FROM config_workload_keys WHERE leaf_workload_key = $1 AND status IN ('active','draining') LIMIT 1`,
+			runner.WorkloadKey).Scan(&configID)
+
 		if _, dbErr := s.scheduler.db.ExecContext(pauseCtx, `
 			INSERT INTO session_snapshots (
 				session_id, runner_id, workload_key, host_id, status, layer_count, paused_at,
-				runner_ttl_seconds, session_max_age_seconds, auto_pause, network_policy_preset, network_policy
+				runner_ttl_seconds, session_max_age_seconds, auto_pause, network_policy_preset, network_policy, config_id
 			)
-			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9, $10)
+			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9, $10, $11)
 			ON CONFLICT (session_id) DO UPDATE SET
 				status = 'suspended',
 				layer_count = EXCLUDED.layer_count,
@@ -998,9 +1004,10 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 				session_max_age_seconds = EXCLUDED.session_max_age_seconds,
 				auto_pause = EXCLUDED.auto_pause,
 				network_policy_preset = EXCLUDED.network_policy_preset,
-				network_policy = EXCLUDED.network_policy
+				network_policy = EXCLUDED.network_policy,
+				config_id = EXCLUDED.config_id
 		`, resp.SessionId, req.RunnerID, runner.WorkloadKey, host.ID, resp.Layer+1,
-			runner.RunnerTTLSeconds, runner.SessionMaxAgeSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy); dbErr != nil {
+			runner.RunnerTTLSeconds, runner.SessionMaxAgeSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy, configID); dbErr != nil {
 			s.logger.WithError(dbErr).WithField("session_id", resp.SessionId).Error("Failed to update session_snapshots table")
 		}
 	}
@@ -1019,171 +1026,6 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 		"session_id":          resp.SessionId,
 		"snapshot_size_bytes": resp.SnapshotSizeBytes,
 		"layer":               resp.Layer,
-	})
-}
-
-// HandleConnectRunner connects to a runner: extends TTL if running, resumes if suspended.
-// POST /api/v1/runners/connect
-// Body: {"runner_id": "abc-123"}
-func (s *ControlPlaneServer) HandleConnectRunner(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		RunnerID string `json:"runner_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-	if req.RunnerID == "" {
-		http.Error(w, "runner_id is required", http.StatusBadRequest)
-		return
-	}
-
-	runner, err := s.hostRegistry.GetRunner(req.RunnerID)
-	if err != nil {
-		// Check if suspended in session_snapshots
-		var sessionID, hostID, workloadKey string
-		var status string
-		var sessionTTL sql.NullInt64
-		var sessionMaxAge sql.NullInt64
-		var sessionAutoPause sql.NullBool
-		var sessionNPPreset sql.NullString
-		var sessionNPJSON sql.NullString
-		scanErr := s.scheduler.db.QueryRowContext(r.Context(),
-			`SELECT session_id, host_id, workload_key, status, runner_ttl_seconds, session_max_age_seconds, auto_pause, network_policy_preset, network_policy
-			 FROM session_snapshots WHERE runner_id = $1`,
-			req.RunnerID).Scan(&sessionID, &hostID, &workloadKey, &status, &sessionTTL, &sessionMaxAge, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON)
-		if scanErr != nil || status != "suspended" {
-			http.Error(w, "runner not found", http.StatusNotFound)
-			return
-		}
-
-		// Pick the host to resume on. Prefer the original host unless it's
-		// draining/terminating or unreachable — in that case, fall back to
-		// another available host using cache-affinity scheduling.
-		var resumeHost *Host
-		selectionReason := "sticky_same_host"
-		origHost, origErr := s.hostRegistry.GetHost(hostID)
-		if origErr == nil && origHost.Status != "draining" && origHost.Status != "terminating" {
-			resumeHost = origHost
-		} else {
-			// Look up workload_key for affinity scheduling
-			selectionReason = "sticky_fallback"
-			resumeHost = s.scheduler.selectBestHostForWorkloadKey(s.hostRegistry.GetAvailableHosts(), workloadKey)
-		}
-		if resumeHost == nil {
-			w.Header().Set("Retry-After", "5")
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			json.NewEncoder(w).Encode(map[string]string{"error": "no available host for session resume"})
-			return
-		}
-		routing := fcrotel.RoutingCrossHost
-		if resumeHost.ID == hostID {
-			routing = fcrotel.RoutingSameHost
-		}
-		s.scheduler.recordResumeRoutingTelemetry(r.Context(), workloadKey, "connect", routing)
-		s.scheduler.recordPlacementTelemetry(r.Context(), workloadKey, "connect", selectionReason, placementCacheState(resumeHost, workloadKey, ""))
-
-		conn, err := grpc.NewClient(resumeHost.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			http.Error(w, "failed to connect to host", http.StatusInternalServerError)
-			return
-		}
-		defer conn.Close()
-
-		client := pb.NewHostAgentClient(conn)
-		resumeReq := &pb.ResumeRunnerRequest{
-			SessionId:           sessionID,
-			WorkloadKey:         workloadKey,
-			TtlSeconds:          int32(sessionTTL.Int64),
-			AutoPause:           sessionAutoPause.Valid && sessionAutoPause.Bool,
-			NetworkPolicyPreset: sessionNPPreset.String,
-			RunnerId:            req.RunnerID,
-		}
-		if sessionNPJSON.Valid {
-			resumeReq.NetworkPolicyJson = sessionNPJSON.String
-		}
-		// Use a detached context so the GCS-backed resume completes even if
-		// the HTTP client disconnects (same rationale as HandlePauseRunner).
-		resumeCtx, resumeCancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer resumeCancel()
-		resp, err := client.ResumeRunner(resumeCtx, resumeReq)
-		if err != nil || resp.Error != "" {
-			var errMsg string
-			if err != nil {
-				errMsg = err.Error()
-			} else {
-				errMsg = resp.Error
-			}
-			http.Error(w, errMsg, http.StatusInternalServerError)
-			return
-		}
-
-		resumedRunnerID := resp.Runner.GetId()
-		if resumedRunnerID == "" {
-			http.Error(w, "resume succeeded but returned empty runner id", http.StatusInternalServerError)
-			return
-		}
-
-		if err := s.hostRegistry.AddRunner(r.Context(), &Runner{
-			ID:                   resumedRunnerID,
-			HostID:               resumeHost.ID,
-			Status:               "busy",
-			InternalIP:           resp.Runner.GetInternalIp(),
-			WorkloadKey:          workloadKey,
-			RunnerTTLSeconds:     int(sessionTTL.Int64),
-			SessionMaxAgeSeconds: int(sessionMaxAge.Int64),
-			AutoPause:            sessionAutoPause.Valid && sessionAutoPause.Bool,
-			NetworkPolicyPreset:  sessionNPPreset.String,
-			NetworkPolicyJSON:    sessionNPJSON.String,
-		}); err != nil {
-			http.Error(w, "failed to register resumed runner", http.StatusInternalServerError)
-			return
-		}
-
-		// Update session status and host assignment
-		_, _ = s.scheduler.db.ExecContext(r.Context(),
-			`UPDATE session_snapshots SET runner_id = $1, status = 'active', host_id = $2 WHERE session_id = $3`,
-			resumedRunnerID, resumeHost.ID, sessionID)
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(map[string]string{
-			"status":       "resumed",
-			"runner_id":    resumedRunnerID,
-			"host_address": resumeHost.HTTPAddress,
-		})
-		return
-	}
-
-	// Runner exists — it's running, forward connect to extend TTL
-	host, err := s.hostRegistry.GetHost(runner.HostID)
-	if err != nil {
-		http.Error(w, "host not found", http.StatusInternalServerError)
-		return
-	}
-
-	// If the host is draining, the runner will soon be gone — tell the client to retry.
-	if host.Status == "draining" || host.Status == "terminating" {
-		w.Header().Set("Retry-After", "5")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{"error": "host is draining, retry shortly"})
-		return
-	}
-
-	// Forward to host's HTTP connect endpoint
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":       "connected",
-		"runner_id":    req.RunnerID,
-		"host_address": host.HTTPAddress,
 	})
 }
 

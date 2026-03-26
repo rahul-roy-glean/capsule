@@ -183,9 +183,12 @@ message AllocateRunnerRequest {
   string snapshot_version = 13;   // Explicit version to use; skips current-pointer.json lookup
   int32 ttl_seconds = 14;         // idle timeout from snapshot config (0 = no timeout)
   bool auto_pause = 15;           // pause on TTL expiry instead of destroy
-  string snapshot_tag = 16;       // optional: named tag to resolve snapshot version
+  reserved 16;
+  reserved "snapshot_tag";
   string network_policy_preset = 17; // optional: named preset (e.g., "restricted-egress", "agent-sandbox")
   string network_policy_json = 18;   // optional: full NetworkPolicy as JSON (overrides preset)
+  string runner_id = 19;              // original runner ID for session resume (enables GCS-backed cross-host resume)
+  bool resume = 20;                   // true when control plane wants host to attempt session resume
 }
 
 // AllocateRunnerResponse
@@ -310,6 +313,7 @@ message TriggerSnapshotBuildResponse {
 
 message PauseRunnerRequest {
   string runner_id = 1;
+  bool sync_fs = 2;
 }
 
 message PauseRunnerResponse {

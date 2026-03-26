@@ -24,7 +24,6 @@ from capsule_sdk.models.layered_config import (
 from capsule_sdk.models.runner import (
     AllocateRunnerRequest,
     AllocateRunnerResponse,
-    ConnectResult,
     ExecEvent,
     ExecRequest,
     ExecResult,
@@ -41,7 +40,6 @@ __all__ = [
     "AllocateRunnerResponse",
     "CapsuleModel",
     "BuildResponse",
-    "ConnectResult",
     "CreateConfigResponse",
     "DriveSpec",
     "ExecEvent",

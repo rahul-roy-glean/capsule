@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -129,7 +131,11 @@ func (m *Manager) ReleaseExec(runnerID string) {
 
 // PauseRunner creates a diff snapshot of the runner's VM, saves session state,
 // and destroys the VM. The runner transitions to StateSuspended.
-func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResult, error) {
+// If syncFS is true, guest filesystems are synced before snapshotting so that
+// all data is flushed from the page cache to the block device. This is needed
+// when the session may later be resumed via migration (fresh boot without
+// the original memory snapshot).
+func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool) (*PauseResult, error) {
 	m.mu.Lock()
 	runner, exists := m.runners[runnerID]
 	if !exists {
@@ -189,6 +195,31 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string) (*PauseResul
 
 	stateFile := filepath.Join(layerDir, "snapshot.state")
 	memDiffFile := filepath.Join(layerDir, "mem_diff.sparse")
+
+	// Flush guest filesystem caches before snapshotting when requested.
+	// Without this, data written to extension drives may still be in the guest
+	// page cache (ext4 delayed allocation) and not yet on the block device.
+	// Normal resume restores memory (including page cache) so it's fine, but
+	// migration discards memory and boots fresh — any unflushed data is lost.
+	if syncFS && runner.InternalIP != nil {
+		syncURL := fmt.Sprintf("http://%s:10501/exec", runner.InternalIP)
+		syncBody := `{"command":["sync"]}`
+		syncCtx, syncCancel := context.WithTimeout(ctx, 5*time.Second)
+		req, _ := http.NewRequestWithContext(syncCtx, "POST", syncURL, strings.NewReader(syncBody))
+		req.Header.Set("Content-Type", "application/json")
+		if resp, err := http.DefaultClient.Do(req); err != nil {
+			m.logger.WithError(err).Warn("Pause: failed to sync guest filesystems (thaw-agent unreachable)")
+		} else {
+			// The /exec endpoint streams ndjson — we must drain the body
+			// to wait for the sync command to actually complete. Without
+			// this, resp.Body.Close() returns immediately after headers
+			// arrive and the snapshot races with the still-running sync.
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			m.logger.Info("Pause: guest filesystem sync complete")
+		}
+		syncCancel()
+	}
 
 	// Create diff snapshot (pauses VM internally)
 	diffStart := time.Now()
@@ -920,7 +951,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 	}
 
 	if workloadKey != "" && metadata.WorkloadKey != workloadKey {
-		return nil, fmt.Errorf("workload_key mismatch: session has %s, requested %s", metadata.WorkloadKey, workloadKey)
+		return nil, fmt.Errorf("session %s workload_key mismatch: session=%q, request=%q", sessionID, metadata.WorkloadKey, workloadKey)
 	}
 
 	if metadata.Layers == 0 {

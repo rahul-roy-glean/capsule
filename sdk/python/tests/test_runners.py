@@ -15,7 +15,7 @@ from capsule_sdk._errors import (
 )
 from capsule_sdk._http import HttpClient
 from capsule_sdk.models.layered_config import CreateConfigResponse
-from capsule_sdk.models.runner import AllocateRunnerResponse, ConnectResult, PauseResult, RunnerStatus
+from capsule_sdk.models.runner import AllocateRunnerResponse, PauseResult, RunnerStatus
 from capsule_sdk.models.workload import ResolvedWorkloadRef
 from capsule_sdk.resources.layered_configs import LayeredConfigs
 from capsule_sdk.resources.runners import Runners
@@ -131,15 +131,6 @@ class TestRunners:
         assert result.success is True
         assert result.layer == 2
 
-    def test_connect(self, runners: Runners, http_client: HttpClient) -> None:
-        resp_data = {"status": "connected", "runner_id": "r-1", "host_address": "10.0.0.2:8080"}
-        mock_resp = httpx.Response(200, json=resp_data)
-        with patch.object(http_client._client, "request", return_value=mock_resp):
-            result = runners.connect("r-1")
-        assert isinstance(result, ConnectResult)
-        assert result.host_address == "10.0.0.2:8080"
-        assert runners._host_cache["r-1"] == "10.0.0.2:8080"
-
     def test_resolve_host_uses_cache(self, runners: Runners) -> None:
         runners._host_cache["r-1"] = "cached-host:8080"
         host = runners._resolve_host("r-1")
@@ -222,7 +213,7 @@ class TestRunners:
     def test_from_config_uses_allocate_ready_by_default(self, runners: Runners) -> None:
         session = RunnerSession(runners, "r-42", host_address="10.0.0.1:8080", session_id="s-1", request_id="req-1")
         with patch.object(runners, "allocate_ready", return_value=session) as allocate_ready:
-            result = runners.from_config("my-workload", tag="stable")
+            result = runners.from_config("my-workload")
         assert result is session
         allocate_ready.assert_called_once()
 

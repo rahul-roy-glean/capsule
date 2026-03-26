@@ -212,6 +212,46 @@ func buildPlatformLayerDef(cfg *LayeredConfig) LayerDef {
 	}
 }
 
+// ConfigStructurallyEqual checks that two LayeredConfigs have the same
+// hash-affecting structure: layer count, layer names, init_commands, drives, and tier.
+// Returns nil if they are structurally equal, or an error describing the first difference.
+// Base image and runtime settings (TTL, auto_pause, start_command, network_policy,
+// auth, auto_rollout, refresh_commands, refresh_interval) are allowed to differ.
+func ConfigStructurallyEqual(old, new *LayeredConfig) error {
+	if old.Config.Tier != new.Config.Tier {
+		return fmt.Errorf("tier changed from %q to %q", old.Config.Tier, new.Config.Tier)
+	}
+
+	if len(old.Layers) != len(new.Layers) {
+		return fmt.Errorf("layer count changed from %d to %d", len(old.Layers), len(new.Layers))
+	}
+
+	for i := range old.Layers {
+		oldL := old.Layers[i]
+		newL := new.Layers[i]
+
+		if oldL.Name != newL.Name {
+			return fmt.Errorf("layer %d name changed from %q to %q", i, oldL.Name, newL.Name)
+		}
+
+		// Compare init_commands canonically (JSON marshal for stable comparison)
+		oldCmds, _ := json.Marshal(oldL.InitCommands)
+		newCmds, _ := json.Marshal(newL.InitCommands)
+		if string(oldCmds) != string(newCmds) {
+			return fmt.Errorf("layer %q init_commands changed", oldL.Name)
+		}
+
+		// Compare drives
+		oldDrives, _ := json.Marshal(oldL.Drives)
+		newDrives, _ := json.Marshal(newL.Drives)
+		if string(oldDrives) != string(newDrives) {
+			return fmt.Errorf("layer %q drives changed", oldL.Name)
+		}
+	}
+
+	return nil
+}
+
 // ComputeBaseImageHash returns a hash for a base image URI.
 // Used to include the image identity in the layer hash chain.
 func ComputeBaseImageHash(imageURI string) string {

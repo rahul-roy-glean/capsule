@@ -1078,6 +1078,13 @@ func (m *Manager) setupSnapshotSymlinks(runnerID, overlayPath string, extensionD
 	return perRunnerDir, cleanup, nil
 }
 
+// GetAuthProxy returns the auth proxy for a runner, or nil if none exists.
+func (m *Manager) GetAuthProxy(runnerID string) *authproxy.AuthProxy {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.authProxies[runnerID]
+}
+
 // GetRunner returns a runner by ID
 func (m *Manager) GetRunner(runnerID string) (*Runner, error) {
 	m.mu.RLock()
@@ -1267,7 +1274,7 @@ func (m *Manager) PauseSessionRunners(ctx context.Context) (int, error) {
 	var errs []error
 	paused := 0
 	for _, id := range targets {
-		if _, err := m.PauseRunner(ctx, id); err != nil {
+		if _, err := m.PauseRunner(ctx, id, false); err != nil {
 			m.logger.WithError(err).WithField("runner_id", id).Warn("Failed to pause session runner during drain")
 			errs = append(errs, err)
 			continue

@@ -193,7 +193,7 @@ class TestAsyncRunners:
 
         async def run() -> None:
             with patch.object(runners, "allocate_ready", AsyncMock(return_value=session)) as allocate_ready:
-                result = await runners.from_config("my-workload", tag="stable")
+                result = await runners.from_config("my-workload")
             assert result is session
             allocate_ready.assert_awaited_once()
 
