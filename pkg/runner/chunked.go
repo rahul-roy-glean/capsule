@@ -1337,40 +1337,6 @@ func (cm *ChunkedManager) Close() error {
 	return cm.Manager.Close()
 }
 
-// waitForThawAgent polls the capsule-thaw-agent /alive endpoint until it returns
-// HTTP 200 or the timeout expires. This ensures the VM is functional after
-// snapshot restore before we expose it to the scheduler.
-func (cm *ChunkedManager) waitForThawAgent(ctx context.Context, ip string, timeout time.Duration) error {
-	aliveURL := fmt.Sprintf("http://%s:%d/alive", ip, snapshot.ThawAgentDebugPort)
-	deadline := time.Now().Add(timeout)
-	pollInterval := 100 * time.Millisecond
-
-	client := &http.Client{Timeout: 2 * time.Second}
-
-	for time.Now().Before(deadline) {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
-		resp, err := client.Get(aliveURL)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				cm.chunkedLogger.WithField("url", aliveURL).Debug("Thaw-agent ready")
-				return nil
-			}
-		}
-
-		select {
-		case <-time.After(pollInterval):
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-
-	return fmt.Errorf("capsule-thaw-agent at %s did not become ready within %v", aliveURL, timeout)
-}
-
 // waitForThawAgentExec probes the capsule-thaw-agent with a trivial exec until
 // it responds successfully. This is more reliable after snapshot restore than
 // /alive because it exercises the same handler the host-side exec proxy uses.
