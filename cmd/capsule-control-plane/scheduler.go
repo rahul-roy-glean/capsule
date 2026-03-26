@@ -373,6 +373,12 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			if sessionRunnerID.Valid && sessionRunnerID.String != "" {
 				resumeRunnerID = sessionRunnerID.String
 			}
+			s.logger.WithFields(logrus.Fields{
+				"session_id":        req.SessionID,
+				"session_host_id":   sessionHostID,
+				"session_runner_id": resumeRunnerID,
+				"resume_from_cfg":   resumeFromSessionConfig,
+			}).Info("DEBUG: session_snapshots lookup found suspended session")
 
 			// Check for base image migration: if config_id is known, look up
 			// the current active workload_key and compare.
@@ -732,6 +738,17 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	if resumeFromSessionConfig && migrateFromWorkloadKey == "" && resumeRunnerID != "" {
 		protoReq.RunnerId = resumeRunnerID
 		protoReq.Resume = true
+		s.logger.WithFields(logrus.Fields{
+			"session_id":       req.SessionID,
+			"resume_runner_id": resumeRunnerID,
+		}).Info("DEBUG: setting resume=true on proto request")
+	} else {
+		s.logger.WithFields(logrus.Fields{
+			"session_id":       req.SessionID,
+			"resume_from_cfg":  resumeFromSessionConfig,
+			"migrate_from_wk":  migrateFromWorkloadKey,
+			"resume_runner_id": resumeRunnerID,
+		}).Info("DEBUG: NOT setting resume=true on proto request")
 	}
 	protoReq.Resources = &pb.Resources{
 		Vcpus:    int32(tier.VCPUs),
@@ -1091,8 +1108,10 @@ func (s *Scheduler) ReleaseRunner(ctx context.Context, runnerID string, destroy 
 	}
 
 	// Clean up session_snapshots row so stale entries don't accumulate.
+	// Preserve suspended sessions — they contain GCS-backed snapshot data
+	// needed for cross-host resume after the original host is gone.
 	if s.db != nil {
-		if _, dbErr := s.db.ExecContext(ctx, `DELETE FROM session_snapshots WHERE runner_id = $1`, runnerID); dbErr != nil {
+		if _, dbErr := s.db.ExecContext(ctx, `DELETE FROM session_snapshots WHERE runner_id = $1 AND status != 'suspended'`, runnerID); dbErr != nil {
 			s.logger.WithError(dbErr).WithField("runner_id", runnerID).Warn("Failed to clean up session_snapshots on release")
 		}
 	}
