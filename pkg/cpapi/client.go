@@ -115,9 +115,14 @@ func (c *Client) ReleaseRunner(runnerID string) error {
 }
 
 // PauseRunner pauses a runner and creates a session snapshot.
-func (c *Client) PauseRunner(runnerID string) (*PauseResponse, error) {
+// If syncFS is true, guest filesystems are flushed before snapshotting.
+func (c *Client) PauseRunner(runnerID string, syncFS bool) (*PauseResponse, error) {
+	body := map[string]interface{}{"runner_id": runnerID}
+	if syncFS {
+		body["sync_fs"] = true
+	}
 	var resp PauseResponse
-	if err := c.doWithRetry(http.MethodPost, "/api/v1/runners/pause", map[string]string{"runner_id": runnerID}, &resp); err != nil {
+	if err := c.doWithRetry(http.MethodPost, "/api/v1/runners/pause", body, &resp); err != nil {
 		return nil, err
 	}
 	if resp.Error != "" {

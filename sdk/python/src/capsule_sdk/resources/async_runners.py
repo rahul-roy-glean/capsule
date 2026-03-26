@@ -179,8 +179,11 @@ class AsyncRunners:
         self._host_cache.pop(runner_id, None)
         return data.get("success", False)  # type: ignore[no-any-return]
 
-    async def pause(self, runner_id: str) -> PauseResult:
-        data = await self._http.post("/api/v1/runners/pause", json_body={"runner_id": runner_id})
+    async def pause(self, runner_id: str, *, sync_fs: bool = False) -> PauseResult:
+        body: dict[str, Any] = {"runner_id": runner_id}
+        if sync_fs:
+            body["sync_fs"] = True
+        data = await self._http.post("/api/v1/runners/pause", json_body=body)
         return PauseResult.model_validate(data)
 
     async def quarantine(

@@ -84,9 +84,9 @@ class RunnerSession:
         """Block until the runner is ready."""
         self._runners.wait_ready(self._runner_id, timeout=timeout, poll_interval=poll_interval)
 
-    def pause(self) -> PauseResult:
+    def pause(self, *, sync_fs: bool = False) -> PauseResult:
         """Pause the runner and snapshot its session."""
-        result = self._runners.pause(self._runner_id)
+        result = self._runners.pause(self._runner_id, sync_fs=sync_fs)
         if result.session_id:
             self._session_id = result.session_id
         return result

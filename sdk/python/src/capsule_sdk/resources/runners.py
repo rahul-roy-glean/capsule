@@ -181,8 +181,11 @@ class Runners:
         self._host_cache.pop(runner_id, None)
         return data.get("success", False)  # type: ignore[no-any-return]
 
-    def pause(self, runner_id: str) -> PauseResult:
-        data = self._http.post("/api/v1/runners/pause", json_body={"runner_id": runner_id})
+    def pause(self, runner_id: str, *, sync_fs: bool = False) -> PauseResult:
+        body: dict[str, Any] = {"runner_id": runner_id}
+        if sync_fs:
+            body["sync_fs"] = True
+        data = self._http.post("/api/v1/runners/pause", json_body=body)
         return PauseResult.model_validate(data)
 
     def quarantine(
