@@ -69,8 +69,10 @@ type SessionMetadata struct {
 	VCPUs    int `json:"vcpus,omitempty"`
 	MemoryMB int `json:"memory_mb,omitempty"`
 	// TTL config preserved across pause/resume
-	TTLSeconds int  `json:"ttl_seconds,omitempty"`
-	AutoPause  bool `json:"auto_pause,omitempty"`
+	TTLSeconds              int  `json:"ttl_seconds,omitempty"`
+	AutoPause               bool `json:"auto_pause,omitempty"`
+	SessionMaxAgeSeconds    int  `json:"session_max_age_seconds"`
+	SessionMaxAgeConfigured bool `json:"session_max_age_configured,omitempty"`
 
 	// ServicePort is the port of the user's service inside the VM (from StartCommand).
 	// Preserved so that resume can re-forward it into the network namespace.
@@ -259,21 +261,23 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 	}
 
 	metadata := SessionMetadata{
-		SessionID:       sessionID,
-		WorkloadKey:     runner.WorkloadKey,
-		RunnerID:        runnerID,
-		HostID:          m.config.HostID,
-		Layers:          layerN + 1,
-		CreatedAt:       runner.CreatedAt,
-		PausedAt:        time.Now(),
-		RootfsPath:      runner.RootfsOverlay,
-		VCPUs:           runner.Resources.VCPUs,
-		MemoryMB:        runner.Resources.MemoryMB,
-		TTLSeconds:      runner.TTLSeconds,
-		AutoPause:       runner.AutoPause,
-		ServicePort:     runner.ServicePort,
-		SnapshotVersion: runner.SnapshotVersion,
-		AuthConfig:      runner.AuthConfig,
+		SessionID:               sessionID,
+		WorkloadKey:             runner.WorkloadKey,
+		RunnerID:                runnerID,
+		HostID:                  m.config.HostID,
+		Layers:                  layerN + 1,
+		CreatedAt:               runner.CreatedAt,
+		PausedAt:                time.Now(),
+		RootfsPath:              runner.RootfsOverlay,
+		VCPUs:                   runner.Resources.VCPUs,
+		MemoryMB:                runner.Resources.MemoryMB,
+		TTLSeconds:              runner.TTLSeconds,
+		AutoPause:               runner.AutoPause,
+		SessionMaxAgeSeconds:    m.sessionMaxAgeSecondsForRunner(runner),
+		SessionMaxAgeConfigured: runner.SessionMaxAgeConfigured,
+		ServicePort:             runner.ServicePort,
+		SnapshotVersion:         runner.SnapshotVersion,
+		AuthConfig:              runner.AuthConfig,
 	}
 
 	// GCS-backed upload: when sessionMemStore is configured, upload dirty mem
@@ -666,21 +670,23 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 	}
 
 	metadata := SessionMetadata{
-		SessionID:       sessionID,
-		WorkloadKey:     runner.WorkloadKey,
-		RunnerID:        runnerID,
-		HostID:          m.config.HostID,
-		Layers:          layerN + 1,
-		CreatedAt:       runner.CreatedAt,
-		PausedAt:        time.Now(),
-		RootfsPath:      runner.RootfsOverlay,
-		VCPUs:           runner.Resources.VCPUs,
-		MemoryMB:        runner.Resources.MemoryMB,
-		TTLSeconds:      runner.TTLSeconds,
-		AutoPause:       runner.AutoPause,
-		ServicePort:     runner.ServicePort,
-		SnapshotVersion: runner.SnapshotVersion,
-		AuthConfig:      runner.AuthConfig,
+		SessionID:               sessionID,
+		WorkloadKey:             runner.WorkloadKey,
+		RunnerID:                runnerID,
+		HostID:                  m.config.HostID,
+		Layers:                  layerN + 1,
+		CreatedAt:               runner.CreatedAt,
+		PausedAt:                time.Now(),
+		RootfsPath:              runner.RootfsOverlay,
+		VCPUs:                   runner.Resources.VCPUs,
+		MemoryMB:                runner.Resources.MemoryMB,
+		TTLSeconds:              runner.TTLSeconds,
+		AutoPause:               runner.AutoPause,
+		SessionMaxAgeSeconds:    m.sessionMaxAgeSecondsForRunner(runner),
+		SessionMaxAgeConfigured: runner.SessionMaxAgeConfigured,
+		ServicePort:             runner.ServicePort,
+		SnapshotVersion:         runner.SnapshotVersion,
+		AuthConfig:              runner.AuthConfig,
 	}
 
 	// GCS-backed upload (same logic as PauseRunner)
@@ -1226,20 +1232,22 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 			VCPUs:    metadata.VCPUs,
 			MemoryMB: metadata.MemoryMB,
 		},
-		CreatedAt:     metadata.CreatedAt,
-		StartedAt:     time.Now(),
-		SocketPath:    filepath.Join(m.config.SocketDir, runnerID+".sock"),
-		LogPath:       filepath.Join(m.config.LogDir, runnerID+".log"),
-		MetricsPath:   filepath.Join(m.config.LogDir, runnerID+".metrics"),
-		RootfsOverlay: overlayPath,
-		SessionID:     sessionID,
-		SessionDir:    sessionDir,
-		SessionLayers: metadata.Layers,
-		TTLSeconds:    metadata.TTLSeconds,
-		AutoPause:     metadata.AutoPause,
-		ServicePort:   metadata.ServicePort,
-		AuthConfig:    metadata.AuthConfig,
-		LastExecAt:    time.Now(),
+		CreatedAt:               metadata.CreatedAt,
+		StartedAt:               time.Now(),
+		SocketPath:              filepath.Join(m.config.SocketDir, runnerID+".sock"),
+		LogPath:                 filepath.Join(m.config.LogDir, runnerID+".log"),
+		MetricsPath:             filepath.Join(m.config.LogDir, runnerID+".metrics"),
+		RootfsOverlay:           overlayPath,
+		SessionID:               sessionID,
+		SessionDir:              sessionDir,
+		SessionLayers:           metadata.Layers,
+		TTLSeconds:              metadata.TTLSeconds,
+		AutoPause:               metadata.AutoPause,
+		SessionMaxAgeSeconds:    metadata.SessionMaxAgeSeconds,
+		SessionMaxAgeConfigured: metadata.SessionMaxAgeConfigured || metadata.SessionMaxAgeSeconds > 0,
+		ServicePort:             metadata.ServicePort,
+		AuthConfig:              metadata.AuthConfig,
+		LastExecAt:              time.Now(),
 	}
 
 	// Recreate auth proxy if the paused runner had one

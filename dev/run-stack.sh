@@ -124,6 +124,11 @@ MGR_CMD="$REPO_ROOT/bin/capsule-manager \
   --idle-target=0 \
   --log-level=debug"
 
+if [ -n "${CAPSULE_MANAGER_EXTRA_FLAGS:-}" ]; then
+  MGR_CMD="$MGR_CMD $CAPSULE_MANAGER_EXTRA_FLAGS"
+  echo "  Extra capsule-manager flags: $CAPSULE_MANAGER_EXTRA_FLAGS"
+fi
+
 if [ -n "$GCS_BUCKET" ]; then
   MGR_CMD="$MGR_CMD --snapshot-bucket=$GCS_BUCKET"
   echo "  GCS session chunks: enabled (bucket: $GCS_BUCKET)"
@@ -162,3 +167,4 @@ echo "  Firecracker Manager: http://localhost:9080"
 echo "  Logs:                $LOG_DIR/"
 echo ""
 echo "Run 'make dev-test-file-ops' for a quick smoke test or 'GCS_BUCKET=<bucket> make dev-test-gcs-pause-resume' for session coverage."
+echo "Run 'make dev-test-host-gc' for a host garbage-collection smoke test."

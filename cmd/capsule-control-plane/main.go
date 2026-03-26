@@ -993,20 +993,21 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 		if _, dbErr := s.scheduler.db.ExecContext(pauseCtx, `
 			INSERT INTO session_snapshots (
 				session_id, runner_id, workload_key, host_id, status, layer_count, paused_at,
-				runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, config_id
+				runner_ttl_seconds, session_max_age_seconds, auto_pause, network_policy_preset, network_policy, config_id
 			)
-			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9, $10)
+			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9, $10, $11)
 			ON CONFLICT (session_id) DO UPDATE SET
 				status = 'suspended',
 				layer_count = EXCLUDED.layer_count,
 				paused_at = NOW(),
 				runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
+				session_max_age_seconds = EXCLUDED.session_max_age_seconds,
 				auto_pause = EXCLUDED.auto_pause,
 				network_policy_preset = EXCLUDED.network_policy_preset,
 				network_policy = EXCLUDED.network_policy,
 				config_id = EXCLUDED.config_id
 		`, resp.SessionId, req.RunnerID, runner.WorkloadKey, host.ID, resp.Layer+1,
-			runner.RunnerTTLSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy, configID); dbErr != nil {
+			runner.RunnerTTLSeconds, runner.SessionMaxAgeSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy, configID); dbErr != nil {
 			s.logger.WithError(dbErr).WithField("session_id", resp.SessionId).Error("Failed to update session_snapshots table")
 		}
 	}

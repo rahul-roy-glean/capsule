@@ -1942,6 +1942,264 @@ data:
                 }
               }
             }
+          },
+          {
+            "xPos": 6,
+            "yPos": 14,
+            "width": 6,
+            "height": 4,
+            "widget": {
+              "title": "Host GC Current Bytes",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.gc.sessions.bytes\" AND metric.label.service_name=\"capsule-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "sessions",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.gc.session_state.bytes\" AND metric.label.service_name=\"capsule-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "session state",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.gc.chunk_cache.bytes\" AND metric.label.service_name=\"capsule-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "chunk cache",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.gc.logs.bytes\" AND metric.label.service_name=\"capsule-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "logs",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.gc.quarantine.bytes\" AND metric.label.service_name=\"capsule-manager\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_MAX",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "quarantine",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "bytes"
+                }
+              }
+            }
+          },
+          {
+            "xPos": 0,
+            "yPos": 18,
+            "width": 6,
+            "height": 4,
+            "widget": {
+              "title": "Host GC Bytes Reclaimed / Min",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.gc.bytes_reclaimed\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.artifact_class=\"sessions\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "sessions",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.gc.bytes_reclaimed\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.artifact_class=\"session_state\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "session state",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.gc.bytes_reclaimed\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.artifact_class=\"chunk_cache\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "chunk cache",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.gc.bytes_reclaimed\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.artifact_class=\"logs\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "logs",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.gc.bytes_reclaimed\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.artifact_class=\"quarantine\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "quarantine",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "bytes/min"
+                }
+              }
+            }
+          },
+          {
+            "xPos": 6,
+            "yPos": 18,
+            "width": 6,
+            "height": 4,
+            "widget": {
+              "title": "Host GC Files Removed / Min",
+              "xyChart": {
+                "dataSets": [
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.gc.files_removed\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.artifact_class=\"sessions\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "sessions",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.gc.files_removed\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.artifact_class=\"session_state\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "session state",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.gc.files_removed\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.artifact_class=\"chunk_cache\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "chunk cache",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.gc.files_removed\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.artifact_class=\"logs\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "logs",
+                    "plotType": "LINE"
+                  },
+                  {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "metric.type=\"workload.googleapis.com/host.gc.files_removed\" AND metric.label.service_name=\"capsule-manager\" AND metric.label.artifact_class=\"quarantine\"",
+                        "aggregation": {
+                          "alignmentPeriod": "60s",
+                          "perSeriesAligner": "ALIGN_DELTA",
+                          "crossSeriesReducer": "REDUCE_SUM"
+                        }
+                      }
+                    },
+                    "legendTemplate": "quarantine",
+                    "plotType": "LINE"
+                  }
+                ],
+                "yAxis": {
+                  "label": "files/min"
+                }
+              }
+            }
           }
         ]
       }

@@ -76,50 +76,57 @@ const (
 	ChunkNegCacheHits       CounterName = "chunk.neg_cache.hits"
 	NetworkBytesTx          CounterName = "network.bytes_tx"
 	NetworkBytesRx          CounterName = "network.bytes_rx"
+	HostGCBytesReclaimed    CounterName = "host.gc.bytes_reclaimed"
+	HostGCFilesRemoved      CounterName = "host.gc.files_removed"
 )
 
 // Gauge names (Int64Gauge).
 const (
-	HostCPUTotal           GaugeName = "host.cpu_millicores.total"
-	HostCPUUsed            GaugeName = "host.cpu_millicores.used"
-	HostMemTotal           GaugeName = "host.memory_mb.total"
-	HostMemUsed            GaugeName = "host.memory_mb.used"
-	CPHostsTotal           GaugeName = "control_plane.hosts"
-	CPHostsReady           GaugeName = "control_plane.hosts.ready"
-	CPHostsDraining        GaugeName = "control_plane.hosts.draining"
-	CPHostsTerminating     GaugeName = "control_plane.hosts.terminating"
-	CPHostsUnhealthy       GaugeName = "control_plane.hosts.unhealthy"
-	CPHostsTerminated      GaugeName = "control_plane.hosts.terminated"
-	CPRunnersTotal         GaugeName = "control_plane.runners"
-	CPRunnersTotalCurrent  GaugeName = "control_plane.runners.total"
-	CPRunnersIdleCurrent   GaugeName = "control_plane.runners.idle"
-	CPRunnersBusyCurrent   GaugeName = "control_plane.runners.busy"
-	CPWorkloadRunnersTotal GaugeName = "control_plane.workload.runners.total"
-	CPWorkloadRunnersIdle  GaugeName = "control_plane.workload.runners.idle"
-	CPWorkloadRunnersBusy  GaugeName = "control_plane.workload.runners.busy"
-	CPWorkloadHostsActive  GaugeName = "control_plane.workload.hosts.active"
-	CPFleetCPUTotal        GaugeName = "control_plane.fleet.cpu_millicores.total"
-	CPFleetCPUUsed         GaugeName = "control_plane.fleet.cpu_millicores.used"
-	CPFleetCPUFree         GaugeName = "control_plane.fleet.cpu_millicores.free"
-	CPFleetMemTotal        GaugeName = "control_plane.fleet.memory_mb.total"
-	CPFleetMemUsed         GaugeName = "control_plane.fleet.memory_mb.used"
-	CPFleetMemFree         GaugeName = "control_plane.fleet.memory_mb.free"
-	ChunkedDiskCacheSize   GaugeName = "chunked.disk_cache.size"
-	ChunkedDiskCacheMax    GaugeName = "chunked.disk_cache.max"
-	ChunkedDiskCacheItems  GaugeName = "chunked.disk_cache.items"
-	ChunkedMemCacheSize    GaugeName = "chunked.mem_cache.size"
-	ChunkedMemCacheMax     GaugeName = "chunked.mem_cache.max"
-	ChunkedMemCacheItems   GaugeName = "chunked.mem_cache.items"
-	ChunkedDirtyChunks     GaugeName = "chunked.dirty_chunks"
-	PoolRunners            GaugeName = "pool.runners"
-	PoolMemoryUsed         GaugeName = "pool.memory.used"
-	PoolMemoryMax          GaugeName = "pool.memory.max"
-	SnapshotSize           GaugeName = "snapshot.size"
-	SnapshotAge            GaugeName = "snapshot.age"
-	HostGCSSyncBytes       GaugeName = "host.gcs_sync.bytes"
-	HostUptime             GaugeName = "host.uptime"
-	CacheArtifactSize      GaugeName = "cache.artifact.size"
-	NetworkConnections     GaugeName = "network.nat_connections"
+	HostCPUTotal            GaugeName = "host.cpu_millicores.total"
+	HostCPUUsed             GaugeName = "host.cpu_millicores.used"
+	HostMemTotal            GaugeName = "host.memory_mb.total"
+	HostMemUsed             GaugeName = "host.memory_mb.used"
+	CPHostsTotal            GaugeName = "control_plane.hosts"
+	CPHostsReady            GaugeName = "control_plane.hosts.ready"
+	CPHostsDraining         GaugeName = "control_plane.hosts.draining"
+	CPHostsTerminating      GaugeName = "control_plane.hosts.terminating"
+	CPHostsUnhealthy        GaugeName = "control_plane.hosts.unhealthy"
+	CPHostsTerminated       GaugeName = "control_plane.hosts.terminated"
+	CPRunnersTotal          GaugeName = "control_plane.runners"
+	CPRunnersTotalCurrent   GaugeName = "control_plane.runners.total"
+	CPRunnersIdleCurrent    GaugeName = "control_plane.runners.idle"
+	CPRunnersBusyCurrent    GaugeName = "control_plane.runners.busy"
+	CPWorkloadRunnersTotal  GaugeName = "control_plane.workload.runners.total"
+	CPWorkloadRunnersIdle   GaugeName = "control_plane.workload.runners.idle"
+	CPWorkloadRunnersBusy   GaugeName = "control_plane.workload.runners.busy"
+	CPWorkloadHostsActive   GaugeName = "control_plane.workload.hosts.active"
+	CPFleetCPUTotal         GaugeName = "control_plane.fleet.cpu_millicores.total"
+	CPFleetCPUUsed          GaugeName = "control_plane.fleet.cpu_millicores.used"
+	CPFleetCPUFree          GaugeName = "control_plane.fleet.cpu_millicores.free"
+	CPFleetMemTotal         GaugeName = "control_plane.fleet.memory_mb.total"
+	CPFleetMemUsed          GaugeName = "control_plane.fleet.memory_mb.used"
+	CPFleetMemFree          GaugeName = "control_plane.fleet.memory_mb.free"
+	ChunkedDiskCacheSize    GaugeName = "chunked.disk_cache.size"
+	ChunkedDiskCacheMax     GaugeName = "chunked.disk_cache.max"
+	ChunkedDiskCacheItems   GaugeName = "chunked.disk_cache.items"
+	ChunkedMemCacheSize     GaugeName = "chunked.mem_cache.size"
+	ChunkedMemCacheMax      GaugeName = "chunked.mem_cache.max"
+	ChunkedMemCacheItems    GaugeName = "chunked.mem_cache.items"
+	ChunkedDirtyChunks      GaugeName = "chunked.dirty_chunks"
+	PoolRunners             GaugeName = "pool.runners"
+	PoolMemoryUsed          GaugeName = "pool.memory.used"
+	PoolMemoryMax           GaugeName = "pool.memory.max"
+	SnapshotSize            GaugeName = "snapshot.size"
+	SnapshotAge             GaugeName = "snapshot.age"
+	HostGCSSyncBytes        GaugeName = "host.gcs_sync.bytes"
+	HostUptime              GaugeName = "host.uptime"
+	CacheArtifactSize       GaugeName = "cache.artifact.size"
+	NetworkConnections      GaugeName = "network.nat_connections"
+	HostGCSessionsBytes     GaugeName = "host.gc.sessions.bytes"
+	HostGCSessionStateBytes GaugeName = "host.gc.session_state.bytes"
+	HostGCChunkCacheBytes   GaugeName = "host.gc.chunk_cache.bytes"
+	HostGCLogBytes          GaugeName = "host.gc.logs.bytes"
+	HostGCQuarantineBytes   GaugeName = "host.gc.quarantine.bytes"
 )
 
 // Float64Gauge names.
@@ -172,12 +179,15 @@ var counterDescriptions = map[CounterName]string{
 	ChunkNegCacheHits:       "Negative cache hits for chunk lookups",
 	NetworkBytesTx:          "Total network bytes transmitted",
 	NetworkBytesRx:          "Total network bytes received",
+	HostGCBytesReclaimed:    "Total bytes reclaimed by host garbage collection",
+	HostGCFilesRemoved:      "Total files or directories removed by host garbage collection",
 }
 
 var counterUnits = map[CounterName]string{
-	ChunkFetchBytes: "By",
-	NetworkBytesTx:  "By",
-	NetworkBytesRx:  "By",
+	ChunkFetchBytes:      "By",
+	NetworkBytesTx:       "By",
+	NetworkBytesRx:       "By",
+	HostGCBytesReclaimed: "By",
 }
 
 // Description and unit maps for histograms.
@@ -239,46 +249,51 @@ var histogramUnits = map[HistogramName]string{
 
 // Description and unit maps for gauges.
 var gaugeDescriptions = map[GaugeName]string{
-	HostCPUTotal:           "Total CPU millicores on the host",
-	HostCPUUsed:            "Used CPU millicores on the host",
-	HostMemTotal:           "Total memory in MB on the host",
-	HostMemUsed:            "Used memory in MB on the host",
-	CPHostsTotal:           "Total number of hosts in the control plane",
-	CPHostsReady:           "Number of ready hosts in the control plane",
-	CPHostsDraining:        "Number of draining hosts in the control plane",
-	CPHostsTerminating:     "Number of terminating hosts in the control plane",
-	CPHostsUnhealthy:       "Number of unhealthy hosts in the control plane",
-	CPHostsTerminated:      "Number of terminated hosts tracked by the control plane",
-	CPRunnersTotal:         "Total number of runners in the control plane",
-	CPRunnersTotalCurrent:  "Current total number of runners in the control plane",
-	CPRunnersIdleCurrent:   "Current number of idle runners in the control plane",
-	CPRunnersBusyCurrent:   "Current number of busy runners in the control plane",
-	CPWorkloadRunnersTotal: "Current total number of runners for a workload in the control plane",
-	CPWorkloadRunnersIdle:  "Current number of idle runners for a workload in the control plane",
-	CPWorkloadRunnersBusy:  "Current number of busy runners for a workload in the control plane",
-	CPWorkloadHostsActive:  "Current number of hosts serving a workload in the control plane",
-	CPFleetCPUTotal:        "Total fleet CPU millicores",
-	CPFleetCPUUsed:         "Used fleet CPU millicores",
-	CPFleetCPUFree:         "Free fleet CPU millicores",
-	CPFleetMemTotal:        "Total fleet memory in MB",
-	CPFleetMemUsed:         "Used fleet memory in MB",
-	CPFleetMemFree:         "Free fleet memory in MB",
-	ChunkedDiskCacheSize:   "Current disk cache size in bytes",
-	ChunkedDiskCacheMax:    "Maximum disk cache size in bytes",
-	ChunkedDiskCacheItems:  "Number of items in the disk cache",
-	ChunkedMemCacheSize:    "Current memory cache size in bytes",
-	ChunkedMemCacheMax:     "Maximum memory cache size in bytes",
-	ChunkedMemCacheItems:   "Number of items in the memory cache",
-	ChunkedDirtyChunks:     "Number of dirty chunks pending write",
-	PoolRunners:            "Number of runners in the pool",
-	PoolMemoryUsed:         "Used memory in the pool in bytes",
-	PoolMemoryMax:          "Maximum pool memory in bytes",
-	SnapshotSize:           "Size of the current snapshot in bytes",
-	SnapshotAge:            "Age of the current snapshot in seconds",
-	HostGCSSyncBytes:       "Bytes synced from GCS",
-	HostUptime:             "Host uptime in seconds",
-	CacheArtifactSize:      "Artifact cache size in bytes",
-	NetworkConnections:     "Number of active NAT connections",
+	HostCPUTotal:            "Total CPU millicores on the host",
+	HostCPUUsed:             "Used CPU millicores on the host",
+	HostMemTotal:            "Total memory in MB on the host",
+	HostMemUsed:             "Used memory in MB on the host",
+	CPHostsTotal:            "Total number of hosts in the control plane",
+	CPHostsReady:            "Number of ready hosts in the control plane",
+	CPHostsDraining:         "Number of draining hosts in the control plane",
+	CPHostsTerminating:      "Number of terminating hosts in the control plane",
+	CPHostsUnhealthy:        "Number of unhealthy hosts in the control plane",
+	CPHostsTerminated:       "Number of terminated hosts tracked by the control plane",
+	CPRunnersTotal:          "Total number of runners in the control plane",
+	CPRunnersTotalCurrent:   "Current total number of runners in the control plane",
+	CPRunnersIdleCurrent:    "Current number of idle runners in the control plane",
+	CPRunnersBusyCurrent:    "Current number of busy runners in the control plane",
+	CPWorkloadRunnersTotal:  "Current total number of runners for a workload in the control plane",
+	CPWorkloadRunnersIdle:   "Current number of idle runners for a workload in the control plane",
+	CPWorkloadRunnersBusy:   "Current number of busy runners for a workload in the control plane",
+	CPWorkloadHostsActive:   "Current number of hosts serving a workload in the control plane",
+	CPFleetCPUTotal:         "Total fleet CPU millicores",
+	CPFleetCPUUsed:          "Used fleet CPU millicores",
+	CPFleetCPUFree:          "Free fleet CPU millicores",
+	CPFleetMemTotal:         "Total fleet memory in MB",
+	CPFleetMemUsed:          "Used fleet memory in MB",
+	CPFleetMemFree:          "Free fleet memory in MB",
+	ChunkedDiskCacheSize:    "Current disk cache size in bytes",
+	ChunkedDiskCacheMax:     "Maximum disk cache size in bytes",
+	ChunkedDiskCacheItems:   "Number of items in the disk cache",
+	ChunkedMemCacheSize:     "Current memory cache size in bytes",
+	ChunkedMemCacheMax:      "Maximum memory cache size in bytes",
+	ChunkedMemCacheItems:    "Number of items in the memory cache",
+	ChunkedDirtyChunks:      "Number of dirty chunks pending write",
+	PoolRunners:             "Number of runners in the pool",
+	PoolMemoryUsed:          "Used memory in the pool in bytes",
+	PoolMemoryMax:           "Maximum pool memory in bytes",
+	SnapshotSize:            "Size of the current snapshot in bytes",
+	SnapshotAge:             "Age of the current snapshot in seconds",
+	HostGCSSyncBytes:        "Bytes synced from GCS",
+	HostUptime:              "Host uptime in seconds",
+	CacheArtifactSize:       "Artifact cache size in bytes",
+	NetworkConnections:      "Number of active NAT connections",
+	HostGCSessionsBytes:     "Current bytes consumed by local session directories",
+	HostGCSessionStateBytes: "Current bytes consumed by temporary session-state files",
+	HostGCChunkCacheBytes:   "Current bytes consumed by the on-disk chunk cache",
+	HostGCLogBytes:          "Current bytes consumed by runner logs and metrics",
+	HostGCQuarantineBytes:   "Current bytes consumed by quarantine directories",
 }
 
 var gaugeUnits = map[GaugeName]string{}
@@ -376,6 +391,7 @@ const (
 	AttrPhase           = attribute.Key("phase")
 	AttrStatusCode      = attribute.Key("status_code")
 	AttrStatusClass     = attribute.Key("status_class")
+	AttrArtifactClass   = attribute.Key("artifact_class")
 	AttrWorkloadKey     = attribute.Key("workload_key")
 	AttrHostID          = attribute.Key("host_id")
 	AttrRunnerID        = attribute.Key("runner_id")

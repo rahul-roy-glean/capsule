@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,8 @@ import (
 )
 
 const schedulerRequestTTL = 5 * time.Minute
+
+const sessionMaxAgeLabelKey = "_session_max_age_seconds"
 
 type recentSchedulerAllocation struct {
 	resp      *AllocateRunnerResponse
@@ -95,6 +98,14 @@ func (s *Scheduler) beginIdempotentAllocation(reqID string) (*AllocateRunnerResp
 	}
 	s.recentRequests[reqID] = alloc
 	return nil, alloc, true
+}
+
+func setInternalAllocateLabels(labels map[string]string, sessionMaxAgeSeconds int) map[string]string {
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	labels[sessionMaxAgeLabelKey] = strconv.Itoa(sessionMaxAgeSeconds)
+	return labels
 }
 
 func (s *Scheduler) waitForIdempotentAllocation(ctx context.Context, reqID string, alloc *recentSchedulerAllocation) (*AllocateRunnerResponse, error) {
@@ -353,6 +364,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	var sessionHostID string
 	var resumeFromSessionConfig bool
 	var sessionTTL sql.NullInt64
+	var sessionMaxAge sql.NullInt64
 	var sessionAutoPause sql.NullBool
 	var sessionNPPreset sql.NullString
 	var sessionNPJSON sql.NullString
@@ -365,9 +377,9 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		var sessionConfigID sql.NullString
 		var sessionRunnerID sql.NullString
 		err := s.db.QueryRowContext(ctx,
-			`SELECT host_id, status, workload_key, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, config_id, runner_id
+			`SELECT host_id, status, workload_key, runner_ttl_seconds, session_max_age_seconds, auto_pause, network_policy_preset, network_policy, config_id, runner_id
 			 FROM session_snapshots WHERE session_id = $1`,
-			req.SessionID).Scan(&sessionHostID, &status, &sessionWorkloadKey, &sessionTTL, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON, &sessionConfigID, &sessionRunnerID)
+			req.SessionID).Scan(&sessionHostID, &status, &sessionWorkloadKey, &sessionTTL, &sessionMaxAge, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON, &sessionConfigID, &sessionRunnerID)
 		if err == nil && status == "suspended" && sessionHostID != "" {
 			resumeFromSessionConfig = true
 			if sessionRunnerID.Valid && sessionRunnerID.String != "" {
@@ -439,6 +451,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	var tierName string
 	var startCmd *snapshot.StartCommand
 	var runnerTTLSeconds int
+	var sessionMaxAgeSeconds int
 	var autoPause bool
 	var configNetworkPolicyPreset string
 	var configNetworkPolicyJSON string
@@ -452,6 +465,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			tierName = wc.Tier
 			startCmd = wc.StartCommand
 			runnerTTLSeconds = wc.RunnerTTLSeconds
+			sessionMaxAgeSeconds = wc.SessionMaxAgeSeconds
 			autoPause = wc.AutoPause
 			configNetworkPolicyPreset = wc.NetworkPolicyPreset
 			configNetworkPolicyJSON = wc.NetworkPolicyJSON
@@ -472,20 +486,21 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			var startCommandJSON sql.NullString
 			var tierCol sql.NullString
 			var ttlCol sql.NullInt64
+			var sessionMaxAgeCol sql.NullInt64
 			var autoPauseCol sql.NullBool
 			var npPreset sql.NullString
 			var npJSON sql.NullString
 			var configJSON sql.NullString
 
-			err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, start_command, tier, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, config_json FROM layered_configs WHERE leaf_workload_key = $1 ORDER BY created_at DESC LIMIT 1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON, &configJSON)
+			err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, start_command, tier, runner_ttl_seconds, session_max_age_seconds, auto_pause, network_policy_preset, network_policy, config_json FROM layered_configs WHERE leaf_workload_key = $1 ORDER BY created_at DESC LIMIT 1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &sessionMaxAgeCol, &autoPauseCol, &npPreset, &npJSON, &configJSON)
 			if err != nil {
 				// Fallback: workload_key may be from a previous config version (draining).
 				err = s.db.QueryRowContext(ctx, `
-					SELECT lc.max_concurrent_runners, lc.start_command, lc.tier, lc.runner_ttl_seconds, lc.auto_pause, lc.network_policy_preset, lc.network_policy, lc.config_json
+					SELECT lc.max_concurrent_runners, lc.start_command, lc.tier, lc.runner_ttl_seconds, lc.session_max_age_seconds, lc.auto_pause, lc.network_policy_preset, lc.network_policy, lc.config_json
 					FROM config_workload_keys cwk
 					JOIN layered_configs lc ON lc.config_id = cwk.config_id
 					WHERE cwk.leaf_workload_key = $1
-					ORDER BY lc.created_at DESC LIMIT 1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON, &configJSON)
+					ORDER BY lc.created_at DESC LIMIT 1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &sessionMaxAgeCol, &autoPauseCol, &npPreset, &npJSON, &configJSON)
 			}
 			if err != nil {
 				failureReason = "workload_key_not_found"
@@ -513,6 +528,9 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			}
 			if ttlCol.Valid {
 				runnerTTLSeconds = int(ttlCol.Int64)
+			}
+			if sessionMaxAgeCol.Valid {
+				sessionMaxAgeSeconds = int(sessionMaxAgeCol.Int64)
 			}
 			if autoPauseCol.Valid {
 				autoPause = autoPauseCol.Bool
@@ -543,6 +561,9 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			runnerTTLSeconds = int(sessionTTL.Int64)
 		} else {
 			runnerTTLSeconds = 0
+		}
+		if sessionMaxAge.Valid {
+			sessionMaxAgeSeconds = int(sessionMaxAge.Int64)
 		}
 		autoPause = sessionAutoPause.Valid && sessionAutoPause.Bool
 		configNetworkPolicyPreset = ""
@@ -696,7 +717,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	}
 	protoReq := &pb.AllocateRunnerRequest{
 		RequestId:   req.RequestID,
-		Labels:      req.Labels,
+		Labels:      setInternalAllocateLabels(req.Labels, sessionMaxAgeSeconds),
 		WorkloadKey: workloadKey,
 		SessionId:   req.SessionID,
 		TtlSeconds:  int32(runnerTTLSeconds),
@@ -894,17 +915,18 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		// Success — register runner and return
 		if resp.Runner != nil {
 			if err := s.hostRegistry.AddRunner(ctx, &Runner{
-				ID:                  resp.Runner.Id,
-				HostID:              h.ID,
-				InternalIP:          resp.Runner.InternalIp,
-				Status:              "busy",
-				WorkloadKey:         workloadKey,
-				RunnerTTLSeconds:    runnerTTLSeconds,
-				AutoPause:           autoPause,
-				NetworkPolicyPreset: effectiveNPPreset,
-				NetworkPolicyJSON:   effectiveNPJSON,
-				ReservedCPU:         effectiveCPU,
-				ReservedMemoryMB:    tier.MemoryMB,
+				ID:                   resp.Runner.Id,
+				HostID:               h.ID,
+				InternalIP:           resp.Runner.InternalIp,
+				Status:               "busy",
+				WorkloadKey:          workloadKey,
+				RunnerTTLSeconds:     runnerTTLSeconds,
+				SessionMaxAgeSeconds: sessionMaxAgeSeconds,
+				AutoPause:            autoPause,
+				NetworkPolicyPreset:  effectiveNPPreset,
+				NetworkPolicyJSON:    effectiveNPJSON,
+				ReservedCPU:          effectiveCPU,
+				ReservedMemoryMB:     tier.MemoryMB,
 			}); err != nil {
 				s.logger.WithError(err).Warn("Failed to register runner in control plane registry")
 			}

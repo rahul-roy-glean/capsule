@@ -35,16 +35,17 @@ func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
 	// runners table. This freezes TTL behavior at allocate time instead of
 	// re-reading mutable layered-config defaults by workload key.
 	type runnerConfig struct {
-		ttlSeconds          int
-		autoPause           bool
-		workloadKey         string
-		networkPolicyPreset string
-		networkPolicyJSON   string
+		ttlSeconds           int
+		sessionMaxAgeSeconds int
+		autoPause            bool
+		workloadKey          string
+		networkPolicyPreset  string
+		networkPolicyJSON    string
 	}
 	configs := make(map[string]runnerConfig)
 	if s.snapshotManager != nil && s.snapshotManager.db != nil {
 		rows, err := s.snapshotManager.db.QueryContext(ctx,
-			`SELECT id, workload_key, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
+			`SELECT id, workload_key, runner_ttl_seconds, session_max_age_seconds, auto_pause, network_policy_preset, network_policy
 			 FROM runners
 			 WHERE auto_pause = true AND runner_ttl_seconds > 0`)
 		if err != nil {
@@ -57,7 +58,7 @@ func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
 			var cfg runnerConfig
 			var npPreset sql.NullString
 			var npJSON sql.NullString
-			if err := rows.Scan(&runnerID, &cfg.workloadKey, &cfg.ttlSeconds, &cfg.autoPause, &npPreset, &npJSON); err != nil {
+			if err := rows.Scan(&runnerID, &cfg.workloadKey, &cfg.ttlSeconds, &cfg.sessionMaxAgeSeconds, &cfg.autoPause, &npPreset, &npJSON); err != nil {
 				continue
 			}
 			if npPreset.Valid {
@@ -156,20 +157,21 @@ func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
 			_, _ = s.scheduler.db.ExecContext(ctx, `
 				INSERT INTO session_snapshots (
 					session_id, runner_id, workload_key, host_id, status, layer_count, paused_at,
-					runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, config_id
+					runner_ttl_seconds, session_max_age_seconds, auto_pause, network_policy_preset, network_policy, config_id
 				)
-				VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9, $10)
+				VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9, $10, $11)
 				ON CONFLICT (session_id) DO UPDATE SET
 					status = 'suspended',
 					layer_count = EXCLUDED.layer_count,
 					paused_at = NOW(),
 					runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
+					session_max_age_seconds = EXCLUDED.session_max_age_seconds,
 					auto_pause = EXCLUDED.auto_pause,
 					network_policy_preset = EXCLUDED.network_policy_preset,
 					network_policy = EXCLUDED.network_policy,
 					config_id = EXCLUDED.config_id
 			`, resp.SessionId, c.runnerID, c.config.workloadKey, c.hostID, resp.Layer+1,
-				c.config.ttlSeconds, c.config.autoPause, c.config.networkPolicyPreset, networkPolicy, configID)
+				c.config.ttlSeconds, c.config.sessionMaxAgeSeconds, c.config.autoPause, c.config.networkPolicyPreset, networkPolicy, configID)
 		}
 
 		if err := s.hostRegistry.RemoveRunner(c.runnerID); err != nil {

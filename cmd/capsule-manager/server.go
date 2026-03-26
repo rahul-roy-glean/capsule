@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -18,6 +20,8 @@ import (
 	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
 )
 
+const sessionMaxAgeLabelKey = "_session_max_age_seconds"
+
 // HostAgentServer implements the HostAgent gRPC service
 type HostAgentServer struct {
 	pb.UnimplementedHostAgentServer
@@ -25,6 +29,21 @@ type HostAgentServer struct {
 	chunkedMgr       *runner.ChunkedManager
 	lifecycleMetrics managerLifecycleMetrics
 	logger           *logrus.Entry
+}
+
+func applyInternalAllocateLabels(req *pb.AllocateRunnerRequest, allocReq *runner.AllocateRequest) error {
+	if req == nil || allocReq == nil {
+		return nil
+	}
+	if v, ok := req.Labels[sessionMaxAgeLabelKey]; ok && v != "" {
+		seconds, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("invalid %s: %w", sessionMaxAgeLabelKey, err)
+		}
+		allocReq.SessionMaxAgeSeconds = seconds
+		allocReq.SessionMaxAgeConfigured = true
+	}
+	return nil
 }
 
 // NewHostAgentServer creates a HostAgentServer with chunked snapshot support
@@ -88,6 +107,9 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 			return nil, status.Errorf(codes.InvalidArgument, "invalid _auth_config_json: %v", err)
 		}
 		allocReq.AuthConfig = &ac
+	}
+	if err := applyInternalAllocateLabels(req, &allocReq); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 
 	// Extract base image migration info from labels (control plane packs them
@@ -186,6 +208,8 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 	// Freeze TTL config on the runner for both fresh allocations and resumes.
 	r.TTLSeconds = allocReq.TTLSeconds
 	r.AutoPause = allocReq.AutoPause
+	r.SessionMaxAgeSeconds = allocReq.SessionMaxAgeSeconds
+	r.SessionMaxAgeConfigured = allocReq.SessionMaxAgeConfigured
 	if allocReq.AuthConfig != nil {
 		r.AuthConfig = allocReq.AuthConfig
 	}

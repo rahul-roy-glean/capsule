@@ -188,6 +188,36 @@ func TestRunnerToProto_NilIP(t *testing.T) {
 	}
 }
 
+func TestApplyInternalAllocateLabels_SessionMaxAge(t *testing.T) {
+	req := &pb.AllocateRunnerRequest{
+		Labels: map[string]string{
+			sessionMaxAgeLabelKey: "7200",
+		},
+	}
+	allocReq := &runner.AllocateRequest{}
+	if err := applyInternalAllocateLabels(req, allocReq); err != nil {
+		t.Fatalf("applyInternalAllocateLabels() error = %v", err)
+	}
+	if allocReq.SessionMaxAgeSeconds != 7200 {
+		t.Fatalf("SessionMaxAgeSeconds = %d, want 7200", allocReq.SessionMaxAgeSeconds)
+	}
+	if !allocReq.SessionMaxAgeConfigured {
+		t.Fatal("SessionMaxAgeConfigured should be true")
+	}
+}
+
+func TestApplyInternalAllocateLabels_InvalidSessionMaxAge(t *testing.T) {
+	req := &pb.AllocateRunnerRequest{
+		Labels: map[string]string{
+			sessionMaxAgeLabelKey: "not-a-number",
+		},
+	}
+	allocReq := &runner.AllocateRequest{}
+	if err := applyInternalAllocateLabels(req, allocReq); err == nil {
+		t.Fatal("expected invalid session max age to return error")
+	}
+}
+
 // TestAllocateRunnerRequest_ResumeFields verifies that the new runner_id and
 // resume proto fields roundtrip correctly through the generated Go code.
 func TestAllocateRunnerRequest_ResumeFields(t *testing.T) {
