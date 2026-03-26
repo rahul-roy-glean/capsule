@@ -41,7 +41,6 @@ type Scheduler struct {
 	hostRegistry    *HostRegistry
 	db              *sql.DB
 	snapshotManager *SnapshotManager
-	tagRegistry     *SnapshotTagRegistry
 	configCache     *ConfigCache
 	logger          *logrus.Entry
 
@@ -61,12 +60,11 @@ type Scheduler struct {
 }
 
 // NewScheduler creates a new scheduler
-func NewScheduler(hr *HostRegistry, db *sql.DB, sm *SnapshotManager, tr *SnapshotTagRegistry, logger *logrus.Logger) *Scheduler {
+func NewScheduler(hr *HostRegistry, db *sql.DB, sm *SnapshotManager, logger *logrus.Logger) *Scheduler {
 	return &Scheduler{
 		hostRegistry:    hr,
 		db:              db,
 		snapshotManager: sm,
-		tagRegistry:     tr,
 		logger:          logger.WithField("component", "scheduler"),
 		recentRequests:  make(map[string]*recentSchedulerAllocation),
 	}
@@ -220,7 +218,6 @@ type AllocateRunnerRequest struct {
 	SessionID           string
 	VCPUs               int
 	MemoryMB            int
-	SnapshotTag         string
 	NetworkPolicyPreset string
 	NetworkPolicyJSON   string
 }
@@ -348,6 +345,95 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	workloadKey := req.WorkloadKey
 	var taggedSnapshotVersion string
 
+	// Session resume: if a suspended session exists, use its original
+	// workload_key so that config lookup (tier, snapshot version, auth, etc.)
+	// matches the snapshot the session was paused with.
+	// If the config's base image has changed (new active workload_key), detect
+	// the migration and pass info to the host agent via labels.
+	var sessionHostID string
+	var resumeFromSessionConfig bool
+	var sessionTTL sql.NullInt64
+	var sessionAutoPause sql.NullBool
+	var sessionNPPreset sql.NullString
+	var sessionNPJSON sql.NullString
+	var migrateFromWorkloadKey string // set when base image migration is needed
+	var migrateFromRunnerID string
+	var resumeRunnerID string // runner ID for cross-host session resume
+	if req.SessionID != "" && s.db != nil {
+		var status string
+		var sessionWorkloadKey sql.NullString
+		var sessionConfigID sql.NullString
+		var sessionRunnerID sql.NullString
+		err := s.db.QueryRowContext(ctx,
+			`SELECT host_id, status, workload_key, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, config_id, runner_id
+			 FROM session_snapshots WHERE session_id = $1`,
+			req.SessionID).Scan(&sessionHostID, &status, &sessionWorkloadKey, &sessionTTL, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON, &sessionConfigID, &sessionRunnerID)
+		if err == nil && status == "suspended" && sessionHostID != "" {
+			resumeFromSessionConfig = true
+			if sessionRunnerID.Valid && sessionRunnerID.String != "" {
+				resumeRunnerID = sessionRunnerID.String
+			}
+			s.logger.WithFields(logrus.Fields{
+				"session_id":        req.SessionID,
+				"session_host_id":   sessionHostID,
+				"session_runner_id": resumeRunnerID,
+				"resume_from_cfg":   resumeFromSessionConfig,
+			}).Info("DEBUG: session_snapshots lookup found suspended session")
+
+			// Check for base image migration: if config_id is known, look up
+			// the current active workload_key and compare.
+			if sessionConfigID.Valid && sessionConfigID.String != "" && sessionWorkloadKey.Valid && sessionWorkloadKey.String != "" {
+				var currentActiveWK sql.NullString
+				s.db.QueryRowContext(ctx,
+					`SELECT leaf_workload_key FROM config_workload_keys
+					 WHERE config_id = $1 AND status = 'active' LIMIT 1`,
+					sessionConfigID.String).Scan(&currentActiveWK)
+
+				if currentActiveWK.Valid && currentActiveWK.String != "" && currentActiveWK.String != sessionWorkloadKey.String {
+					// Base image migration detected: session was paused with old wk,
+					// config now has a new active wk (new base image).
+					migrateFromWorkloadKey = sessionWorkloadKey.String
+					if sessionRunnerID.Valid {
+						migrateFromRunnerID = sessionRunnerID.String
+					}
+					// Use the NEW workload_key for config lookup, scoring, and snapshot version
+					workloadKey = currentActiveWK.String
+					s.logger.WithFields(logrus.Fields{
+						"session_id":    req.SessionID,
+						"config_id":     sessionConfigID.String,
+						"old_wk":        sessionWorkloadKey.String,
+						"new_wk":        currentActiveWK.String,
+						"old_runner_id": migrateFromRunnerID,
+					}).Info("Base image migration detected: session will resume with new golden snapshot + old extension drives")
+				} else {
+					// No migration — use session's workload_key as before
+					if sessionWorkloadKey.Valid && sessionWorkloadKey.String != "" {
+						if workloadKey != "" && workloadKey != sessionWorkloadKey.String {
+							s.logger.WithFields(logrus.Fields{
+								"session_id":         req.SessionID,
+								"requested_workload": workloadKey,
+								"session_workload":   sessionWorkloadKey.String,
+							}).Warn("Resume: overriding requested workload_key with session's original workload_key")
+						}
+						workloadKey = sessionWorkloadKey.String
+					}
+				}
+			} else {
+				// No config_id on session — fallback to original behavior
+				if sessionWorkloadKey.Valid && sessionWorkloadKey.String != "" {
+					if workloadKey != "" && workloadKey != sessionWorkloadKey.String {
+						s.logger.WithFields(logrus.Fields{
+							"session_id":         req.SessionID,
+							"requested_workload": workloadKey,
+							"session_workload":   sessionWorkloadKey.String,
+						}).Warn("Resume: overriding requested workload_key with session's original workload_key")
+					}
+					workloadKey = sessionWorkloadKey.String
+				}
+			}
+		}
+	}
+
 	// Look up config for fairness checks, start_command, tier, and TTL/auto_pause.
 	// Uses in-memory cache first, falls back to DB on miss.
 	var tierName string
@@ -356,7 +442,6 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	var autoPause bool
 	var configNetworkPolicyPreset string
 	var configNetworkPolicyJSON string
-	var resumeFromSessionConfig bool
 	var authConfigJSON string
 	if workloadKey != "" {
 		var wc *WorkloadConfig
@@ -402,66 +487,46 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 					WHERE cwk.leaf_workload_key = $1
 					ORDER BY lc.created_at DESC LIMIT 1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON, &configJSON)
 			}
-			if err == nil {
-				if tierCol.Valid && tierCol.String != "" {
-					tierName = tierCol.String
-				}
-				if maxConcurrent > 0 {
-					var currentCount int
-					_ = s.db.QueryRowContext(ctx, `
-						SELECT COUNT(*) FROM runners WHERE workload_key = $1 AND status IN ('running','busy','initializing')
-					`, workloadKey).Scan(&currentCount)
-					if currentCount >= maxConcurrent {
-						failureReason = "max_concurrent_runners"
-						return nil, fmt.Errorf("workload_key %s at max concurrent runners (%d/%d)", workloadKey, currentCount, maxConcurrent)
-					}
-				}
-				if startCommandJSON.Valid && startCommandJSON.String != "" {
-					startCmd = &snapshot.StartCommand{}
-					if err := json.Unmarshal([]byte(startCommandJSON.String), startCmd); err != nil {
-						s.logger.WithError(err).Warn("Failed to parse start_command from config")
-						startCmd = nil
-					}
-				}
-				if ttlCol.Valid {
-					runnerTTLSeconds = int(ttlCol.Int64)
-				}
-				if autoPauseCol.Valid {
-					autoPause = autoPauseCol.Bool
-				}
-				if npPreset.Valid {
-					configNetworkPolicyPreset = npPreset.String
-				}
-				if npJSON.Valid {
-					configNetworkPolicyJSON = npJSON.String
-				}
-				if configJSON.Valid {
-					authConfigJSON = extractAuthConfigJSON(configJSON.String)
+			if err != nil {
+				failureReason = "workload_key_not_found"
+				return nil, fmt.Errorf("workload_key %s not found", workloadKey)
+			}
+			if tierCol.Valid && tierCol.String != "" {
+				tierName = tierCol.String
+			}
+			if maxConcurrent > 0 {
+				var currentCount int
+				_ = s.db.QueryRowContext(ctx, `
+					SELECT COUNT(*) FROM runners WHERE workload_key = $1 AND status IN ('running','busy','initializing')
+				`, workloadKey).Scan(&currentCount)
+				if currentCount >= maxConcurrent {
+					failureReason = "max_concurrent_runners"
+					return nil, fmt.Errorf("workload_key %s at max concurrent runners (%d/%d)", workloadKey, currentCount, maxConcurrent)
 				}
 			}
+			if startCommandJSON.Valid && startCommandJSON.String != "" {
+				startCmd = &snapshot.StartCommand{}
+				if err := json.Unmarshal([]byte(startCommandJSON.String), startCmd); err != nil {
+					s.logger.WithError(err).Warn("Failed to parse start_command from config")
+					startCmd = nil
+				}
+			}
+			if ttlCol.Valid {
+				runnerTTLSeconds = int(ttlCol.Int64)
+			}
+			if autoPauseCol.Valid {
+				autoPause = autoPauseCol.Bool
+			}
+			if npPreset.Valid {
+				configNetworkPolicyPreset = npPreset.String
+			}
+			if npJSON.Valid {
+				configNetworkPolicyJSON = npJSON.String
+			}
+			if configJSON.Valid {
+				authConfigJSON = extractAuthConfigJSON(configJSON.String)
+			}
 		}
-	}
-
-	if req.SnapshotTag != "" {
-		if workloadKey == "" {
-			failureReason = "missing_workload_key"
-			return nil, fmt.Errorf("snapshot tag %q requires a workload_key", req.SnapshotTag)
-		}
-		if s.tagRegistry == nil {
-			failureReason = "snapshot_tag_not_found"
-			return nil, fmt.Errorf("snapshot tag %q not found for workload %q", req.SnapshotTag, workloadKey)
-		}
-		v, err := s.tagRegistry.ResolveTagVersion(ctx, workloadKey, req.SnapshotTag)
-		if err != nil {
-			failureReason = "snapshot_tag_not_found"
-			return nil, fmt.Errorf("snapshot tag %q not found for workload %q", req.SnapshotTag, workloadKey)
-		}
-		taggedSnapshotVersion = v
-		s.logger.WithFields(logrus.Fields{
-			"workload_key": workloadKey,
-			"snapshot_tag": req.SnapshotTag,
-			"version":      v,
-		}).Info("Resolved snapshot_tag to version")
 	}
 
 	// Resolve tier (default to "m")
@@ -470,38 +535,23 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	}
 	tier, _ := tiers.Lookup(tierName)
 
-	// Session stickiness: if this is a session resume, prefer the host where
-	// the session was paused. This keeps the LRU chunk cache warm and avoids
-	// cold GCS fetches on resume. When resuming a suspended session, also use
-	// the TTL/network policy persisted on that session instead of re-reading
-	// mutable layered-config defaults by workload key.
-	var sessionHostID string
-	if req.SessionID != "" && s.db != nil {
-		var status string
-		var sessionTTL sql.NullInt64
-		var sessionAutoPause sql.NullBool
-		var sessionNPPreset sql.NullString
-		var sessionNPJSON sql.NullString
-		err := s.db.QueryRowContext(ctx,
-			`SELECT host_id, status, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
-			 FROM session_snapshots WHERE session_id = $1`,
-			req.SessionID).Scan(&sessionHostID, &status, &sessionTTL, &sessionAutoPause, &sessionNPPreset, &sessionNPJSON)
-		if err == nil && status == "suspended" && sessionHostID != "" {
-			resumeFromSessionConfig = true
-			if sessionTTL.Valid {
-				runnerTTLSeconds = int(sessionTTL.Int64)
-			} else {
-				runnerTTLSeconds = 0
-			}
-			autoPause = sessionAutoPause.Valid && sessionAutoPause.Bool
-			configNetworkPolicyPreset = ""
-			if sessionNPPreset.Valid {
-				configNetworkPolicyPreset = sessionNPPreset.String
-			}
-			configNetworkPolicyJSON = ""
-			if sessionNPJSON.Valid {
-				configNetworkPolicyJSON = sessionNPJSON.String
-			}
+	// Session stickiness: apply TTL/network policy overrides from the
+	// suspended session (the lookup and workload_key override already
+	// happened above, before config resolution).
+	if resumeFromSessionConfig {
+		if sessionTTL.Valid {
+			runnerTTLSeconds = int(sessionTTL.Int64)
+		} else {
+			runnerTTLSeconds = 0
+		}
+		autoPause = sessionAutoPause.Valid && sessionAutoPause.Bool
+		configNetworkPolicyPreset = ""
+		if sessionNPPreset.Valid {
+			configNetworkPolicyPreset = sessionNPPreset.String
+		}
+		configNetworkPolicyJSON = ""
+		if sessionNPJSON.Valid {
+			configNetworkPolicyJSON = sessionNPJSON.String
 		}
 	}
 
@@ -673,6 +723,32 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			protoReq.Labels = make(map[string]string)
 		}
 		protoReq.Labels["_auth_config_json"] = authConfigJSON
+	}
+	// Pass base image migration info via labels so the host agent can do a
+	// migrated fresh boot (new golden snapshot + old session extension drives).
+	if migrateFromWorkloadKey != "" {
+		if protoReq.Labels == nil {
+			protoReq.Labels = make(map[string]string)
+		}
+		protoReq.Labels["_migrate_from_workload_key"] = migrateFromWorkloadKey
+		protoReq.Labels["_migrate_from_runner_id"] = migrateFromRunnerID
+	}
+	// Pass cross-host session resume info as proper proto fields so the host
+	// agent can skip the local SessionExists() check and use GCS fallback.
+	if resumeFromSessionConfig && migrateFromWorkloadKey == "" && resumeRunnerID != "" {
+		protoReq.RunnerId = resumeRunnerID
+		protoReq.Resume = true
+		s.logger.WithFields(logrus.Fields{
+			"session_id":       req.SessionID,
+			"resume_runner_id": resumeRunnerID,
+		}).Info("DEBUG: setting resume=true on proto request")
+	} else {
+		s.logger.WithFields(logrus.Fields{
+			"session_id":       req.SessionID,
+			"resume_from_cfg":  resumeFromSessionConfig,
+			"migrate_from_wk":  migrateFromWorkloadKey,
+			"resume_runner_id": resumeRunnerID,
+		}).Info("DEBUG: NOT setting resume=true on proto request")
 	}
 	protoReq.Resources = &pb.Resources{
 		Vcpus:    int32(tier.VCPUs),
@@ -850,6 +926,16 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			SessionID:   resp.GetSessionId(),
 			Resumed:     resp.GetResumed(),
 		}
+
+		// After successful migration allocation, update the session snapshot
+		// so future resumes don't re-migrate. runner_id is reused from the old
+		// session, so only workload_key and status need updating.
+		if migrateFromWorkloadKey != "" && s.db != nil {
+			_, _ = s.db.ExecContext(ctx,
+				`UPDATE session_snapshots SET workload_key = $1, status = 'active', host_id = $2 WHERE session_id = $3`,
+				workloadKey, h.ID, req.SessionID)
+		}
+
 		return allocatedResp, nil
 	}
 
@@ -1022,8 +1108,10 @@ func (s *Scheduler) ReleaseRunner(ctx context.Context, runnerID string, destroy 
 	}
 
 	// Clean up session_snapshots row so stale entries don't accumulate.
+	// Preserve suspended sessions — they contain GCS-backed snapshot data
+	// needed for cross-host resume after the original host is gone.
 	if s.db != nil {
-		if _, dbErr := s.db.ExecContext(ctx, `DELETE FROM session_snapshots WHERE runner_id = $1`, runnerID); dbErr != nil {
+		if _, dbErr := s.db.ExecContext(ctx, `DELETE FROM session_snapshots WHERE runner_id = $1 AND status != 'suspended'`, runnerID); dbErr != nil {
 			s.logger.WithError(dbErr).WithField("runner_id", runnerID).Warn("Failed to clean up session_snapshots on release")
 		}
 	}

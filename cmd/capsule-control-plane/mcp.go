@@ -31,7 +31,6 @@ type mcpDeps struct {
 type AllocateSandboxInput struct {
 	WorkloadKey         string `json:"workload_key" jsonschema:"Snapshot workload key identifying which VM image to boot"`
 	SessionID           string `json:"session_id,omitempty" jsonschema:"Session ID for pause/resume. If a matching suspended session exists it resumes."`
-	SnapshotTag         string `json:"snapshot_tag,omitempty" jsonschema:"Named snapshot tag (e.g. stable or canary)"`
 	NetworkPolicyPreset string `json:"network_policy_preset,omitempty" jsonschema:"Named network policy preset (e.g. restricted-egress or isolated)"`
 }
 
@@ -179,7 +178,6 @@ func (m *mcpDeps) handleAllocate(ctx context.Context, _ *mcp.CallToolRequest, in
 		WorkloadKey:         in.WorkloadKey,
 		Source:              "mcp",
 		SessionID:           in.SessionID,
-		SnapshotTag:         in.SnapshotTag,
 		NetworkPolicyPreset: in.NetworkPolicyPreset,
 	})
 	if err != nil {
@@ -233,12 +231,20 @@ func (m *mcpDeps) handlePause(ctx context.Context, _ *mcp.CallToolRequest, in Pa
 		if runner.NetworkPolicyJSON != "" {
 			networkPolicy = runner.NetworkPolicyJSON
 		}
+		// Derive config_id from the workload_key for migration support.
+		var configID *string
+		var cfgID string
+		if m.db.QueryRowContext(ctx,
+			`SELECT config_id FROM config_workload_keys WHERE leaf_workload_key = $1 AND status IN ('active','draining') LIMIT 1`,
+			runner.WorkloadKey).Scan(&cfgID) == nil {
+			configID = &cfgID
+		}
 		_, _ = m.db.ExecContext(ctx, `
 			INSERT INTO session_snapshots (
 				session_id, runner_id, workload_key, host_id, status, layer_count, paused_at,
-				runner_ttl_seconds, auto_pause, network_policy_preset, network_policy
+				runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, config_id
 			)
-			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9)
+			VALUES ($1, $2, $3, $4, 'suspended', $5, NOW(), $6, $7, $8, $9, $10)
 			ON CONFLICT (session_id) DO UPDATE SET
 				status = 'suspended',
 				layer_count = EXCLUDED.layer_count,
@@ -246,9 +252,10 @@ func (m *mcpDeps) handlePause(ctx context.Context, _ *mcp.CallToolRequest, in Pa
 				runner_ttl_seconds = EXCLUDED.runner_ttl_seconds,
 				auto_pause = EXCLUDED.auto_pause,
 				network_policy_preset = EXCLUDED.network_policy_preset,
-				network_policy = EXCLUDED.network_policy
+				network_policy = EXCLUDED.network_policy,
+				config_id = EXCLUDED.config_id
 		`, resp.SessionId, in.SandboxID, runner.WorkloadKey, host.ID, resp.Layer+1,
-			runner.RunnerTTLSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy)
+			runner.RunnerTTLSeconds, runner.AutoPause, runner.NetworkPolicyPreset, networkPolicy, configID)
 	}
 
 	_ = m.hostRegistry.RemoveRunner(in.SandboxID)

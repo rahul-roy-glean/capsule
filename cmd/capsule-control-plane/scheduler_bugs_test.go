@@ -99,40 +99,11 @@ func TestReleaseDoesNotCleanSessionSnapshots(t *testing.T) {
 	t.Log("BUG DOCUMENTED: scheduler.ReleaseRunner does not clean session_snapshots DB rows")
 }
 
-func TestAllocateRunner_MissingSnapshotTagFailsFast(t *testing.T) {
-	logger := logrus.New()
-	logger.SetLevel(logrus.WarnLevel)
-	hr := NewHostRegistry(nil, logger)
-	hr.hosts["host-1"] = &Host{
-		ID:                 "host-1",
-		InstanceName:       "host-1",
-		Status:             "ready",
-		LastHeartbeat:      time.Now(),
-		GRPCAddress:        "127.0.0.1:65535",
-		TotalCPUMillicores: 16000,
-		TotalMemoryMB:      65536,
-	}
-
-	s := NewScheduler(hr, nil, nil, nil, logger)
-
-	_, err := s.AllocateRunner(context.Background(), AllocateRunnerRequest{
-		RequestID:   "req-1",
-		WorkloadKey: "wk-missing",
-		SnapshotTag: "stable",
-	})
-	if err == nil {
-		t.Fatal("expected missing snapshot tag to fail")
-	}
-	if got := err.Error(); got != `snapshot tag "stable" not found for workload "wk-missing"` {
-		t.Fatalf("unexpected error: %s", got)
-	}
-}
-
 func TestSchedulerIdempotentAllocationWaitsForLeader(t *testing.T) {
 	logger := logrus.New()
 	logger.SetLevel(logrus.WarnLevel)
 	hr := NewHostRegistry(nil, logger)
-	s := NewScheduler(hr, nil, nil, nil, logger)
+	s := NewScheduler(hr, nil, nil, logger)
 
 	existing, alloc, leader := s.beginIdempotentAllocation("req-1")
 	if existing != nil {
@@ -171,7 +142,7 @@ func TestSchedulerCachedIdempotentAllocationRequiresLiveRunner(t *testing.T) {
 	logger := logrus.New()
 	logger.SetLevel(logrus.WarnLevel)
 	hr := NewHostRegistry(nil, logger)
-	s := NewScheduler(hr, nil, nil, nil, logger)
+	s := NewScheduler(hr, nil, nil, logger)
 
 	resp := &AllocateRunnerResponse{RunnerID: "runner-1", HostID: "host-1", HostAddress: "10.0.0.1:8080"}
 	s.recentRequests["req-1"] = &recentSchedulerAllocation{

@@ -217,7 +217,7 @@ func setupFixture(cp *cpapi.Client, mgrClient *http.Client, mgr, workloadKey, mu
 		return "", fmt.Errorf("pre-pause sanity mismatch: got=%q want=%q", stdout, expectStdout)
 	}
 
-	if _, err := cp.PauseRunner(runnerID); err != nil {
+	if _, err := cp.PauseRunner(runnerID, false); err != nil {
 		_ = cp.ReleaseRunner(runnerID)
 		return "", fmt.Errorf("pause fixture: %w", err)
 	}
@@ -256,7 +256,7 @@ func runOnce(cp *cpapi.Client, mgrClient *http.Client, mgr, workloadKey, session
 	res.ResumeTTI = time.Since(resumeStart)
 
 	pauseStart := time.Now()
-	if _, err := cp.PauseRunner(runnerID); err != nil {
+	if _, err := cp.PauseRunner(runnerID, false); err != nil {
 		_ = cp.ReleaseRunner(runnerID)
 		return res, "pause", fmt.Errorf("pause: %w", err)
 	}

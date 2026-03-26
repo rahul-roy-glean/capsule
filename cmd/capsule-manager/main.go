@@ -1286,21 +1286,20 @@ func runnerProxyHandler(mgr *runner.Manager, logger *logrus.Logger, lifecycleMet
 			return
 		}
 
-		// Handle /api/v1/runners/{id}/connect (extend TTL or resume)
-		if connectParts := strings.SplitN(suffix, "/connect", 2); len(connectParts) == 2 && connectParts[1] == "" {
-			runnerID := connectParts[0]
-			runnerID = strings.TrimSuffix(runnerID, "/")
-			setManagerRoute(w, "/api/v1/runners/:id/connect", "capsule_manager.runner_connect")
-			handleConnectRunner(w, r, mgr, log, runnerID, lifecycleMetrics)
-			return
-		}
-
 		// Handle /api/v1/runners/{id}/files/{op} (file operations in VM)
 		if filesParts := strings.SplitN(suffix, "/files/", 2); len(filesParts) == 2 {
 			runnerID := strings.TrimSuffix(filesParts[0], "/")
 			fileOp := filesParts[1]
 			setManagerRoute(w, "/api/v1/runners/:id/files/"+fileOp, "capsule_manager.runner_files")
 			handleFileOp(w, r, mgr, log, runnerID, fileOp, lifecycleMetrics)
+			return
+		}
+
+		// Handle /api/v1/runners/{id}/auth/update-token (push tokens to auth proxy)
+		if authParts := strings.SplitN(suffix, "/auth/update-token", 2); len(authParts) == 2 && authParts[1] == "" {
+			runnerID := strings.TrimSuffix(authParts[0], "/")
+			setManagerRoute(w, "/api/v1/runners/:id/auth/update-token", "capsule_manager.runner_auth_update_token")
+			handleAuthUpdateToken(w, r, mgr, log, runnerID)
 			return
 		}
 
@@ -1877,8 +1876,10 @@ func handlePauseRunner(w http.ResponseWriter, r *http.Request, mgr *runner.Manag
 		return
 	}
 
+	syncFS := r.URL.Query().Get("sync") == "true"
+
 	start := time.Now()
-	result, err := mgr.PauseRunner(r.Context(), runnerID)
+	result, err := mgr.PauseRunner(r.Context(), runnerID, syncFS)
 	if err != nil {
 		log.WithError(err).WithField("runner_id", runnerID).Error("Failed to pause runner")
 		recordSessionPauseMetrics(r.Context(), lifecycleMetrics, time.Since(start), fcrotel.ResultFailure, "http")
@@ -1923,61 +1924,46 @@ func handleCheckpointRunner(w http.ResponseWriter, r *http.Request, mgr *runner.
 	})
 }
 
-// handleConnectRunner handles POST /api/v1/runners/{id}/connect
-// If running: extends TTL (200). If suspended: resumes (201).
-func handleConnectRunner(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string, lifecycleMetrics managerLifecycleMetrics) {
+// handleAuthUpdateToken handles POST /api/v1/runners/{id}/auth/update-token
+// Proxies the request to the auth proxy's /update-token endpoint.
+func handleAuthUpdateToken(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	rn, err := mgr.GetRunner(runnerID)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("runner not found: %s", runnerID), http.StatusNotFound)
+	proxy := mgr.GetAuthProxy(runnerID)
+	if proxy == nil {
+		http.Error(w, fmt.Sprintf("no auth proxy for runner %s", runnerID), http.StatusNotFound)
+		return
+	}
+	addr := proxy.TokenUpdateAddr()
+	if addr == "" {
+		http.Error(w, "auth proxy has no token update endpoint", http.StatusServiceUnavailable)
 		return
 	}
 
-	switch rn.State {
-	case runner.StateIdle, runner.StateBusy:
-		// Runner is active — reset TTL timer
-		mgr.ResetTTL(runnerID)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{
-			"status":    "connected",
-			"runner_id": runnerID,
-		})
+	targetURL := fmt.Sprintf("http://%s/update-token", addr)
+	log.WithFields(logrus.Fields{
+		"runner_id": runnerID,
+		"target":    targetURL,
+	}).Debug("Proxying auth token update")
 
-	case runner.StateSuspended:
-		// Runner is suspended — resume from session
-		if rn.SessionID == "" {
-			http.Error(w, "runner has no session_id", http.StatusBadRequest)
-			return
-		}
-		start := time.Now()
-		resumed, err := mgr.ResumeFromSession(r.Context(), rn.SessionID, rn.WorkloadKey, runnerID)
-		if err != nil {
-			log.WithError(err).WithField("runner_id", runnerID).Error("Failed to resume runner")
-			recordSessionResumeMetrics(r.Context(), mgr, lifecycleMetrics, rn.SessionID, time.Since(start), fcrotel.ResultFailure, "connect_http")
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
-		}
-		recordSessionResumeMetrics(r.Context(), mgr, lifecycleMetrics, rn.SessionID, time.Since(start), fcrotel.ResultSuccess, "connect_http")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(map[string]string{
-			"status":    "resumed",
-			"runner_id": resumed.ID,
-		})
-
-	default:
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error":  fmt.Sprintf("runner is in state %s, cannot connect", rn.State),
-			"status": string(rn.State),
-		})
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, r.Body)
+	if err != nil {
+		http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
+		return
 	}
+	upstreamReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(upstreamReq)
+	if err != nil {
+		log.WithError(err).WithField("runner_id", runnerID).Warn("Failed to reach auth proxy for token update")
+		http.Error(w, "bad gateway: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }

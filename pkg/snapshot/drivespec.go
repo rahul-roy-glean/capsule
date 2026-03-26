@@ -15,4 +15,6 @@ type ExtensionDrive struct {
 	Chunks    []ChunkRef `json:"chunks"`
 	ReadOnly  bool       `json:"read_only"`
 	SizeBytes int64      `json:"size_bytes"`
+	Label     string     `json:"label,omitempty"`
+	MountPath string     `json:"mount_path,omitempty"`
 }

@@ -125,7 +125,7 @@ func (d *ChunkedDisk) Mount() error {
 
 	d.logger.WithField("mount_point", d.mountPoint).Info("Chunked disk mounted")
 
-	// Serve the filesystem in a goroutine
+	// Serve FUSE requests in background
 	go func() {
 		if err := fs.Serve(c, d); err != nil {
 			d.logger.WithError(err).Error("FUSE serve failed")
@@ -456,6 +456,14 @@ func (d *ChunkedDisk) DirtyChunkCount() int {
 	d.dirtyChunksMu.RLock()
 	defer d.dirtyChunksMu.RUnlock()
 	return len(d.dirtyChunks)
+}
+
+// ResetDirtyChunks clears all CoW dirty chunks, making the base chunks
+// (from the chunk store) visible again.
+func (d *ChunkedDisk) ResetDirtyChunks() {
+	d.dirtyChunksMu.Lock()
+	d.dirtyChunks = make(map[int][]byte)
+	d.dirtyChunksMu.Unlock()
 }
 
 // Stats returns disk statistics

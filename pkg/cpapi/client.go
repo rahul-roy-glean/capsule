@@ -35,7 +35,6 @@ type AllocateRequest struct {
 	WorkloadKey         string            `json:"workload_key"`
 	Labels              map[string]string `json:"labels,omitempty"`
 	SessionID           string            `json:"session_id,omitempty"`
-	SnapshotTag         string            `json:"snapshot_tag,omitempty"`
 	NetworkPolicyPreset string            `json:"network_policy_preset,omitempty"`
 	NetworkPolicyJSON   string            `json:"network_policy_json,omitempty"`
 }
@@ -116,9 +115,14 @@ func (c *Client) ReleaseRunner(runnerID string) error {
 }
 
 // PauseRunner pauses a runner and creates a session snapshot.
-func (c *Client) PauseRunner(runnerID string) (*PauseResponse, error) {
+// If syncFS is true, guest filesystems are flushed before snapshotting.
+func (c *Client) PauseRunner(runnerID string, syncFS bool) (*PauseResponse, error) {
+	body := map[string]interface{}{"runner_id": runnerID}
+	if syncFS {
+		body["sync_fs"] = true
+	}
 	var resp PauseResponse
-	if err := c.doWithRetry(http.MethodPost, "/api/v1/runners/pause", map[string]string{"runner_id": runnerID}, &resp); err != nil {
+	if err := c.doWithRetry(http.MethodPost, "/api/v1/runners/pause", body, &resp); err != nil {
 		return nil, err
 	}
 	if resp.Error != "" {

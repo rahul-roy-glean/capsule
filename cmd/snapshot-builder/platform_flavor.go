@@ -350,7 +350,7 @@ func configureAlpineRootfs(rootfsDir, runnerUser string) error {
 	if err := os.MkdirAll(bootDir, 0755); err != nil {
 		return fmt.Errorf("create boot runlevel dir: %w", err)
 	}
-	for _, svc := range []string{"procfs", "sysfs", "devfs", "hwclock", "modules", "sysctl", "hostname", "bootmisc", "syslog"} {
+	for _, svc := range []string{"procfs", "sysfs", "devfs", "mdev", "hwclock", "modules", "sysctl", "hostname", "bootmisc", "syslog"} {
 		target := filepath.Join(rootfsDir, "etc/init.d", svc)
 		if _, err := os.Stat(target); err == nil {
 			if err := forceSymlink("/etc/init.d/"+svc, filepath.Join(bootDir, svc)); err != nil {
@@ -700,6 +700,10 @@ iface eth0 inet manual
 
 func renderAlpineInittab() string {
 	return `# Firecracker microVM inittab (busybox init + OpenRC)
+# Ensure /dev is devtmpfs and block device nodes exist before OpenRC services.
+# Alpine-like images may not have udev/mdev services; devtmpfs auto-creates
+# nodes for kernel-known devices, and mdev -s catches anything missed.
+::sysinit:/bin/sh -c 'mount -t devtmpfs devtmpfs /dev 2>/dev/null; mount -t sysfs sysfs /sys 2>/dev/null; mount -t proc proc /proc 2>/dev/null; [ -x /sbin/mdev ] && mdev -s 2>/dev/null; true'
 ::sysinit:/sbin/openrc sysinit
 ::sysinit:/sbin/openrc boot
 ::wait:/sbin/openrc default
