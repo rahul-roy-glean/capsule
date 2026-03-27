@@ -20,6 +20,7 @@ jobs:
       go: ${{ steps.filter.outputs.go }}
       migrations: ${{ steps.filter.outputs.migrations }}
       python_sdk: ${{ steps.filter.outputs.python_sdk }}
+      typescript_sdk: ${{ steps.filter.outputs.typescript_sdk }}
       workflows: ${{ steps.filter.outputs.workflows }}
       helm: ${{ steps.filter.outputs.helm }}
       examples: ${{ steps.filter.outputs.examples }}
@@ -43,6 +44,8 @@ jobs:
               - '.github/scripts/check-migrations.sh'
             python_sdk:
               - 'sdk/python/**'
+            typescript_sdk:
+              - 'sdk/typescript/**'
             workflows:
               - '.github/workflows/**'
               - '.github/scripts/**'
@@ -202,6 +205,30 @@ jobs:
       - name: Pytest
         run: python -m pytest tests/ -v --ignore=tests/e2e_live.py -m "not contract"
 
+  sdk-typescript:
+    name: TypeScript SDK
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.typescript_sdk == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: Unit tests
+        run: npm test
+
   workflow-lint:
     name: Workflow Lint
     needs: changes
@@ -280,3 +307,9 @@ jobs:
           pip install -e ".[dev]"
           CAPSULE_BASE_URL=http://localhost:8080 CAPSULE_TOKEN=test-token \
             python -m pytest tests/test_contract.py -v -m contract
+      - name: Run TypeScript contract tests
+        run: |
+          cd sdk/typescript
+          npm ci
+          CAPSULE_BASE_URL=http://localhost:8080 CAPSULE_TOKEN=test-token \
+            npm run test:contract
