@@ -126,6 +126,41 @@ resource "helm_release" "control_plane" {
     value = local.infra.control_plane_service_account
   }
 
+  set {
+    name  = "autoscaler.scaleUpThreshold"
+    value = var.autoscaler_scale_up_threshold
+  }
+
+  set {
+    name  = "autoscaler.scaleDownThreshold"
+    value = var.autoscaler_scale_down_threshold
+  }
+
+  set {
+    name  = "autoscaler.cooldown"
+    value = var.autoscaler_cooldown
+  }
+
+  set {
+    name  = "autoscaler.bootCooldown"
+    value = var.autoscaler_boot_cooldown
+  }
+
+  set {
+    name  = "autoscaler.rateWindow"
+    value = var.autoscaler_rate_window
+  }
+
+  set {
+    name  = "autoscaler.settlingThreshold"
+    value = var.autoscaler_settling_threshold
+  }
+
+  set {
+    name  = "autoscaler.minHostAge"
+    value = var.autoscaler_min_host_age
+  }
+
   depends_on = [
     kubernetes_secret.db_credentials,
     kubernetes_secret.github_credentials,

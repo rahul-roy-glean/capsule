@@ -6,6 +6,7 @@ package uffd
 import (
 	"context"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/sirupsen/logrus"
@@ -42,6 +43,7 @@ type Prefetcher struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	done   chan struct{} // closed when all prefetch work completes
 	logger *logrus.Entry
 }
 
@@ -82,6 +84,7 @@ func NewPrefetcher(cfg PrefetcherConfig) *Prefetcher {
 		copyWorkers:  copyWorkers,
 		ctx:          ctx,
 		cancel:       cancel,
+		done:         make(chan struct{}),
 		logger:       cfg.Logger.WithField("component", "uffd-prefetcher"),
 	}
 }
@@ -99,9 +102,17 @@ func (p *Prefetcher) SetUFFD(uffdFd int, mappings []GuestRegionUFFDMapping) {
 	p.mappings = mappings
 }
 
+// Done returns a channel that is closed when all prefetch work (both fetch and
+// copy phases) has completed. Callers can select on this with a timeout to wait
+// for prefetching before resuming the VM.
+func (p *Prefetcher) Done() <-chan struct{} {
+	return p.done
+}
+
 // Start begins both phases of prefetching. Non-blocking.
 func (p *Prefetcher) Start() {
 	if p.mapping == nil || len(p.mapping.Offsets) == 0 {
+		close(p.done)
 		return
 	}
 
@@ -190,12 +201,21 @@ func (p *Prefetcher) Start() {
 	}
 
 	p.logger.Debug("Prefetcher fetch and copy workers started")
+
+	// Signal completion when all phases finish.
+	go func() {
+		p.wg.Wait()
+		close(p.done)
+	}()
 }
 
 // Stop cancels all prefetcher goroutines and waits for them to finish.
 func (p *Prefetcher) Stop() {
+	stopStart := time.Now()
 	p.cancel()
+	p.logger.Debug("Prefetcher.Stop: waiting for goroutines")
 	p.wg.Wait()
+	p.logger.WithField("stop_ms", time.Since(stopStart).Milliseconds()).Debug("Prefetcher.Stop: complete")
 }
 
 // getPageData retrieves a single page from the chunk store using snapshot metadata.

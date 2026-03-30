@@ -396,11 +396,13 @@ func (cs *ChunkStore) GetChunk(ctx context.Context, hash string) ([]byte, error)
 	// 4. Singleflight-coalesced GCS fetch.
 	// Use a detached context inside singleflight so a short-deadline caller
 	// doesn't cancel the shared fetch for other waiters.
+	// DoChan + select on ctx.Done() lets cancelled callers bail out immediately
+	// without waiting for the shared fetch to complete (e.g. during handler teardown).
 	type fetchResult struct {
 		data       []byte
 		compressed []byte
 	}
-	v, err, shared := cs.fetchGroup.Do(hash, func() (interface{}, error) {
+	ch := cs.fetchGroup.DoChan(hash, func() (interface{}, error) {
 		fetchCtx, fetchCancel := context.WithTimeout(context.Background(), cs.gcsFetchTimeout)
 		defer fetchCancel()
 
@@ -453,6 +455,17 @@ func (cs *ChunkStore) GetChunk(ctx context.Context, hash string) ([]byte, error)
 
 		return &fetchResult{data: data, compressed: compressed}, nil
 	})
+
+	// Wait for either the singleflight result or caller cancellation.
+	var v interface{}
+	var err error
+	var shared bool
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		v, err, shared = res.Val, res.Err, res.Shared
+	}
 
 	if shared {
 		if cs.chunkSFDedup != nil {

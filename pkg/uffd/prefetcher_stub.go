@@ -29,6 +29,13 @@ func NewPrefetcher(cfg PrefetcherConfig) *Prefetcher { return &Prefetcher{} }
 // SetUFFD is a stub.
 func (p *Prefetcher) SetUFFD(uffdFd int, mappings []GuestRegionUFFDMapping) {}
 
+// Done is a stub — returns a closed channel (always ready).
+func (p *Prefetcher) Done() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
 // Start is a stub.
 func (p *Prefetcher) Start() {}
 

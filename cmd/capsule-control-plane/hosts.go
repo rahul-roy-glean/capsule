@@ -80,6 +80,7 @@ type HostRegistry struct {
 	mu            sync.RWMutex
 	logger        *logrus.Entry
 	allocFailures atomic.Int64
+	rateTracker   *AllocationRateTracker
 }
 
 func (hr *HostRegistry) RecordAllocFailure() {
@@ -90,13 +91,24 @@ func (hr *HostRegistry) DrainAllocFailures() int64 {
 	return hr.allocFailures.Swap(0)
 }
 
+// RecordAllocation records an allocation attempt (success or failure) for rate tracking.
+func (hr *HostRegistry) RecordAllocation(cpuMillicores int) {
+	hr.rateTracker.Record(cpuMillicores)
+}
+
+// GetAllocationRate returns the current allocation rate in mCPU/s.
+func (hr *HostRegistry) GetAllocationRate() float64 {
+	return hr.rateTracker.Rate()
+}
+
 // NewHostRegistry creates a new host registry
 func NewHostRegistry(db *sql.DB, logger *logrus.Logger) *HostRegistry {
 	return &HostRegistry{
-		db:      db,
-		hosts:   make(map[string]*Host),
-		runners: make(map[string]*Runner),
-		logger:  logger.WithField("component", "host-registry"),
+		db:          db,
+		hosts:       make(map[string]*Host),
+		runners:     make(map[string]*Runner),
+		logger:      logger.WithField("component", "host-registry"),
+		rateTracker: NewAllocationRateTracker(60*time.Second, 65536),
 	}
 }
 
@@ -364,17 +376,15 @@ func (hr *HostRegistry) releasePendingReservation(hostID string, cpu, mem int) {
 
 // AddRunner adds or updates a runner in the registry.
 // Uses upsert so that session-resumed runners (which reuse the same ID) don't
-// fail on duplicate key.
+// fail on duplicate key. The DB write runs outside the lock to avoid holding
+// mu during I/O.
 func (hr *HostRegistry) AddRunner(ctx context.Context, runner *Runner) error {
-	hr.mu.Lock()
-	defer hr.mu.Unlock()
-
-	var networkPolicy any
-	if runner.NetworkPolicyJSON != "" {
-		networkPolicy = runner.NetworkPolicyJSON
-	}
-
 	if hr.db != nil {
+		var networkPolicy any
+		if runner.NetworkPolicyJSON != "" {
+			networkPolicy = runner.NetworkPolicyJSON
+		}
+
 		_, err := hr.db.ExecContext(ctx, `
 			INSERT INTO runners (id, host_id, status, internal_ip, job_id, workload_key,
 				runner_ttl_seconds, auto_pause, network_policy_preset, network_policy)
@@ -396,7 +406,9 @@ func (hr *HostRegistry) AddRunner(ctx context.Context, runner *Runner) error {
 		}
 	}
 
+	hr.mu.Lock()
 	hr.runners[runner.ID] = runner
+	hr.mu.Unlock()
 	return nil
 }
 
@@ -412,11 +424,10 @@ func (hr *HostRegistry) GetRunner(runnerID string) (*Runner, error) {
 	return runner, nil
 }
 
-// RemoveRunner removes a runner from the registry
+// RemoveRunner removes a runner from the registry.
+// The DB delete runs outside the lock to avoid holding mu during I/O.
 func (hr *HostRegistry) RemoveRunner(runnerID string) error {
 	hr.mu.Lock()
-	defer hr.mu.Unlock()
-
 	runner := hr.runners[runnerID]
 	if runner != nil {
 		if host := hr.hosts[runner.HostID]; host != nil && hr.runnerReportedLocked(host, runnerID) {
@@ -430,6 +441,8 @@ func (hr *HostRegistry) RemoveRunner(runnerID string) error {
 			}
 		}
 	}
+	delete(hr.runners, runnerID)
+	hr.mu.Unlock()
 
 	if hr.db != nil {
 		_, err := hr.db.Exec(`DELETE FROM runners WHERE id = $1`, runnerID)
@@ -438,7 +451,6 @@ func (hr *HostRegistry) RemoveRunner(runnerID string) error {
 		}
 	}
 
-	delete(hr.runners, runnerID)
 	return nil
 }
 
@@ -464,20 +476,21 @@ func (hr *HostRegistry) RemoveHost(hostID string) {
 }
 
 // CleanupHostRunners deletes all runners for a host from both DB and in-memory map.
+// The DB delete runs outside the lock to avoid holding mu during I/O.
 func (hr *HostRegistry) CleanupHostRunners(ctx context.Context, hostID string) error {
 	hr.mu.Lock()
-	defer hr.mu.Unlock()
+	for id, r := range hr.runners {
+		if r.HostID == hostID {
+			delete(hr.runners, id)
+		}
+	}
+	hr.mu.Unlock()
 
 	_, err := hr.db.ExecContext(ctx, `DELETE FROM runners WHERE host_id = $1`, hostID)
 	if err != nil {
 		return fmt.Errorf("failed to delete runners for host %s: %w", hostID, err)
 	}
 
-	for id, r := range hr.runners {
-		if r.HostID == hostID {
-			delete(hr.runners, id)
-		}
-	}
 	return nil
 }
 

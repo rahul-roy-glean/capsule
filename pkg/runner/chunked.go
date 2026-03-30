@@ -1103,11 +1103,14 @@ func (cm *ChunkedManager) ReleaseRunnerChunked(ctx context.Context, runnerID str
 	if proxy != nil {
 		proxy.Stop()
 	}
-	if vm != nil {
-		vm.Stop()
-	}
+	// Stop UFFD handler BEFORE Firecracker — FC may be stuck in kernel page
+	// faults waiting for UFFDIO_COPY. Closing the handler unblocks those
+	// faults so SIGTERM can be delivered cleanly.
 	if handler != nil {
 		handler.Stop()
+	}
+	if vm != nil {
+		vm.Stop()
 	}
 	if fuseDisk != nil {
 		fuseDisk.Unmount()
@@ -1496,6 +1499,10 @@ func (cm *ChunkedManager) setupExtensionFUSEDiskForRunner(runnerID, driveID stri
 		return "", fmt.Errorf("failed to create FUSE ext mount dir for %s: %w", driveID, err)
 	}
 
+	// Clean any stale FUSE mount from a previous pause whose background
+	// cleanup hasn't completed yet (same runner ID → same path).
+	fuse.CleanStaleMounts(fuseMountDir)
+
 	fuseDisk, err := fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
 		ChunkStore: cm.chunkStore,
 		Chunks:     chunks,
@@ -1570,6 +1577,10 @@ func (cm *ChunkedManager) setupRootfsFUSEDiskForRunner(runnerID string, chunks [
 	if err := os.MkdirAll(fuseMountDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create FUSE rootfs mount dir: %w", err)
 	}
+
+	// Clean any stale FUSE mount from a previous pause whose background
+	// cleanup hasn't completed yet (same runner ID → same path).
+	fuse.CleanStaleMounts(fuseMountDir)
 
 	fuseDisk, err := fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
 		ChunkStore: cm.chunkStore,

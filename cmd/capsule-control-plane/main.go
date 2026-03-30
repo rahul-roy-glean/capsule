@@ -22,7 +22,6 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
@@ -951,13 +950,12 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Forward to host agent gRPC
-	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// Forward to host agent gRPC (reuse pooled connection)
+	conn, err := s.scheduler.getHostConn(host.GRPCAddress)
 	if err != nil {
 		http.Error(w, "failed to connect to host", http.StatusInternalServerError)
 		return
 	}
-	defer conn.Close()
 
 	client := pb.NewHostAgentClient(conn)
 	// Use a detached context with a generous timeout so the GCS upload

@@ -118,6 +118,15 @@ downscaler:
   maxDrains: 1
   heartbeatStale: 90s
 
+autoscaler:
+  scaleUpThreshold: "0.9"
+  scaleDownThreshold: "0.5"
+  cooldown: "5m"
+  bootCooldown: "3m"
+  rateWindow: "60s"
+  settlingThreshold: "0.2"
+  minHostAge: "10m"
+
 service:
   type: LoadBalancer
   annotations:

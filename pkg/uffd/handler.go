@@ -149,6 +149,12 @@ type Handler struct {
 	// when Firecracker connects.
 	prefetcher *Prefetcher
 
+	// Diff overlay (optional local file for session diff pages).
+	// When diffFD >= 0, dirty pages are served via pread from the local
+	// sparse diff file before falling through to ChunkStore for base pages.
+	diffFD     int      // file descriptor (-1 if no overlay)
+	diffBitmap []uint64 // bit-per-page bitmap built from DiffSegments
+
 	// Fault policy
 	consecutiveFailures    uint64 // atomic
 	killOnce               sync.Once
@@ -202,6 +208,14 @@ type HandlerConfig struct {
 	// 0 means derive from the ChunkStore's LRU size (50% of cache / chunk size),
 	// hard-capped at DefaultMaxPrefetchPages. Set explicitly to override.
 	MaxPrefetchPages int
+
+	// DiffOverlayPath is the path to a local sparse diff file.
+	// When set, dirty pages are served from this file (via pread)
+	// before falling through to ChunkStore for base pages.
+	DiffOverlayPath string
+	// DiffSegments lists the data regions in the diff file.
+	// Used to build a per-page bitmap for O(1) dirty check.
+	DiffSegments []snapshot.DiffSegment
 }
 
 // DefaultMaxPrefetchPages is the hard upper bound when MaxPrefetchPages is not
@@ -232,6 +246,7 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 		ctx:                    ctx,
 		cancel:                 cancel,
 		connected:              make(chan struct{}),
+		diffFD:                 -1,
 		onFatal:                cfg.OnFatal,
 		faultTimeout:           faultTimeout,
 		maxConsecutiveFailures: maxConsecutiveFailures,
@@ -276,6 +291,41 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 
 	// Chunk lookup is built after receiving memory mappings from Firecracker
 	// in handleConnection(), not here.
+
+	// Initialize diff overlay if configured.
+	if cfg.DiffOverlayPath != "" {
+		fd, err := unix.Open(cfg.DiffOverlayPath, unix.O_RDONLY, 0)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("failed to open diff overlay %s: %w", cfg.DiffOverlayPath, err)
+		}
+		h.diffFD = fd
+
+		// Build a per-page bitmap from DiffSegments for O(1) dirty checks.
+		if len(cfg.DiffSegments) > 0 {
+			var maxPage uint64
+			for _, seg := range cfg.DiffSegments {
+				endPage := uint64(seg.Offset+seg.Length-1) / PageSize
+				if endPage > maxPage {
+					maxPage = endPage
+				}
+			}
+			numWords := (maxPage + 64) / 64
+			h.diffBitmap = make([]uint64, numWords)
+			for _, seg := range cfg.DiffSegments {
+				firstPage := uint64(seg.Offset) / PageSize
+				lastPage := uint64(seg.Offset+seg.Length-1) / PageSize
+				for p := firstPage; p <= lastPage; p++ {
+					h.diffBitmap[p/64] |= 1 << (p % 64)
+				}
+			}
+			h.logger.WithFields(logrus.Fields{
+				"diff_fd":      fd,
+				"segments":     len(cfg.DiffSegments),
+				"bitmap_words": len(h.diffBitmap),
+			}).Info("Diff overlay initialized")
+		}
+	}
 
 	return h, nil
 }
@@ -612,6 +662,42 @@ func (h *Handler) handleSingleFault(uffdFd int, address uint64) error {
 	// Queue eager fetch for upcoming chunks (async, non-blocking)
 	h.queueEagerFetch(offset)
 
+	// Fast path: serve from local diff overlay if page is dirty.
+	// Local pread is ~microseconds vs ChunkStore GCS fetch ~milliseconds.
+	if h.diffFD >= 0 {
+		pageIdx := offset / PageSize
+		wordIdx := pageIdx / 64
+		bitIdx := pageIdx % 64
+		if wordIdx < uint64(len(h.diffBitmap)) && h.diffBitmap[wordIdx]&(1<<bitIdx) != 0 {
+			page := make([]byte, PageSize)
+			n, _ := unix.Pread(h.diffFD, page, int64(offset))
+			if n == PageSize {
+				// Bitmap says this page is dirty — serve it unconditionally.
+				// Even if it's all zeros, that means the VM wrote zeros here
+				// (the bitmap was built from SEEK_DATA/SEEK_HOLE, so sparse
+				// holes are NOT in the bitmap).
+				if h.prefetchTracker != nil {
+					h.prefetchTracker.Add(int64(offset))
+				}
+				cp := uffdioCopy{
+					Dst:  pageAddr,
+					Src:  uint64(uintptr(unsafe.Pointer(&page[0]))),
+					Len:  PageSize,
+					Mode: 0,
+				}
+				_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(uffdFd), UFFDIO_COPY, uintptr(unsafe.Pointer(&cp)))
+				if errno != 0 && errno != unix.EEXIST {
+					return fmt.Errorf("UFFDIO_COPY (diff overlay) failed: %w", errno)
+				}
+				if h.faultServiceHist != nil {
+					h.faultServiceHist.Record(context.Background(), time.Since(faultStart).Seconds())
+				}
+				return nil
+			}
+			// Short read → fall through to base ChunkStore
+		}
+	}
+
 	// Fast path: use UFFDIO_ZEROPAGE for zero/missing chunks.
 	// This is faster than UFFDIO_COPY because the kernel maps a shared zero
 	// page without copying any data.
@@ -752,14 +838,24 @@ func (h *Handler) getPageData(ctx context.Context, offset uint64) ([]byte, error
 
 // Stop stops the UFFD handler and any associated prefetcher.
 func (h *Handler) Stop() {
+	stopStart := time.Now()
 	h.cancel()
 	if h.listener != nil {
 		h.listener.Close()
 	}
+	h.logger.Debug("Handler.Stop: waiting for goroutines")
 	h.wg.Wait()
+	h.logger.WithField("wg_wait_ms", time.Since(stopStart).Milliseconds()).Debug("Handler.Stop: goroutines finished")
 	if h.prefetcher != nil {
+		pfStart := time.Now()
 		h.prefetcher.Stop()
+		h.logger.WithField("prefetcher_stop_ms", time.Since(pfStart).Milliseconds()).Debug("Handler.Stop: prefetcher stopped")
 	}
+	if h.diffFD >= 0 {
+		unix.Close(h.diffFD)
+		h.diffFD = -1
+	}
+	h.logger.WithField("total_stop_ms", time.Since(stopStart).Milliseconds()).Debug("Handler.Stop: complete")
 }
 
 // GetPrefetchMapping stops the prefetch tracker and returns the recorded
