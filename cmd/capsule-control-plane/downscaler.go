@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -27,6 +28,9 @@ type downscalerConfig struct {
 	ScaleDownThreshold   float64
 	Cooldown             time.Duration
 	BootCooldown         time.Duration // cooldown after demand-driven scale-up (host boot time)
+	RateWindow           time.Duration // sliding window for allocation rate tracking
+	SettlingThreshold    float64       // min utilization before host counts for scale-down
+	MinHostAge           time.Duration // minimum age before a host can be drained
 }
 
 func loadDownscalerConfig(logger *logrus.Entry) downscalerConfig {
@@ -100,6 +104,27 @@ func loadDownscalerConfig(logger *logrus.Entry) downscalerConfig {
 		}
 	}
 
+	rateWindow := 60 * time.Second
+	if raw := strings.TrimSpace(os.Getenv("AUTOSCALER_RATE_WINDOW")); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			rateWindow = d
+		}
+	}
+
+	settlingThresholdVal := 0.2
+	if raw := strings.TrimSpace(os.Getenv("AUTOSCALER_SETTLING_THRESHOLD")); raw != "" {
+		if v, err := strconv.ParseFloat(raw, 64); err == nil && v >= 0 && v <= 1 {
+			settlingThresholdVal = v
+		}
+	}
+
+	minHostAge := 10 * time.Minute
+	if raw := strings.TrimSpace(os.Getenv("AUTOSCALER_MIN_HOST_AGE")); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d >= 0 {
+			minHostAge = d
+		}
+	}
+
 	return downscalerConfig{
 		Enabled:              enabled,
 		ProjectID:            projectID,
@@ -113,6 +138,9 @@ func loadDownscalerConfig(logger *logrus.Entry) downscalerConfig {
 		ScaleDownThreshold:   scaleDownThreshold,
 		Cooldown:             cooldown,
 		BootCooldown:         bootCooldown,
+		RateWindow:           rateWindow,
+		SettlingThreshold:    settlingThresholdVal,
+		MinHostAge:           minHostAge,
 	}
 }
 
@@ -204,6 +232,7 @@ type hostStore interface {
 	CleanupHostRunners(ctx context.Context, hostID string) error
 	RemoveHost(hostID string)
 	DrainAllocFailures() int64
+	GetAllocationRate() float64
 }
 
 // gcpMIGClient wraps a real GCP compute.Service for production use.
@@ -367,6 +396,22 @@ func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, mc migClient, h
 	}
 
 	allocFailures := hs.DrainAllocFailures()
+	allocationRate := hs.GetAllocationRate()
+
+	// Compute remaining capacity and average capacity per host.
+	var remainingCapacity int
+	var totalCapacity int
+	for _, h := range readyHosts {
+		spare := h.TotalCPUMillicores - h.UsedCPUMillicores
+		if spare > 0 {
+			remainingCapacity += spare
+		}
+		totalCapacity += h.TotalCPUMillicores
+	}
+	var avgCapacityPerHost int
+	if len(readyHosts) > 0 {
+		avgCapacityPerHost = totalCapacity / len(readyHosts)
+	}
 
 	// Demand-driven scale-up uses a shorter boot cooldown to give the new
 	// host time to start and register before we scale up again.
@@ -387,17 +432,33 @@ func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, mc migClient, h
 		}
 	}
 
-	decision := computeAutoscaleDecision(readyHosts, cfg.ScaleUpThreshold, cfg.ScaleDownThreshold, allocFailures)
+	decision := computeAutoscaleDecision(autoscaleInput{
+		readyHosts:         readyHosts,
+		scaleUpThreshold:   cfg.ScaleUpThreshold,
+		scaleDownThreshold: cfg.ScaleDownThreshold,
+		settlingThreshold:  cfg.SettlingThreshold,
+		minHostAge:         cfg.MinHostAge,
+		allocFailures:      allocFailures,
+		allocationRateCPU:  allocationRate,
+		remainingCapacity:  remainingCapacity,
+		bootCooldown:       cfg.BootCooldown,
+		avgCapacityPerHost: avgCapacityPerHost,
+	})
 
 	switch decision.action {
 	case scaleActionUp:
-		newTarget := currentTarget + 1
+		scaleBy := decision.scaleUpBy
+		if scaleBy < 1 {
+			scaleBy = 1
+		}
+		newTarget := currentTarget + int64(scaleBy)
 		if err := mc.Resize(ctx, newTarget); err != nil {
 			return false, fmt.Errorf("scale-up resize to %d: %w", newTarget, err)
 		}
 		log.WithFields(logrus.Fields{
 			"old_target": currentTarget,
 			"new_target": newTarget,
+			"scale_by":   scaleBy,
 			"reason":     decision.reason,
 		}).Info("Scaled up MIG")
 		return true, nil
@@ -428,26 +489,57 @@ const (
 
 type autoscaleDecision struct {
 	action      scaleAction
+	scaleUpBy   int   // hosts to add (default 1, rate-based can be >1)
 	drainTarget *Host // set when action == scaleActionDown
 	reason      string
 }
 
-// settlingThreshold is the minimum utilization (20%) a host must reach before
-// it counts toward the scale-down min(Xi) calculation. Hosts below this are
-// still filling up with runners and would drag down min(Xi) prematurely.
-const settlingThreshold = 0.2
+type autoscaleInput struct {
+	readyHosts         []*Host
+	scaleUpThreshold   float64
+	scaleDownThreshold float64
+	settlingThreshold  float64
+	minHostAge         time.Duration
+	allocFailures      int64
+	allocationRateCPU  float64       // mCPU/s from rate tracker
+	remainingCapacity  int           // total spare CPU mCPU across ready hosts
+	bootCooldown       time.Duration // used for time-to-exhaustion calculation
+	avgCapacityPerHost int           // average totalCPU per host
+}
 
 // computeAutoscaleDecision is the pure decision logic for scale-up / scale-down.
-// It examines ready hosts' CPU utilization to decide what to do.
-func computeAutoscaleDecision(readyHosts []*Host, scaleUpThreshold, scaleDownThreshold float64, allocFailures int64) autoscaleDecision {
-	// Demand-driven: allocation failures since last check
-	if allocFailures > 0 {
-		return autoscaleDecision{action: scaleActionUp, reason: fmt.Sprintf("%d allocation failures since last check", allocFailures)}
+// Priority: alloc failures > no ready hosts > rate-based > utilization-based > scale-down.
+func computeAutoscaleDecision(input autoscaleInput) autoscaleDecision {
+	// 1. Demand-driven: allocation failures since last check
+	if input.allocFailures > 0 {
+		return autoscaleDecision{action: scaleActionUp, scaleUpBy: 1, reason: fmt.Sprintf("%d allocation failures since last check", input.allocFailures)}
 	}
 
-	// Zero capacity: no ready hosts at all
-	if len(readyHosts) == 0 {
-		return autoscaleDecision{action: scaleActionUp, reason: "no ready hosts available"}
+	// 2. Zero capacity: no ready hosts at all
+	if len(input.readyHosts) == 0 {
+		return autoscaleDecision{action: scaleActionUp, scaleUpBy: 1, reason: "no ready hosts available"}
+	}
+
+	// 3. Rate-based: predict capacity exhaustion
+	// Only engage when average utilization is already meaningful — avoids
+	// over-scaling for small tiers (e.g. XS) that barely dent host capacity.
+	if input.allocationRateCPU > 0 && input.remainingCapacity > 0 && input.avgCapacityPerHost > 0 {
+		avgUtil := 1.0 - float64(input.remainingCapacity)/float64(len(input.readyHosts)*input.avgCapacityPerHost)
+		if avgUtil >= input.settlingThreshold {
+			timeToExhaustion := float64(input.remainingCapacity) / input.allocationRateCPU
+			if timeToExhaustion < input.bootCooldown.Seconds() {
+				deficit := input.allocationRateCPU*input.bootCooldown.Seconds() - float64(input.remainingCapacity)
+				hostsNeeded := int(math.Ceil(deficit / float64(input.avgCapacityPerHost)))
+				if hostsNeeded < 1 {
+					hostsNeeded = 1
+				}
+				return autoscaleDecision{
+					action:    scaleActionUp,
+					scaleUpBy: hostsNeeded,
+					reason:    fmt.Sprintf("rate-based: %.1f mCPU/s, TTE=%.0fs < boot %s, util=%.0f%%, need %d hosts", input.allocationRateCPU, timeToExhaustion, input.bootCooldown, avgUtil*100, hostsNeeded),
+				}
+			}
+		}
 	}
 
 	type hostUtil struct {
@@ -455,15 +547,15 @@ func computeAutoscaleDecision(readyHosts []*Host, scaleUpThreshold, scaleDownThr
 		xi   float64
 	}
 
-	utils := make([]hostUtil, len(readyHosts))
-	for i, h := range readyHosts {
+	utils := make([]hostUtil, len(input.readyHosts))
+	for i, h := range input.readyHosts {
 		utils[i] = hostUtil{
 			host: h,
 			xi:   float64(h.UsedCPUMillicores) / float64(h.TotalCPUMillicores),
 		}
 	}
 
-	// --- Scale up ---
+	// 4. Utilization-based scale up: min(Xi) > threshold
 	if len(utils) > 0 {
 		minXi := utils[0].xi
 		for _, u := range utils[1:] {
@@ -471,29 +563,27 @@ func computeAutoscaleDecision(readyHosts []*Host, scaleUpThreshold, scaleDownThr
 				minXi = u.xi
 			}
 		}
-		if minXi > scaleUpThreshold {
-			return autoscaleDecision{action: scaleActionUp, reason: fmt.Sprintf("min utilization %.2f > threshold %.2f", minXi, scaleUpThreshold)}
+		if minXi > input.scaleUpThreshold {
+			return autoscaleDecision{action: scaleActionUp, scaleUpBy: 1, reason: fmt.Sprintf("min utilization %.2f > threshold %.2f", minXi, input.scaleUpThreshold)}
 		}
 	}
 
 	// --- Scale down ---
-	if len(readyHosts) <= 1 {
+	if len(input.readyHosts) <= 1 {
 		return autoscaleDecision{action: scaleActionNone, reason: "too few hosts to scale down"}
 	}
 
 	// Separate hosts into "settled" (reached settlingThreshold) and
-	// "warming" (still filling up with runners). Only settled hosts
-	// participate in the min(Xi) check so that newly-added hosts
-	// don't cause premature scale-down.
+	// "warming" (still filling up with runners).
 	var settled []hostUtil
 	for _, u := range utils {
-		if u.xi >= settlingThreshold {
+		if u.xi >= input.settlingThreshold {
 			settled = append(settled, u)
 		}
 	}
 
 	// If no host has reached the settling threshold, all are genuinely
-	// underutilized — use all hosts for the decision (don't block scale-down).
+	// underutilized — use all hosts for the decision.
 	candidates := settled
 	if len(candidates) == 0 {
 		candidates = utils
@@ -506,22 +596,34 @@ func computeAutoscaleDecision(readyHosts []*Host, scaleUpThreshold, scaleDownThr
 		}
 	}
 
-	if minXi >= scaleDownThreshold {
+	if minXi >= input.scaleDownThreshold {
 		return autoscaleDecision{action: scaleActionNone, reason: "utilization above scale-down threshold"}
 	}
 
-	// Pick the newest host with the lowest Xi as drain victim.
-	sort.Slice(utils, func(i, j int) bool {
-		if !utils[i].host.CreatedAt.Equal(utils[j].host.CreatedAt) {
-			return utils[i].host.CreatedAt.After(utils[j].host.CreatedAt)
+	// Filter hosts younger than MinHostAge from drain candidates.
+	var eligible []hostUtil
+	for _, u := range utils {
+		if time.Since(u.host.CreatedAt) >= input.minHostAge {
+			eligible = append(eligible, u)
 		}
-		return utils[i].xi < utils[j].xi
+	}
+	if len(eligible) == 0 {
+		return autoscaleDecision{action: scaleActionNone, reason: "all hosts too young for drain"}
+	}
+
+	// Pick the newest eligible host with the lowest Xi as drain victim.
+	sort.Slice(eligible, func(i, j int) bool {
+		if !eligible[i].host.CreatedAt.Equal(eligible[j].host.CreatedAt) {
+			return eligible[i].host.CreatedAt.After(eligible[j].host.CreatedAt)
+		}
+		return eligible[i].xi < eligible[j].xi
 	})
 
 	return autoscaleDecision{
 		action:      scaleActionDown,
-		drainTarget: utils[0].host,
-		reason:      fmt.Sprintf("min utilization %.2f < threshold %.2f", minXi, scaleDownThreshold),
+		scaleUpBy:   0,
+		drainTarget: eligible[0].host,
+		reason:      fmt.Sprintf("min utilization %.2f < threshold %.2f", minXi, input.scaleDownThreshold),
 	}
 }
 

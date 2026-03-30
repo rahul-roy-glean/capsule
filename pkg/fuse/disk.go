@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -142,10 +143,26 @@ func (d *ChunkedDisk) Mount() error {
 func (d *ChunkedDisk) Unmount() error {
 	d.cancel()
 	if d.conn != nil {
-		fuse.Unmount(d.mountPoint)
+		// Close the FUSE connection first — this immediately interrupts all
+		// pending FUSE operations by closing /dev/fuse, which is faster than
+		// fusermount -u (which asks the kernel to drain pending ops first).
 		d.conn.Close()
+		if err := fuse.Unmount(d.mountPoint); err != nil {
+			// fusermount -u failed (e.g. race with kernel cleanup). Fall back
+			// to lazy unmount so the mount point is freed for the next resume
+			// (same runner ID → same path).
+			exec.Command("umount", "-l", d.mountPoint).Run()
+		}
 	}
 	return nil
+}
+
+// CleanStaleMounts force-unmounts any existing FUSE mount at the given path.
+// Called before creating a new FUSE mount to handle the case where a previous
+// pause's background FUSE cleanup hasn't completed yet (same runner ID → same path).
+// No-op if nothing is mounted at the path (umount -l fails fast).
+func CleanStaleMounts(mountPoint string) {
+	exec.Command("umount", "-l", mountPoint).Run()
 }
 
 // DiskImagePath returns the path to the virtual disk image file

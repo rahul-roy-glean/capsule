@@ -618,12 +618,14 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 
 	if !anyAvailable {
 		s.hostRegistry.RecordAllocFailure()
+		s.hostRegistry.RecordAllocation(effectiveCPU)
 		failureReason = "no_available_hosts"
 		retErr = fmt.Errorf("no available hosts")
 		return nil, retErr
 	}
 	if len(candidates) == 0 {
 		s.hostRegistry.RecordAllocFailure()
+		s.hostRegistry.RecordAllocation(effectiveCPU)
 		failureReason = "insufficient_capacity"
 		retErr = fmt.Errorf("no host with sufficient capacity for tier %s (need %d CPU, %d MB memory)", tierName, effectiveCPU, effectiveMemoryMB)
 		return nil, retErr
@@ -910,6 +912,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			}
 		}
 		s.hostRegistry.releasePendingReservation(h.ID, effectiveCPU, effectiveMemoryMB)
+		s.hostRegistry.RecordAllocation(effectiveCPU)
 		selectionReason := "best_fit"
 		if stickySelected && h.ID == sessionHostID {
 			selectionReason = "sticky_same_host"
@@ -943,6 +946,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// demand-driven scale-up path sees the signal, not just pre-scan capacity
 	// shortages.
 	s.hostRegistry.RecordAllocFailure()
+	s.hostRegistry.RecordAllocation(effectiveCPU)
 	failureReason = "no_suitable_host_after_attempts"
 	if lastErr != nil {
 		retErr = lastErr
@@ -1079,18 +1083,26 @@ func (s *Scheduler) ReleaseRunner(ctx context.Context, runnerID string, destroy 
 		return nil
 	}
 
-	// Connect to host and release
+	// Connect to host and release. Use a bounded context so a hung host agent
+	// doesn't block the release for the full HTTP request timeout.
 	conn, err := s.getHostConn(host.GRPCAddress)
 	if err != nil {
 		return err
 	}
 
+	releaseCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
 	client := pb.NewHostAgentClient(conn)
-	resp, err := client.ReleaseRunner(ctx, &pb.ReleaseRunnerRequest{
+	resp, err := client.ReleaseRunner(releaseCtx, &pb.ReleaseRunnerRequest{
 		RunnerId: runnerID,
 		Destroy:  destroy,
 	})
 	if err != nil {
+		// If the host agent is unreachable or timed out, still clean up
+		// our own registry so the runner doesn't leak in-memory state.
+		s.logger.WithError(err).WithField("runner_id", runnerID).Warn("Host agent ReleaseRunner failed, cleaning up registry")
+		_ = s.hostRegistry.RemoveRunner(runnerID)
 		return fmt.Errorf("host agent ReleaseRunner failed: %w", err)
 	}
 	// If the host agent says the runner is already gone, that's fine —

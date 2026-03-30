@@ -6,8 +6,6 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	pb "github.com/rahul-roy-glean/capsule/api/proto/runner"
 )
@@ -118,7 +116,7 @@ func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
 			"host_id":   c.hostID,
 		}).Info("TTL expired, auto-pausing runner")
 
-		conn, err := grpc.NewClient(c.grpcAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := s.scheduler.getHostConn(c.grpcAddress)
 		if err != nil {
 			s.logger.WithError(err).WithField("runner_id", c.runnerID).Warn("TTL enforcement: failed to connect to host")
 			continue
@@ -126,7 +124,6 @@ func (s *ControlPlaneServer) enforceTTLs(ctx context.Context) {
 
 		client := pb.NewHostAgentClient(conn)
 		resp, err := client.PauseRunner(ctx, &pb.PauseRunnerRequest{RunnerId: c.runnerID})
-		conn.Close()
 		if err != nil {
 			s.logger.WithError(err).WithField("runner_id", c.runnerID).Warn("TTL enforcement: pause RPC failed")
 			continue

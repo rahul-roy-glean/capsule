@@ -210,11 +210,10 @@ func (m *mcpDeps) handlePause(ctx context.Context, _ *mcp.CallToolRequest, in Pa
 		return nil, PauseSandboxOutput{}, fmt.Errorf("host not found: %w", err)
 	}
 
-	conn, err := grpc.NewClient(host.GRPCAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := m.scheduler.getHostConn(host.GRPCAddress)
 	if err != nil {
 		return nil, PauseSandboxOutput{}, fmt.Errorf("connect to host: %w", err)
 	}
-	defer conn.Close()
 
 	client := pb.NewHostAgentClient(conn)
 	resp, err := client.PauseRunner(ctx, &pb.PauseRunnerRequest{RunnerId: in.SandboxID})

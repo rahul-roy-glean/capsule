@@ -68,6 +68,11 @@ type Runner struct {
 
 	PausedAt time.Time `json:"paused_at,omitempty"`
 
+	// DiffOverlayPath tracks the local sparse diff file from the most recent
+	// resume. Used during the next pause to merge with new dirty pages
+	// (multi-pause chain). Set during ResumeFromSession, consumed by PauseRunner.
+	DiffOverlayPath string `json:"diff_overlay_path,omitempty"`
+
 	// Session pause/resume fields
 	SessionID     string    `json:"session_id,omitempty"`
 	TTLSeconds    int       `json:"ttl_seconds,omitempty"`

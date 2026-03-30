@@ -475,9 +475,17 @@ func (c *Client) stopFirecrackerLocked() error {
 
 	c.logger.Info("Stopping Firecracker process")
 
-	// Try graceful shutdown first
-	if err := c.process.Process.Signal(syscall.SIGTERM); err != nil {
-		c.logger.WithError(err).Warn("Failed to send SIGTERM")
+	// Send SIGTERM to the entire process group. Firecracker is launched via
+	// "unshare --mount sh -c 'exec ... firecracker'", so c.process.Process
+	// is the unshare PID. A plain Signal(SIGTERM) only reaches unshare, not
+	// the firecracker child. Signaling the negative PID targets the whole
+	// process group so firecracker receives the signal.
+	pgid := c.process.Process.Pid
+	if err := syscall.Kill(-pgid, syscall.SIGTERM); err != nil {
+		// Fallback to direct signal if process group kill fails
+		if err2 := c.process.Process.Signal(syscall.SIGTERM); err2 != nil {
+			c.logger.WithError(err2).Warn("Failed to send SIGTERM")
+		}
 	}
 
 	// Wait briefly for graceful shutdown. The procExited channel is closed by
@@ -486,9 +494,10 @@ func (c *Client) stopFirecrackerLocked() error {
 	case <-c.procExited:
 		// Process exited
 	case <-time.After(5 * time.Second):
-		// Force kill
+		// Force kill the entire process group
 		c.logger.Warn("Forcing kill of Firecracker process")
-		c.process.Process.Kill()
+		syscall.Kill(-pgid, syscall.SIGKILL)
+		c.process.Process.Kill() // fallback
 		<-c.procExited
 	}
 

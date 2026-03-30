@@ -111,8 +111,9 @@ class BuildResponse(CapsuleModel):
 
     config_id: str
     status: str | None = None
-    force: str | None = None
-    clean: str | None = None
+    force: bool | None = None
+    clean: bool | None = None
+    enqueued: int | None = None
 
 
 class RefreshResponse(CapsuleModel):

@@ -185,7 +185,11 @@ class Runners:
         body: dict[str, Any] = {"runner_id": runner_id}
         if sync_fs:
             body["sync_fs"] = True
-        data = self._http.post("/api/v1/runners/pause", json_body=body)
+        data = self._http.post(
+            "/api/v1/runners/pause",
+            json_body=body,
+            timeout=self._http.operation_timeout,
+        )
         return PauseResult.model_validate(data)
 
     def quarantine(

@@ -10,11 +10,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
 	"github.com/rahul-roy-glean/capsule/pkg/firecracker"
@@ -176,6 +178,20 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 	layerN := runner.SessionLayers
 	runner.mu.Unlock()
 
+	// Acquire pause semaphore to limit concurrent GCS operations.
+	select {
+	case m.pauseSem <- struct{}{}:
+	case <-ctx.Done():
+		runner.mu.Lock()
+		runner.State = prePauseState
+		runner.mu.Unlock()
+		return nil, ctx.Err()
+	}
+	// NOTE: pauseSem is released explicitly after GCS uploads complete,
+	// NOT via defer. The post-upload teardown (vm.Stop, handler.Stop,
+	// FUSE cleanup, namespace release) can take seconds and must not
+	// hold the semaphore — otherwise it serializes all pauses.
+
 	m.logger.WithFields(logrus.Fields{
 		"runner_id":  runnerID,
 		"session_id": sessionID,
@@ -185,6 +201,7 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 	// Create session layer directory
 	layerDir := filepath.Join(m.sessionBaseDir(), sessionID, fmt.Sprintf("layer_%d", layerN))
 	if err := os.MkdirAll(layerDir, 0755); err != nil {
+		<-m.pauseSem
 		m.mu.Lock()
 		runner.State = prePauseState
 		m.mu.Unlock()
@@ -222,6 +239,7 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 	// Create diff snapshot (pauses VM internally)
 	diffStart := time.Now()
 	if err := vm.CreateDiffSnapshot(ctx, stateFile, memDiffFile); err != nil {
+		<-m.pauseSem
 		m.mu.Lock()
 		runner.State = prePauseState
 		m.mu.Unlock()
@@ -284,14 +302,8 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 		uploader := snapshot.NewSessionChunkUploader(m.sessionMemStore, m.sessionDiskStore, m.logger.Logger)
 
 		// Load the base ChunkIndex for memory.
-		// Priority:
-		//   1. Previous session's GCS ChunkIndex (multi-pause chain)
-		//   2. Golden CI snapshot metadata converted to ChunkIndex
-		//   3. Empty base (all dirty pages treated as new)
 		var baseMemIndex *snapshot.ChunkIndex
 		if prevGCSMemIndex != "" {
-			// We have a previous session index — download it as the base so
-			// non-dirty chunks carry forward without re-upload.
 			prevIdx, dlErr := uploader.DownloadChunkIndex(ctx, prevGCSMemIndex)
 			if dlErr != nil {
 				m.logger.WithError(dlErr).Warn("Failed to download previous session ChunkIndex; falling back to golden base")
@@ -303,7 +315,6 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 			baseMemIndex = snapshot.ChunkIndexFromMeta(goldenMeta)
 		}
 		if baseMemIndex == nil {
-			// Fallback: empty base — all dirty pages treated as new.
 			baseMemIndex = &snapshot.ChunkIndex{
 				Version:        "1",
 				CreatedAt:      time.Now(),
@@ -318,207 +329,206 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 			baseMemIndex.Region.DefaultFill = "zero"
 		}
 
-		mergeStart := time.Now()
-		newMemIndex, err := uploader.MergeAndUploadMem(ctx, memDiffFile, baseMemIndex)
-		mergeDuration := time.Since(mergeStart)
-		if err != nil {
-			// In chunked mode, local-only fallback won't work (no rootfs.img or
-			// snapshot.mem on disk), so a GCS upload failure is fatal for the pause.
-			m.mu.Lock()
-			runner.State = prePauseState
-			m.mu.Unlock()
-			return nil, fmt.Errorf("failed to upload session memory chunks to GCS: %w", err)
-		} else {
-			m.logger.WithField("merge_upload_ms", mergeDuration.Milliseconds()).Info("Pause: MergeAndUploadMem complete")
+		// Parallel phase: merge+upload mem chunks, upload VM state, and upload
+		// dirty disk chunks concurrently.
+		var newMemIndex *snapshot.ChunkIndex
+		newExtDiskIndexes := map[string]*snapshot.ChunkIndex{}
+		var newRootfsDiskIndex *snapshot.ChunkIndex
+		var extDiskMu sync.Mutex
+		vmStateGCSPath := uploader.FullGCSPath(gcsBase + "/snapshot.state")
+
+		uploadStart := time.Now()
+		g, gCtx := errgroup.WithContext(ctx)
+
+		// Merge and upload memory chunks.
+		g.Go(func() error {
+			idx, err := uploader.MergeAndUploadMem(gCtx, memDiffFile, baseMemIndex)
+			if err != nil {
+				return fmt.Errorf("failed to upload session memory chunks to GCS: %w", err)
+			}
 			// Attach prefetch mapping from UFFD handler if available.
 			if handler, ok := m.uffdHandlers[runnerID].(*uffd.Handler); ok {
 				if pm := handler.GetPrefetchMapping(); pm != nil {
-					newMemIndex.PrefetchMapping = pm
+					idx.PrefetchMapping = pm
 					m.logger.WithField("offsets", len(pm.Offsets)).Info("Attached prefetch mapping to ChunkIndex")
 				}
 			}
+			newMemIndex = idx
+			return nil
+		})
 
-			vmStateGCSPath := uploader.FullGCSPath(gcsBase + "/snapshot.state")
+		// Upload VM state.
+		g.Go(func() error {
+			return uploader.UploadVMState(gCtx, stateFile, vmStateGCSPath)
+		})
 
-			if uploadErr := uploader.UploadVMState(ctx, stateFile, vmStateGCSPath); uploadErr != nil {
-				// In chunked mode, local-only fallback won't work — fail the pause.
-				m.mu.Lock()
-				runner.State = prePauseState
-				m.mu.Unlock()
-				return nil, fmt.Errorf("failed to upload VM state to GCS: %w", uploadErr)
-			} else {
-				// Upload dirty FUSE extension disk chunks if available (per-drive).
-				newExtDiskIndexes := map[string]*snapshot.ChunkIndex{}
-				if m.getDirtyExtensionDiskChunks != nil && m.sessionDiskStore != nil {
-					allDirty := m.getDirtyExtensionDiskChunks(runnerID)
-					for driveID, dirtyChunks := range allDirty {
-						if len(dirtyChunks) == 0 {
-							continue
-						}
-						// Chain: use previous session's ChunkIndex as base when available,
-						// falling back to the extension drive's chunks from the golden metadata.
-						var baseDiskIndex *snapshot.ChunkIndex
-						if prevGCSDiskIndexObjects != nil {
-							if prevPath := prevGCSDiskIndexObjects[driveID]; prevPath != "" {
-								prevIdx, dlErr := uploader.DownloadChunkIndex(ctx, prevPath)
-								if dlErr != nil {
-									m.logger.WithError(dlErr).Warnf("Failed to download previous disk index for drive %s; falling back to golden base", driveID)
-								} else {
-									baseDiskIndex = prevIdx
-								}
+		// Upload dirty extension disk chunks (one goroutine per dirty drive).
+		if m.getDirtyExtensionDiskChunks != nil && m.sessionDiskStore != nil {
+			allDirty := m.getDirtyExtensionDiskChunks(runnerID)
+			for driveID, dirtyChunks := range allDirty {
+				if len(dirtyChunks) == 0 {
+					continue
+				}
+				did := driveID
+				dc := dirtyChunks
+				g.Go(func() error {
+					var baseDiskIndex *snapshot.ChunkIndex
+					if prevGCSDiskIndexObjects != nil {
+						if prevPath := prevGCSDiskIndexObjects[did]; prevPath != "" {
+							prevIdx, dlErr := uploader.DownloadChunkIndex(gCtx, prevPath)
+							if dlErr == nil {
+								baseDiskIndex = prevIdx
 							}
 						}
-						if baseDiskIndex == nil {
-							baseDiskIndex = buildExtensionDriveBaseIndex(goldenMeta, driveID)
-						}
-						diskIdx, diskErr := uploader.MergeAndUploadDisk(ctx, dirtyChunks, baseDiskIndex)
-						if diskErr != nil {
-							m.logger.WithError(diskErr).Warnf("GCS disk chunk upload failed for drive %s; drive not included in session", driveID)
-						} else {
-							newExtDiskIndexes[driveID] = diskIdx
-						}
 					}
-				}
-
-				// Include non-dirty extension drives from golden metadata so the
-				// manifest is self-contained. The snapshot state references these
-				// drives, so resume needs their ChunkIndex to create FUSE disks.
-				// No chunk upload needed — just carry forward the golden index.
-				if goldenMeta != nil {
-					for driveID, extDrive := range goldenMeta.ExtensionDrives {
-						if _, already := newExtDiskIndexes[driveID]; already {
-							continue
-						}
-						if len(extDrive.Chunks) == 0 {
-							continue
-						}
-						newExtDiskIndexes[driveID] = buildExtensionDriveBaseIndex(goldenMeta, driveID)
+					if baseDiskIndex == nil {
+						baseDiskIndex = buildExtensionDriveBaseIndex(goldenMeta, did)
 					}
-				}
-
-				// Upload dirty FUSE rootfs disk chunks if available.
-				var newRootfsDiskIndex *snapshot.ChunkIndex
-				if m.getDirtyRootfsDiskChunks != nil && m.sessionDiskStore != nil {
-					dirtyRootfs := m.getDirtyRootfsDiskChunks(runnerID)
-					if len(dirtyRootfs) > 0 {
-						var baseRootfsIndex *snapshot.ChunkIndex
-						if prevGCSDiskIndexObjects != nil {
-							if prevPath := prevGCSDiskIndexObjects["__rootfs__"]; prevPath != "" {
-								prevIdx, dlErr := uploader.DownloadChunkIndex(ctx, prevPath)
-								if dlErr != nil {
-									m.logger.WithError(dlErr).Warn("Failed to download previous rootfs disk index; falling back to golden base")
-								} else {
-									baseRootfsIndex = prevIdx
-								}
-							}
-						}
-						if baseRootfsIndex == nil {
-							baseRootfsIndex = buildRootfsDriveBaseIndex(goldenMeta)
-						}
-						rootfsIdx, rootfsErr := uploader.MergeAndUploadDisk(ctx, dirtyRootfs, baseRootfsIndex)
-						if rootfsErr != nil {
-							m.logger.WithError(rootfsErr).Warn("GCS rootfs disk chunk upload failed; rootfs not included in session")
-						} else {
-							newRootfsDiskIndex = rootfsIdx
-						}
+					diskIdx, diskErr := uploader.MergeAndUploadDisk(gCtx, dc, baseDiskIndex)
+					if diskErr != nil {
+						m.logger.WithError(diskErr).Warnf("GCS disk chunk upload failed for drive %s", did)
+						return nil
 					}
-				}
+					extDiskMu.Lock()
+					newExtDiskIndexes[did] = diskIdx
+					extDiskMu.Unlock()
+					return nil
+				})
+			}
+		}
 
-				// Always include rootfs in GCS manifest for cross-host resume.
-				// If no dirty chunks were uploaded, carry forward the golden base
-				// or previous session's rootfs index so the resume path can create
-				// a FUSE rootfs disk.
-				if newRootfsDiskIndex == nil {
+		// Upload dirty rootfs disk chunks.
+		if m.getDirtyRootfsDiskChunks != nil && m.sessionDiskStore != nil {
+			dirtyRootfs := m.getDirtyRootfsDiskChunks(runnerID)
+			if len(dirtyRootfs) > 0 {
+				g.Go(func() error {
+					var baseRootfsIndex *snapshot.ChunkIndex
 					if prevGCSDiskIndexObjects != nil {
 						if prevPath := prevGCSDiskIndexObjects["__rootfs__"]; prevPath != "" {
-							prevIdx, dlErr := uploader.DownloadChunkIndex(ctx, prevPath)
+							prevIdx, dlErr := uploader.DownloadChunkIndex(gCtx, prevPath)
 							if dlErr == nil {
-								newRootfsDiskIndex = prevIdx
+								baseRootfsIndex = prevIdx
 							}
 						}
 					}
-					if newRootfsDiskIndex == nil && goldenMeta != nil && len(goldenMeta.RootfsChunks) > 0 {
-						newRootfsDiskIndex = buildRootfsDriveBaseIndex(goldenMeta)
+					if baseRootfsIndex == nil {
+						baseRootfsIndex = buildRootfsDriveBaseIndex(goldenMeta)
+					}
+					rootfsIdx, rootfsErr := uploader.MergeAndUploadDisk(gCtx, dirtyRootfs, baseRootfsIndex)
+					if rootfsErr != nil {
+						m.logger.WithError(rootfsErr).Warn("GCS rootfs disk chunk upload failed")
+						return nil
+					}
+					newRootfsDiskIndex = rootfsIdx
+					return nil
+				})
+			}
+		}
+
+		if err := g.Wait(); err != nil {
+			<-m.pauseSem
+			m.mu.Lock()
+			runner.State = prePauseState
+			m.mu.Unlock()
+			return nil, fmt.Errorf("parallel upload failed: %w", err)
+		}
+		m.logger.WithField("upload_ms", time.Since(uploadStart).Milliseconds()).Info("Pause: parallel uploads complete")
+
+		// Include non-dirty extension drives from golden metadata.
+		if goldenMeta != nil {
+			for driveID, extDrive := range goldenMeta.ExtensionDrives {
+				if _, already := newExtDiskIndexes[driveID]; already {
+					continue
+				}
+				if len(extDrive.Chunks) == 0 {
+					continue
+				}
+				newExtDiskIndexes[driveID] = buildExtensionDriveBaseIndex(goldenMeta, driveID)
+			}
+		}
+
+		// Always include rootfs in manifest for cross-host resume.
+		if newRootfsDiskIndex == nil {
+			if prevGCSDiskIndexObjects != nil {
+				if prevPath := prevGCSDiskIndexObjects["__rootfs__"]; prevPath != "" {
+					prevIdx, dlErr := uploader.DownloadChunkIndex(ctx, prevPath)
+					if dlErr == nil {
+						newRootfsDiskIndex = prevIdx
 					}
 				}
+			}
+			if newRootfsDiskIndex == nil && goldenMeta != nil && len(goldenMeta.RootfsChunks) > 0 {
+				newRootfsDiskIndex = buildRootfsDriveBaseIndex(goldenMeta)
+			}
+		}
 
-				snapshotID := uuid.New().String()
-				man := &snapshot.SnapshotManifest{
-					Version:     "1",
-					SnapshotID:  snapshotID,
-					CreatedAt:   time.Now(),
-					WorkloadKey: runner.WorkloadKey,
-				}
-				man.Firecracker.VMStateObject = vmStateGCSPath
-				man.Memory.Mode = "chunked"
-				man.Memory.TotalSizeBytes = baseMemIndex.Region.LogicalSizeBytes
-				man.Memory.ChunkIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
-				man.Integrity.Algo = "sha256"
+		snapshotID := uuid.New().String()
+		man := &snapshot.SnapshotManifest{
+			Version:     "1",
+			SnapshotID:  snapshotID,
+			CreatedAt:   time.Now(),
+			WorkloadKey: runner.WorkloadKey,
+		}
+		man.Firecracker.VMStateObject = vmStateGCSPath
+		man.Memory.Mode = "chunked"
+		man.Memory.TotalSizeBytes = baseMemIndex.Region.LogicalSizeBytes
+		man.Memory.ChunkIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
+		man.Integrity.Algo = "sha256"
 
-				// Populate rootfs disk section if dirty rootfs chunks were uploaded.
-				if newRootfsDiskIndex != nil {
-					man.Disk = snapshot.DiskSection{
-						Mode:             "chunked",
-						TotalSizeBytes:   newRootfsDiskIndex.Region.LogicalSizeBytes,
-						ChunkIndexObject: uploader.FullGCSPath(gcsBase + "/__rootfs__-disk.json"),
-					}
-				}
+		if newRootfsDiskIndex != nil {
+			man.Disk = snapshot.DiskSection{
+				Mode:             "chunked",
+				TotalSizeBytes:   newRootfsDiskIndex.Region.LogicalSizeBytes,
+				ChunkIndexObject: uploader.FullGCSPath(gcsBase + "/__rootfs__-disk.json"),
+			}
+		}
 
-				if len(newExtDiskIndexes) > 0 {
-					man.ExtensionDisks = make(map[string]snapshot.DiskSection)
-					for driveID, diskIdx := range newExtDiskIndexes {
-						man.ExtensionDisks[driveID] = snapshot.DiskSection{
-							Mode:             "chunked",
-							TotalSizeBytes:   diskIdx.Region.LogicalSizeBytes,
-							ChunkIndexObject: uploader.FullGCSPath(gcsBase + "/" + driveID + "-disk.json"),
-						}
-					}
-				}
-
-				// Include rootfs disk index in the extension indexes map so it gets
-				// uploaded alongside extension drive indexes by WriteManifestWithExtensions.
-				allDiskIndexes := make(map[string]*snapshot.ChunkIndex, len(newExtDiskIndexes)+1)
-				for k, v := range newExtDiskIndexes {
-					allDiskIndexes[k] = v
-				}
-				if newRootfsDiskIndex != nil {
-					allDiskIndexes["__rootfs__"] = newRootfsDiskIndex
-				}
-
-				if writeErr := uploader.WriteManifestWithExtensions(ctx, gcsBase, man, newMemIndex, allDiskIndexes); writeErr != nil {
-					// In chunked mode, local-only fallback won't work — fail the pause.
-					m.mu.Lock()
-					runner.State = prePauseState
-					m.mu.Unlock()
-					return nil, fmt.Errorf("failed to write session manifest to GCS: %w", writeErr)
-				} else {
-					metadata.GCSManifestPath = uploader.FullGCSPath(gcsBase + "/snapshot_manifest.json")
-					metadata.GCSMemIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
-					// Carry forward previous disk index objects for drives
-					// that weren't dirty this pause so the chain is never
-					// broken. Without this, a drive dirty in pause 1 but
-					// clean in pause 2 loses its index reference, forcing
-					// a full re-upload when it's dirty again in pause 3.
-					if len(prevGCSDiskIndexObjects) > 0 || len(allDiskIndexes) > 0 {
-						if metadata.GCSDiskIndexObjects == nil {
-							metadata.GCSDiskIndexObjects = make(map[string]string)
-						}
-						for driveID, path := range prevGCSDiskIndexObjects {
-							if _, dirty := allDiskIndexes[driveID]; !dirty {
-								metadata.GCSDiskIndexObjects[driveID] = path
-							}
-						}
-						for driveID := range allDiskIndexes {
-							metadata.GCSDiskIndexObjects[driveID] = uploader.FullGCSPath(gcsBase + "/" + driveID + "-disk.json")
-						}
-					}
-					m.logger.WithFields(logrus.Fields{
-						"runner_id":    runnerID,
-						"gcs_manifest": metadata.GCSManifestPath,
-					}).Info("Session uploaded to GCS successfully")
+		if len(newExtDiskIndexes) > 0 {
+			man.ExtensionDisks = make(map[string]snapshot.DiskSection)
+			for driveID, diskIdx := range newExtDiskIndexes {
+				man.ExtensionDisks[driveID] = snapshot.DiskSection{
+					Mode:             "chunked",
+					TotalSizeBytes:   diskIdx.Region.LogicalSizeBytes,
+					ChunkIndexObject: uploader.FullGCSPath(gcsBase + "/" + driveID + "-disk.json"),
 				}
 			}
 		}
+
+		allDiskIndexes := make(map[string]*snapshot.ChunkIndex, len(newExtDiskIndexes)+1)
+		for k, v := range newExtDiskIndexes {
+			allDiskIndexes[k] = v
+		}
+		if newRootfsDiskIndex != nil {
+			allDiskIndexes["__rootfs__"] = newRootfsDiskIndex
+		}
+
+		if writeErr := uploader.WriteManifestWithExtensions(ctx, gcsBase, man, newMemIndex, allDiskIndexes); writeErr != nil {
+			<-m.pauseSem
+			m.mu.Lock()
+			runner.State = prePauseState
+			m.mu.Unlock()
+			return nil, fmt.Errorf("failed to write session manifest to GCS: %w", writeErr)
+		}
+
+		metadata.GCSManifestPath = uploader.FullGCSPath(gcsBase + "/snapshot_manifest.json")
+		metadata.GCSMemIndexObject = uploader.FullGCSPath(gcsBase + "/chunked-metadata.json")
+		if len(prevGCSDiskIndexObjects) > 0 || len(allDiskIndexes) > 0 {
+			if metadata.GCSDiskIndexObjects == nil {
+				metadata.GCSDiskIndexObjects = make(map[string]string)
+			}
+			for driveID, path := range prevGCSDiskIndexObjects {
+				if _, dirty := allDiskIndexes[driveID]; !dirty {
+					metadata.GCSDiskIndexObjects[driveID] = path
+				}
+			}
+			for driveID := range allDiskIndexes {
+				metadata.GCSDiskIndexObjects[driveID] = uploader.FullGCSPath(gcsBase + "/" + driveID + "-disk.json")
+			}
+		}
+		m.logger.WithFields(logrus.Fields{
+			"runner_id":    runnerID,
+			"gcs_manifest": metadata.GCSManifestPath,
+		}).Info("Session uploaded to GCS successfully (diff_file mode)")
 	}
 	metadataBytes, _ := json.MarshalIndent(metadata, "", "  ")
 	if err := os.WriteFile(filepath.Join(sessionDir, "metadata.json"), metadataBytes, 0644); err != nil {
@@ -533,8 +543,19 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 		}
 	}
 
+	// Release pause semaphore — all GCS I/O is done. The teardown below
+	// (vm.Stop, handler.Stop, FUSE cleanup) can be slow but doesn't need
+	// the semaphore, so other pauses can proceed with their GCS uploads.
+	<-m.pauseSem
+
 	// Stop VM and clean up resources (but NOT the rootfs overlay or extension drives — session needs them)
+	teardownStart := time.Now()
+	m.logger.WithField("runner_id", runnerID).Debug("Pause teardown: stopping VM")
 	vm.Stop()
+	m.logger.WithFields(logrus.Fields{
+		"runner_id":  runnerID,
+		"vm_stop_ms": time.Since(teardownStart).Milliseconds(),
+	}).Debug("Pause teardown: VM stopped")
 
 	// Extract resources from maps under lock, then stop them outside.
 	m.mu.Lock()
@@ -545,8 +566,14 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 	delete(m.authProxies, runnerID)
 	m.mu.Unlock()
 
+	handlerStart := time.Now()
 	if handler != nil {
+		m.logger.WithField("runner_id", runnerID).Debug("Pause teardown: stopping UFFD handler")
 		handler.Stop()
+		m.logger.WithFields(logrus.Fields{
+			"runner_id":       runnerID,
+			"handler_stop_ms": time.Since(handlerStart).Milliseconds(),
+		}).Debug("Pause teardown: UFFD handler stopped")
 	}
 	if proxy != nil {
 		proxy.Stop()
@@ -554,14 +581,38 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 
 	// Unmount FUSE disks after VM stop (Firecracker no longer holds fds open).
 	// This prevents stale mounts from colliding with fresh FUSE mounts on re-resume.
+	// Run in background — even with conn.Close() reordering, FUSE unmount can
+	// still block if fs.Serve is draining. The lazy unmount fallback in
+	// ChunkedDisk.Unmount ensures the mount point is freed for the next resume.
 	if m.cleanupFUSEDisks != nil {
-		m.cleanupFUSEDisks(runnerID)
+		cleanup := m.cleanupFUSEDisks
+		rid := runnerID
+		go func() {
+			fuseStart := time.Now()
+			m.logger.WithField("runner_id", rid).Debug("Pause teardown: cleaning up FUSE disks (background)")
+			cleanup(rid)
+			m.logger.WithFields(logrus.Fields{
+				"runner_id":       rid,
+				"fuse_cleanup_ms": time.Since(fuseStart).Milliseconds(),
+			}).Debug("Pause teardown: FUSE disks cleaned up")
+		}()
 	}
 
 	// Release network namespace outside lock (involves syscalls).
+	nsStart := time.Now()
 	if m.netnsNetwork != nil {
+		m.logger.WithField("runner_id", runnerID).Debug("Pause teardown: releasing network namespace")
 		m.netnsNetwork.ReleaseNamespace(runnerID)
+		m.logger.WithFields(logrus.Fields{
+			"runner_id":     runnerID,
+			"ns_release_ms": time.Since(nsStart).Milliseconds(),
+		}).Debug("Pause teardown: network namespace released")
 	}
+
+	m.logger.WithFields(logrus.Fields{
+		"runner_id":   runnerID,
+		"teardown_ms": time.Since(teardownStart).Milliseconds(),
+	}).Debug("Pause teardown: complete")
 
 	// Final map cleanup and state update under lock (fast ops only).
 	m.mu.Lock()
@@ -990,6 +1041,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 	extensionDrivePaths := map[string]string{}
 	var uffdHandler uffdStopper
 	var latestStateFile string
+	var sessionPrefetcher *uffd.Prefetcher
 
 	if metadata.GCSManifestPath != "" && m.sessionMemStore != nil {
 		// GCS-backed resume: download ChunkIndex, convert to ChunkedSnapshotMetadata,
@@ -1024,20 +1076,17 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 		}
 
 		// Start prefetcher if a recorded access-pattern mapping exists.
-		// Phase 1 (fetch workers) begins immediately, warming the ChunkStore cache.
-		// Phase 2 (copy workers) waits for the UFFD connection, then installs pages
-		// via UFFDIO_COPY before the VM faults on them.
-		var prefetcher *uffd.Prefetcher
 		if chunkedMeta.MemPrefetchMapping != nil && len(chunkedMeta.MemPrefetchMapping.Offsets) > 0 {
-			prefetcher = uffd.NewPrefetcher(uffd.PrefetcherConfig{
-				Mapping:    chunkedMeta.MemPrefetchMapping,
-				ChunkStore: m.sessionMemStore,
-				Metadata:   chunkedMeta,
-				Connected:  gcsHandler.Connected(),
-				Logger:     m.logger.Logger,
+			sessionPrefetcher = uffd.NewPrefetcher(uffd.PrefetcherConfig{
+				Mapping:     chunkedMeta.MemPrefetchMapping,
+				ChunkStore:  m.sessionMemStore,
+				Metadata:    chunkedMeta,
+				Connected:   gcsHandler.Connected(),
+				Logger:      m.logger.Logger,
+				CopyWorkers: 16,
 			})
-			gcsHandler.SetPrefetcher(prefetcher)
-			prefetcher.Start()
+			gcsHandler.SetPrefetcher(sessionPrefetcher)
+			sessionPrefetcher.Start()
 			m.logger.WithField("pages", len(chunkedMeta.MemPrefetchMapping.Offsets)).Info("Started access-pattern prefetcher")
 		}
 
@@ -1066,7 +1115,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 					gcsHandler.Stop()
 					return nil, fmt.Errorf("failed to download disk chunk index for drive %s: %w", driveID, diskDlErr)
 				}
-				// Convert ChunkIndex extents to dense ChunkRef slice for FUSE.
 				diskRefs := snapshot.ChunkIndexToRefs(diskIdx)
 				fusePath, fuseErr := m.setupExtensionFUSEDisk(runnerID, driveID, diskRefs, diskIdx.Region.LogicalSizeBytes, diskIdx.ChunkSizeBytes)
 				if fuseErr != nil {
@@ -1195,6 +1243,24 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 	// so removing the directory entry is safe and avoids accumulation.
 	if latestStateFile != "" {
 		os.Remove(latestStateFile)
+	}
+
+	// Wait for prefetcher to install pages into guest memory BEFORE resuming
+	// the VM. This eliminates the page fault storm that occurs when 100+ VMs
+	// resume simultaneously — prefetching without a running vCPU is much
+	// cheaper (no mmap_lock contention, no TLB flushes, optimal page order).
+	if sessionPrefetcher != nil {
+		prefetchStart := time.Now()
+		select {
+		case <-sessionPrefetcher.Done():
+			m.logger.WithField("prefetch_ms", time.Since(prefetchStart).Milliseconds()).Info("Prefetch completed before resume")
+		case <-time.After(2 * time.Second):
+			m.logger.WithField("prefetch_ms", time.Since(prefetchStart).Milliseconds()).Warn("Prefetch timed out, resuming with partial prefetch")
+		case <-ctx.Done():
+			uffdHandler.Stop()
+			vm.Stop()
+			return nil, ctx.Err()
+		}
 	}
 
 	// Set up port forwarding for netns

@@ -135,3 +135,45 @@ variable "alert_queue_depth_threshold" {
   type        = number
   default     = 10
 }
+
+variable "autoscaler_scale_up_threshold" {
+  description = "CPU utilization threshold (0-1) above which to scale up hosts"
+  type        = string
+  default     = "0.9"
+}
+
+variable "autoscaler_scale_down_threshold" {
+  description = "CPU utilization threshold (0-1) below which to scale down hosts"
+  type        = string
+  default     = "0.5"
+}
+
+variable "autoscaler_cooldown" {
+  description = "Minimum time between autoscale actions (Go duration, e.g. 5m)"
+  type        = string
+  default     = "5m"
+}
+
+variable "autoscaler_boot_cooldown" {
+  description = "Cooldown after demand-driven scale-up to wait for host boot (Go duration)"
+  type        = string
+  default     = "3m"
+}
+
+variable "autoscaler_rate_window" {
+  description = "Sliding window for allocation rate tracking (Go duration)"
+  type        = string
+  default     = "60s"
+}
+
+variable "autoscaler_settling_threshold" {
+  description = "Minimum utilization (0-1) before a host counts for scale-down decisions"
+  type        = string
+  default     = "0.2"
+}
+
+variable "autoscaler_min_host_age" {
+  description = "Minimum age before a host can be drained (Go duration)"
+  type        = string
+  default     = "10m"
+}

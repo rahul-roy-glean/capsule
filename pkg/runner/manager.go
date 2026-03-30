@@ -21,6 +21,7 @@ import (
 	"github.com/rahul-roy-glean/capsule/pkg/firecracker"
 	"github.com/rahul-roy-glean/capsule/pkg/network"
 	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
+	"github.com/rahul-roy-glean/capsule/pkg/tiers"
 )
 
 type recentAllocation struct {
@@ -35,6 +36,10 @@ type recentAllocation struct {
 type uffdStopper interface {
 	Stop()
 }
+
+// maxConcurrentPauses limits the number of simultaneous pause operations to
+// avoid overwhelming GCS with thousands of concurrent upload requests.
+const maxConcurrentPauses = 8
 
 // Manager manages the lifecycle of runners on a host
 type Manager struct {
@@ -55,6 +60,7 @@ type Manager struct {
 	runnerToSlot map[string]int
 	draining     bool
 	stopCh       chan struct{}
+	pauseSem     chan struct{} // limits concurrent pause operations
 	mu           sync.RWMutex
 	logger       *logrus.Entry
 
@@ -154,6 +160,7 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 		pendingSessions: make(map[string]string),
 		policyEnforcers: make(map[string]*network.PolicyEnforcer),
 		authProxies:     make(map[string]*authproxy.AuthProxy),
+		pauseSem:        make(chan struct{}, maxConcurrentPauses),
 		stopCh:          make(chan struct{}),
 		logger:          logger.WithField("component", "runner-manager"),
 	}
@@ -1126,7 +1133,7 @@ func (m *Manager) GetStatus() ManagerStatus {
 		}
 		switch r.State {
 		case StateBooting, StateInitializing, StateIdle, StateBusy, StateDraining, StateQuarantined, StateRetiring, StatePausing:
-			usedCPU += r.Resources.VCPUs * 1000
+			usedCPU += tiers.EffectiveCPUMillicores(tiers.Tier{VCPUs: r.Resources.VCPUs})
 			usedMem += r.Resources.MemoryMB
 		}
 	}
@@ -1192,11 +1199,11 @@ func (m *Manager) CanAddRunner(vcpus, memoryMB int) bool {
 
 	var usedCPU, usedMem int
 	for _, r := range m.runners {
-		usedCPU += r.Resources.VCPUs * 1000
+		usedCPU += tiers.EffectiveCPUMillicores(tiers.Tier{VCPUs: r.Resources.VCPUs})
 		usedMem += r.Resources.MemoryMB
 	}
 
-	return (m.config.TotalCPUMillicores-usedCPU) >= vcpus*1000 &&
+	return (m.config.TotalCPUMillicores-usedCPU) >= tiers.EffectiveCPUMillicores(tiers.Tier{VCPUs: vcpus}) &&
 		(m.config.TotalMemoryMB-usedMem) >= memoryMB
 }
 
@@ -1254,16 +1261,30 @@ func (m *Manager) PauseSessionRunners(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
-	var errs []error
-	paused := 0
+	var (
+		wg     sync.WaitGroup
+		mu     sync.Mutex
+		errs   []error
+		paused int
+	)
 	for _, id := range targets {
-		if _, err := m.PauseRunner(ctx, id, false); err != nil {
-			m.logger.WithError(err).WithField("runner_id", id).Warn("Failed to pause session runner during drain")
-			errs = append(errs, err)
-			continue
-		}
-		paused++
+		wg.Add(1)
+		go func(runnerID string) {
+			defer wg.Done()
+			if _, err := m.PauseRunner(ctx, runnerID, false); err != nil {
+				m.logger.WithError(err).WithField("runner_id", runnerID).Warn("Failed to pause session runner during drain")
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			paused++
+			mu.Unlock()
+		}(id)
 	}
+	wg.Wait()
+
 	if len(errs) > 0 {
 		return paused, joinErrors(errs)
 	}

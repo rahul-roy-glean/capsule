@@ -24,6 +24,7 @@ func newTestManager(opts ...func(*Manager)) *Manager {
 		pendingSessions: make(map[string]string),
 		uffdHandlers:    make(map[string]uffdStopper),
 		authProxies:     make(map[string]*authproxy.AuthProxy),
+		pauseSem:        make(chan struct{}, maxConcurrentPauses),
 		stopCh:          make(chan struct{}),
 		logger:          logger.WithField("test", true),
 	}
@@ -333,8 +334,8 @@ func TestGetStatus_ExcludesSuspendedAndPausedResourceUsage(t *testing.T) {
 
 	status := m.GetStatus()
 
-	if status.UsedCPUMillicores != 2000 {
-		t.Fatalf("UsedCPUMillicores = %d, want 2000", status.UsedCPUMillicores)
+	if status.UsedCPUMillicores != 500 {
+		t.Fatalf("UsedCPUMillicores = %d, want 500", status.UsedCPUMillicores)
 	}
 	if status.UsedMemoryMB != 4096 {
 		t.Fatalf("UsedMemoryMB = %d, want 4096", status.UsedMemoryMB)

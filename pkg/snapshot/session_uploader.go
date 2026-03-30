@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/klauspost/compress/zstd"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
@@ -20,7 +21,7 @@ import (
 
 // sessionChunkUploadConcurrency controls how many chunks are uploaded in
 // parallel during MergeAndUploadMem.
-const sessionChunkUploadConcurrency = 16
+const sessionChunkUploadConcurrency = 32
 
 // SessionChunkUploader merges dirty diff pages into base snapshot chunks and
 // uploads them to GCS, producing self-contained ChunkIndex objects that can
@@ -77,6 +78,15 @@ func (u *SessionChunkUploader) MergeAndUploadMem(ctx context.Context, memDiffPat
 	if err != nil {
 		return nil, fmt.Errorf("failed to find dirty chunks in %s: %w", memDiffPath, err)
 	}
+
+	// Build a page-level bitmap of data extents using SEEK_DATA/SEEK_HOLE.
+	// This distinguishes "VM wrote zeros" (data extent) from "sparse hole"
+	// (not dirty, use base data). Without this, zero pages from the VM would
+	// be incorrectly replaced with stale base data, corrupting guest memory.
+	pageBitmap, err := buildPageBitmap(memDiffPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build page bitmap for %s: %w", memDiffPath, err)
+	}
 	findDirtyDuration := time.Since(start)
 
 	u.logger.WithFields(logrus.Fields{
@@ -121,7 +131,7 @@ func (u *SessionChunkUploader) MergeAndUploadMem(ctx context.Context, memDiffPat
 	for chunkIdx := range dirtyChunks {
 		ci := chunkIdx // capture
 		g.Go(func() error {
-			ref, err := u.mergeChunk(gCtx, diffFile, ci, chunkSize, totalSize, baseByChunkIdx)
+			ref, err := u.mergeChunk(gCtx, diffFile, ci, chunkSize, totalSize, baseByChunkIdx, pageBitmap)
 			results <- chunkResult{idx: ci, ref: ref, err: err}
 			return err
 		})
@@ -200,11 +210,15 @@ func (u *SessionChunkUploader) MergeAndUploadMem(ctx context.Context, memDiffPat
 }
 
 // mergeChunk fetches/reads the dirty chunk data and uploads it.
+// pageBitmap has one bit per page: set if the page is in a data extent
+// (SEEK_DATA), clear if it's a sparse hole. This correctly distinguishes
+// "VM wrote zeros" from "page not dirty, use base".
 func (u *SessionChunkUploader) mergeChunk(
 	ctx context.Context,
 	diffFile *os.File,
 	chunkIdx, chunkSize, totalSize int64,
 	baseByIdx map[int64]ManifestChunkRef,
+	pageBitmap []uint64,
 ) (ManifestChunkRef, error) {
 	offset := chunkIdx * chunkSize
 	size := chunkSize
@@ -219,14 +233,14 @@ func (u *SessionChunkUploader) mergeChunk(
 	}
 
 	// Check if there is a base chunk we need to merge with.
-	// The diff file is sparse: unwritten pages are zeroed. If the diff chunk
-	// has zero pages we need to fill them from the base chunk.
+	// Use the page bitmap to determine which pages are sparse holes (use base)
+	// vs data extents (use diff, even if all zeros).
 	needsMerge := false
 	if base, ok := baseByIdx[chunkIdx]; ok && base.Hash != ZeroChunkHash {
-		// Check if the diff has any zero pages (which means base pages show through).
 		for i := 0; i+PageSize <= len(diffData); i += PageSize {
-			page := diffData[i : i+PageSize]
-			if isZeroChunk(page) {
+			pageOffset := offset + int64(i)
+			if !pageInBitmap(pageBitmap, pageOffset) {
+				// This page is a sparse hole — need to fill from base.
 				needsMerge = true
 				break
 			}
@@ -248,13 +262,14 @@ func (u *SessionChunkUploader) mergeChunk(
 				"base_fetch_ms": baseFetchDur.Milliseconds(),
 			}).Warn("Slow base chunk fetch during merge")
 		}
-		// Overlay: non-zero diff pages replace base pages.
+		// Start with base data, then overlay pages that are in data extents.
 		merged := make([]byte, size)
 		copy(merged, baseData[:size])
 		for i := 0; i+PageSize <= len(diffData); i += PageSize {
-			page := diffData[i : i+PageSize]
-			if !isZeroChunk(page) {
-				copy(merged[i:], page)
+			pageOffset := offset + int64(i)
+			if pageInBitmap(pageBitmap, pageOffset) {
+				// Page is in a data extent — use diff data (even if zeros).
+				copy(merged[i:], diffData[i:i+PageSize])
 			}
 		}
 		diffData = merged
@@ -321,6 +336,353 @@ func (u *SessionChunkUploader) findDirtyChunks(path string, chunkSize int64) (ma
 	}
 
 	return dirty, nil
+}
+
+// buildPageBitmap walks a sparse file with SEEK_DATA/SEEK_HOLE and returns
+// a bitmap with one bit per page. Bit N is set if page N is in a data extent
+// (has actual data, including zeros the VM wrote). Clear bits are sparse holes
+// (page was never written, should use base data on merge).
+func buildPageBitmap(path string) ([]uint64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	numPages := (fi.Size() + PageSize - 1) / PageSize
+	numWords := (numPages + 63) / 64
+	bitmap := make([]uint64, numWords)
+
+	for offset := int64(0); ; {
+		dataStart, err := unix.Seek(int(f.Fd()), offset, unix.SEEK_DATA)
+		if err != nil {
+			break // ENXIO = no more data segments
+		}
+		holeStart, err := unix.Seek(int(f.Fd()), dataStart, unix.SEEK_HOLE)
+		if err != nil {
+			holeStart = fi.Size()
+		}
+
+		firstPage := dataStart / PageSize
+		lastPage := (holeStart - 1) / PageSize
+		for p := firstPage; p <= lastPage; p++ {
+			bitmap[p/64] |= 1 << uint(p%64)
+		}
+
+		offset = holeStart
+	}
+
+	return bitmap, nil
+}
+
+// pageInBitmap returns true if the page at the given byte offset is marked
+// as a data extent in the bitmap (not a sparse hole).
+func pageInBitmap(bitmap []uint64, byteOffset int64) bool {
+	page := uint64(byteOffset) / PageSize
+	word := page / 64
+	if word >= uint64(len(bitmap)) {
+		return false
+	}
+	return bitmap[word]&(1<<(page%64)) != 0
+}
+
+// findDirtySegments uses SEEK_DATA/SEEK_HOLE to find byte-level data regions
+// in a sparse file. Returns segments (offset+length pairs) and total dirty bytes.
+func findDirtySegments(path string) ([]DiffSegment, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer f.Close()
+
+	var segments []DiffSegment
+	var totalDirty int64
+
+	for offset := int64(0); ; {
+		dataStart, err := unix.Seek(int(f.Fd()), offset, unix.SEEK_DATA)
+		if err != nil {
+			break // ENXIO = no more data segments
+		}
+		holeStart, err := unix.Seek(int(f.Fd()), dataStart, unix.SEEK_HOLE)
+		if err != nil {
+			fi, statErr := f.Stat()
+			if statErr != nil {
+				break
+			}
+			holeStart = fi.Size()
+		}
+
+		length := holeStart - dataStart
+		segments = append(segments, DiffSegment{
+			Offset: dataStart,
+			Length: length,
+		})
+		totalDirty += length
+
+		offset = holeStart
+	}
+
+	return segments, totalDirty, nil
+}
+
+// UploadMemDiff streams all dirty segments from a sparse memory diff file into
+// a single zstd-compressed GCS blob. Returns the blob object path and segments.
+// This replaces MergeAndUploadMem for the diff_file mode, reducing GCS round-trips
+// from ~30 per-chunk (fetch base + upload merged) to a single streaming upload.
+func (u *SessionChunkUploader) UploadMemDiff(ctx context.Context, memDiffPath, gcsBase string, totalSize int64) (string, []DiffSegment, error) {
+	start := time.Now()
+
+	segments, totalDirty, err := findDirtySegments(memDiffPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to find dirty segments: %w", err)
+	}
+
+	u.logger.WithFields(logrus.Fields{
+		"mem_diff_path":  memDiffPath,
+		"segments":       len(segments),
+		"total_dirty_mb": totalDirty / (1024 * 1024),
+	}).Info("UploadMemDiff: streaming dirty segments to GCS")
+
+	blobPath := u.prefixedPath(gcsBase + "/mem_diff.zst")
+
+	bucket := u.gcsClient.Bucket(u.gcsBucket)
+	obj := bucket.Object(blobPath)
+	w := obj.NewWriter(ctx)
+	w.ContentType = "application/zstd"
+
+	zw, err := zstd.NewWriter(w, zstd.WithEncoderLevel(zstd.SpeedFastest))
+	if err != nil {
+		w.Close()
+		return "", nil, fmt.Errorf("failed to create zstd writer: %w", err)
+	}
+
+	f, err := os.Open(memDiffPath)
+	if err != nil {
+		zw.Close()
+		w.Close()
+		return "", nil, fmt.Errorf("failed to open mem diff: %w", err)
+	}
+	defer f.Close()
+
+	buf := make([]byte, 256*1024) // 256KB read buffer
+	for _, seg := range segments {
+		remaining := seg.Length
+		off := seg.Offset
+		for remaining > 0 {
+			n := int64(len(buf))
+			if remaining < n {
+				n = remaining
+			}
+			nr, err := f.ReadAt(buf[:n], off)
+			if err != nil && err != io.EOF {
+				zw.Close()
+				w.Close()
+				return "", nil, fmt.Errorf("failed to read diff at offset %d: %w", off, err)
+			}
+			if nr == 0 {
+				break
+			}
+			if _, err := zw.Write(buf[:nr]); err != nil {
+				zw.Close()
+				w.Close()
+				return "", nil, fmt.Errorf("failed to write to zstd: %w", err)
+			}
+			off += int64(nr)
+			remaining -= int64(nr)
+		}
+	}
+
+	if err := zw.Close(); err != nil {
+		w.Close()
+		return "", nil, fmt.Errorf("failed to close zstd writer: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return "", nil, fmt.Errorf("failed to close GCS writer: %w", err)
+	}
+
+	u.logger.WithFields(logrus.Fields{
+		"blob_path": blobPath,
+		"segments":  len(segments),
+		"dirty_mb":  totalDirty / (1024 * 1024),
+		"ms":        time.Since(start).Milliseconds(),
+	}).Info("UploadMemDiff complete")
+
+	return blobPath, segments, nil
+}
+
+// DownloadMemDiff downloads a zstd-compressed diff blob from GCS and
+// reconstructs a sparse local file with data at the correct offsets.
+func (u *SessionChunkUploader) DownloadMemDiff(ctx context.Context, blobObject string, segments []DiffSegment, totalSize int64, localPath string) error {
+	if u.gcsClient == nil {
+		return fmt.Errorf("GCS client not configured")
+	}
+
+	bucket := u.gcsClient.Bucket(u.gcsBucket)
+	reader, err := bucket.Object(blobObject).NewReader(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to open diff blob %s: %w", blobObject, err)
+	}
+	defer reader.Close()
+
+	zr, err := zstd.NewReader(reader)
+	if err != nil {
+		return fmt.Errorf("failed to create zstd reader: %w", err)
+	}
+	defer zr.Close()
+
+	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+		return fmt.Errorf("failed to create parent dir: %w", err)
+	}
+
+	f, err := os.Create(localPath)
+	if err != nil {
+		return fmt.Errorf("failed to create local diff file: %w", err)
+	}
+	defer f.Close()
+
+	// Create a sparse file of the correct total size.
+	if err := f.Truncate(totalSize); err != nil {
+		return fmt.Errorf("failed to truncate diff file: %w", err)
+	}
+
+	buf := make([]byte, 256*1024)
+	for _, seg := range segments {
+		remaining := seg.Length
+		off := seg.Offset
+		for remaining > 0 {
+			n := int64(len(buf))
+			if remaining < n {
+				n = remaining
+			}
+			nr, err := io.ReadFull(zr, buf[:n])
+			if err != nil && err != io.ErrUnexpectedEOF {
+				return fmt.Errorf("failed to read from zstd at offset %d: %w", off, err)
+			}
+			if nr == 0 {
+				break
+			}
+			if _, err := f.WriteAt(buf[:nr], off); err != nil {
+				return fmt.Errorf("failed to write to diff file at offset %d: %w", off, err)
+			}
+			off += int64(nr)
+			remaining -= int64(nr)
+		}
+	}
+
+	return nil
+}
+
+// MergeLocalDiffs merges two local sparse diff files into one. The newer diff
+// (newDiffPath) takes priority over the previous diff (prevDiffPath) at
+// overlapping offsets. Used for multi-pause chains to combine accumulated diffs.
+func MergeLocalDiffs(outPath, prevDiffPath, newDiffPath string, totalSize int64) ([]DiffSegment, error) {
+	prevSegs, _, err := findDirtySegments(prevDiffPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find segments in prev diff: %w", err)
+	}
+	newSegs, _, err := findDirtySegments(newDiffPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find segments in new diff: %w", err)
+	}
+
+	outFile, err := os.Create(outPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer outFile.Close()
+
+	if err := outFile.Truncate(totalSize); err != nil {
+		return nil, fmt.Errorf("failed to truncate output: %w", err)
+	}
+
+	buf := make([]byte, 256*1024)
+
+	// Helper to copy segments from a source file to outFile.
+	copySegments := func(srcPath string, segs []DiffSegment) error {
+		src, err := os.Open(srcPath)
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+		for _, seg := range segs {
+			remaining := seg.Length
+			off := seg.Offset
+			for remaining > 0 {
+				n := int64(len(buf))
+				if remaining < n {
+					n = remaining
+				}
+				nr, err := src.ReadAt(buf[:n], off)
+				if err != nil && err != io.EOF {
+					return err
+				}
+				if nr == 0 {
+					break
+				}
+				if _, err := outFile.WriteAt(buf[:nr], off); err != nil {
+					return err
+				}
+				off += int64(nr)
+				remaining -= int64(nr)
+			}
+		}
+		return nil
+	}
+
+	// Copy prev diff first (base layer).
+	if err := copySegments(prevDiffPath, prevSegs); err != nil {
+		return nil, fmt.Errorf("failed to copy prev diff: %w", err)
+	}
+
+	// Overlay new diff (newer data wins at overlapping offsets).
+	if err := copySegments(newDiffPath, newSegs); err != nil {
+		return nil, fmt.Errorf("failed to copy new diff: %w", err)
+	}
+
+	// Find the merged segments of the output file.
+	mergedSegs, _, err := findDirtySegments(outPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find merged segments: %w", err)
+	}
+
+	return mergedSegs, nil
+}
+
+// UploadJSON uploads a JSON-serializable value to a GCS object path.
+func (u *SessionChunkUploader) UploadJSON(ctx context.Context, gcsObjectPath string, v any) error {
+	if u.gcsClient == nil {
+		return fmt.Errorf("GCS client not configured")
+	}
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal %s: %w", gcsObjectPath, err)
+	}
+	bucket := u.gcsClient.Bucket(u.gcsBucket)
+	w := bucket.Object(gcsObjectPath).NewWriter(ctx)
+	w.ContentType = "application/json"
+	if _, err := w.Write(data); err != nil {
+		w.Close()
+		return fmt.Errorf("write %s: %w", gcsObjectPath, err)
+	}
+	return w.Close()
+}
+
+// DownloadJSON downloads and unmarshals a JSON object from GCS into v.
+func (u *SessionChunkUploader) DownloadJSON(ctx context.Context, gcsObjectPath string, v any) error {
+	if u.gcsClient == nil {
+		return fmt.Errorf("GCS client not configured")
+	}
+	bucket := u.gcsClient.Bucket(u.gcsBucket)
+	reader, err := bucket.Object(gcsObjectPath).NewReader(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to open %s: %w", gcsObjectPath, err)
+	}
+	defer reader.Close()
+	return json.NewDecoder(reader).Decode(v)
 }
 
 // MergeAndUploadDisk produces a self-contained ChunkIndex for the FUSE disk.
@@ -576,8 +938,10 @@ func (u *SessionChunkUploader) WriteManifestWithExtensions(
 	}
 
 	memIdxPath := u.prefixedPath(gcsBase + "/chunked-metadata.json")
-	if err := uploadJSON(memIdxPath, memIndex); err != nil {
-		return fmt.Errorf("failed to upload mem chunk index: %w", err)
+	if memIndex != nil {
+		if err := uploadJSON(memIdxPath, memIndex); err != nil {
+			return fmt.Errorf("failed to upload mem chunk index: %w", err)
+		}
 	}
 
 	for driveID, diskIdx := range extDiskIndexes {

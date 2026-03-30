@@ -101,6 +101,20 @@ spec:
               value: {{ .Values.downscaler.maxDrains | quote }}
             - name: DOWNSCALER_HEARTBEAT_STALE
               value: {{ .Values.downscaler.heartbeatStale | quote }}
+            - name: AUTOSCALER_SCALE_UP_THRESHOLD
+              value: {{ .Values.autoscaler.scaleUpThreshold | quote }}
+            - name: AUTOSCALER_SCALE_DOWN_THRESHOLD
+              value: {{ .Values.autoscaler.scaleDownThreshold | quote }}
+            - name: AUTOSCALER_COOLDOWN
+              value: {{ .Values.autoscaler.cooldown | quote }}
+            - name: AUTOSCALER_BOOT_COOLDOWN
+              value: {{ .Values.autoscaler.bootCooldown | quote }}
+            - name: AUTOSCALER_RATE_WINDOW
+              value: {{ .Values.autoscaler.rateWindow | quote }}
+            - name: AUTOSCALER_SETTLING_THRESHOLD
+              value: {{ .Values.autoscaler.settlingThreshold | quote }}
+            - name: AUTOSCALER_MIN_HOST_AGE
+              value: {{ .Values.autoscaler.minHostAge | quote }}
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: {{ if .Values.otelCollector.enabled }}"127.0.0.1:4317"{{ else }}"otel-collector.{{ include "capsule.namespace" . }}.svc.cluster.local:4317"{{ end }}
             - name: ENVIRONMENT

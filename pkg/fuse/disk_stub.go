@@ -40,6 +40,9 @@ func (d *ChunkedDisk) Unmount() error {
 	return nil
 }
 
+// CleanStaleMounts is a stub
+func CleanStaleMounts(mountPoint string) {}
+
 // DiskImagePath is a stub
 func (d *ChunkedDisk) DiskImagePath() string {
 	return ""

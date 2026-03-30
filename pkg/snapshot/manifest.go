@@ -2,6 +2,12 @@ package snapshot
 
 import "time"
 
+// DiffSegment describes a contiguous data region in a memory diff blob.
+type DiffSegment struct {
+	Offset int64 `json:"offset"`
+	Length int64 `json:"length"`
+}
+
 // SnapshotManifest is the top-level restore contract written during session pause.
 // It lives at {gcsBase}/snapshot_manifest.json and references all other objects.
 type SnapshotManifest struct {
@@ -13,9 +19,13 @@ type SnapshotManifest struct {
 		VMStateObject string `json:"vmstate_object"`
 	} `json:"firecracker"`
 	Memory struct {
-		Mode             string `json:"mode"`
-		TotalSizeBytes   int64  `json:"total_size_bytes"`
-		ChunkIndexObject string `json:"chunk_index_object"`
+		Mode                  string        `json:"mode"`
+		TotalSizeBytes        int64         `json:"total_size_bytes"`
+		ChunkIndexObject      string        `json:"chunk_index_object"`                // chunked mode
+		DiffBlobObject        string        `json:"diff_blob_object,omitempty"`        // diff_file mode
+		DiffSegments          []DiffSegment `json:"diff_segments,omitempty"`           // diff_file mode
+		BaseChunkIndexObject  string        `json:"base_chunk_index_object,omitempty"` // diff_file mode
+		PrefetchMappingObject string        `json:"prefetch_mapping_object,omitempty"` // diff_file mode
 	} `json:"memory"`
 	// Disk covers the rootfs dirty overlay.
 	Disk DiskSection `json:"disk"`
