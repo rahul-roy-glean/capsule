@@ -104,3 +104,4 @@ sdk/python/dist
 sdk/python/.venv/
 
 scripts/scale/
+scratch/
