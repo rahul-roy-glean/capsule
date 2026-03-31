@@ -939,16 +939,10 @@ func (s *ControlPlaneServer) HandlePauseRunner(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// If host is draining/terminating, session runners are already being
-	// proactively paused by the host agent — return 503 so the client retries
-	// via /allocate with session_id which will resume on a new host.
-	if host.Status == "draining" || host.Status == "terminating" {
-		w.Header().Set("Retry-After", "5")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{"error": "host is draining"})
-		return
-	}
+	// NOTE: We intentionally do NOT reject pause requests for draining hosts.
+	// Pausing saves runner state to GCS — this is exactly what should happen
+	// on a draining host. The draining check only makes sense for allocate
+	// (don't place NEW runners on a draining host), not for pause.
 
 	// Forward to host agent gRPC (reuse pooled connection)
 	conn, err := s.scheduler.getHostConn(host.GRPCAddress)

@@ -20,8 +20,10 @@ import (
 )
 
 // sessionChunkUploadConcurrency controls how many chunks are uploaded in
-// parallel during MergeAndUploadMem.
-const sessionChunkUploadConcurrency = 32
+// parallel during MergeAndUploadMem / MergeAndUploadDisk. Lower values
+// reduce GCS stream contention when many runners pause concurrently
+// (10 runners × 16 streams = 160 total, well within NIC capacity).
+const sessionChunkUploadConcurrency = 16
 
 // SessionChunkUploader merges dirty diff pages into base snapshot chunks and
 // uploads them to GCS, producing self-contained ChunkIndex objects that can

@@ -293,11 +293,11 @@ func NewChunkStore(ctx context.Context, cfg ChunkStoreConfig) (*ChunkStore, erro
 }
 
 // StoreChunk stores a chunk and returns its hash.
-// Deduplication is handled via the in-memory LRU cache: if the chunk is
-// already cached we skip the upload entirely. Otherwise we upload
+// Deduplication is handled via the shared in-memory LRU cache: if the chunk
+// is already cached we skip the upload entirely. Otherwise we upload
 // unconditionally — CAS writes are idempotent so re-uploading an existing
-// chunk is harmless and saves the two GCS round-trips (Attrs + getChunkSize)
-// that a pre-upload existence check would require.
+// chunk is harmless. The LRU cache is shared across all runners, so the
+// first runner to upload a chunk populates the cache for subsequent runners.
 func (cs *ChunkStore) StoreChunk(ctx context.Context, data []byte) (string, int64, error) {
 	// Compute hash of uncompressed data
 	hash := sha256.Sum256(data)

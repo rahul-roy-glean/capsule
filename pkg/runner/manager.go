@@ -37,9 +37,17 @@ type uffdStopper interface {
 	Stop()
 }
 
-// maxConcurrentPauses limits the number of simultaneous pause operations to
-// avoid overwhelming GCS with thousands of concurrent upload requests.
-const maxConcurrentPauses = 8
+// maxConcurrentSnapshots limits the number of simultaneous diff snapshot
+// creations. Snapshots are disk I/O heavy (writing ~512MB state files), so
+// we keep this low to avoid disk contention that inflates snapshot latency.
+const maxConcurrentSnapshots = 8
+
+// maxConcurrentUploads limits the number of simultaneous GCS upload phases.
+// Each upload phase spawns up to sessionChunkUploadConcurrency (16) parallel
+// GCS streams, so 10 × 16 = 160 concurrent streams — enough parallelism
+// to saturate the NIC without thrashing. Higher values (e.g. 16) cause
+// 512 streams and 4-6s tail latencies from bandwidth contention.
+const maxConcurrentUploads = 10
 
 // Manager manages the lifecycle of runners on a host
 type Manager struct {
@@ -60,7 +68,8 @@ type Manager struct {
 	runnerToSlot map[string]int
 	draining     bool
 	stopCh       chan struct{}
-	pauseSem     chan struct{} // limits concurrent pause operations
+	pauseSem     chan struct{} // limits concurrent snapshot creation (disk I/O)
+	uploadSem    chan struct{} // limits concurrent GCS upload phases (network)
 	mu           sync.RWMutex
 	logger       *logrus.Entry
 
@@ -160,7 +169,8 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 		pendingSessions: make(map[string]string),
 		policyEnforcers: make(map[string]*network.PolicyEnforcer),
 		authProxies:     make(map[string]*authproxy.AuthProxy),
-		pauseSem:        make(chan struct{}, maxConcurrentPauses),
+		pauseSem:        make(chan struct{}, maxConcurrentSnapshots),
+		uploadSem:       make(chan struct{}, maxConcurrentUploads),
 		stopCh:          make(chan struct{}),
 		logger:          logger.WithField("component", "runner-manager"),
 	}
@@ -306,6 +316,10 @@ type bringupLease struct {
 // uniqueness, finds an available slot, and registers the slot mapping
 // under m.mu.Lock. Network namespace creation happens outside the lock
 // to avoid blocking other manager operations during the ~100ms syscall.
+//
+// Fast path: if the pre-warming pool has a ready namespace, the lease is
+// acquired instantly without any syscalls. Falls back to synchronous
+// creation when the pool is empty.
 func (m *Manager) AcquireBringupLease(runnerID, sessionID string) (*bringupLease, error) {
 	m.mu.Lock()
 
@@ -328,6 +342,35 @@ func (m *Manager) AcquireBringupLease(runnerID, sessionID string) (*bringupLease
 		}
 	}
 
+	// Fast path: try to claim a pre-warmed namespace from the pool.
+	if m.netnsNetwork != nil {
+		if entry := m.netnsNetwork.TryClaimFromPool(); entry != nil {
+			// Re-key slot ownership from pool sentinel to this runner.
+			delete(m.slotToRunner, entry.Slot) // remove "__pool__"
+			m.slotToRunner[entry.Slot] = runnerID
+			m.runnerToSlot[runnerID] = entry.Slot
+			if sessionID != "" {
+				m.pendingSessions[sessionID] = runnerID
+			}
+			m.pendingAllocations++
+			m.mu.Unlock()
+
+			// Re-key namespace from placeholder to real vmID.
+			m.netnsNetwork.ReassignNamespace(entry.PlaceholderID, runnerID)
+
+			lease := &bringupLease{
+				manager:   m,
+				runnerID:  runnerID,
+				sessionID: sessionID,
+				slot:      entry.Slot,
+				NsInfo:    entry.NsInfo,
+			}
+			lease.Tap = entry.NsInfo.GetTapDevice(m.netnsNetwork.GetSubnet())
+			return lease, nil
+		}
+	}
+
+	// Slow path: no pool entry available, allocate slot and create synchronously.
 	slot := m.findAvailableSlot()
 	if slot < 0 {
 		m.mu.Unlock()
@@ -414,9 +457,33 @@ func (l *bringupLease) Commit() {
 
 // SetNetNSNetwork configures the manager to use per-VM network namespaces.
 // Each VM gets a namespace with point-to-point veth routing, and Firecracker
-// is launched inside the namespace.
+// is launched inside the namespace. A pre-warming pool of 8 namespaces is
+// started to eliminate namespace creation latency from the bringup path.
 func (m *Manager) SetNetNSNetwork(netnsNet *network.NetNSNetwork) {
 	m.netnsNetwork = netnsNet
+	netnsNet.StartPool(8, m.allocateSlotForPool, m.releaseSlotForPool)
+}
+
+// allocateSlotForPool allocates a slot for the pre-warming pool under m.mu.
+// Returns -1 if no slots are available.
+func (m *Manager) allocateSlotForPool() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	slot := m.findAvailableSlot()
+	if slot < 0 {
+		return -1
+	}
+	m.slotToRunner[slot] = "__pool__"
+	return slot
+}
+
+// releaseSlotForPool releases a pool-owned slot under m.mu.
+func (m *Manager) releaseSlotForPool(slot int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if owner, ok := m.slotToRunner[slot]; ok && owner == "__pool__" {
+		delete(m.slotToRunner, slot)
+	}
 }
 
 func (m *Manager) IsDraining() bool {
@@ -432,6 +499,13 @@ func (m *Manager) SetDraining(draining bool) (changed bool) {
 		return false
 	}
 	m.draining = draining
+
+	// Stop the pre-warming pool when entering drain mode — no new runners
+	// will be allocated, so pooled namespaces would just leak until shutdown.
+	if draining && m.netnsNetwork != nil {
+		m.netnsNetwork.StopPool()
+	}
+
 	return true
 }
 
@@ -543,6 +617,7 @@ func (m *Manager) ReleaseRunner(runnerID string, destroy bool) error {
 		// Release network namespace, slot mappings were already cleaned above.
 		if m.netnsNetwork != nil {
 			m.netnsNetwork.ReleaseNamespace(runnerID)
+			m.netnsNetwork.NotifyReplenish()
 		}
 		if overlayPath != "" {
 			os.Remove(overlayPath)
@@ -951,6 +1026,7 @@ func (m *Manager) cleanupRunner(runnerID, tapDevice, overlayPath string) {
 	if m.netnsNetwork != nil {
 		// Per-VM namespace mode: release the entire namespace
 		m.netnsNetwork.ReleaseNamespace(runnerID)
+		m.netnsNetwork.NotifyReplenish()
 	}
 	if slot, ok := m.runnerToSlot[runnerID]; ok {
 		delete(m.slotToRunner, slot)
@@ -1300,6 +1376,11 @@ func (m *Manager) Close() error {
 		close(m.stopCh)
 	}
 
+	// Stop the namespace pre-warming pool before tearing down runners.
+	if m.netnsNetwork != nil {
+		m.netnsNetwork.StopPool()
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1417,6 +1498,10 @@ func (m *Manager) ReconcileOrphans(ctx context.Context) {
 		for _, entry := range netEntries {
 			name := entry.Name()
 			if strings.HasPrefix(name, "veth-") || (strings.HasPrefix(name, "tap-") && name != "tap-slot-0") {
+				// Skip pool-owned veths — they belong to pre-warmed namespaces.
+				if strings.Contains(name, "_pwm") {
+					continue
+				}
 				// Check if this TAP belongs to an active runner
 				m.mu.RLock()
 				inUse := false

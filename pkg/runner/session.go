@@ -178,7 +178,11 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 	layerN := runner.SessionLayers
 	runner.mu.Unlock()
 
-	// Acquire pause semaphore to limit concurrent GCS operations.
+	// Acquire snapshot semaphore to limit concurrent diff snapshot creation.
+	// Snapshots are disk I/O heavy (~512MB writes), so we bound concurrency
+	// to avoid inflating snapshot latency from disk contention. The semaphore
+	// is released immediately after the snapshot completes — GCS uploads use
+	// a separate, higher-capacity semaphore (uploadSem).
 	select {
 	case m.pauseSem <- struct{}{}:
 	case <-ctx.Done():
@@ -187,10 +191,6 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 		runner.mu.Unlock()
 		return nil, ctx.Err()
 	}
-	// NOTE: pauseSem is released explicitly after GCS uploads complete,
-	// NOT via defer. The post-upload teardown (vm.Stop, handler.Stop,
-	// FUSE cleanup, namespace release) can take seconds and must not
-	// hold the semaphore — otherwise it serializes all pauses.
 
 	m.logger.WithFields(logrus.Fields{
 		"runner_id":  runnerID,
@@ -202,9 +202,9 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 	layerDir := filepath.Join(m.sessionBaseDir(), sessionID, fmt.Sprintf("layer_%d", layerN))
 	if err := os.MkdirAll(layerDir, 0755); err != nil {
 		<-m.pauseSem
-		m.mu.Lock()
+		runner.mu.Lock()
 		runner.State = prePauseState
-		m.mu.Unlock()
+		runner.mu.Unlock()
 		return nil, fmt.Errorf("failed to create session layer dir: %w", err)
 	}
 
@@ -240,9 +240,9 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 	diffStart := time.Now()
 	if err := vm.CreateDiffSnapshot(ctx, stateFile, memDiffFile); err != nil {
 		<-m.pauseSem
-		m.mu.Lock()
+		runner.mu.Lock()
 		runner.State = prePauseState
-		m.mu.Unlock()
+		runner.mu.Unlock()
 		return nil, fmt.Errorf("failed to create diff snapshot: %w", err)
 	}
 	diffDuration := time.Since(diffStart)
@@ -260,6 +260,10 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 		"diff_snapshot_ms": diffDuration.Milliseconds(),
 		"snapshot_bytes":   snapshotSize,
 	}).Info("Pause: diff snapshot created")
+
+	// Release snapshot semaphore — the disk-heavy work is done. Other pauses
+	// can now start their snapshots while this one proceeds with GCS uploads.
+	<-m.pauseSem
 
 	// Write metadata.json
 	sessionDir := filepath.Join(m.sessionBaseDir(), sessionID)
@@ -338,6 +342,19 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 		vmStateGCSPath := uploader.FullGCSPath(gcsBase + "/snapshot.state")
 
 		uploadStart := time.Now()
+
+		// Acquire upload semaphore to limit concurrent GCS upload phases.
+		// Each phase spawns 3-4 streams; with cap=16 that's ~64 concurrent
+		// streams — enough parallelism without thrashing the network.
+		select {
+		case m.uploadSem <- struct{}{}:
+		case <-ctx.Done():
+			runner.mu.Lock()
+			runner.State = prePauseState
+			runner.mu.Unlock()
+			return nil, ctx.Err()
+		}
+
 		g, gCtx := errgroup.WithContext(ctx)
 
 		// Merge and upload memory chunks.
@@ -426,10 +443,10 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 		}
 
 		if err := g.Wait(); err != nil {
-			<-m.pauseSem
-			m.mu.Lock()
+			<-m.uploadSem
+			runner.mu.Lock()
 			runner.State = prePauseState
-			m.mu.Unlock()
+			runner.mu.Unlock()
 			return nil, fmt.Errorf("parallel upload failed: %w", err)
 		}
 		m.logger.WithField("upload_ms", time.Since(uploadStart).Milliseconds()).Info("Pause: parallel uploads complete")
@@ -503,10 +520,10 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 		}
 
 		if writeErr := uploader.WriteManifestWithExtensions(ctx, gcsBase, man, newMemIndex, allDiskIndexes); writeErr != nil {
-			<-m.pauseSem
-			m.mu.Lock()
+			<-m.uploadSem
+			runner.mu.Lock()
 			runner.State = prePauseState
-			m.mu.Unlock()
+			runner.mu.Unlock()
 			return nil, fmt.Errorf("failed to write session manifest to GCS: %w", writeErr)
 		}
 
@@ -543,78 +560,13 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 		}
 	}
 
-	// Release pause semaphore — all GCS I/O is done. The teardown below
-	// (vm.Stop, handler.Stop, FUSE cleanup) can be slow but doesn't need
-	// the semaphore, so other pauses can proceed with their GCS uploads.
-	<-m.pauseSem
-
-	// Stop VM and clean up resources (but NOT the rootfs overlay or extension drives — session needs them)
-	teardownStart := time.Now()
-	m.logger.WithField("runner_id", runnerID).Debug("Pause teardown: stopping VM")
-	vm.Stop()
-	m.logger.WithFields(logrus.Fields{
-		"runner_id":  runnerID,
-		"vm_stop_ms": time.Since(teardownStart).Milliseconds(),
-	}).Debug("Pause teardown: VM stopped")
-
-	// Extract resources from maps under lock, then stop them outside.
-	m.mu.Lock()
-	delete(m.vms, runnerID)
-	handler := m.uffdHandlers[runnerID]
-	delete(m.uffdHandlers, runnerID)
-	proxy := m.authProxies[runnerID]
-	delete(m.authProxies, runnerID)
-	m.mu.Unlock()
-
-	handlerStart := time.Now()
-	if handler != nil {
-		m.logger.WithField("runner_id", runnerID).Debug("Pause teardown: stopping UFFD handler")
-		handler.Stop()
-		m.logger.WithFields(logrus.Fields{
-			"runner_id":       runnerID,
-			"handler_stop_ms": time.Since(handlerStart).Milliseconds(),
-		}).Debug("Pause teardown: UFFD handler stopped")
-	}
-	if proxy != nil {
-		proxy.Stop()
+	// Release upload semaphore — all GCS I/O is done.
+	if m.sessionMemStore != nil {
+		<-m.uploadSem
 	}
 
-	// Unmount FUSE disks after VM stop (Firecracker no longer holds fds open).
-	// This prevents stale mounts from colliding with fresh FUSE mounts on re-resume.
-	// Run in background — even with conn.Close() reordering, FUSE unmount can
-	// still block if fs.Serve is draining. The lazy unmount fallback in
-	// ChunkedDisk.Unmount ensures the mount point is freed for the next resume.
-	if m.cleanupFUSEDisks != nil {
-		cleanup := m.cleanupFUSEDisks
-		rid := runnerID
-		go func() {
-			fuseStart := time.Now()
-			m.logger.WithField("runner_id", rid).Debug("Pause teardown: cleaning up FUSE disks (background)")
-			cleanup(rid)
-			m.logger.WithFields(logrus.Fields{
-				"runner_id":       rid,
-				"fuse_cleanup_ms": time.Since(fuseStart).Milliseconds(),
-			}).Debug("Pause teardown: FUSE disks cleaned up")
-		}()
-	}
-
-	// Release network namespace outside lock (involves syscalls).
-	nsStart := time.Now()
-	if m.netnsNetwork != nil {
-		m.logger.WithField("runner_id", runnerID).Debug("Pause teardown: releasing network namespace")
-		m.netnsNetwork.ReleaseNamespace(runnerID)
-		m.logger.WithFields(logrus.Fields{
-			"runner_id":     runnerID,
-			"ns_release_ms": time.Since(nsStart).Milliseconds(),
-		}).Debug("Pause teardown: network namespace released")
-	}
-
-	m.logger.WithFields(logrus.Fields{
-		"runner_id":   runnerID,
-		"teardown_ms": time.Since(teardownStart).Milliseconds(),
-	}).Debug("Pause teardown: complete")
-
-	// Final map cleanup and state update under lock (fast ops only).
+	// Update state to Suspended and prepare the result BEFORE teardown,
+	// so the gRPC response returns immediately. Teardown runs in background.
 	m.mu.Lock()
 	if slot, ok := m.runnerToSlot[runnerID]; ok {
 		delete(m.slotToRunner, slot)
@@ -625,7 +577,90 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 	runner.SessionLayers = layerN + 1
 	runner.SessionDir = sessionDir
 	runner.PausedAt = time.Now()
+
+	// Extract resources from maps under lock for background teardown.
+	delete(m.vms, runnerID)
+	handler := m.uffdHandlers[runnerID]
+	delete(m.uffdHandlers, runnerID)
+	proxy := m.authProxies[runnerID]
+	delete(m.authProxies, runnerID)
 	m.mu.Unlock()
+
+	// Background teardown: vm.Stop, handler.Stop, ns.Release, and FUSE
+	// cleanup run concurrently in a background goroutine. None of these
+	// affect the PauseResult or GCS state — they only free host resources.
+	go func() {
+		teardownStart := time.Now()
+		var wg sync.WaitGroup
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.logger.WithField("runner_id", runnerID).Debug("Pause teardown: stopping VM")
+			vm.Stop()
+			m.logger.WithFields(logrus.Fields{
+				"runner_id":  runnerID,
+				"vm_stop_ms": time.Since(teardownStart).Milliseconds(),
+			}).Debug("Pause teardown: VM stopped")
+		}()
+
+		if handler != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				handlerStart := time.Now()
+				m.logger.WithField("runner_id", runnerID).Debug("Pause teardown: stopping UFFD handler")
+				handler.Stop()
+				m.logger.WithFields(logrus.Fields{
+					"runner_id":       runnerID,
+					"handler_stop_ms": time.Since(handlerStart).Milliseconds(),
+				}).Debug("Pause teardown: UFFD handler stopped")
+			}()
+		}
+
+		if proxy != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				proxy.Stop()
+			}()
+		}
+
+		if m.netnsNetwork != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				nsStart := time.Now()
+				m.logger.WithField("runner_id", runnerID).Debug("Pause teardown: releasing network namespace")
+				m.netnsNetwork.ReleaseNamespace(runnerID)
+				m.logger.WithFields(logrus.Fields{
+					"runner_id":     runnerID,
+					"ns_release_ms": time.Since(nsStart).Milliseconds(),
+				}).Debug("Pause teardown: network namespace released")
+			}()
+		}
+
+		// FUSE cleanup: unmount disks after VM stop completes.
+		if m.cleanupFUSEDisks != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				fuseStart := time.Now()
+				m.logger.WithField("runner_id", runnerID).Debug("Pause teardown: cleaning up FUSE disks")
+				m.cleanupFUSEDisks(runnerID)
+				m.logger.WithFields(logrus.Fields{
+					"runner_id":       runnerID,
+					"fuse_cleanup_ms": time.Since(fuseStart).Milliseconds(),
+				}).Debug("Pause teardown: FUSE disks cleaned up")
+			}()
+		}
+
+		wg.Wait()
+		m.logger.WithFields(logrus.Fields{
+			"runner_id":   runnerID,
+			"teardown_ms": time.Since(teardownStart).Milliseconds(),
+		}).Debug("Pause teardown: complete")
+	}()
 
 	m.logger.WithFields(logrus.Fields{
 		"runner_id":     runnerID,
@@ -1006,10 +1041,48 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 	// Always use the runner ID from session metadata (authoritative source).
 	runnerID = metadata.RunnerID
 
-	// Acquire lease: atomically checks capacity, validates session uniqueness,
-	// reserves slot, and creates network namespace.
-	lease, err := m.AcquireBringupLease(runnerID, sessionID)
-	if err != nil {
+	// Parallelize lease acquisition + kernel path lookup with GCS manifest
+	// download. These are independent operations and the GCS round-trip is
+	// the slower of the two.
+	var lease *bringupLease
+	var kernelPath string
+	var man *snapshot.SnapshotManifest
+	var uploader *snapshot.SessionChunkUploader
+
+	setupG, setupCtx := errgroup.WithContext(ctx)
+
+	setupG.Go(func() error {
+		var leaseErr error
+		lease, leaseErr = m.AcquireBringupLease(runnerID, sessionID)
+		if leaseErr != nil {
+			return leaseErr
+		}
+		var kernErr error
+		kernelPath, kernErr = m.snapshotCache.GetKernelPath()
+		if kernErr != nil {
+			lease.Release()
+			lease = nil
+			return fmt.Errorf("failed to get kernel path: %w", kernErr)
+		}
+		return nil
+	})
+
+	if metadata.GCSManifestPath != "" && m.sessionMemStore != nil {
+		uploader = snapshot.NewSessionChunkUploader(m.sessionMemStore, m.sessionDiskStore, m.logger.Logger)
+		setupG.Go(func() error {
+			var dlErr error
+			man, dlErr = uploader.DownloadManifest(setupCtx, metadata.GCSManifestPath)
+			if dlErr != nil {
+				return fmt.Errorf("failed to download session manifest: %w", dlErr)
+			}
+			return nil
+		})
+	}
+
+	if err := setupG.Wait(); err != nil {
+		if lease != nil {
+			lease.Release()
+		}
 		return nil, err
 	}
 	defer lease.Release()
@@ -1019,14 +1092,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 		"layers":       metadata.Layers,
 		"workload_key": metadata.WorkloadKey,
 	}).Info("Resuming runner from session snapshot")
-
-	// Kernel path is always needed; full snapshot paths (rootfs, mem) are only
-	// needed for the local-resume fallback.  Defer GetSnapshotPaths() to the
-	// local branch so GCS-backed resumes don't fail on missing rootfs.img.
-	kernelPath, err := m.snapshotCache.GetKernelPath()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get kernel path: %w", err)
-	}
 
 	tap := lease.Tap
 	nsInfo := lease.NsInfo
@@ -1042,105 +1107,197 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 	var uffdHandler uffdStopper
 	var latestStateFile string
 	var sessionPrefetcher *uffd.Prefetcher
+	var proxy *authproxy.AuthProxy
 
-	if metadata.GCSManifestPath != "" && m.sessionMemStore != nil {
-		// GCS-backed resume: download ChunkIndex, convert to ChunkedSnapshotMetadata,
+	if man != nil && uploader != nil {
+		// GCS-backed resume: manifest already downloaded in parallel above.
+		// Download ChunkIndex, convert to ChunkedSnapshotMetadata,
 		// create a Handler that fetches pages lazily from GCS.
-		uploader := snapshot.NewSessionChunkUploader(m.sessionMemStore, m.sessionDiskStore, m.logger.Logger)
 
-		man, dlErr := uploader.DownloadManifest(ctx, metadata.GCSManifestPath)
-		if dlErr != nil {
-			return nil, fmt.Errorf("failed to download session manifest: %w", dlErr)
-		}
+		// Phase A: Parallel downloads + FUSE setup + Firecracker process start.
+		// These are structured to maximize overlap:
+		//  - Mem index download → UFFD handler creation (sequential dependency)
+		//  - Disk index downloads → FUSE mounts (sequential dependency per drive)
+		//  - VM state download → needed for LoadSnapshot only
+		//  - Firecracker process start → needs netns only, overlaps with everything
+		//  - Port forwarding + auth proxy → needs netns only, overlaps with everything
+		var memIdx *snapshot.ChunkIndex
+		var rootfsDiskIdx *snapshot.ChunkIndex
+		extDiskIndexes := map[string]*snapshot.ChunkIndex{}
+		var extDiskMu sync.Mutex
 
-		memIdx, dlErr := uploader.DownloadChunkIndex(ctx, man.Memory.ChunkIndexObject)
-		if dlErr != nil {
-			return nil, fmt.Errorf("failed to download mem chunk index: %w", dlErr)
-		}
-
-		chunkedMeta := snapshot.ChunkIndexToMetadata(memIdx)
-		gcsHandler, handlerErr := uffd.NewHandler(uffd.HandlerConfig{
-			SocketPath:             uffdSocketPath,
-			ChunkStore:             m.sessionMemStore,
-			Metadata:               chunkedMeta,
-			Logger:                 m.logger.Logger,
-			FaultConcurrency:       32,
-			EnablePrefetchTracking: true,
-		})
-		if handlerErr != nil {
-			return nil, fmt.Errorf("failed to create GCS UFFD handler: %w", handlerErr)
-		}
-		if startErr := gcsHandler.Start(); startErr != nil {
-			gcsHandler.Stop()
-			return nil, fmt.Errorf("failed to start GCS UFFD handler: %w", startErr)
-		}
-
-		// Start prefetcher if a recorded access-pattern mapping exists.
-		if chunkedMeta.MemPrefetchMapping != nil && len(chunkedMeta.MemPrefetchMapping.Offsets) > 0 {
-			sessionPrefetcher = uffd.NewPrefetcher(uffd.PrefetcherConfig{
-				Mapping:     chunkedMeta.MemPrefetchMapping,
-				ChunkStore:  m.sessionMemStore,
-				Metadata:    chunkedMeta,
-				Connected:   gcsHandler.Connected(),
-				Logger:      m.logger.Logger,
-				CopyWorkers: 16,
-			})
-			gcsHandler.SetPrefetcher(sessionPrefetcher)
-			sessionPrefetcher.Start()
-			m.logger.WithField("pages", len(chunkedMeta.MemPrefetchMapping.Offsets)).Info("Started access-pattern prefetcher")
-		}
-
-		uffdHandler = gcsHandler
-
-		// Download the VM state file locally (Firecracker requires a local path).
 		localStateDir := filepath.Join(m.config.SocketDir, "session-state")
 		if mkdirErr := os.MkdirAll(localStateDir, 0755); mkdirErr != nil {
-			gcsHandler.Stop()
 			return nil, fmt.Errorf("failed to create local state dir: %w", mkdirErr)
 		}
 		latestStateFile = filepath.Join(localStateDir, runnerID+".state")
-		if dlErr := uploader.DownloadVMState(ctx, man.Firecracker.VMStateObject, latestStateFile); dlErr != nil {
-			gcsHandler.Stop()
-			return nil, fmt.Errorf("failed to download VM state from GCS: %w", dlErr)
-		}
 
-		// Set up FUSE disks for extension drives if the manifest includes extension disk ChunkIndexes.
+		// memReady signals when the memory chunk index is downloaded and the
+		// UFFD handler is created + started. LoadSnapshot needs this.
+		memReady := make(chan struct{})
+		var gcsHandler *uffd.Handler
+
+		setupG, setupCtx := errgroup.WithContext(ctx)
+
+		// Download mem chunk index → create UFFD handler → start prefetcher.
+		setupG.Go(func() error {
+			var dlErr error
+			memIdx, dlErr = uploader.DownloadChunkIndex(setupCtx, man.Memory.ChunkIndexObject)
+			if dlErr != nil {
+				return fmt.Errorf("failed to download mem chunk index: %w", dlErr)
+			}
+
+			chunkedMeta := snapshot.ChunkIndexToMetadata(memIdx)
+			var handlerErr error
+			gcsHandler, handlerErr = uffd.NewHandler(uffd.HandlerConfig{
+				SocketPath:             uffdSocketPath,
+				ChunkStore:             m.sessionMemStore,
+				Metadata:               chunkedMeta,
+				Logger:                 m.logger.Logger,
+				FaultConcurrency:       32,
+				EnablePrefetchTracking: true,
+			})
+			if handlerErr != nil {
+				return fmt.Errorf("failed to create GCS UFFD handler: %w", handlerErr)
+			}
+			if startErr := gcsHandler.Start(); startErr != nil {
+				gcsHandler.Stop()
+				return fmt.Errorf("failed to start GCS UFFD handler: %w", startErr)
+			}
+
+			// Start prefetcher if a recorded access-pattern mapping exists.
+			if chunkedMeta.MemPrefetchMapping != nil && len(chunkedMeta.MemPrefetchMapping.Offsets) > 0 {
+				sessionPrefetcher = uffd.NewPrefetcher(uffd.PrefetcherConfig{
+					Mapping:     chunkedMeta.MemPrefetchMapping,
+					ChunkStore:  m.sessionMemStore,
+					Metadata:    chunkedMeta,
+					Connected:   gcsHandler.Connected(),
+					Logger:      m.logger.Logger,
+					CopyWorkers: 16,
+				})
+				gcsHandler.SetPrefetcher(sessionPrefetcher)
+				sessionPrefetcher.Start()
+				m.logger.WithField("pages", len(chunkedMeta.MemPrefetchMapping.Offsets)).Info("Started access-pattern prefetcher")
+			}
+
+			close(memReady)
+			return nil
+		})
+
+		// Download VM state (needed for LoadSnapshot, runs in parallel).
+		setupG.Go(func() error {
+			if dlErr := uploader.DownloadVMState(setupCtx, man.Firecracker.VMStateObject, latestStateFile); dlErr != nil {
+				return fmt.Errorf("failed to download VM state from GCS: %w", dlErr)
+			}
+			return nil
+		})
+
+		// Download disk indexes → FUSE mount (each drive is independent).
 		if m.setupExtensionFUSEDisk != nil {
 			for driveID, diskSection := range man.ExtensionDisks {
 				if diskSection.Mode != "chunked" || diskSection.ChunkIndexObject == "" {
 					continue
 				}
-				diskIdx, diskDlErr := uploader.DownloadChunkIndex(ctx, diskSection.ChunkIndexObject)
-				if diskDlErr != nil {
-					gcsHandler.Stop()
-					return nil, fmt.Errorf("failed to download disk chunk index for drive %s: %w", driveID, diskDlErr)
-				}
-				diskRefs := snapshot.ChunkIndexToRefs(diskIdx)
-				fusePath, fuseErr := m.setupExtensionFUSEDisk(runnerID, driveID, diskRefs, diskIdx.Region.LogicalSizeBytes, diskIdx.ChunkSizeBytes)
-				if fuseErr != nil {
-					gcsHandler.Stop()
-					return nil, fmt.Errorf("failed to setup FUSE disk for drive %s session resume: %w", driveID, fuseErr)
-				}
-				extensionDrivePaths[driveID] = fusePath
+				did := driveID
+				obj := diskSection.ChunkIndexObject
+				setupG.Go(func() error {
+					diskIdx, diskDlErr := uploader.DownloadChunkIndex(setupCtx, obj)
+					if diskDlErr != nil {
+						return fmt.Errorf("failed to download disk chunk index for drive %s: %w", did, diskDlErr)
+					}
+					extDiskMu.Lock()
+					extDiskIndexes[did] = diskIdx
+					extDiskMu.Unlock()
+					// Mount FUSE disk immediately after download — no need to wait for other indexes.
+					diskRefs := snapshot.ChunkIndexToRefs(diskIdx)
+					fusePath, fuseErr := m.setupExtensionFUSEDisk(runnerID, did, diskRefs, diskIdx.Region.LogicalSizeBytes, diskIdx.ChunkSizeBytes)
+					if fuseErr != nil {
+						return fmt.Errorf("failed to setup FUSE disk for drive %s session resume: %w", did, fuseErr)
+					}
+					extDiskMu.Lock()
+					extensionDrivePaths[did] = fusePath
+					extDiskMu.Unlock()
+					return nil
+				})
 			}
 		}
 
-		// Set up FUSE disk for rootfs if the manifest includes a rootfs disk ChunkIndex.
+		// Download rootfs disk index → FUSE mount.
 		if m.setupRootfsFUSEDisk != nil && man.Disk.Mode == "chunked" && man.Disk.ChunkIndexObject != "" {
-			rootfsDiskIdx, diskDlErr := uploader.DownloadChunkIndex(ctx, man.Disk.ChunkIndexObject)
-			if diskDlErr != nil {
-				gcsHandler.Stop()
-				return nil, fmt.Errorf("failed to download rootfs disk chunk index: %w", diskDlErr)
-			}
-			rootfsRefs := snapshot.ChunkIndexToRefs(rootfsDiskIdx)
-			rootfsFusePath, fuseErr := m.setupRootfsFUSEDisk(runnerID, rootfsRefs, rootfsDiskIdx.Region.LogicalSizeBytes, rootfsDiskIdx.ChunkSizeBytes)
-			if fuseErr != nil {
-				gcsHandler.Stop()
-				return nil, fmt.Errorf("failed to setup FUSE rootfs disk for session resume: %w", fuseErr)
-			}
-			overlayPath = rootfsFusePath
-			m.logger.WithField("rootfs_fuse_path", rootfsFusePath).Info("Using FUSE-backed rootfs for cross-host session resume")
+			setupG.Go(func() error {
+				var diskDlErr error
+				rootfsDiskIdx, diskDlErr = uploader.DownloadChunkIndex(setupCtx, man.Disk.ChunkIndexObject)
+				if diskDlErr != nil {
+					return fmt.Errorf("failed to download rootfs disk chunk index: %w", diskDlErr)
+				}
+				rootfsRefs := snapshot.ChunkIndexToRefs(rootfsDiskIdx)
+				rootfsFusePath, fuseErr := m.setupRootfsFUSEDisk(runnerID, rootfsRefs, rootfsDiskIdx.Region.LogicalSizeBytes, rootfsDiskIdx.ChunkSizeBytes)
+				if fuseErr != nil {
+					return fmt.Errorf("failed to setup FUSE rootfs disk for session resume: %w", fuseErr)
+				}
+				overlayPath = rootfsFusePath
+				m.logger.WithField("rootfs_fuse_path", rootfsFusePath).Info("Using FUSE-backed rootfs for cross-host session resume")
+				return nil
+			})
 		}
+
+		// Port forwarding — only needs network namespace, not VM.
+		if m.netnsNetwork != nil {
+			setupG.Go(func() error {
+				if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentHealthPort); err != nil {
+					m.logger.WithError(err).Warn("Failed to forward capsule-thaw-agent health port")
+				}
+				if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentDebugPort); err != nil {
+					m.logger.WithError(err).Warn("Failed to forward capsule-thaw-agent debug port")
+				}
+				if metadata.ServicePort > 0 {
+					if err := m.netnsNetwork.ForwardPort(runnerID, metadata.ServicePort); err != nil {
+						m.logger.WithField("port", metadata.ServicePort).WithError(err).Warn("Failed to forward service port on resume")
+					}
+				}
+				return nil
+			})
+		}
+
+		// Auth proxy — only needs network namespace, not VM.
+		if metadata.AuthConfig != nil && m.netnsNetwork != nil {
+			setupG.Go(func() error {
+				ns, nsErr := m.netnsNetwork.GetNamespace(runnerID)
+				if nsErr != nil {
+					m.logger.WithError(nsErr).Warn("Failed to get namespace for auth proxy on resume")
+					return nil // non-fatal
+				}
+				hostVethIP := net.IPv4(10, 200, byte(ns.Slot), 1).String()
+				p, pErr := authproxy.NewAuthProxy(
+					runnerID,
+					*metadata.AuthConfig,
+					ns.Path,
+					ns.Gateway.String(),
+					hostVethIP,
+					m.logger,
+				)
+				if pErr != nil {
+					m.logger.WithError(pErr).Warn("Failed to create auth proxy on resume (non-fatal)")
+					return nil
+				}
+				if startErr := p.Start(context.Background()); startErr != nil {
+					p.Stop()
+					m.logger.WithError(startErr).Warn("Failed to start auth proxy on resume (non-fatal)")
+					return nil
+				}
+				proxy = p
+				return nil
+			})
+		}
+
+		if setupErr := setupG.Wait(); setupErr != nil {
+			if gcsHandler != nil {
+				gcsHandler.Stop()
+			}
+			return nil, setupErr
+		}
+
+		uffdHandler = gcsHandler
 
 		m.logger.WithFields(logrus.Fields{
 			"session_id":  sessionID,
@@ -1245,38 +1402,10 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 		os.Remove(latestStateFile)
 	}
 
-	// Wait for prefetcher to install pages into guest memory BEFORE resuming
-	// the VM. This eliminates the page fault storm that occurs when 100+ VMs
-	// resume simultaneously — prefetching without a running vCPU is much
-	// cheaper (no mmap_lock contention, no TLB flushes, optimal page order).
-	if sessionPrefetcher != nil {
-		prefetchStart := time.Now()
-		select {
-		case <-sessionPrefetcher.Done():
-			m.logger.WithField("prefetch_ms", time.Since(prefetchStart).Milliseconds()).Info("Prefetch completed before resume")
-		case <-time.After(2 * time.Second):
-			m.logger.WithField("prefetch_ms", time.Since(prefetchStart).Milliseconds()).Warn("Prefetch timed out, resuming with partial prefetch")
-		case <-ctx.Done():
-			uffdHandler.Stop()
-			vm.Stop()
-			return nil, ctx.Err()
-		}
-	}
-
-	// Set up port forwarding for netns
-	if m.netnsNetwork != nil {
-		if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentHealthPort); err != nil {
-			m.logger.WithError(err).Warn("Failed to forward capsule-thaw-agent health port")
-		}
-		if err := m.netnsNetwork.ForwardPort(runnerID, snapshot.ThawAgentDebugPort); err != nil {
-			m.logger.WithError(err).Warn("Failed to forward capsule-thaw-agent debug port")
-		}
-		if metadata.ServicePort > 0 {
-			if err := m.netnsNetwork.ForwardPort(runnerID, metadata.ServicePort); err != nil {
-				m.logger.WithField("port", metadata.ServicePort).WithError(err).Warn("Failed to forward service port on resume")
-			}
-		}
-	}
+	// Prefetch is fire-and-forget: the prefetcher started during setup and
+	// loads pages in background via UFFD. Any pages not yet prefetched will
+	// be demand-fetched on page fault — the VM is fully functional regardless.
+	// (Matches infra's approach: no blocking wait before resume.)
 
 	// Build runner record
 	runner := &Runner{
@@ -1306,32 +1435,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 		ServicePort:   metadata.ServicePort,
 		AuthConfig:    metadata.AuthConfig,
 		LastExecAt:    time.Now(),
-	}
-
-	// Recreate auth proxy if the paused runner had one
-	var proxy *authproxy.AuthProxy
-	if metadata.AuthConfig != nil && m.netnsNetwork != nil {
-		ns, nsErr := m.netnsNetwork.GetNamespace(runnerID)
-		if nsErr != nil {
-			m.logger.WithError(nsErr).Warn("Failed to get namespace for auth proxy on resume")
-		} else {
-			hostVethIP := net.IPv4(10, 200, byte(ns.Slot), 1).String()
-			proxy, err = authproxy.NewAuthProxy(
-				runnerID,
-				*metadata.AuthConfig,
-				ns.Path,
-				ns.Gateway.String(),
-				hostVethIP,
-				m.logger,
-			)
-			if err != nil {
-				m.logger.WithError(err).Warn("Failed to create auth proxy on resume (non-fatal)")
-			} else if startErr := proxy.Start(context.Background()); startErr != nil {
-				proxy.Stop()
-				proxy = nil
-				m.logger.WithError(startErr).Warn("Failed to start auth proxy on resume (non-fatal)")
-			}
-		}
 	}
 
 	m.mu.Lock()
@@ -1374,11 +1477,8 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 	}
 
 	// Wait for the capsule-thaw-agent inside the VM to become responsive.
-	// After snapshot restore the agent needs ~1-2s to detect the new MMDS
+	// After snapshot restore the agent needs to detect the new MMDS
 	// current_time, thaw frozen filesystems, and reconfigure networking.
-	// Without this check the control plane may route requests to a runner
-	// whose agent is not yet ready (or whose guest is stuck), causing
-	// silent 30s timeouts.
 	readyTimeout := 5 * time.Second
 	if err := m.waitForThawAgentReady(ctx, internalIP.String(), readyTimeout); err != nil {
 		m.logger.WithError(err).WithFields(logrus.Fields{
@@ -1386,10 +1486,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 			"session_id": sessionID,
 			"ip":         internalIP.String(),
 		}).Warn("Thaw-agent not ready after session resume")
-		// Don't fail the resume — the agent may just be slow. Log the
-		// warning so operators can investigate, but still return the
-		// runner. The caller will get a timeout on the first request
-		// which is no worse than the current behavior.
 	}
 
 	m.logger.WithFields(logrus.Fields{
@@ -1406,9 +1502,9 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 func (m *Manager) waitForThawAgentReady(ctx context.Context, ip string, timeout time.Duration) error {
 	aliveURL := fmt.Sprintf("http://%s:%d/alive", ip, snapshot.ThawAgentDebugPort)
 	deadline := time.Now().Add(timeout)
-	pollInterval := 100 * time.Millisecond
+	pollInterval := 10 * time.Millisecond
 
-	client := &http.Client{Timeout: 2 * time.Second}
+	client := &http.Client{Timeout: 100 * time.Millisecond}
 
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {

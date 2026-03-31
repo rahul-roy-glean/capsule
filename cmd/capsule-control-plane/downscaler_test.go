@@ -855,8 +855,8 @@ func TestComputeAutoscaleDecision_RateBasedScaleUp(t *testing.T) {
 
 func TestComputeAutoscaleDecision_RateBasedMultiHostScaleUp(t *testing.T) {
 	now := time.Now()
-	// 1 host, 100 mCPU remaining. Rate=20 mCPU/s → TTE=5s << 180s boot
-	// deficit = 20*180 - 100 = 3500. hosts = ceil(3500/1000) = 4
+	// 1 host, 100 mCPU remaining. Rate=20 mCPU/s → TTE=5s << 2×180s=360s headroom
+	// deficit = 20*360 - 100 = 7100. hosts = ceil(7100/1000) = 8
 	hosts := []*Host{
 		makeHost("h1", 900, 1000, now.Add(-2*time.Hour)),
 	}
@@ -874,8 +874,8 @@ func TestComputeAutoscaleDecision_RateBasedMultiHostScaleUp(t *testing.T) {
 	if d.action != scaleActionUp {
 		t.Fatalf("expected rate-based scaleActionUp, got %d", d.action)
 	}
-	if d.scaleUpBy != 4 {
-		t.Fatalf("expected scaleUpBy=4 for multi-host, got %d", d.scaleUpBy)
+	if d.scaleUpBy != 8 {
+		t.Fatalf("expected scaleUpBy=8 for multi-host (2x headroom), got %d", d.scaleUpBy)
 	}
 }
 
@@ -1026,20 +1026,20 @@ func TestRunDownscaleOnce_RateBasedMultiHostResize(t *testing.T) {
 	if !acted {
 		t.Fatal("expected action taken for rate-based scale-up")
 	}
-	// Rate=20, remaining=100, TTE=5s < boot=180s.
-	// deficit=20*180-100=3500, hosts=ceil(3500/1000)=4
-	if mc.resizedTo != 5 { // 1 + 4
-		t.Fatalf("expected MIG resized to 5 (1+4), got %d", mc.resizedTo)
+	// Rate=20, remaining=100, TTE=5s < 2×boot=360s.
+	// deficit=20*360-100=7100, hosts=ceil(7100/1000)=8
+	if mc.resizedTo != 9 { // 1 + 8
+		t.Fatalf("expected MIG resized to 9 (1+8), got %d", mc.resizedTo)
 	}
 }
 
 func TestComputeAutoscaleDecision_RateBasedSkipsLowUtilization(t *testing.T) {
 	now := time.Now()
-	// Host at 10% utilization with high allocation rate. TTE would trigger
-	// rate-based scaling, but utilization is below settlingThreshold (20%)
+	// Host at 5% utilization with high allocation rate. TTE would trigger
+	// rate-based scaling, but utilization is below settlingThreshold/2 (10%)
 	// so the rate-based check should be skipped.
 	hosts := []*Host{
-		makeHost("h1", 100, 1000, now.Add(-2*time.Hour)),
+		makeHost("h1", 50, 1000, now.Add(-2*time.Hour)),
 	}
 	d := computeAutoscaleDecision(autoscaleInput{
 		readyHosts:         hosts,
@@ -1048,11 +1048,11 @@ func TestComputeAutoscaleDecision_RateBasedSkipsLowUtilization(t *testing.T) {
 		settlingThreshold:  0.2,
 		allocFailures:      0,
 		allocationRateCPU:  50.0, // very high rate
-		remainingCapacity:  900,  // lots of spare
+		remainingCapacity:  950,  // lots of spare
 		bootCooldown:       3 * time.Minute,
 		avgCapacityPerHost: 1000,
 	})
-	// avgUtil = 1 - 900/(1*1000) = 0.1 < 0.2 settling → rate-based skipped
+	// avgUtil = 1 - 950/(1*1000) = 0.05 < 0.1 (settlingThreshold/2) → rate-based skipped
 	if d.action == scaleActionUp {
 		t.Fatal("should not rate-based scale up when utilization is below settling threshold")
 	}

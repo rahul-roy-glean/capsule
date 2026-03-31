@@ -567,14 +567,15 @@ func (h *Handler) handlePageFaults(uffdFd int) {
 			if currentFaults != lastFaultCount {
 				cacheStats := h.chunkStore.CacheStats()
 				h.logger.WithFields(logrus.Fields{
-					"total_faults":   currentFaults,
-					"delta":          currentFaults - lastFaultCount,
-					"remote_fetches": h.chunkStore.RemoteFetches(),
-					"lru_hits":       cacheStats.Hits,
-					"lru_misses":     cacheStats.Misses,
-					"lru_evictions":  cacheStats.Evictions,
-					"lru_items":      cacheStats.ItemCount,
-					"lru_size_mb":    cacheStats.Size / (1024 * 1024),
+					"total_faults":    currentFaults,
+					"delta":           currentFaults - lastFaultCount,
+					"remote_fetches":  h.chunkStore.RemoteFetches(),
+					"lru_hits":        cacheStats.Hits,
+					"lru_misses":      cacheStats.Misses,
+					"lru_evictions":   cacheStats.Evictions,
+					"lru_items":       cacheStats.ItemCount,
+					"lru_size_mb":     cacheStats.Size / (1024 * 1024),
+					"lru_max_size_mb": cacheStats.MaxSize / (1024 * 1024),
 				}).Debug("UFFD fault activity")
 				lastFaultCount = currentFaults
 			}

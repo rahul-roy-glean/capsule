@@ -24,7 +24,6 @@ import (
 	"github.com/rahul-roy-glean/capsule/pkg/fuse"
 	"github.com/rahul-roy-glean/capsule/pkg/network"
 	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
-	"github.com/rahul-roy-glean/capsule/pkg/tiers"
 	"github.com/rahul-roy-glean/capsule/pkg/uffd"
 )
 
@@ -133,26 +132,19 @@ func NewChunkedManager(ctx context.Context, cfg ChunkedManagerConfig, logger *lo
 
 	// Setup chunked snapshot infrastructure if enabled
 	if cfg.UseChunkedSnapshots {
-		// Compute auto cache size from host resources and expected runner capacity.
-		// We estimate max runners the host can support (CPU-limited, default tier),
-		// reserve RAM for those VMs + OS overhead, and split the remainder equally
-		// between disk and memory caches.
+		// Compute auto cache size from host resources. We allocate 25% of total
+		// RAM per cache (50% total for disk + mem). This is safe for any tier
+		// mix: even if VMs consume the other 50%, the Go GC and LRU eviction
+		// handle memory pressure gracefully. A tier-based calculation would
+		// break with mixed workloads (XS + M + L on the same host).
 		const osOverheadBytes = 4 * 1024 * 1024 * 1024 // 4GB for OS/kernel/system
 		autoCacheSize := int64(2 * 1024 * 1024 * 1024) // 2GB fallback
 		var sysinfo unix.Sysinfo_t
 		if err := unix.Sysinfo(&sysinfo); err == nil && sysinfo.Totalram > 0 {
 			totalRAM := int64(sysinfo.Totalram)
-			defaultTier := tiers.All[tiers.DefaultTier]
-			effectiveCPU := tiers.EffectiveCPUMillicores(defaultTier)
-			if cfg.HostConfig.TotalCPUMillicores > 0 && effectiveCPU > 0 {
-				maxRunners := int64(cfg.HostConfig.TotalCPUMillicores) / int64(effectiveCPU)
-				reservedForVMs := maxRunners * int64(defaultTier.MemoryMB) * 1024 * 1024
-				cacheable := totalRAM - reservedForVMs - osOverheadBytes
-				if cacheable > 0 {
-					autoCacheSize = cacheable / 2 // split between disk + mem caches
-				}
-			} else {
-				autoCacheSize = totalRAM / 8 // 12.5% fallback when CPU info unavailable
+			usableRAM := totalRAM - osOverheadBytes
+			if usableRAM > 0 {
+				autoCacheSize = usableRAM / 4 // 25% of usable RAM per cache
 			}
 		}
 
@@ -1069,63 +1061,67 @@ func (cm *ChunkedManager) ReleaseRunnerChunked(ctx context.Context, runnerID str
 	}
 	cm.mu.Unlock()
 
-	// Phase 2: blocking cleanup — outside lock.
-	cm.chunkedLogger.WithFields(logrus.Fields{
-		"runner_id":        runnerID,
-		"save_incremental": saveIncremental,
-	}).Info("Releasing chunked runner")
+	// Phase 2: expensive cleanup — run in background so the gRPC response
+	// returns immediately. Phase 1 already removed the runner from all maps,
+	// so CanAddRunner sees the freed capacity and new allocations work.
+	go func() {
+		cm.chunkedLogger.WithFields(logrus.Fields{
+			"runner_id":        runnerID,
+			"save_incremental": saveIncremental,
+		}).Info("Releasing chunked runner")
 
-	// Save incremental snapshot if requested
-	if defaultMeta != nil {
-		dirtyCount := fuseDisk.DirtyChunkCount()
-		if dirtyCount > 0 {
-			cm.chunkedLogger.WithFields(logrus.Fields{
-				"runner_id":    runnerID,
-				"dirty_chunks": dirtyCount,
-			}).Info("Saving dirty chunks for incremental snapshot")
-
-			dirtyChunks := fuseDisk.GetDirtyChunks()
-			uploader := snapshot.NewIncrementalUploader(cm.chunkStore, cm.logger.Logger)
-
-			newVersion := fmt.Sprintf("%s-%s", defaultMeta.Version, runnerID[:8])
-			newMeta, err := uploader.UploadIncrementalSnapshot(ctx, defaultMeta, dirtyChunks, nil, newVersion)
-			if err != nil {
-				cm.chunkedLogger.WithError(err).Warn("Failed to save incremental snapshot")
-			} else {
+		// Save incremental snapshot if requested
+		if defaultMeta != nil {
+			dirtyCount := fuseDisk.DirtyChunkCount()
+			if dirtyCount > 0 {
 				cm.chunkedLogger.WithFields(logrus.Fields{
-					"new_version":  newMeta.Version,
+					"runner_id":    runnerID,
 					"dirty_chunks": dirtyCount,
-				}).Info("Incremental snapshot saved")
+				}).Info("Saving dirty chunks for incremental snapshot")
+
+				dirtyChunks := fuseDisk.GetDirtyChunks()
+				uploader := snapshot.NewIncrementalUploader(cm.chunkStore, cm.logger.Logger)
+
+				newVersion := fmt.Sprintf("%s-%s", defaultMeta.Version, runnerID[:8])
+				newMeta, err := uploader.UploadIncrementalSnapshot(context.Background(), defaultMeta, dirtyChunks, nil, newVersion)
+				if err != nil {
+					cm.chunkedLogger.WithError(err).Warn("Failed to save incremental snapshot")
+				} else {
+					cm.chunkedLogger.WithFields(logrus.Fields{
+						"new_version":  newMeta.Version,
+						"dirty_chunks": dirtyCount,
+					}).Info("Incremental snapshot saved")
+				}
 			}
 		}
-	}
 
-	if proxy != nil {
-		proxy.Stop()
-	}
-	// Stop UFFD handler BEFORE Firecracker — FC may be stuck in kernel page
-	// faults waiting for UFFDIO_COPY. Closing the handler unblocks those
-	// faults so SIGTERM can be delivered cleanly.
-	if handler != nil {
-		handler.Stop()
-	}
-	if vm != nil {
-		vm.Stop()
-	}
-	if fuseDisk != nil {
-		fuseDisk.Unmount()
-	}
-	for _, disk := range extDisks {
-		disk.Unmount()
-	}
+		if proxy != nil {
+			proxy.Stop()
+		}
+		// Stop UFFD handler BEFORE Firecracker — FC may be stuck in kernel page
+		// faults waiting for UFFDIO_COPY. Closing the handler unblocks those
+		// faults so SIGTERM can be delivered cleanly.
+		if handler != nil {
+			handler.Stop()
+		}
+		if vm != nil {
+			vm.Stop()
+		}
+		if fuseDisk != nil {
+			fuseDisk.Unmount()
+		}
+		for _, disk := range extDisks {
+			disk.Unmount()
+		}
 
-	// Cleanup network
-	cm.netnsNetwork.ReleaseNamespace(runnerID)
+		// Cleanup network
+		cm.netnsNetwork.ReleaseNamespace(runnerID)
 
-	// Cleanup workspace and sockets
-	os.RemoveAll(filepath.Join(cm.config.WorkspaceDir, runnerID))
-	os.Remove(filepath.Join(cm.config.SocketDir, runnerID+".sock"))
-	os.Remove(filepath.Join(cm.config.SocketDir, runnerID+".uffd.sock"))
+		// Cleanup workspace and sockets
+		os.RemoveAll(filepath.Join(cm.config.WorkspaceDir, runnerID))
+		os.Remove(filepath.Join(cm.config.SocketDir, runnerID+".sock"))
+		os.Remove(filepath.Join(cm.config.SocketDir, runnerID+".uffd.sock"))
+	}()
 
 	return nil
 }

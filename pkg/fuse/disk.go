@@ -139,20 +139,21 @@ func (d *ChunkedDisk) Mount() error {
 	return nil
 }
 
-// Unmount unmounts the FUSE filesystem
+// Unmount unmounts the FUSE filesystem.
+// Uses MNT_DETACH (lazy unmount) via syscall to avoid blocking. The regular
+// fusermount -u path serializes on kernel VFS locks, causing 100 concurrent
+// unmounts to take 30+ seconds. Lazy unmount detaches the mount instantly and
+// the kernel cleans up asynchronously once all references (Firecracker is
+// already dead) are gone. After detaching, Close() unblocks the Serve
+// goroutine's ReadRequest safely.
 func (d *ChunkedDisk) Unmount() error {
 	d.cancel()
 	if d.conn != nil {
-		// Close the FUSE connection first — this immediately interrupts all
-		// pending FUSE operations by closing /dev/fuse, which is faster than
-		// fusermount -u (which asks the kernel to drain pending ops first).
-		d.conn.Close()
-		if err := fuse.Unmount(d.mountPoint); err != nil {
-			// fusermount -u failed (e.g. race with kernel cleanup). Fall back
-			// to lazy unmount so the mount point is freed for the next resume
-			// (same runner ID → same path).
-			exec.Command("umount", "-l", d.mountPoint).Run()
+		if err := syscall.Unmount(d.mountPoint, syscall.MNT_DETACH); err != nil {
+			d.logger.WithError(err).WithField("mount_point", d.mountPoint).Debug("Lazy unmount syscall failed, trying fusermount")
+			fuse.Unmount(d.mountPoint)
 		}
+		d.conn.Close()
 	}
 	return nil
 }
