@@ -539,12 +539,6 @@ shutdown -h now
 			NetworkInterfaces: []*computepb.NetworkInterface{
 				{
 					Network: proto.String(networkURL),
-					AccessConfigs: []*computepb.AccessConfig{
-						{
-							Name: proto.String("External NAT"),
-							Type: proto.String("ONE_TO_ONE_NAT"),
-						},
-					},
 				},
 			},
 			Metadata: &computepb.Metadata{

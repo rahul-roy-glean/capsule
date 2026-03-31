@@ -1536,12 +1536,6 @@ shutdown -h now
 
 	netIface := &computepb.NetworkInterface{
 		Network: proto.String(networkURL),
-		AccessConfigs: []*computepb.AccessConfig{
-			{
-				Type: proto.String("ONE_TO_ONE_NAT"),
-				Name: proto.String("External NAT"),
-			},
-		},
 	}
 	if sm.builderSubnet != "" {
 		region := sm.gcpZone[:len(sm.gcpZone)-2] // strip zone suffix (e.g. "us-central1-c" -> "us-central1")
