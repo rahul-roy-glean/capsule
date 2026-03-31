@@ -307,7 +307,7 @@ func main() {
 
 	// Network is configured by kernel boot parameters (ip=...), so we just need
 	// to wait briefly for the interface to be ready
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 	setStep("waiting_for_mmds")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -483,8 +483,15 @@ func main() {
 				// (the health server has a reference to the original mmdsData)
 				mmdsData.Latest = newData.Latest
 
-				// Thaw any frozen filesystems before accessing drives.
-				thawFrozenFilesystems()
+				// Thaw frozen filesystems and reconfigure network concurrently.
+				// Root fs is excluded from thaw, so network config (which writes
+				// to /sys, /proc, /etc on root) is safe to run in parallel.
+				var thawNetWg sync.WaitGroup
+				thawNetWg.Add(1)
+				go func() {
+					defer thawNetWg.Done()
+					thawFrozenFilesystems()
+				}()
 
 				// Recreate symlink after restore (tmpfs was fresh, symlink from warmup is gone)
 				// Use configured paths from MMDS
@@ -505,6 +512,8 @@ func main() {
 						log.Info("Post-restore network reconfigured successfully")
 					}
 				}
+
+				thawNetWg.Wait()
 
 				// Sync clock from MMDS current_time after snapshot restore.
 				// The host sets current_time when building MMDS data. Without this,
@@ -1025,16 +1034,6 @@ func configureNetwork(data *MMDSData) error {
 			"routes":      strings.TrimSpace(string(routeCheck)),
 		}).Info("configureNetwork: post-config state")
 
-		// Quick connectivity test using Go's net.DialTimeout (no ping needed)
-		testConn, testErr := gonet.DialTimeout("tcp", net.Gateway+":80", 2*time.Second)
-		if testErr != nil {
-			// TCP to gateway:80 won't work, try UDP DNS instead
-			log.WithField("gateway_test_err", testErr.Error()).Info("configureNetwork: gateway TCP test (expected to fail, not a real service)")
-		} else {
-			testConn.Close()
-			log.Info("configureNetwork: gateway reachable")
-		}
-
 		return nil
 	}
 
@@ -1110,7 +1109,7 @@ func watchForSnapshotRestore() {
 	lastTime := ""
 
 	for {
-		time.Sleep(1 * time.Second)
+		time.Sleep(10 * time.Millisecond)
 
 		req, err := http.NewRequest("GET", endpoint, nil)
 		if err != nil {
@@ -1121,7 +1120,7 @@ func watchForSnapshotRestore() {
 		// Use a fresh client per request -- after snapshot restore, pooled
 		// connections in http.DefaultClient are stale/dead.
 		client := &http.Client{
-			Timeout: 3 * time.Second,
+			Timeout: 500 * time.Millisecond,
 			Transport: &http.Transport{
 				DisableKeepAlives: true,
 			},
@@ -1146,51 +1145,63 @@ func watchForSnapshotRestore() {
 		// New current_time detected -- this means we were restored from a snapshot
 		lastTime = ct
 
-		// Thaw frozen filesystems FIRST.  The host freezes ext4 drives
-		// before taking a session snapshot.  Without thawing, any I/O on
-		// those mounts (e.g. /workspace) blocks in D-state indefinitely,
-		// causing request handlers to hang and the agent to appear dead.
-		thawFrozenFilesystems()
+		// Run all restore operations in parallel: filesystem thaw, clock sync,
+		// and network reconfiguration are independent. This reduces the total
+		// time from sequential sum (~1-2s) to max of the three (~500ms).
+		var restoreWg sync.WaitGroup
 
-		hostTime, err := time.Parse(time.RFC3339, ct)
-		if err != nil {
-			log.WithError(err).Warn("watchForSnapshotRestore: failed to parse current_time")
-			continue
-		}
+		restoreWg.Add(1)
+		go func() {
+			defer restoreWg.Done()
+			thawFrozenFilesystems()
+		}()
 
-		tv := syscall.Timeval{
-			Sec:  hostTime.Unix(),
-			Usec: 0,
-		}
-		if err := syscall.Settimeofday(&tv); err != nil {
-			// Fallback: use date command
-			formatted := hostTime.UTC().Format("2006-01-02 15:04:05")
-			if output, err := exec.Command("date", "-u", "-s", formatted).CombinedOutput(); err != nil {
-				log.WithError(err).WithField("output", string(output)).Warn("watchForSnapshotRestore: date command failed")
-				continue
+		restoreWg.Add(1)
+		go func() {
+			defer restoreWg.Done()
+			hostTime, err := time.Parse(time.RFC3339, ct)
+			if err != nil {
+				log.WithError(err).Warn("watchForSnapshotRestore: failed to parse current_time")
+				return
 			}
-		}
-
-		log.WithFields(logrus.Fields{
-			"source":      "mmds-watcher",
-			"server_time": hostTime.UTC().Format(time.RFC3339),
-		}).Info("Clock synced from MMDS after snapshot restore")
-
-		// Reconfigure network -- the VM may have been resumed on a different
-		// TAP slot with a new IP. Without this, the guest retains the old IP
-		// and cannot receive traffic.
-		newData, fetchErr := fetchMMDSData()
-		if fetchErr != nil {
-			log.WithError(fetchErr).Warn("watchForSnapshotRestore: failed to fetch MMDS for network reconfig")
-			continue
-		}
-		if !*skipNetwork && newData.Latest.Network.IP != "" {
-			if err := configureNetwork(newData); err != nil {
-				log.WithError(err).Warn("watchForSnapshotRestore: network reconfiguration failed")
-			} else {
-				log.WithField("new_ip", newData.Latest.Network.IP).Info("Network reconfigured after snapshot restore")
+			tv := syscall.Timeval{
+				Sec:  hostTime.Unix(),
+				Usec: 0,
 			}
-		}
+			if err := syscall.Settimeofday(&tv); err != nil {
+				formatted := hostTime.UTC().Format("2006-01-02 15:04:05")
+				if output, err := exec.Command("date", "-u", "-s", formatted).CombinedOutput(); err != nil {
+					log.WithError(err).WithField("output", string(output)).Warn("watchForSnapshotRestore: date command failed")
+				}
+			}
+			log.WithFields(logrus.Fields{
+				"source":      "mmds-watcher",
+				"server_time": hostTime.UTC().Format(time.RFC3339),
+			}).Info("Clock synced from MMDS after snapshot restore")
+		}()
+
+		// Fetch MMDS + reconfigure network in parallel with clock sync and thaw.
+		var newData *MMDSData
+		restoreWg.Add(1)
+		go func() {
+			defer restoreWg.Done()
+			var fetchErr error
+			newData, fetchErr = fetchMMDSData()
+			if fetchErr != nil {
+				log.WithError(fetchErr).Warn("watchForSnapshotRestore: failed to fetch MMDS for network reconfig")
+				return
+			}
+			if !*skipNetwork && newData.Latest.Network.IP != "" {
+				if err := configureNetwork(newData); err != nil {
+					log.WithError(err).Warn("watchForSnapshotRestore: network reconfiguration failed")
+				} else {
+					log.WithField("new_ip", newData.Latest.Network.IP).Info("Network reconfigured after snapshot restore")
+				}
+			}
+		}()
+
+		// Wait for all restore operations to complete before remounting drives.
+		restoreWg.Wait()
 
 		// Base image migration: if RemountDrives is set, the FUSE-backed
 		// extension drives now serve session data but the kernel's VFS/ext4
@@ -1198,7 +1209,7 @@ func watchForSnapshotRestore() {
 		// drop_caches alone doesn't clear ext4's internal metadata (inodes,
 		// dentries, block bitmaps). We must umount+mount to force ext4 to
 		// re-read everything from the FUSE-backed block device.
-		if newData.Latest.RemountDrives {
+		if newData != nil && newData.Latest.RemountDrives {
 			log.Info("Migration detected after snapshot restore: remounting extension drives")
 			// Find all ext4 mounts on /dev/vd* (extension drives)
 			mountsData, _ := os.ReadFile("/proc/mounts")
@@ -1427,6 +1438,7 @@ func thawFrozenFilesystems() {
 		log.WithError(err).Warn("Failed to read /proc/mounts for thaw")
 		return
 	}
+	var wg sync.WaitGroup
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 3 {
@@ -1436,12 +1448,17 @@ func thawFrozenFilesystems() {
 		if fsType != "ext4" || mountPath == "/" {
 			continue
 		}
-		if out, err := exec.Command("fsfreeze", "--unfreeze", mountPath).CombinedOutput(); err != nil {
-			log.WithError(err).WithField("mount_path", mountPath).Debugf("fsfreeze --unfreeze (output: %s)", string(out))
-		} else {
-			log.WithField("mount_path", mountPath).Info("Thawed frozen filesystem")
-		}
+		wg.Add(1)
+		go func(mp string) {
+			defer wg.Done()
+			if out, err := exec.Command("fsfreeze", "--unfreeze", mp).CombinedOutput(); err != nil {
+				log.WithError(err).WithField("mount_path", mp).Debugf("fsfreeze --unfreeze (output: %s)", string(out))
+			} else {
+				log.WithField("mount_path", mp).Info("Thawed frozen filesystem")
+			}
+		}(mountPath)
 	}
+	wg.Wait()
 }
 
 // runWarmupMode runs the snapshot warmup process by dispatching each command,

@@ -24,7 +24,8 @@ func newTestManager(opts ...func(*Manager)) *Manager {
 		pendingSessions: make(map[string]string),
 		uffdHandlers:    make(map[string]uffdStopper),
 		authProxies:     make(map[string]*authproxy.AuthProxy),
-		pauseSem:        make(chan struct{}, maxConcurrentPauses),
+		pauseSem:        make(chan struct{}, maxConcurrentSnapshots),
+		uploadSem:       make(chan struct{}, maxConcurrentUploads),
 		stopCh:          make(chan struct{}),
 		logger:          logger.WithField("test", true),
 	}

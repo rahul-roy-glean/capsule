@@ -95,6 +95,23 @@ func (ns *VMNamespace) GetFirecrackerNetNSPath() string {
 	return ""
 }
 
+// PoolEntry is a stub on non-Linux platforms.
+type PoolEntry struct {
+	PlaceholderID string
+	Slot          int
+	NsInfo        *VMNamespace
+}
+
+func (n *NetNSNetwork) StartPool(_ int, _ func() int, _ func(int)) {}
+
+func (n *NetNSNetwork) StopPool() {}
+
+func (n *NetNSNetwork) TryClaimFromPool() *PoolEntry { return nil }
+
+func (n *NetNSNetwork) ReassignNamespace(_, _ string) {}
+
+func (n *NetNSNetwork) NotifyReplenish() {}
+
 func EnsureNetNSDir() error {
 	return fmt.Errorf("network namespaces are only supported on Linux")
 }

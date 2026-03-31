@@ -36,6 +36,21 @@ type NetNSNetwork struct {
 	namespaces    map[string]*VMNamespace // vmID -> namespace info
 	mu            sync.Mutex
 	logger        *logrus.Entry
+
+	// Pre-warming pool fields
+	pool          chan *PoolEntry // buffered channel of pre-warmed namespaces
+	poolReplenish chan struct{}   // signal to replenish (non-blocking send)
+	poolStop      chan struct{}   // signal to stop goroutine
+	poolSize      int             // target pool size (0 = disabled)
+	allocSlot     func() int      // callback: allocate slot under manager lock, returns -1 if full
+	releaseSlot   func(int)       // callback: release slot under manager lock
+}
+
+// PoolEntry holds a pre-created namespace ready to be claimed by a runner.
+type PoolEntry struct {
+	PlaceholderID string
+	Slot          int
+	NsInfo        *VMNamespace
 }
 
 // VMNamespace holds info about a VM's network namespace
@@ -270,9 +285,6 @@ func configureHostVethSysctls(iface string) error {
 // and TAP device (tap-slot-0) are created, replicating the topology the
 // snapshot expects.
 func (n *NetNSNetwork) CreateNamespaceForVM(vmID string, slot int) (*VMNamespace, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
 	shortID := vmID
 	if len(shortID) > 8 {
 		shortID = shortID[:8]
@@ -552,7 +564,9 @@ func (n *NetNSNetwork) CreateNamespaceForVM(vmID string, slot int) (*VMNamespace
 		Handle:          newNS,
 	}
 
+	n.mu.Lock()
 	n.namespaces[vmID] = nsInfo
+	n.mu.Unlock()
 
 	n.logger.WithFields(logrus.Fields{
 		"vm_id":     vmID,
@@ -567,12 +581,13 @@ func (n *NetNSNetwork) CreateNamespaceForVM(vmID string, slot int) (*VMNamespace
 // ReleaseNamespace removes a VM's network namespace and all associated resources.
 func (n *NetNSNetwork) ReleaseNamespace(vmID string) error {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-
 	nsInfo, exists := n.namespaces[vmID]
 	if !exists {
+		n.mu.Unlock()
 		return nil
 	}
+	delete(n.namespaces, vmID)
+	n.mu.Unlock()
 
 	n.logger.WithFields(logrus.Fields{
 		"vm_id":     vmID,
@@ -593,8 +608,6 @@ func (n *NetNSNetwork) ReleaseNamespace(vmID string) error {
 
 	// Delete named namespace
 	netns.DeleteNamed(nsInfo.Name)
-
-	delete(n.namespaces, vmID)
 
 	return nil
 }
@@ -813,4 +826,145 @@ func (n *NetNSNetwork) GetSubnet() *net.IPNet {
 // EnsureNetNSDir ensures /var/run/netns exists
 func EnsureNetNSDir() error {
 	return os.MkdirAll("/var/run/netns", 0755)
+}
+
+// StartPool initialises and pre-fills a pool of pre-warmed network namespaces.
+// allocSlot/releaseSlot are callbacks that allocate and release slot numbers
+// under the manager's lock. The pool is pre-filled synchronously (blocking
+// until `size` entries are ready or slots are exhausted), then a background
+// goroutine replenishes the pool as entries are claimed.
+func (n *NetNSNetwork) StartPool(size int, allocSlot func() int, releaseSlot func(int)) {
+	if size <= 0 {
+		return
+	}
+	n.poolSize = size
+	n.allocSlot = allocSlot
+	n.releaseSlot = releaseSlot
+	n.pool = make(chan *PoolEntry, size)
+	n.poolReplenish = make(chan struct{}, 1)
+	n.poolStop = make(chan struct{})
+
+	// Pre-fill synchronously so pool is hot before first request.
+	counter := 0
+	for i := 0; i < size; i++ {
+		slot := allocSlot()
+		if slot < 0 {
+			break
+		}
+		id := fmt.Sprintf("_pwm%04d", counter)
+		counter++
+		nsInfo, err := n.CreateNamespaceForVM(id, slot)
+		if err != nil {
+			releaseSlot(slot)
+			n.logger.WithError(err).Warn("Pool: failed to pre-create namespace during init")
+			break
+		}
+		n.pool <- &PoolEntry{PlaceholderID: id, Slot: slot, NsInfo: nsInfo}
+	}
+	n.logger.WithFields(logrus.Fields{
+		"target_size": size,
+		"prefilled":   len(n.pool),
+	}).Info("Network namespace pool started")
+
+	go n.replenishLoop(counter)
+}
+
+// StopPool stops the background replenish goroutine and drains any remaining
+// pool entries, releasing their namespaces and slots.
+func (n *NetNSNetwork) StopPool() {
+	if n.poolStop == nil {
+		return
+	}
+	close(n.poolStop)
+
+	// Drain remaining entries.
+	for {
+		select {
+		case entry := <-n.pool:
+			n.ReleaseNamespace(entry.PlaceholderID)
+			n.releaseSlot(entry.Slot)
+		default:
+			return
+		}
+	}
+}
+
+// TryClaimFromPool attempts a non-blocking receive from the pool.
+// Returns a pool entry if one is available, nil otherwise.
+// On success, signals the background goroutine to replenish.
+func (n *NetNSNetwork) TryClaimFromPool() *PoolEntry {
+	if n.pool == nil {
+		return nil
+	}
+	select {
+	case entry := <-n.pool:
+		n.logger.WithFields(logrus.Fields{
+			"placeholder_id": entry.PlaceholderID,
+			"slot":           entry.Slot,
+		}).Info("Pool: claimed pre-warmed namespace")
+		// Signal replenish (non-blocking).
+		select {
+		case n.poolReplenish <- struct{}{}:
+		default:
+		}
+		return entry
+	default:
+		n.logger.Debug("Pool: empty, creating synchronously")
+		return nil
+	}
+}
+
+// ReassignNamespace re-keys a namespace from oldID to newID in the namespaces map.
+// Used when claiming a pool entry to replace the placeholder ID with the real vmID.
+func (n *NetNSNetwork) ReassignNamespace(oldID, newID string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if ns, ok := n.namespaces[oldID]; ok {
+		n.namespaces[newID] = ns
+		delete(n.namespaces, oldID)
+	}
+}
+
+// NotifyReplenish signals the background goroutine that a slot may have been
+// freed (e.g. after runner cleanup) so the pool can be topped up.
+func (n *NetNSNetwork) NotifyReplenish() {
+	if n.poolReplenish == nil {
+		return
+	}
+	select {
+	case n.poolReplenish <- struct{}{}:
+	default:
+	}
+}
+
+// replenishLoop is the background goroutine that keeps the pool filled.
+func (n *NetNSNetwork) replenishLoop(counter int) {
+	for {
+		select {
+		case <-n.poolStop:
+			return
+		case <-n.poolReplenish:
+			for len(n.pool) < n.poolSize {
+				slot := n.allocSlot()
+				if slot < 0 {
+					break // no slots available, try later
+				}
+				id := fmt.Sprintf("_pwm%04d", counter)
+				counter++
+				nsInfo, err := n.CreateNamespaceForVM(id, slot)
+				if err != nil {
+					n.releaseSlot(slot)
+					n.logger.WithError(err).Warn("Pool: failed to pre-create namespace")
+					break
+				}
+				select {
+				case n.pool <- &PoolEntry{PlaceholderID: id, Slot: slot, NsInfo: nsInfo}:
+				default:
+					// Pool full (race), release this one.
+					n.ReleaseNamespace(id)
+					n.releaseSlot(slot)
+				}
+			}
+		}
+	}
 }

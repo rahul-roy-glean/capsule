@@ -521,14 +521,16 @@ func computeAutoscaleDecision(input autoscaleInput) autoscaleDecision {
 	}
 
 	// 3. Rate-based: predict capacity exhaustion
-	// Only engage when average utilization is already meaningful — avoids
-	// over-scaling for small tiers (e.g. XS) that barely dent host capacity.
+	// Trigger when TTE < 2× bootCooldown — this gives a full boot-time
+	// buffer so the new host is ready before capacity actually runs out.
+	// Only engage when average utilization is meaningful to avoid noise.
 	if input.allocationRateCPU > 0 && input.remainingCapacity > 0 && input.avgCapacityPerHost > 0 {
 		avgUtil := 1.0 - float64(input.remainingCapacity)/float64(len(input.readyHosts)*input.avgCapacityPerHost)
-		if avgUtil >= input.settlingThreshold {
+		if avgUtil >= input.settlingThreshold/2 {
 			timeToExhaustion := float64(input.remainingCapacity) / input.allocationRateCPU
-			if timeToExhaustion < input.bootCooldown.Seconds() {
-				deficit := input.allocationRateCPU*input.bootCooldown.Seconds() - float64(input.remainingCapacity)
+			headroom := input.bootCooldown.Seconds() * 2
+			if timeToExhaustion < headroom {
+				deficit := input.allocationRateCPU*headroom - float64(input.remainingCapacity)
 				hostsNeeded := int(math.Ceil(deficit / float64(input.avgCapacityPerHost)))
 				if hostsNeeded < 1 {
 					hostsNeeded = 1
@@ -536,7 +538,7 @@ func computeAutoscaleDecision(input autoscaleInput) autoscaleDecision {
 				return autoscaleDecision{
 					action:    scaleActionUp,
 					scaleUpBy: hostsNeeded,
-					reason:    fmt.Sprintf("rate-based: %.1f mCPU/s, TTE=%.0fs < boot %s, util=%.0f%%, need %d hosts", input.allocationRateCPU, timeToExhaustion, input.bootCooldown, avgUtil*100, hostsNeeded),
+					reason:    fmt.Sprintf("rate-based: %.1f mCPU/s, TTE=%.0fs < 2×boot %s, util=%.0f%%, need %d hosts", input.allocationRateCPU, timeToExhaustion, input.bootCooldown, avgUtil*100, hostsNeeded),
 				}
 			}
 		}
