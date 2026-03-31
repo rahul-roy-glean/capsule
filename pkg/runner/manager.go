@@ -461,7 +461,7 @@ func (l *bringupLease) Commit() {
 // started to eliminate namespace creation latency from the bringup path.
 func (m *Manager) SetNetNSNetwork(netnsNet *network.NetNSNetwork) {
 	m.netnsNetwork = netnsNet
-	netnsNet.StartPool(8, m.allocateSlotForPool, m.releaseSlotForPool)
+	netnsNet.StartPool(32, m.allocateSlotForPool, m.releaseSlotForPool)
 }
 
 // allocateSlotForPool allocates a slot for the pre-warming pool under m.mu.

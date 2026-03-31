@@ -3,9 +3,11 @@ package tiers
 import "fmt"
 
 // CPUOversubscriptionFactor is the ratio of effective CPU to actual vCPUs.
-// Firecracker VMs rarely saturate all cores simultaneously, so we allow
-// 4:1 oversubscription (each host core serves 2 guest vCPUs).
-const CPUOversubscriptionFactor = 0.25
+// Firecracker VMs rarely saturate all cores simultaneously. At 0.32, each
+// XS vCPU consumes 320 mCPU for scheduling, giving ~100 XS runners per
+// 32-vCPU host — enough headroom for thaw-agent startup latency to stay
+// under 2s even at full capacity.
+const CPUOversubscriptionFactor = 0.32
 
 // Tier defines a VM resource tier baked into a snapshot.
 type Tier struct {
