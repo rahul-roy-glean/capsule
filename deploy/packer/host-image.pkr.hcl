@@ -77,7 +77,9 @@ source "googlecompute" "capsule-host" {
   tags       = ["capsule-host"]
 
   # Use IAP tunnel for SSH (requires firewall rule for 35.235.240.0/20 -> port 22)
-  use_iap    = true
+  use_iap            = true
+  omit_external_ip   = true
+  use_internal_ip    = true
 
   # Enable nested virtualization for Firecracker
   enable_nested_virtualization = true
