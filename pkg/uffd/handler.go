@@ -418,15 +418,7 @@ func (h *Handler) acceptLoop() {
 
 		h.logger.Info("Firecracker connected to UFFD handler")
 
-		// Signal that a connection has been received
-		select {
-		case <-h.connected:
-			// already closed
-		default:
-			close(h.connected)
-		}
-
-		// Handle this connection
+		// Handle this connection (signals connected after SetUFFD)
 		h.wg.Add(1)
 		go h.handleConnection(conn)
 	}
@@ -467,6 +459,15 @@ func (h *Handler) handleConnection(conn net.Conn) {
 	// connection (the prefetcher's copy workers wait on h.connected).
 	if h.prefetcher != nil {
 		h.prefetcher.SetUFFD(uffdFd, mappings)
+	}
+
+	// Signal that connection is ready — prefetcher copy workers can now
+	// safely access mappings via SetUFFD above.
+	select {
+	case <-h.connected:
+		// already closed
+	default:
+		close(h.connected)
 	}
 
 	h.logger.WithFields(logrus.Fields{

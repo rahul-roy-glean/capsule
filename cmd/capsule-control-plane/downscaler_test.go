@@ -874,8 +874,8 @@ func TestComputeAutoscaleDecision_RateBasedMultiHostScaleUp(t *testing.T) {
 	if d.action != scaleActionUp {
 		t.Fatalf("expected rate-based scaleActionUp, got %d", d.action)
 	}
-	if d.scaleUpBy != 8 {
-		t.Fatalf("expected scaleUpBy=8 for multi-host (2x headroom), got %d", d.scaleUpBy)
+	if d.scaleUpBy != 1 {
+		t.Fatalf("expected scaleUpBy=1 (conservative, 1 at a time), got %d", d.scaleUpBy)
 	}
 }
 
@@ -1009,7 +1009,7 @@ func TestComputeAutoscaleDecision_SettlingThresholdConfigurable(t *testing.T) {
 
 func TestRunDownscaleOnce_RateBasedMultiHostResize(t *testing.T) {
 	now := time.Now()
-	// 1 host with 100 mCPU remaining, rate=20 mCPU/s → needs 4 new hosts
+	// 1 host with 100 mCPU remaining, rate=20 mCPU/s → scale up 1 at a time
 	hosts := []*Host{
 		{ID: "1", InstanceName: "h1", Status: "ready", TotalCPUMillicores: 1000, UsedCPUMillicores: 900, CreatedAt: now.Add(-2 * time.Hour), LastHeartbeat: now},
 	}
@@ -1026,10 +1026,9 @@ func TestRunDownscaleOnce_RateBasedMultiHostResize(t *testing.T) {
 	if !acted {
 		t.Fatal("expected action taken for rate-based scale-up")
 	}
-	// Rate=20, remaining=100, TTE=5s < 2×boot=360s.
-	// deficit=20*360-100=7100, hosts=ceil(7100/1000)=8
-	if mc.resizedTo != 9 { // 1 + 8
-		t.Fatalf("expected MIG resized to 9 (1+8), got %d", mc.resizedTo)
+	// Rate-based scaling adds 1 host at a time (conservative).
+	if mc.resizedTo != 2 { // 1 + 1
+		t.Fatalf("expected MIG resized to 2 (1+1), got %d", mc.resizedTo)
 	}
 }
 

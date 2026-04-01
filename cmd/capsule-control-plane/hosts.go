@@ -201,7 +201,7 @@ func (hr *HostRegistry) UpsertHeartbeat(ctx context.Context, hb HostHeartbeat) (
 			total_memory_mb = EXCLUDED.total_memory_mb,
 			used_memory_mb = EXCLUDED.used_memory_mb,
 			status = CASE
-				WHEN hosts.status IN ('terminating','terminated') THEN hosts.status
+				WHEN hosts.status IN ('draining','terminating','terminated','unhealthy') THEN hosts.status
 				ELSE 'ready'
 			END
 		RETURNING id, status

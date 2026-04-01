@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -279,8 +278,8 @@ func (g *gcpMIGClient) Resize(ctx context.Context, newSize int64) error {
 	return err
 }
 
-// runDownscaleOnce returns (actionTaken, error). actionTaken is true when a
-// scale-up resize or scale-down drain was performed (used for cooldown tracking).
+// runDownscaleOnce returns ("up", nil) for scale-up, ("down", nil) for scale-down,
+// ("", nil) for no action, or ("", err) on failure.
 func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, mc migClient, hs hostStore, lastScaleAction time.Time, log *logrus.Entry) (bool, error) {
 	currentTarget, err := mc.GetTargetSize(ctx)
 	if err != nil {
@@ -413,25 +412,6 @@ func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, mc migClient, h
 		avgCapacityPerHost = totalCapacity / len(readyHosts)
 	}
 
-	// Demand-driven scale-up uses a shorter boot cooldown to give the new
-	// host time to start and register before we scale up again.
-	demandDriven := allocFailures > 0 || len(readyHosts) == 0
-	if demandDriven {
-		if !lastScaleAction.IsZero() && time.Since(lastScaleAction) < cfg.BootCooldown {
-			log.WithFields(logrus.Fields{
-				"since_last_scale": time.Since(lastScaleAction).Round(time.Second),
-				"boot_cooldown":    cfg.BootCooldown,
-				"alloc_failures":   allocFailures,
-			}).Debug("Demand-driven scale-up suppressed: waiting for new host to boot")
-			return false, nil
-		}
-	} else {
-		// Normal cooldown check — only for utilization-based decisions
-		if !lastScaleAction.IsZero() && time.Since(lastScaleAction) < cfg.Cooldown {
-			return false, nil
-		}
-	}
-
 	decision := computeAutoscaleDecision(autoscaleInput{
 		readyHosts:         readyHosts,
 		scaleUpThreshold:   cfg.ScaleUpThreshold,
@@ -444,6 +424,24 @@ func runDownscaleOnce(ctx context.Context, cfg downscalerConfig, mc migClient, h
 		bootCooldown:       cfg.BootCooldown,
 		avgCapacityPerHost: avgCapacityPerHost,
 	})
+
+	// Apply cooldown AFTER computing the decision. All scale-up decisions
+	// use BootCooldown — we add 1 host at a time and wait for it to boot
+	// before checking again. Scale-down uses the longer Cooldown.
+	if decision.action == scaleActionUp {
+		if !lastScaleAction.IsZero() && time.Since(lastScaleAction) < cfg.BootCooldown {
+			log.WithFields(logrus.Fields{
+				"since_last_scale": time.Since(lastScaleAction).Round(time.Second),
+				"cooldown":         cfg.BootCooldown,
+				"reason":           decision.reason,
+			}).Debug("Scale-up suppressed: waiting for new host to boot")
+			return false, nil
+		}
+	} else if decision.action == scaleActionDown {
+		if !lastScaleAction.IsZero() && time.Since(lastScaleAction) < cfg.Cooldown {
+			return false, nil
+		}
+	}
 
 	switch decision.action {
 	case scaleActionUp:
@@ -521,24 +519,26 @@ func computeAutoscaleDecision(input autoscaleInput) autoscaleDecision {
 	}
 
 	// 3. Rate-based: predict capacity exhaustion
-	// Trigger when TTE < 2× bootCooldown — this gives a full boot-time
-	// buffer so the new host is ready before capacity actually runs out.
-	// Only engage when average utilization is meaningful to avoid noise.
-	if input.allocationRateCPU > 0 && input.remainingCapacity > 0 && input.avgCapacityPerHost > 0 {
+	// Trigger when TTE < bootCooldown — scale up one host at a time,
+	// giving it time to boot before capacity runs out.
+	// When remainingCapacity is 0, capacity is already exhausted — scale up immediately.
+	if input.allocationRateCPU > 0 && input.avgCapacityPerHost > 0 {
+		if input.remainingCapacity <= 0 {
+			return autoscaleDecision{
+				action:    scaleActionUp,
+				scaleUpBy: 1,
+				reason:    fmt.Sprintf("rate-based: capacity exhausted (remaining=0), allocation rate=%.1f mCPU/s", input.allocationRateCPU),
+			}
+		}
 		avgUtil := 1.0 - float64(input.remainingCapacity)/float64(len(input.readyHosts)*input.avgCapacityPerHost)
 		if avgUtil >= input.settlingThreshold/2 {
 			timeToExhaustion := float64(input.remainingCapacity) / input.allocationRateCPU
-			headroom := input.bootCooldown.Seconds() * 2
+			headroom := input.bootCooldown.Seconds() * 1.4
 			if timeToExhaustion < headroom {
-				deficit := input.allocationRateCPU*headroom - float64(input.remainingCapacity)
-				hostsNeeded := int(math.Ceil(deficit / float64(input.avgCapacityPerHost)))
-				if hostsNeeded < 1 {
-					hostsNeeded = 1
-				}
 				return autoscaleDecision{
 					action:    scaleActionUp,
-					scaleUpBy: hostsNeeded,
-					reason:    fmt.Sprintf("rate-based: %.1f mCPU/s, TTE=%.0fs < 2×boot %s, util=%.0f%%, need %d hosts", input.allocationRateCPU, timeToExhaustion, input.bootCooldown, avgUtil*100, hostsNeeded),
+					scaleUpBy: 1,
+					reason:    fmt.Sprintf("rate-based: %.1f mCPU/s, TTE=%.0fs < boot %s, util=%.0f%%", input.allocationRateCPU, timeToExhaustion, input.bootCooldown, avgUtil*100),
 				}
 			}
 		}

@@ -830,49 +830,44 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		}
 	}
 
-	// Pre-warm critical disk chunks before VM resume to prevent guest kernel
+	// Pre-warm critical disk chunks in the background to prevent guest kernel
 	// soft lockups. On restore, jbd2 (ext4 journal) and the filesystem mount
 	// immediately read the superblock, block group descriptors, and journal.
-	// With FUSE-backed disks these reads block on GCS fetches; if 4 VMs all
-	// resume simultaneously the chunk store is overwhelmed and the guest vCPU
-	// stalls for >20s triggering a soft lockup watchdog before capsule-thaw-agent
-	// can register with GitHub Actions.
+	// With FUSE-backed disks these reads block on GCS fetches; prefetching
+	// populates the chunk store LRU cache so FUSE Read() returns from cache.
 	//
-	// Prefetching the first 16 chunks (64MB @ 4MB/chunk) covers:
-	//   - ext4 superblock (offset 1024)
-	//   - block group descriptor table
-	//   - entire jbd2 journal (usually within first 64MB on a 50GB volume)
-	// Repo-cache-seed only needs the superblock (first 2 chunks = 8MB).
-	// These fetches run in parallel and populate the chunk store LRU cache
-	// so FUSE Read() returns immediately from cache on the actual mount.
+	// Fire-and-forget: the prefetch runs in background goroutines while
+	// VM creation proceeds. By the time Firecracker issues its first disk
+	// reads (~100-200ms later after process spawn + LoadSnapshot), the
+	// critical chunks are already cached.
 	{
 		prefetchCtx, prefetchCancel := context.WithTimeout(ctx, 30*time.Second)
-		defer prefetchCancel()
-
-		// Collect all read-only extension FUSE disks to prefetch.
-		nPrefetch := 1 + len(extensionFUSEDisks)
-		prefetchDone := make(chan error, nPrefetch)
 		go func() {
-			err := fuseDisk.PrefetchHead(prefetchCtx, 16)
-			if err != nil {
-				cm.chunkedLogger.WithError(err).WithField("runner_id", runnerID).Warn("Rootfs prefetch incomplete (non-fatal)")
-			}
-			prefetchDone <- err
-		}()
-		for did, ed := range extensionFUSEDisks {
-			did, ed := did, ed
+			defer prefetchCancel()
+			nPrefetch := 1 + len(extensionFUSEDisks)
+			prefetchDone := make(chan error, nPrefetch)
 			go func() {
-				err := ed.PrefetchHead(prefetchCtx, 2)
+				err := fuseDisk.PrefetchHead(prefetchCtx, 16)
 				if err != nil {
-					cm.chunkedLogger.WithError(err).WithFields(logrus.Fields{"runner_id": runnerID, "drive_id": did}).Warn("Extension disk prefetch incomplete (non-fatal)")
+					cm.chunkedLogger.WithError(err).WithField("runner_id", runnerID).Warn("Rootfs prefetch incomplete (non-fatal)")
 				}
 				prefetchDone <- err
 			}()
-		}
-		for i := 0; i < nPrefetch; i++ {
-			<-prefetchDone
-		}
-		cm.chunkedLogger.WithField("runner_id", runnerID).Debug("Pre-resume disk prefetch complete")
+			for did, ed := range extensionFUSEDisks {
+				did, ed := did, ed
+				go func() {
+					err := ed.PrefetchHead(prefetchCtx, 2)
+					if err != nil {
+						cm.chunkedLogger.WithError(err).WithFields(logrus.Fields{"runner_id": runnerID, "drive_id": did}).Warn("Extension disk prefetch incomplete (non-fatal)")
+					}
+					prefetchDone <- err
+				}()
+			}
+			for i := 0; i < nPrefetch; i++ {
+				<-prefetchDone
+			}
+			cm.chunkedLogger.WithField("runner_id", runnerID).Debug("Pre-resume disk prefetch complete")
+		}()
 	}
 
 	// Eagerly fetch the VM state (CPU/device state) from the ChunkStore.

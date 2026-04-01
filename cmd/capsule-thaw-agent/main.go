@@ -1109,7 +1109,7 @@ func watchForSnapshotRestore() {
 	lastTime := ""
 
 	for {
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 
 		req, err := http.NewRequest("GET", endpoint, nil)
 		if err != nil {
