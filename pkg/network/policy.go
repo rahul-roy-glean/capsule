@@ -392,3 +392,20 @@ func (p *NetworkPolicy) Clone() *NetworkPolicy {
 	}
 	return &clone
 }
+
+// WithAccessPlaneAccess returns a clone of the policy with egress rules added
+// to allow traffic to the access plane's HTTP API and CONNECT proxy ports.
+// Used when a runner is configured to use an external access plane instead of
+// a host-local auth proxy.
+func (p *NetworkPolicy) WithAccessPlaneAccess(accessPlaneIP string) *NetworkPolicy {
+	clone := p.Clone()
+	if clone == nil {
+		clone = &NetworkPolicy{DefaultEgressAction: PolicyActionDeny}
+	}
+	clone.AllowedEgress = append(clone.AllowedEgress, EgressRule{
+		Description: "Allow access to project access plane",
+		CIDRs:       []string{accessPlaneIP + "/32"},
+		Ports:       []PortRange{{Start: 8080, End: 8080}, {Start: 3128, End: 3128}},
+	})
+	return clone
+}

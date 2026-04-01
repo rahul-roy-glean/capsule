@@ -11,7 +11,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/rahul-roy-glean/capsule/api/proto/runner"
-	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
+	"github.com/rahul-roy-glean/capsule/pkg/accessplane"
 	"github.com/rahul-roy-glean/capsule/pkg/network"
 	fcrotel "github.com/rahul-roy-glean/capsule/pkg/otel"
 	"github.com/rahul-roy-glean/capsule/pkg/runner"
@@ -81,11 +81,11 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		allocReq.NetworkPolicy = &np
 	}
 
-	// Extract auth config from labels (control plane packs auth config here).
-	if v, ok := req.Labels["_auth_config_json"]; ok && v != "" {
-		var ac authproxy.AuthConfig
+	// Extract access plane config from labels (control plane packs it here).
+	if v, ok := req.Labels["_access_plane_config_json"]; ok && v != "" {
+		var ac accessplane.Config
 		if err := json.Unmarshal([]byte(v), &ac); err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "invalid _auth_config_json: %v", err)
+			return nil, status.Errorf(codes.InvalidArgument, "invalid _access_plane_config_json: %v", err)
 		}
 		allocReq.AuthConfig = &ac
 	}
@@ -141,7 +141,7 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 		// Try to resume from session snapshot (control plane signals intent via Resume flag)
 		if allocReq.Resume {
 			resumeStart := time.Now()
-			r, err = s.manager.ResumeFromSession(ctx, allocReq.SessionID, allocReq.WorkloadKey, allocReq.RunnerID)
+			r, err = s.manager.ResumeFromSession(ctx, allocReq.SessionID, allocReq.WorkloadKey, allocReq.RunnerID, req.Labels["_attestation_token"])
 			resumeDuration := time.Since(resumeStart)
 
 			if err == nil {
@@ -187,7 +187,7 @@ func (s *HostAgentServer) AllocateRunner(ctx context.Context, req *pb.AllocateRu
 	r.TTLSeconds = allocReq.TTLSeconds
 	r.AutoPause = allocReq.AutoPause
 	if allocReq.AuthConfig != nil {
-		r.AuthConfig = allocReq.AuthConfig
+		r.AccessPlaneConfig = allocReq.AuthConfig
 	}
 	if r.SessionID != "" && r.LastExecAt.IsZero() {
 		r.LastExecAt = r.StartedAt
@@ -368,7 +368,7 @@ func (s *HostAgentServer) ResumeRunner(ctx context.Context, req *pb.ResumeRunner
 		"workload_key": req.WorkloadKey,
 	}).Info("ResumeRunner request")
 
-	r, err := s.manager.ResumeFromSession(ctx, req.SessionId, req.WorkloadKey, req.RunnerId)
+	r, err := s.manager.ResumeFromSession(ctx, req.SessionId, req.WorkloadKey, req.RunnerId, "")
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to resume runner")
 		recordSessionResumeMetrics(ctx, s.manager, s.lifecycleMetrics, req.SessionId, time.Since(start), fcrotel.ResultFailure, "resume_rpc")

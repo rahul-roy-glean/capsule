@@ -319,12 +319,6 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 		if len(cfg.Config.NetworkPolicy) > 0 && string(cfg.Config.NetworkPolicy) != "null" {
 			npJSON = string(cfg.Config.NetworkPolicy)
 		}
-		authJSON := ""
-		if cfg.Config.Auth != nil {
-			if ab, err := json.Marshal(cfg.Config.Auth); err == nil {
-				authJSON = string(ab)
-			}
-		}
 		r.configCache.PutWorkloadConfig(&WorkloadConfig{
 			WorkloadKey:          leafWorkloadKey,
 			Tier:                 tierName,
@@ -335,7 +329,6 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 			MaxConcurrentRunners: 0,
 			NetworkPolicyPreset:  cfg.Config.NetworkPolicyPreset,
 			NetworkPolicyJSON:    npJSON,
-			AuthConfigJSON:       authJSON,
 		})
 	}
 	return configID, leafWorkloadKey, nil

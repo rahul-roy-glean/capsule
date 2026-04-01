@@ -49,6 +49,7 @@ var zeroChunkBuf = make([]byte, snapshot.DefaultChunkSize)
 // ChunkedDisk implements a FUSE filesystem backed by chunked snapshots
 type ChunkedDisk struct {
 	chunkStore *snapshot.ChunkStore
+	tenantID   string // tenant scope for cache isolation
 	chunks     []snapshot.ChunkRef
 	totalSize  int64
 	chunkSize  int64
@@ -76,6 +77,7 @@ type ChunkedDisk struct {
 // ChunkedDiskConfig holds configuration for the chunked disk
 type ChunkedDiskConfig struct {
 	ChunkStore *snapshot.ChunkStore
+	TenantID   string // tenant scope for cache isolation (empty = no isolation)
 	Chunks     []snapshot.ChunkRef
 	TotalSize  int64
 	ChunkSize  int64
@@ -93,6 +95,7 @@ func NewChunkedDisk(cfg ChunkedDiskConfig) (*ChunkedDisk, error) {
 
 	return &ChunkedDisk{
 		chunkStore:  cfg.ChunkStore,
+		tenantID:    cfg.TenantID,
 		chunks:      cfg.Chunks,
 		totalSize:   cfg.TotalSize,
 		chunkSize:   cfg.ChunkSize,
@@ -389,7 +392,7 @@ func (d *ChunkedDisk) getChunkData(chunkIdx int) ([]byte, error) {
 
 	atomic.AddUint64(&d.chunkReads, 1)
 	start := time.Now()
-	data, err := d.chunkStore.GetChunk(d.ctx, chunk.Hash)
+	data, err := d.chunkStore.GetChunkForTenant(d.ctx, chunk.Hash, d.tenantID)
 	elapsed := time.Since(start)
 	if err != nil {
 		d.logger.WithError(err).WithFields(logrus.Fields{
@@ -428,7 +431,7 @@ func (d *ChunkedDisk) getOrCreateDirtyChunk(chunkIdx int) ([]byte, error) {
 			originalData = make([]byte, d.chunkSize)
 		} else {
 			var err error
-			originalData, err = d.chunkStore.GetChunk(d.ctx, chunk.Hash)
+			originalData, err = d.chunkStore.GetChunkForTenant(d.ctx, chunk.Hash, d.tenantID)
 			if err != nil {
 				return nil, err
 			}
@@ -531,7 +534,7 @@ func (d *ChunkedDisk) PrefetchHead(ctx context.Context, n int) error {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			if _, err := d.chunkStore.GetChunk(ctx, hash); err != nil {
+			if _, err := d.chunkStore.GetChunkForTenant(ctx, hash, d.tenantID); err != nil {
 				errs <- err
 			}
 		}(ref.Hash)

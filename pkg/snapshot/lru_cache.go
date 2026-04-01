@@ -199,6 +199,28 @@ func (c *LRUCache) Stats() CacheStats {
 	}
 }
 
+// EvictByPrefix removes all entries whose keys start with the given prefix.
+// Used for tenant cache purge when a tenant's last VM leaves the host.
+func (c *LRUCache) EvictByPrefix(prefix string) int {
+	var evicted int
+	for _, s := range c.shards {
+		s.mu.Lock()
+		var toRemove []*list.Element
+		for _, elem := range s.items {
+			entry := elem.Value.(*cacheEntry)
+			if len(entry.key) > len(prefix) && entry.key[:len(prefix)] == prefix {
+				toRemove = append(toRemove, elem)
+			}
+		}
+		for _, elem := range toRemove {
+			s.removeElement(elem)
+			evicted++
+		}
+		s.mu.Unlock()
+	}
+	return evicted
+}
+
 // CacheStats holds cache statistics
 type CacheStats struct {
 	Size      int64

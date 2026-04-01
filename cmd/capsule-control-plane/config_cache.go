@@ -23,7 +23,14 @@ type WorkloadConfig struct {
 	MaxConcurrentRunners int
 	NetworkPolicyPreset  string
 	NetworkPolicyJSON    string
-	AuthConfigJSON       string // JSON-encoded authproxy.AuthConfig for injection into host agent
+
+	// Access plane fields — loaded from project_access_planes table
+	// based on the project that owns this workload.
+	AccessPlaneAddr      string // HTTP API address (e.g. "http://access-plane:8080")
+	AccessPlaneProxyAddr string // CONNECT proxy address (e.g. "access-plane:3128")
+	AttestationSecret    string // HMAC secret for minting runner tokens
+	CACertPEM            string // CA cert for SSL bump
+	TenantID             string // Tenant identifier for the access plane
 }
 
 // ConfigCache provides in-memory lookup for workload_key→config metadata.
@@ -74,7 +81,7 @@ func (cc *ConfigCache) loadFromDB() {
 				wc.NetworkPolicyJSON = npJSON.String
 			}
 			if configJSON.Valid {
-				wc.AuthConfigJSON = extractAuthConfigJSON(configJSON.String)
+				// Access plane config is loaded separately from project_access_planes table.
 			}
 			cc.workloadConfig[wc.WorkloadKey] = &wc
 		}
@@ -111,7 +118,7 @@ func (cc *ConfigCache) loadFromDB() {
 				wc.NetworkPolicyJSON = npJSON.String
 			}
 			if configJSON.Valid {
-				wc.AuthConfigJSON = extractAuthConfigJSON(configJSON.String)
+				// Access plane config is loaded separately from project_access_planes table.
 			}
 			// Only add if not already loaded from layered_configs (active takes precedence)
 			if _, exists := cc.workloadConfig[wc.WorkloadKey]; !exists {
@@ -184,7 +191,7 @@ func (cc *ConfigCache) loadWorkloadConfigFromDB(ctx context.Context, workloadKey
 		wc.NetworkPolicyJSON = npJSON.String
 	}
 	if configJSON.Valid {
-		wc.AuthConfigJSON = extractAuthConfigJSON(configJSON.String)
+		// Access plane config is loaded separately from project_access_planes table.
 	}
 	return &wc
 }
@@ -196,17 +203,33 @@ func (cc *ConfigCache) PutWorkloadConfig(wc *WorkloadConfig) {
 	cc.mu.Unlock()
 }
 
-// extractAuthConfigJSON extracts the "config.auth" field from a LayeredConfig JSON blob.
-func extractAuthConfigJSON(configJSON string) string {
-	var raw struct {
-		Config struct {
-			Auth json.RawMessage `json:"auth"`
-		} `json:"config"`
+// LoadAccessPlaneForProject looks up the access plane configuration for a
+// project from the project_access_planes table. Returns nil if no access plane
+// is configured for the project.
+func (cc *ConfigCache) LoadAccessPlaneForProject(ctx context.Context, projectID string) *AccessPlaneInfo {
+	if projectID == "" {
+		return nil
 	}
-	if err := json.Unmarshal([]byte(configJSON), &raw); err != nil || len(raw.Config.Auth) == 0 || string(raw.Config.Auth) == "null" {
-		return ""
+	var info AccessPlaneInfo
+	err := cc.db.QueryRowContext(ctx,
+		`SELECT access_plane_addr, proxy_addr, attestation_secret_ref, COALESCE(ca_cert_pem, ''), tenant_id
+		 FROM project_access_planes WHERE project_id = $1`, projectID).Scan(
+		&info.Addr, &info.ProxyAddr, &info.AttestationSecretRef, &info.CACertPEM, &info.TenantID)
+	if err != nil {
+		return nil
 	}
-	return string(raw.Config.Auth)
+	info.ProjectID = projectID
+	return &info
+}
+
+// AccessPlaneInfo holds the access plane deployment details for a project.
+type AccessPlaneInfo struct {
+	ProjectID            string
+	Addr                 string // HTTP API address
+	ProxyAddr            string // CONNECT proxy address
+	AttestationSecretRef string // sm:project/secret reference
+	CACertPEM            string
+	TenantID             string
 }
 
 // InvalidateWorkloadConfig removes a workload config from the cache.

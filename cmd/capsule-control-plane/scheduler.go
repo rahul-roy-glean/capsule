@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -442,7 +445,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	var autoPause bool
 	var configNetworkPolicyPreset string
 	var configNetworkPolicyJSON string
-	var authConfigJSON string
+	var accessPlaneInfo *AccessPlaneInfo
 	if workloadKey != "" {
 		var wc *WorkloadConfig
 		if s.configCache != nil {
@@ -455,7 +458,6 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			autoPause = wc.AutoPause
 			configNetworkPolicyPreset = wc.NetworkPolicyPreset
 			configNetworkPolicyJSON = wc.NetworkPolicyJSON
-			authConfigJSON = wc.AuthConfigJSON
 			if wc.MaxConcurrentRunners > 0 && s.db != nil {
 				var currentCount int
 				_ = s.db.QueryRowContext(ctx, `
@@ -524,7 +526,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 				configNetworkPolicyJSON = npJSON.String
 			}
 			if configJSON.Valid {
-				authConfigJSON = extractAuthConfigJSON(configJSON.String)
+				// Access plane config is loaded from project_access_planes, not from config_json.
 			}
 		}
 	}
@@ -715,16 +717,32 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			protoReq.Labels["_network_policy_json"] = effectiveNPJSON
 		}
 	}
-	s.logger.WithFields(logrus.Fields{
-		"workload_key":    workloadKey,
-		"auth_config_len": len(authConfigJSON),
-		"has_auth_config": authConfigJSON != "",
-	}).Info("DEBUG: auth config for allocation")
-	if authConfigJSON != "" {
+	// Load access plane config for this project and pack into labels.
+	if s.configCache != nil {
+		// TODO: resolve project_id from workload config or request
+		accessPlaneInfo = s.configCache.LoadAccessPlaneForProject(ctx, "")
+	}
+	if accessPlaneInfo != nil {
 		if protoReq.Labels == nil {
 			protoReq.Labels = make(map[string]string)
 		}
-		protoReq.Labels["_auth_config_json"] = authConfigJSON
+		apcJSON, _ := json.Marshal(map[string]string{
+			"api_endpoint":   accessPlaneInfo.Addr,
+			"proxy_endpoint": accessPlaneInfo.ProxyAddr,
+			"ca_cert_pem":    accessPlaneInfo.CACertPEM,
+			"tenant_id":      accessPlaneInfo.TenantID,
+		})
+		protoReq.Labels["_access_plane_config_json"] = string(apcJSON)
+
+		// Mint attestation token for the runner.
+		runnerID := protoReq.RunnerId
+		if runnerID == "" {
+			runnerID = req.RequestID // fallback for fresh allocations
+		}
+		token, err := mintAttestationToken(runnerID, req.SessionID, accessPlaneInfo.TenantID, []byte(accessPlaneInfo.AttestationSecretRef))
+		if err == nil {
+			protoReq.Labels["_attestation_token"] = token
+		}
 	}
 	// Pass base image migration info via labels so the host agent can do a
 	// migrated fresh boot (new golden snapshot + old session extension drives).
@@ -1241,4 +1259,24 @@ type SchedulerStats struct {
 	UsedMemoryMB       int
 	IdleRunners        int
 	BusyRunners        int
+}
+
+// mintAttestationToken produces an HMAC-SHA256 signed token for a runner to
+// authenticate with the access plane. Format: base64(json).base64(hmac).
+func mintAttestationToken(runnerID, sessionID, tenantID string, secret []byte) (string, error) {
+	claims := map[string]interface{}{
+		"runner_id":  runnerID,
+		"session_id": sessionID,
+		"tenant_id":  tenantID,
+		"issued_at":  time.Now().UTC().Format(time.RFC3339),
+		"expires_at": time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
+	}
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		return "", fmt.Errorf("mint token: marshal claims: %w", err)
+	}
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(payload)
+	sig := mac.Sum(nil)
+	return base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(sig), nil
 }

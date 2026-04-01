@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
+	"github.com/rahul-roy-glean/capsule/pkg/accessplane"
 	"github.com/rahul-roy-glean/capsule/pkg/network"
 	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
 )
@@ -55,8 +55,8 @@ type Runner struct {
 	PreQuarantineState      State
 	QuarantineEgressBlocked bool
 	QuarantinePaused        bool
-	ServicePort             int                   // Port of the user's service inside the VM (from StartCommand)
-	AuthConfig              *authproxy.AuthConfig // Auth proxy config, preserved for pause/resume
+	ServicePort             int                 // Port of the user's service inside the VM (from StartCommand)
+	AccessPlaneConfig       *accessplane.Config // Access plane config, preserved for pause/resume
 
 	// Network policy fields
 	NetworkPolicy          *network.NetworkPolicy `json:"network_policy,omitempty"`
@@ -112,7 +112,12 @@ type AllocateRequest struct {
 	AutoPause           bool                   // pause on TTL vs destroy
 	NetworkPolicyPreset string                 // optional: named preset (e.g., "restricted-egress")
 	NetworkPolicy       *network.NetworkPolicy // optional: full policy override
-	AuthConfig          *authproxy.AuthConfig  // optional: auth proxy configuration
+	AuthConfig          *accessplane.Config    // optional: access plane configuration
+
+	// Per-project GCS buckets for multi-tenant deployments.
+	// When set, these override the host-level SnapshotBucket/SessionChunkBucket.
+	SnapshotBucket     string // project's GCS bucket for base snapshots
+	SessionChunkBucket string // project's GCS bucket for session chunks/metadata
 
 	RunnerID string // original runner ID for session resume (from control plane)
 	Resume   bool   // true when control plane wants host to attempt session resume
@@ -121,6 +126,15 @@ type AllocateRequest struct {
 	// new golden snapshot but overrides extension drives with the session's data.
 	MigrateFromWorkloadKey string // old session's workload key (for GCS path construction)
 	MigrateFromRunnerID    string // old session's runner ID (for GCS path construction)
+}
+
+// tenantID returns the tenant identifier from the access plane config, or empty
+// string if no access plane is configured. Used for cache isolation.
+func (r AllocateRequest) tenantID() string {
+	if r.AuthConfig != nil {
+		return r.AuthConfig.TenantID
+	}
+	return ""
 }
 
 // MMDSData represents data to inject into the microVM via MMDS
@@ -174,11 +188,11 @@ type MMDSData struct {
 			Commands []snapshot.SnapshotCommand `json:"commands,omitempty"`
 		} `json:"warmup,omitempty"`
 		Proxy struct {
-			CACertPEM    string            `json:"ca_cert_pem,omitempty"`
-			Address      string            `json:"address,omitempty"`
-			MetadataHost string            `json:"metadata_host,omitempty"`
-			AuthHosts    []string          `json:"auth_hosts,omitempty"` // non-wildcard hosts for transparent iptables redirect
-			AuthEnv      map[string]string `json:"auth_env,omitempty"`   // env vars from providers (e.g. GH_TOKEN)
+			CACertPEM        string `json:"ca_cert_pem,omitempty"`
+			Address          string `json:"address,omitempty"`           // CONNECT proxy endpoint (e.g. "access-plane:3128")
+			APIEndpoint      string `json:"api_endpoint,omitempty"`      // Access plane HTTP API (e.g. "http://access-plane:8080")
+			AttestationToken string `json:"attestation_token,omitempty"` // HMAC token for access plane auth
+			TenantID         string `json:"tenant_id,omitempty"`
 		} `json:"proxy,omitempty"`
 	} `json:"latest"`
 }

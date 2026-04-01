@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,7 +18,6 @@ import (
 	"golang.org/x/sync/singleflight"
 	"golang.org/x/sys/unix"
 
-	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
 	"github.com/rahul-roy-glean/capsule/pkg/firecracker"
 	"github.com/rahul-roy-glean/capsule/pkg/fuse"
 	"github.com/rahul-roy-glean/capsule/pkg/network"
@@ -357,7 +355,6 @@ func (cm *ChunkedManager) registerAllocatedRunner(
 	fuseDisk *fuse.ChunkedDisk,
 	extensionDisks map[string]*fuse.ChunkedDisk,
 	uffdHandler *uffd.Handler,
-	proxy *authproxy.AuthProxy,
 ) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -375,9 +372,6 @@ func (cm *ChunkedManager) registerAllocatedRunner(
 		// Also store in Manager.uffdHandlers so PauseRunner (which runs on
 		// *Manager via embedding) can find and stop the handler.
 		cm.Manager.uffdHandlers[runnerID] = uffdHandler
-	}
-	if proxy != nil {
-		cm.authProxies[runnerID] = proxy
 	}
 	cm.runners[runnerID] = runner
 	cm.vms[runnerID] = vm
@@ -426,7 +420,7 @@ func (cm *ChunkedManager) restoreAndActivateRunner(
 	useFileBackedMem bool,
 	extensionDrivePaths map[string]string,
 	driveSpecs []snapshot.DriveSpec,
-) (chunkedVM, *authproxy.AuthProxy, error) {
+) (chunkedVM, error) {
 	// Set up per-runner snapshot symlinks before creating the VM so the
 	// SnapshotDir is available for the private mount namespace.
 	snapshotDir, symlinkCleanup, setupErr := cm.setupRestoreSymlinks(
@@ -435,7 +429,7 @@ func (cm *ChunkedManager) restoreAndActivateRunner(
 		extensionDrivePaths,
 	)
 	if setupErr != nil {
-		return nil, nil, fmt.Errorf("failed to setup snapshot symlinks: %w", setupErr)
+		return nil, fmt.Errorf("failed to setup snapshot symlinks: %w", setupErr)
 	}
 	defer symlinkCleanup()
 
@@ -443,7 +437,7 @@ func (cm *ChunkedManager) restoreAndActivateRunner(
 
 	vm, err := cm.newVM(vmCfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create VM: %w", err)
+		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
 	var restoreErr error
@@ -452,7 +446,7 @@ func (cm *ChunkedManager) restoreAndActivateRunner(
 	if freshBoot {
 		cm.chunkedLogger.WithField("runner_id", runnerID).Info("Migration: fresh boot (skipping snapshot restore)")
 		if err := vm.Start(ctx); err != nil {
-			return nil, nil, fmt.Errorf("migration fresh boot failed: %w", err)
+			return nil, fmt.Errorf("migration fresh boot failed: %w", err)
 		}
 	} else if useFileBackedMem {
 		cm.chunkedLogger.WithFields(logrus.Fields{
@@ -477,32 +471,11 @@ func (cm *ChunkedManager) restoreAndActivateRunner(
 
 		vm, err = cm.newVM(vmCfg)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to recreate VM: %w", err)
+			return nil, fmt.Errorf("failed to recreate VM: %w", err)
 		}
 
 		if err := vm.Start(ctx); err != nil {
-			return nil, nil, fmt.Errorf("cold boot fallback failed: %w", err)
-		}
-	}
-
-	var proxy *authproxy.AuthProxy
-	if req.AuthConfig != nil && netns != nil {
-		hostVethIP := net.IPv4(10, 200, byte(netns.Slot), 1).String()
-		proxy, err = authproxy.NewAuthProxy(
-			runnerID,
-			*req.AuthConfig,
-			netns.Path,
-			netns.Gateway.String(),
-			hostVethIP,
-			cm.chunkedLogger,
-		)
-		if err != nil {
-			vm.Stop()
-			return nil, nil, fmt.Errorf("failed to create auth proxy: %w", err)
-		}
-		if err := proxy.Start(context.Background()); err != nil {
-			vm.Stop()
-			return nil, nil, fmt.Errorf("failed to start auth proxy: %w", err)
+			return nil, fmt.Errorf("cold boot fallback failed: %w", err)
 		}
 	}
 
@@ -510,42 +483,24 @@ func (cm *ChunkedManager) restoreAndActivateRunner(
 	// Populate MMDS Drives so the thaw-agent can mount extension drives on
 	// fresh boot (migration) and cold boot fallback.
 	mmdsData.Latest.Drives = driveSpecs
-	if proxy != nil {
-		mmdsData.Latest.Proxy.Address = proxy.ProxyAddress()
-		mmdsData.Latest.Proxy.CACertPEM = string(proxy.CACertPEM)
-		mmdsData.Latest.Proxy.MetadataHost = proxy.GatewayIP()
-		// Pass non-wildcard auth hosts so the thaw-agent can set up iptables
-		// transparent redirect rules for them (e.g., github.com, api.github.com).
-		// Wildcard hosts (e.g., *.googleapis.com) are excluded — they can't be
-		// redirected via iptables and should use HTTPS_PROXY instead.
-		if req.AuthConfig != nil {
-			seen := make(map[string]bool)
-			for _, p := range req.AuthConfig.Providers {
-				for _, h := range p.Hosts {
-					if !strings.Contains(h, "*") && !seen[h] {
-						seen[h] = true
-						mmdsData.Latest.Proxy.AuthHosts = append(mmdsData.Latest.Proxy.AuthHosts, h)
-					}
-				}
-				// Merge provider env vars (e.g., GH_TOKEN for GitHub auth).
-				for k, v := range p.Env {
-					if mmdsData.Latest.Proxy.AuthEnv == nil {
-						mmdsData.Latest.Proxy.AuthEnv = make(map[string]string)
-					}
-					mmdsData.Latest.Proxy.AuthEnv[k] = v
-				}
-			}
-		}
+	if req.AuthConfig != nil {
+		mmdsData.Latest.Proxy.Address = req.AuthConfig.ProxyEndpoint
+		mmdsData.Latest.Proxy.CACertPEM = req.AuthConfig.CACertPEM
+		mmdsData.Latest.Proxy.APIEndpoint = req.AuthConfig.APIEndpoint
+		mmdsData.Latest.Proxy.TenantID = req.AuthConfig.TenantID
+	}
+	if token, ok := req.Labels["_attestation_token"]; ok {
+		mmdsData.Latest.Proxy.AttestationToken = token
 	}
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
-		return nil, proxy, fmt.Errorf("failed to set MMDS data: %w", err)
+		return nil, fmt.Errorf("failed to set MMDS data: %w", err)
 	}
 
 	if !freshBoot {
 		if err := vm.Resume(ctx); err != nil {
 			vm.Stop()
-			return nil, proxy, fmt.Errorf("failed to resume VM after MMDS injection: %w", err)
+			return nil, fmt.Errorf("failed to resume VM after MMDS injection: %w", err)
 		}
 	}
 
@@ -570,10 +525,10 @@ func (cm *ChunkedManager) restoreAndActivateRunner(
 	if err := cm.waitForRunnerReady(ctx, runner.InternalIP.String(), readyTimeout); err != nil {
 		cm.chunkedLogger.WithError(err).WithField("runner_id", runnerID).Error("Thaw-agent failed ready check, killing VM")
 		vm.Stop()
-		return nil, proxy, fmt.Errorf("capsule-thaw-agent not ready after %v: %w", readyTimeout, err)
+		return nil, fmt.Errorf("capsule-thaw-agent not ready after %v: %w", readyTimeout, err)
 	}
 
-	return vm, proxy, nil
+	return vm, nil
 }
 
 // AllocateRunnerChunked allocates a runner using chunked snapshots
@@ -685,10 +640,9 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	extensionFUSEDisks := make(map[string]*fuse.ChunkedDisk)
 	var uffdHandler *uffd.Handler
 	var localMemPath string
-	var proxy *authproxy.AuthProxy
 
 	cleanup := func() {
-		cm.cleanupChunkedRunner(runnerID, fuseDisk, extensionFUSEDisks, uffdHandler, proxy)
+		cm.cleanupChunkedRunner(runnerID, fuseDisk, extensionFUSEDisks, uffdHandler)
 	}
 	cleanupOnError := true
 	defer func() {
@@ -705,6 +659,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 
 	fuseDisk, err = fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
 		ChunkStore: cm.chunkStore,
+		TenantID:   req.tenantID(),
 		Chunks:     meta.RootfsChunks,
 		TotalSize:  meta.TotalDiskSize,
 		ChunkSize:  meta.ChunkSize,
@@ -740,6 +695,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 			}
 			extFUSE, fuseErr := fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
 				ChunkStore: cm.chunkStore,
+				TenantID:   req.tenantID(),
 				Chunks:     extDrive.Chunks,
 				TotalSize:  totalExtSize,
 				ChunkSize:  meta.ChunkSize,
@@ -816,6 +772,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 		uffdHandler, err = uffd.NewHandler(uffd.HandlerConfig{
 			SocketPath:             uffdSocketPath,
 			ChunkStore:             cm.memChunkStore,
+			TenantID:               req.tenantID(),
 			Metadata:               meta,
 			Logger:                 cm.logger.Logger,
 			FaultConcurrency:       32,
@@ -965,7 +922,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	restoreStatePath := localStatePath
 
 	// With per-VM namespaces, tap-slot-0 already exists in the namespace — no rename needed.
-	vmIface, proxy, err := cm.restoreAndActivateRunner(
+	vmIface, err := cm.restoreAndActivateRunner(
 		ctx,
 		runnerID,
 		req,
@@ -994,7 +951,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 	runner.State = StateBusy
 	runner.StartedAt = time.Now()
 
-	if err := cm.registerAllocatedRunner(runnerID, runner, vm, fuseDisk, extensionFUSEDisks, uffdHandler, proxy); err != nil {
+	if err := cm.registerAllocatedRunner(runnerID, runner, vm, fuseDisk, extensionFUSEDisks, uffdHandler); err != nil {
 		retErr = err
 		return nil, retErr
 	}
@@ -1013,7 +970,7 @@ func (cm *ChunkedManager) AllocateRunnerChunked(ctx context.Context, req Allocat
 }
 
 // ReleaseRunnerChunked releases a runner and optionally saves dirty chunks.
-// Blocking cleanup (vm.Stop, UFFD/FUSE/proxy teardown, network release) runs
+// Blocking cleanup (vm.Stop, UFFD/FUSE teardown, network release) runs
 // outside cm.mu so concurrent allocations and other releases are not blocked.
 func (cm *ChunkedManager) ReleaseRunnerChunked(ctx context.Context, runnerID string, saveIncremental bool) error {
 	// Phase 1: under lock — extract resources, remove from all maps.
@@ -1031,7 +988,6 @@ func (cm *ChunkedManager) ReleaseRunnerChunked(ctx context.Context, runnerID str
 
 	vm := cm.vms[runnerID]
 	handler := cm.uffdHandlers[runnerID]
-	proxy := cm.authProxies[runnerID]
 	fuseDisk := cm.fuseDisks[runnerID]
 	extDisks := cm.fuseExtensionDisks[runnerID]
 	slot, hasSlot := cm.runnerToSlot[runnerID]
@@ -1047,7 +1003,6 @@ func (cm *ChunkedManager) ReleaseRunnerChunked(ctx context.Context, runnerID str
 	delete(cm.vms, runnerID)
 	delete(cm.uffdHandlers, runnerID)
 	delete(cm.Manager.uffdHandlers, runnerID)
-	delete(cm.authProxies, runnerID)
 	delete(cm.fuseDisks, runnerID)
 	delete(cm.fuseExtensionDisks, runnerID)
 	if hasSlot {
@@ -1090,9 +1045,6 @@ func (cm *ChunkedManager) ReleaseRunnerChunked(ctx context.Context, runnerID str
 			}
 		}
 
-		if proxy != nil {
-			proxy.Stop()
-		}
 		// Stop UFFD handler BEFORE Firecracker — FC may be stuck in kernel page
 		// faults waiting for UFFDIO_COPY. Closing the handler unblocks those
 		// faults so SIGTERM can be delivered cleanly.
@@ -1123,18 +1075,13 @@ func (cm *ChunkedManager) ReleaseRunnerChunked(ctx context.Context, runnerID str
 
 // cleanupChunkedRunner cleans up resources on allocation failure.
 // Network namespace and slot cleanup is handled by the bringupLease, so this
-// function only cleans up FUSE disks, UFFD handler, auth proxy, and local files.
+// function only cleans up FUSE disks, UFFD handler, and local files.
 func (cm *ChunkedManager) cleanupChunkedRunner(
 	runnerID string,
 	fuseDisk *fuse.ChunkedDisk,
 	extensionDisks map[string]*fuse.ChunkedDisk,
 	uffdHandler *uffd.Handler,
-	proxy *authproxy.AuthProxy,
 ) {
-	// Stop auth proxy if started
-	if proxy != nil {
-		proxy.Stop()
-	}
 	if uffdHandler != nil {
 		uffdHandler.Stop()
 	}
@@ -1484,7 +1431,7 @@ func (cm *ChunkedManager) getAllDirtyExtensionDiskChunks(runnerID string) map[st
 
 // setupExtensionFUSEDiskForRunner creates and mounts a FUSE-backed extension disk.
 // Used by Manager.ResumeFromSession for GCS-backed cross-host resume.
-func (cm *ChunkedManager) setupExtensionFUSEDiskForRunner(runnerID, driveID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (string, error) {
+func (cm *ChunkedManager) setupExtensionFUSEDiskForRunner(runnerID, driveID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64, tenantID string) (string, error) {
 	fuseMountDir := filepath.Join(cm.config.WorkspaceDir, runnerID, "fuse-ext-"+driveID)
 	if err := os.MkdirAll(fuseMountDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create FUSE ext mount dir for %s: %w", driveID, err)
@@ -1496,6 +1443,7 @@ func (cm *ChunkedManager) setupExtensionFUSEDiskForRunner(runnerID, driveID stri
 
 	fuseDisk, err := fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
 		ChunkStore: cm.chunkStore,
+		TenantID:   tenantID,
 		Chunks:     chunks,
 		TotalSize:  totalSize,
 		ChunkSize:  chunkSize,
@@ -1563,7 +1511,7 @@ func (cm *ChunkedManager) cleanupFUSEDisksForRunner(runnerID string) {
 
 // setupRootfsFUSEDiskForRunner creates and mounts a FUSE-backed rootfs disk.
 // Used by Manager.ResumeFromSession for GCS-backed cross-host resume.
-func (cm *ChunkedManager) setupRootfsFUSEDiskForRunner(runnerID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (string, error) {
+func (cm *ChunkedManager) setupRootfsFUSEDiskForRunner(runnerID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64, tenantID string) (string, error) {
 	fuseMountDir := filepath.Join(cm.config.WorkspaceDir, runnerID, "fuse-rootfs")
 	if err := os.MkdirAll(fuseMountDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create FUSE rootfs mount dir: %w", err)
@@ -1575,6 +1523,7 @@ func (cm *ChunkedManager) setupRootfsFUSEDiskForRunner(runnerID string, chunks [
 
 	fuseDisk, err := fuse.NewChunkedDisk(fuse.ChunkedDiskConfig{
 		ChunkStore: cm.chunkStore,
+		TenantID:   tenantID,
 		Chunks:     chunks,
 		TotalSize:  totalSize,
 		ChunkSize:  chunkSize,

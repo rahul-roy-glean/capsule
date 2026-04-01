@@ -16,8 +16,6 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
-	_ "github.com/rahul-roy-glean/capsule/pkg/authproxy/providers" // register providers
 	"github.com/rahul-roy-glean/capsule/pkg/firecracker"
 	"github.com/rahul-roy-glean/capsule/pkg/network"
 	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
@@ -80,9 +78,6 @@ type Manager struct {
 	sessionMemStore  *snapshot.ChunkStore
 	sessionDiskStore *snapshot.ChunkStore
 
-	// authProxies tracks per-VM auth proxy instances for credential injection.
-	authProxies map[string]*authproxy.AuthProxy
-
 	// goldenChunkedMeta holds the base snapshot metadata used as the reference
 	// for session pause uploads. Only populated when sessionMemStore is non-nil.
 	goldenChunkedMeta *snapshot.ChunkedSnapshotMetadata
@@ -94,7 +89,7 @@ type Manager struct {
 	// setupExtensionFUSEDisk is a callback set by ChunkedManager that creates
 	// and mounts a FUSE-backed disk for a specific extension drive.
 	// Returns the disk image path. Used by ResumeFromSession.
-	setupExtensionFUSEDisk func(runnerID, driveID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (diskImagePath string, err error)
+	setupExtensionFUSEDisk func(runnerID, driveID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64, tenantID string) (diskImagePath string, err error)
 
 	// getDirtyRootfsDiskChunks returns dirty FUSE rootfs disk chunks for a runner.
 	// Nil when FUSE rootfs disks are not in use (non-chunked mode).
@@ -102,7 +97,7 @@ type Manager struct {
 
 	// setupRootfsFUSEDisk creates and mounts a FUSE-backed rootfs disk from
 	// ChunkRefs during GCS-backed session resume. Returns the disk image path.
-	setupRootfsFUSEDisk func(runnerID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64) (diskImagePath string, err error)
+	setupRootfsFUSEDisk func(runnerID string, chunks []snapshot.ChunkRef, totalSize, chunkSize int64, tenantID string) (diskImagePath string, err error)
 
 	// cleanupFUSEDisks unmounts and removes all FUSE disks (rootfs + extension)
 	// for a runner. Called during pause/checkpoint after getting dirty chunks
@@ -168,7 +163,6 @@ func NewManager(ctx context.Context, cfg HostConfig, logger *logrus.Logger) (*Ma
 		runnerToSlot:    make(map[string]int),
 		pendingSessions: make(map[string]string),
 		policyEnforcers: make(map[string]*network.PolicyEnforcer),
-		authProxies:     make(map[string]*authproxy.AuthProxy),
 		pauseSem:        make(chan struct{}, maxConcurrentSnapshots),
 		uploadSem:       make(chan struct{}, maxConcurrentUploads),
 		stopCh:          make(chan struct{}),
@@ -571,7 +565,6 @@ func (m *Manager) ReleaseRunner(runnerID string, destroy bool) error {
 	vm := m.vms[runnerID]
 	handler := m.uffdHandlers[runnerID]
 	enforcer := m.policyEnforcers[runnerID]
-	proxy := m.authProxies[runnerID]
 	overlayPath := runner.RootfsOverlay
 	sessionID := runner.SessionID
 	slot, hasSlot := m.runnerToSlot[runnerID]
@@ -581,7 +574,6 @@ func (m *Manager) ReleaseRunner(runnerID string, destroy bool) error {
 	delete(m.vms, runnerID)
 	delete(m.uffdHandlers, runnerID)
 	delete(m.policyEnforcers, runnerID)
-	delete(m.authProxies, runnerID)
 	if hasSlot {
 		delete(m.slotToRunner, slot)
 		delete(m.runnerToSlot, runnerID)
@@ -602,9 +594,6 @@ func (m *Manager) ReleaseRunner(runnerID string, destroy bool) error {
 	}
 	if enforcer != nil {
 		enforcer.Remove()
-	}
-	if proxy != nil {
-		proxy.Stop()
 	}
 
 	// Suspended runners already had network released during pause; only clean up overlay/files
@@ -1142,13 +1131,6 @@ func (m *Manager) setupSnapshotSymlinks(runnerID, overlayPath string, extensionD
 		os.RemoveAll(perRunnerDir)
 	}
 	return perRunnerDir, cleanup, nil
-}
-
-// GetAuthProxy returns the auth proxy for a runner, or nil if none exists.
-func (m *Manager) GetAuthProxy(runnerID string) *authproxy.AuthProxy {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.authProxies[runnerID]
 }
 
 // GetRunner returns a runner by ID

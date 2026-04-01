@@ -20,8 +20,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
-	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
-	_ "github.com/rahul-roy-glean/capsule/pkg/authproxy/providers" // register auth providers
+	"github.com/rahul-roy-glean/capsule/pkg/accessplane"
 	"github.com/rahul-roy-glean/capsule/pkg/firecracker"
 	"github.com/rahul-roy-glean/capsule/pkg/fuse"
 	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
@@ -63,7 +62,7 @@ var (
 	runnerUser = flag.String("runner-user", "runner", "Username for non-root commands inside the VM")
 
 	// Auth proxy: transparent credential injection for the warmup VM
-	authConfigJSON = flag.String("auth-config", "", "JSON auth proxy config (AuthConfig). When set, starts an auth proxy on the host to provide GCP metadata and HTTPS credential injection.")
+	authConfigJSON = flag.String("auth-config", "", "JSON access plane config (accessplane.Config). When set, injects access plane proxy info into MMDS for the build VM.")
 
 	// Path to a pre-built capsule-thaw-agent binary to inject into the rootfs.
 	// If empty or the file does not exist, snapshot-builder will attempt to
@@ -211,41 +210,23 @@ func run(logger *logrus.Logger) error {
 	netmask := builderNet.netmask()     // Guest-visible netmask
 	firecrackerNetNSPath := builderNet.firecrackerNetNSPath()
 
-	// Start auth proxy if configured. The proxy provides:
-	// 1. GCP metadata server emulation on gatewayIP:80 (for keyrings.google-artifactregistry-auth)
-	// 2. HTTPS MITM proxy on gatewayIP:3128 (injects auth headers for matched hosts)
-	var authProxy *authproxy.AuthProxy
-	var authProxyAddr string // e.g. "http://172.16.0.1:3128"
+	// Parse access plane config if provided.
+	// The access plane proxy is assumed to be running externally; we just inject
+	// its connection info into MMDS so the build VM can reach it.
+	var accessPlaneConfig *accessplane.Config
 	if *authConfigJSON != "" {
-		var authCfg authproxy.AuthConfig
-		if err := json.Unmarshal([]byte(*authConfigJSON), &authCfg); err != nil {
+		var cfg accessplane.Config
+		if err := json.Unmarshal([]byte(*authConfigJSON), &cfg); err != nil {
 			return fmt.Errorf("parse --auth-config JSON: %w", err)
 		}
+		accessPlaneConfig = &cfg
 		log.WithFields(logrus.Fields{
-			"providers": len(authCfg.Providers),
-			"ssl_bump":  authCfg.Proxy.SSLBump,
-		}).Info("Auth proxy config loaded")
-		proxyPort := authCfg.Proxy.ListenPort
-		if proxyPort == 0 {
-			proxyPort = 3128
-		}
-		authProxyAddr = fmt.Sprintf("http://%s:%d", gatewayIP, proxyPort)
-		var proxyErr error
-		authProxy, proxyErr = authproxy.NewAuthProxy("snapshot-builder", authCfg, firecrackerNetNSPath, gatewayIP, "", log)
-		if proxyErr != nil {
-			return fmt.Errorf("create auth proxy: %w", proxyErr)
-		}
-		if proxyErr = authProxy.Start(ctx); proxyErr != nil {
-			return fmt.Errorf("start auth proxy: %w", proxyErr)
-		}
-		log.WithField("proxy_addr", authProxyAddr).Info("Auth proxy started")
-		defer authProxy.Stop()
-		// Note: DNAT to 169.254.169.254 doesn't work because Firecracker's MMDS
-		// intercepts all traffic to that IP before it reaches the tap interface.
-		// Instead, we pass the metadata host (gatewayIP) via MMDS and set
-		// GCE_METADATA_HOST in the guest so google-auth talks directly to the proxy.
+			"proxy_endpoint": cfg.ProxyEndpoint,
+			"api_endpoint":   cfg.APIEndpoint,
+			"tenant_id":      cfg.TenantID,
+		}).Info("Access plane config loaded")
 	} else {
-		log.Warn("No --auth-config provided, auth proxy disabled (git clone of private repos will fail)")
+		log.Warn("No --auth-config provided, access plane disabled (git clone of private repos will fail)")
 	}
 
 	bootArgs := fmt.Sprintf("console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off",
@@ -323,7 +304,7 @@ func run(logger *logrus.Logger) error {
 			// Restore from parent layer: parent's VM state (+ old layer's extension drives if reattach)
 			log.Info("Attempting restore from parent layer...")
 			var reattachErr error
-			vm, fuseDisk, fuseExtDisks, incrUffdHandler, rootfsFlavorForProvenance, reattachErr = reattachFromParent(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, firecrackerNetNSPath, gcpAccessToken, commands, newDrives, expectedRunnerID, authProxy, authProxyAddr)
+			vm, fuseDisk, fuseExtDisks, incrUffdHandler, rootfsFlavorForProvenance, reattachErr = reattachFromParent(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, firecrackerNetNSPath, gcpAccessToken, commands, newDrives, expectedRunnerID, accessPlaneConfig)
 			if reattachErr != nil {
 				// Child layers MUST restore from parent — cold boot would produce
 				// a fundamentally different snapshot (wrong rootfs, missing parent state).
@@ -342,7 +323,7 @@ func run(logger *logrus.Logger) error {
 		} else {
 			log.Info("Attempting incremental restore from previous snapshot...")
 			var incrementalErr error
-			vm, fuseDisk, fuseExtDisks, incrUffdHandler, rootfsFlavorForProvenance, incrementalErr = restoreFromPreviousSnapshot(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, firecrackerNetNSPath, effectiveWorkloadKey, gcpAccessToken, commands, newDrives, expectedRunnerID, authProxy, authProxyAddr)
+			vm, fuseDisk, fuseExtDisks, incrUffdHandler, rootfsFlavorForProvenance, incrementalErr = restoreFromPreviousSnapshot(ctx, logger, log, vmID, tapName, guestMAC, bootArgs, firecrackerNetNSPath, effectiveWorkloadKey, gcpAccessToken, commands, newDrives, expectedRunnerID, accessPlaneConfig)
 			if incrementalErr != nil {
 				log.WithError(incrementalErr).Warn("Incremental restore failed, falling back to cold boot")
 				vm = nil
@@ -470,7 +451,7 @@ func run(logger *logrus.Logger) error {
 		}
 
 		mmdsData := buildWarmupMMDS(commands, newDrives)
-		injectProxyMMDS(mmdsData, authProxy, authProxyAddr, hostIP)
+		injectProxyMMDS(mmdsData, accessPlaneConfig)
 		if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 			stopVM("set MMDS data failure")
 			return fmt.Errorf("set MMDS data: %w", err)
@@ -1178,7 +1159,7 @@ func restoreFromPreviousSnapshot(
 	commands []snapshot.SnapshotCommand,
 	newDrives []snapshot.DriveSpec,
 	runnerID string,
-	authProxy *authproxy.AuthProxy, authProxyAddr string,
+	accessPlaneConfig *accessplane.Config,
 ) (*firecracker.VM, *fuse.ChunkedDisk, map[string]*fuse.ChunkedDisk, *uffd.Handler, rootfsFlavor, error) {
 	// Use a subdirectory for incremental working files to avoid colliding
 	// with the symlinks in /tmp/snapshot/ that Firecracker expects.
@@ -1533,7 +1514,7 @@ func restoreFromPreviousSnapshot(
 	mmdsData := buildWarmupMMDS(commands, newDrives)
 	// Override runner_id so capsule-thaw-agent detects the change and re-runs warmup
 	mmdsData["latest"].(map[string]interface{})["meta"].(map[string]interface{})["runner_id"] = runnerID
-	injectProxyMMDS(mmdsData, authProxy, authProxyAddr, hostIP)
+	injectProxyMMDS(mmdsData, accessPlaneConfig)
 
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
@@ -1575,7 +1556,7 @@ func reattachFromParent(
 	commands []snapshot.SnapshotCommand,
 	newDrives []snapshot.DriveSpec,
 	runnerID string,
-	authProxy *authproxy.AuthProxy, authProxyAddr string,
+	accessPlaneConfig *accessplane.Config,
 ) (*firecracker.VM, *fuse.ChunkedDisk, map[string]*fuse.ChunkedDisk, *uffd.Handler, rootfsFlavor, error) {
 	reattachDir := filepath.Join(*outputDir, "reattach")
 	if err := os.MkdirAll(reattachDir, 0755); err != nil {
@@ -1941,7 +1922,7 @@ func reattachFromParent(
 	mmdsData := buildWarmupMMDS(commands, newDrives)
 	// Use the caller-provided runnerID so waitForWarmup's expectedRunnerID matches.
 	mmdsData["latest"].(map[string]interface{})["meta"].(map[string]interface{})["runner_id"] = runnerID
-	injectProxyMMDS(mmdsData, authProxy, authProxyAddr, hostIP)
+	injectProxyMMDS(mmdsData, accessPlaneConfig)
 
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		vm.Stop()
@@ -1991,18 +1972,22 @@ func buildWarmupMMDS(commands []snapshot.SnapshotCommand, drives []snapshot.Driv
 	}
 }
 
-// injectProxyMMDS adds auth proxy metadata to the MMDS data if an auth proxy is running.
+// injectProxyMMDS adds access plane proxy metadata to the MMDS data if access plane config is provided.
 // The capsule-thaw-agent reads this to configure HTTPS_PROXY, GCE_METADATA_HOST, and install the CA certificate.
-func injectProxyMMDS(mmdsData map[string]interface{}, proxy *authproxy.AuthProxy, proxyAddr, metadataHost string) {
-	if proxy == nil {
+func injectProxyMMDS(mmdsData map[string]interface{}, config *accessplane.Config) {
+	if config == nil {
 		return
 	}
 	latest := mmdsData["latest"].(map[string]interface{})
-	latest["proxy"] = map[string]interface{}{
-		"ca_cert_pem":   string(proxy.CACertPEM),
-		"address":       proxyAddr,
-		"metadata_host": metadataHost,
+	proxyMap := map[string]interface{}{
+		"address":      config.ProxyEndpoint,
+		"api_endpoint": config.APIEndpoint,
+		"tenant_id":    config.TenantID,
 	}
+	if config.CACertPEM != "" {
+		proxyMap["ca_cert_pem"] = config.CACertPEM
+	}
+	latest["proxy"] = proxyMap
 }
 
 // buildRootfsFromImage creates a Firecracker-compatible ext4 rootfs from a Docker image.
