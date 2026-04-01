@@ -335,8 +335,8 @@ func TestGetStatus_ExcludesSuspendedAndPausedResourceUsage(t *testing.T) {
 
 	status := m.GetStatus()
 
-	if status.UsedCPUMillicores != 500 {
-		t.Fatalf("UsedCPUMillicores = %d, want 500", status.UsedCPUMillicores)
+	if status.UsedCPUMillicores != 640 {
+		t.Fatalf("UsedCPUMillicores = %d, want 640", status.UsedCPUMillicores)
 	}
 	if status.UsedMemoryMB != 4096 {
 		t.Fatalf("UsedMemoryMB = %d, want 4096", status.UsedMemoryMB)

@@ -533,7 +533,7 @@ func computeAutoscaleDecision(input autoscaleInput) autoscaleDecision {
 		avgUtil := 1.0 - float64(input.remainingCapacity)/float64(len(input.readyHosts)*input.avgCapacityPerHost)
 		if avgUtil >= input.settlingThreshold/2 {
 			timeToExhaustion := float64(input.remainingCapacity) / input.allocationRateCPU
-			headroom := input.bootCooldown.Seconds() * 1.2
+			headroom := input.bootCooldown.Seconds() * 1.4
 			if timeToExhaustion < headroom {
 				return autoscaleDecision{
 					action:    scaleActionUp,
