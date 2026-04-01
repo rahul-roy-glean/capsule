@@ -80,9 +80,6 @@ func (cc *ConfigCache) loadFromDB() {
 			if npJSON.Valid {
 				wc.NetworkPolicyJSON = npJSON.String
 			}
-			if configJSON.Valid {
-				// Access plane config is loaded separately from project_access_planes table.
-			}
 			cc.workloadConfig[wc.WorkloadKey] = &wc
 		}
 	}
@@ -116,9 +113,6 @@ func (cc *ConfigCache) loadFromDB() {
 			}
 			if npJSON.Valid {
 				wc.NetworkPolicyJSON = npJSON.String
-			}
-			if configJSON.Valid {
-				// Access plane config is loaded separately from project_access_planes table.
 			}
 			// Only add if not already loaded from layered_configs (active takes precedence)
 			if _, exists := cc.workloadConfig[wc.WorkloadKey]; !exists {
@@ -189,9 +183,6 @@ func (cc *ConfigCache) loadWorkloadConfigFromDB(ctx context.Context, workloadKey
 	}
 	if npJSON.Valid {
 		wc.NetworkPolicyJSON = npJSON.String
-	}
-	if configJSON.Valid {
-		// Access plane config is loaded separately from project_access_planes table.
 	}
 	return &wc
 }

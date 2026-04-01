@@ -525,9 +525,6 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			if npJSON.Valid {
 				configNetworkPolicyJSON = npJSON.String
 			}
-			if configJSON.Valid {
-				// Access plane config is loaded from project_access_planes, not from config_json.
-			}
 		}
 	}
 

@@ -120,10 +120,6 @@ var globalWarmupState = &WarmupState{
 	StartedAt: time.Now(),
 }
 
-// globalAttestationToken stores the access plane attestation token in memory
-// for use in API calls to the access plane. NOT exported as an env var.
-var globalAttestationToken string
-
 // globalProxyEnv holds proxy-related environment variables (HTTPS_PROXY, etc.)
 // set by configureAuthProxy. These are passed to child commands instead of being
 // set process-wide, so they don't persist in snapshots.
@@ -1677,13 +1673,7 @@ func configureAuthProxy(data *MMDSData) error {
 		log.WithField("cert", certPath).Info("Set NODE_EXTRA_CA_CERTS for proxy CA")
 	}
 
-	// 3. Store attestation token in memory (NOT as env var).
-	if data.Latest.Proxy.AttestationToken != "" {
-		globalAttestationToken = data.Latest.Proxy.AttestationToken
-		log.Info("Stored access plane attestation token in memory")
-	}
-
-	// 4. Fetch phantom env vars from the access plane and set them process-wide.
+	// 3. Fetch phantom env vars from the access plane and set them process-wide.
 	// These replace the old AuthEnv / metadata host approach — the access plane
 	// returns environment variables that tools (gh, gcloud, pip, etc.) need.
 	if data.Latest.Proxy.APIEndpoint != "" && data.Latest.Proxy.AttestationToken != "" {

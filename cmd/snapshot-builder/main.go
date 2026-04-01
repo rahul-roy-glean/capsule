@@ -1142,7 +1142,6 @@ func getDefaultIface() string {
 // Firecracker opens drive backing files at the paths baked into the snapshot state,
 // which are /tmp/snapshot/*.img.
 const snapshotSymlinkDir = "/tmp/snapshot"
-const hostIP = "172.16.0.1" // Gateway IP for the VM tap network
 
 // restoreFromPreviousSnapshot downloads the previous chunked snapshot from GCS,
 // mounts rootfs and extension drives via FUSE, restores the VM from snapshot,
