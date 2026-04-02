@@ -16,7 +16,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/klauspost/compress v1.18.3
-	github.com/lib/pq v1.10.9
+	github.com/lib/pq v1.11.2
 	github.com/miekg/dns v1.1.72
 	github.com/modelcontextprotocol/go-sdk v1.4.0
 	github.com/sirupsen/logrus v1.9.3
