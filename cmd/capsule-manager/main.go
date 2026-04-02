@@ -1695,7 +1695,7 @@ func autoResumeIfSuspended(ctx context.Context, mgr *runner.Manager, log *logrus
 
 	result, err, _ := group.Do(runnerID, func() (interface{}, error) {
 		start := time.Now()
-		resumed, err := mgr.ResumeFromSession(ctx, rn.SessionID, rn.WorkloadKey, runnerID)
+		resumed, err := mgr.ResumeFromSession(ctx, rn.SessionID, rn.WorkloadKey, runnerID, "")
 		if err != nil {
 			recordSessionResumeMetrics(ctx, mgr, lifecycleMetrics, rn.SessionID, time.Since(start), fcrotel.ResultFailure, "auto_resume")
 			return nil, fmt.Errorf("auto-resume failed: %w", err)
@@ -1925,45 +1925,8 @@ func handleCheckpointRunner(w http.ResponseWriter, r *http.Request, mgr *runner.
 }
 
 // handleAuthUpdateToken handles POST /api/v1/runners/{id}/auth/update-token
-// Proxies the request to the auth proxy's /update-token endpoint.
+// With the access plane migration, token updates are pushed directly to the
+// external access plane service — the host agent no longer proxies them.
 func handleAuthUpdateToken(w http.ResponseWriter, r *http.Request, mgr *runner.Manager, log *logrus.Entry, runnerID string) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	proxy := mgr.GetAuthProxy(runnerID)
-	if proxy == nil {
-		http.Error(w, fmt.Sprintf("no auth proxy for runner %s", runnerID), http.StatusNotFound)
-		return
-	}
-	addr := proxy.TokenUpdateAddr()
-	if addr == "" {
-		http.Error(w, "auth proxy has no token update endpoint", http.StatusServiceUnavailable)
-		return
-	}
-
-	targetURL := fmt.Sprintf("http://%s/update-token", addr)
-	log.WithFields(logrus.Fields{
-		"runner_id": runnerID,
-		"target":    targetURL,
-	}).Debug("Proxying auth token update")
-
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, r.Body)
-	if err != nil {
-		http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
-		return
-	}
-	upstreamReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(upstreamReq)
-	if err != nil {
-		log.WithError(err).WithField("runner_id", runnerID).Warn("Failed to reach auth proxy for token update")
-		http.Error(w, "bad gateway: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	http.Error(w, "token updates should be sent directly to the access plane", http.StatusGone)
 }

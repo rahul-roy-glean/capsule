@@ -111,6 +111,7 @@ type uffdioCopy struct {
 // Handler handles UFFD page faults by fetching memory chunks on demand
 type Handler struct {
 	chunkStore *snapshot.ChunkStore
+	tenantID   string // tenant scope for cache isolation
 	metadata   *snapshot.ChunkedSnapshotMetadata
 
 	// Guest memory region mappings received from Firecracker.
@@ -172,6 +173,7 @@ type Handler struct {
 type HandlerConfig struct {
 	SocketPath string
 	ChunkStore *snapshot.ChunkStore
+	TenantID   string // tenant scope for cache isolation (empty = no isolation)
 	Metadata   *snapshot.ChunkedSnapshotMetadata
 	Logger     *logrus.Logger
 
@@ -241,6 +243,7 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 
 	h := &Handler{
 		chunkStore:             cfg.ChunkStore,
+		tenantID:               cfg.TenantID,
 		metadata:               cfg.Metadata,
 		socketPath:             cfg.SocketPath,
 		ctx:                    ctx,
@@ -821,7 +824,7 @@ func (h *Handler) getPageData(ctx context.Context, offset uint64) ([]byte, error
 	}
 
 	// Fetch the chunk (hits ChunkStore's in-memory LRU on repeat access)
-	chunkData, err := h.chunkStore.GetChunk(ctx, chunk.Hash)
+	chunkData, err := h.chunkStore.GetChunkForTenant(ctx, chunk.Hash, h.tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch chunk %s: %w", chunk.Hash[:12], err)
 	}

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,7 +17,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
+	"github.com/rahul-roy-glean/capsule/pkg/accessplane"
 	"github.com/rahul-roy-glean/capsule/pkg/firecracker"
 	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
 	"github.com/rahul-roy-glean/capsule/pkg/uffd"
@@ -79,9 +78,9 @@ type SessionMetadata struct {
 	ServicePort int `json:"service_port,omitempty"`
 	// SnapshotVersion is the snapshot version used to boot this runner.
 	SnapshotVersion string `json:"snapshot_version,omitempty"`
-	// AuthConfig preserves the auth proxy configuration so it can be
-	// recreated on resume.
-	AuthConfig *authproxy.AuthConfig `json:"auth_config,omitempty"`
+	// AccessPlaneConfig preserves the access plane configuration so it can be
+	// restored on resume (injected into MMDS).
+	AccessPlaneConfig *accessplane.Config `json:"access_plane_config,omitempty"`
 
 	// GCS-backed session fields (populated when SessionChunkBucket is configured).
 	// When GCSManifestPath is non-empty, ResumeFromSession uses UFFD-backed
@@ -281,21 +280,21 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 	}
 
 	metadata := SessionMetadata{
-		SessionID:       sessionID,
-		WorkloadKey:     runner.WorkloadKey,
-		RunnerID:        runnerID,
-		HostID:          m.config.HostID,
-		Layers:          layerN + 1,
-		CreatedAt:       runner.CreatedAt,
-		PausedAt:        time.Now(),
-		RootfsPath:      runner.RootfsOverlay,
-		VCPUs:           runner.Resources.VCPUs,
-		MemoryMB:        runner.Resources.MemoryMB,
-		TTLSeconds:      runner.TTLSeconds,
-		AutoPause:       runner.AutoPause,
-		ServicePort:     runner.ServicePort,
-		SnapshotVersion: runner.SnapshotVersion,
-		AuthConfig:      runner.AuthConfig,
+		SessionID:         sessionID,
+		WorkloadKey:       runner.WorkloadKey,
+		RunnerID:          runnerID,
+		HostID:            m.config.HostID,
+		Layers:            layerN + 1,
+		CreatedAt:         runner.CreatedAt,
+		PausedAt:          time.Now(),
+		RootfsPath:        runner.RootfsOverlay,
+		VCPUs:             runner.Resources.VCPUs,
+		MemoryMB:          runner.Resources.MemoryMB,
+		TTLSeconds:        runner.TTLSeconds,
+		AutoPause:         runner.AutoPause,
+		ServicePort:       runner.ServicePort,
+		SnapshotVersion:   runner.SnapshotVersion,
+		AccessPlaneConfig: runner.AccessPlaneConfig,
 	}
 
 	// GCS-backed upload: when sessionMemStore is configured, upload dirty mem
@@ -582,8 +581,6 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 	delete(m.vms, runnerID)
 	handler := m.uffdHandlers[runnerID]
 	delete(m.uffdHandlers, runnerID)
-	proxy := m.authProxies[runnerID]
-	delete(m.authProxies, runnerID)
 	m.mu.Unlock()
 
 	// Background teardown: vm.Stop, handler.Stop, ns.Release, and FUSE
@@ -615,14 +612,6 @@ func (m *Manager) PauseRunner(ctx context.Context, runnerID string, syncFS bool)
 					"runner_id":       runnerID,
 					"handler_stop_ms": time.Since(handlerStart).Milliseconds(),
 				}).Debug("Pause teardown: UFFD handler stopped")
-			}()
-		}
-
-		if proxy != nil {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				proxy.Stop()
 			}()
 		}
 
@@ -752,21 +741,21 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 	}
 
 	metadata := SessionMetadata{
-		SessionID:       sessionID,
-		WorkloadKey:     runner.WorkloadKey,
-		RunnerID:        runnerID,
-		HostID:          m.config.HostID,
-		Layers:          layerN + 1,
-		CreatedAt:       runner.CreatedAt,
-		PausedAt:        time.Now(),
-		RootfsPath:      runner.RootfsOverlay,
-		VCPUs:           runner.Resources.VCPUs,
-		MemoryMB:        runner.Resources.MemoryMB,
-		TTLSeconds:      runner.TTLSeconds,
-		AutoPause:       runner.AutoPause,
-		ServicePort:     runner.ServicePort,
-		SnapshotVersion: runner.SnapshotVersion,
-		AuthConfig:      runner.AuthConfig,
+		SessionID:         sessionID,
+		WorkloadKey:       runner.WorkloadKey,
+		RunnerID:          runnerID,
+		HostID:            m.config.HostID,
+		Layers:            layerN + 1,
+		CreatedAt:         runner.CreatedAt,
+		PausedAt:          time.Now(),
+		RootfsPath:        runner.RootfsOverlay,
+		VCPUs:             runner.Resources.VCPUs,
+		MemoryMB:          runner.Resources.MemoryMB,
+		TTLSeconds:        runner.TTLSeconds,
+		AutoPause:         runner.AutoPause,
+		ServicePort:       runner.ServicePort,
+		SnapshotVersion:   runner.SnapshotVersion,
+		AccessPlaneConfig: runner.AccessPlaneConfig,
 	}
 
 	// GCS-backed upload (same logic as PauseRunner)
@@ -1000,7 +989,8 @@ func (m *Manager) CheckpointRunner(ctx context.Context, runnerID string) (*Check
 // ResumeFromSession restores a runner from a session snapshot using layered UFFD.
 // runnerID is optional — when provided (cross-host resume via RPC), it enables
 // downloading session metadata from GCS if not found locally.
-func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey, runnerID string) (*Runner, error) {
+// attestationToken is optional — when provided, it's injected into MMDS for access plane auth.
+func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey, runnerID, attestationToken string) (*Runner, error) {
 	sessionDir := filepath.Join(m.sessionBaseDir(), sessionID)
 
 	// Read metadata — try local disk first, fall back to GCS for cross-host resume.
@@ -1107,7 +1097,12 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 	var uffdHandler uffdStopper
 	var latestStateFile string
 	var sessionPrefetcher *uffd.Prefetcher
-	var proxy *authproxy.AuthProxy
+
+	// Extract tenant ID for cache isolation.
+	tenantID := ""
+	if metadata.AccessPlaneConfig != nil {
+		tenantID = metadata.AccessPlaneConfig.TenantID
+	}
 
 	if man != nil && uploader != nil {
 		// GCS-backed resume: manifest already downloaded in parallel above.
@@ -1120,7 +1115,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 		//  - Disk index downloads → FUSE mounts (sequential dependency per drive)
 		//  - VM state download → needed for LoadSnapshot only
 		//  - Firecracker process start → needs netns only, overlaps with everything
-		//  - Port forwarding + auth proxy → needs netns only, overlaps with everything
+		//  - Port forwarding → needs netns only, overlaps with everything
 		var memIdx *snapshot.ChunkIndex
 		var rootfsDiskIdx *snapshot.ChunkIndex
 		extDiskIndexes := map[string]*snapshot.ChunkIndex{}
@@ -1210,7 +1205,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 					extDiskMu.Unlock()
 					// Mount FUSE disk immediately after download — no need to wait for other indexes.
 					diskRefs := snapshot.ChunkIndexToRefs(diskIdx)
-					fusePath, fuseErr := m.setupExtensionFUSEDisk(runnerID, did, diskRefs, diskIdx.Region.LogicalSizeBytes, diskIdx.ChunkSizeBytes)
+					fusePath, fuseErr := m.setupExtensionFUSEDisk(runnerID, did, diskRefs, diskIdx.Region.LogicalSizeBytes, diskIdx.ChunkSizeBytes, tenantID)
 					if fuseErr != nil {
 						return fmt.Errorf("failed to setup FUSE disk for drive %s session resume: %w", did, fuseErr)
 					}
@@ -1231,7 +1226,7 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 					return fmt.Errorf("failed to download rootfs disk chunk index: %w", diskDlErr)
 				}
 				rootfsRefs := snapshot.ChunkIndexToRefs(rootfsDiskIdx)
-				rootfsFusePath, fuseErr := m.setupRootfsFUSEDisk(runnerID, rootfsRefs, rootfsDiskIdx.Region.LogicalSizeBytes, rootfsDiskIdx.ChunkSizeBytes)
+				rootfsFusePath, fuseErr := m.setupRootfsFUSEDisk(runnerID, rootfsRefs, rootfsDiskIdx.Region.LogicalSizeBytes, rootfsDiskIdx.ChunkSizeBytes, tenantID)
 				if fuseErr != nil {
 					return fmt.Errorf("failed to setup FUSE rootfs disk for session resume: %w", fuseErr)
 				}
@@ -1255,37 +1250,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 						m.logger.WithField("port", metadata.ServicePort).WithError(err).Warn("Failed to forward service port on resume")
 					}
 				}
-				return nil
-			})
-		}
-
-		// Auth proxy — only needs network namespace, not VM.
-		if metadata.AuthConfig != nil && m.netnsNetwork != nil {
-			setupG.Go(func() error {
-				ns, nsErr := m.netnsNetwork.GetNamespace(runnerID)
-				if nsErr != nil {
-					m.logger.WithError(nsErr).Warn("Failed to get namespace for auth proxy on resume")
-					return nil // non-fatal
-				}
-				hostVethIP := net.IPv4(10, 200, byte(ns.Slot), 1).String()
-				p, pErr := authproxy.NewAuthProxy(
-					runnerID,
-					*metadata.AuthConfig,
-					ns.Path,
-					ns.Gateway.String(),
-					hostVethIP,
-					m.logger,
-				)
-				if pErr != nil {
-					m.logger.WithError(pErr).Warn("Failed to create auth proxy on resume (non-fatal)")
-					return nil
-				}
-				if startErr := p.Start(context.Background()); startErr != nil {
-					p.Stop()
-					m.logger.WithError(startErr).Warn("Failed to start auth proxy on resume (non-fatal)")
-					return nil
-				}
-				proxy = p
 				return nil
 			})
 		}
@@ -1421,20 +1385,20 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 			VCPUs:    metadata.VCPUs,
 			MemoryMB: metadata.MemoryMB,
 		},
-		CreatedAt:     metadata.CreatedAt,
-		StartedAt:     time.Now(),
-		SocketPath:    filepath.Join(m.config.SocketDir, runnerID+".sock"),
-		LogPath:       filepath.Join(m.config.LogDir, runnerID+".log"),
-		MetricsPath:   filepath.Join(m.config.LogDir, runnerID+".metrics"),
-		RootfsOverlay: overlayPath,
-		SessionID:     sessionID,
-		SessionDir:    sessionDir,
-		SessionLayers: metadata.Layers,
-		TTLSeconds:    metadata.TTLSeconds,
-		AutoPause:     metadata.AutoPause,
-		ServicePort:   metadata.ServicePort,
-		AuthConfig:    metadata.AuthConfig,
-		LastExecAt:    time.Now(),
+		CreatedAt:         metadata.CreatedAt,
+		StartedAt:         time.Now(),
+		SocketPath:        filepath.Join(m.config.SocketDir, runnerID+".sock"),
+		LogPath:           filepath.Join(m.config.LogDir, runnerID+".log"),
+		MetricsPath:       filepath.Join(m.config.LogDir, runnerID+".metrics"),
+		RootfsOverlay:     overlayPath,
+		SessionID:         sessionID,
+		SessionDir:        sessionDir,
+		SessionLayers:     metadata.Layers,
+		TTLSeconds:        metadata.TTLSeconds,
+		AutoPause:         metadata.AutoPause,
+		ServicePort:       metadata.ServicePort,
+		AccessPlaneConfig: metadata.AccessPlaneConfig,
+		LastExecAt:        time.Now(),
 	}
 
 	m.mu.Lock()
@@ -1443,9 +1407,6 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 	m.runners[runnerID] = runner
 	m.vms[runnerID] = vm
 	m.uffdHandlers[runnerID] = uffdHandler
-	if proxy != nil {
-		m.authProxies[runnerID] = proxy
-	}
 	m.mu.Unlock()
 	lease.Commit()
 
@@ -1454,10 +1415,14 @@ func (m *Manager) ResumeFromSession(ctx context.Context, sessionID, workloadKey,
 		WorkloadKey: metadata.WorkloadKey,
 	}
 	mmdsData := m.buildMMDSData(ctx, runner, tap, allocReq)
-	if proxy != nil {
-		mmdsData.Latest.Proxy.Address = proxy.ProxyAddress()
-		mmdsData.Latest.Proxy.CACertPEM = string(proxy.CACertPEM)
-		mmdsData.Latest.Proxy.MetadataHost = proxy.GatewayIP()
+	if metadata.AccessPlaneConfig != nil {
+		mmdsData.Latest.Proxy.Address = metadata.AccessPlaneConfig.ProxyEndpoint
+		mmdsData.Latest.Proxy.CACertPEM = metadata.AccessPlaneConfig.CACertPEM
+		mmdsData.Latest.Proxy.APIEndpoint = metadata.AccessPlaneConfig.APIEndpoint
+		mmdsData.Latest.Proxy.TenantID = metadata.AccessPlaneConfig.TenantID
+	}
+	if attestationToken != "" {
+		mmdsData.Latest.Proxy.AttestationToken = attestationToken
 	}
 	if err := vm.SetMMDSData(ctx, mmdsData); err != nil {
 		m.logger.WithError(err).Warn("Failed to set MMDS data on resumed runner")

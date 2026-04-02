@@ -359,10 +359,23 @@ func (cs *ChunkStore) StoreChunk(ctx context.Context, data []byte) (string, int6
 // doesn't cancel the shared fetch for other waiters. The caller's context
 // controls how long *this caller* waits for the result.
 func (cs *ChunkStore) GetChunk(ctx context.Context, hash string) ([]byte, error) {
+	return cs.GetChunkForTenant(ctx, hash, "")
+}
+
+// GetChunkForTenant fetches a chunk by hash, scoping cache lookups to the given
+// tenant. When tenantID is non-empty, cache keys are prefixed with the tenant ID
+// to prevent cross-tenant cache hits. The GCS fetch still uses the raw hash since
+// chunk storage in GCS is content-addressed and shared.
+func (cs *ChunkStore) GetChunkForTenant(ctx context.Context, hash, tenantID string) ([]byte, error) {
 	start := time.Now()
 
+	cacheKey := hash
+	if tenantID != "" {
+		cacheKey = tenantID + ":" + hash
+	}
+
 	// 1. Check in-memory LRU cache first (fastest)
-	if data, ok := cs.chunkCache.Get(hash); ok {
+	if data, ok := cs.chunkCache.Get(cacheKey); ok {
 		if cs.chunkFetchHist != nil {
 			cs.chunkFetchHist.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(fcrotel.AttrSource.String("lru_cache")))
 		}
@@ -370,8 +383,8 @@ func (cs *ChunkStore) GetChunk(ctx context.Context, hash string) ([]byte, error)
 	}
 
 	// 2. Check local file cache (sharded path)
-	if data, compressed, ok := cs.readLocalCache(hash); ok {
-		cs.chunkCache.Put(hash, data)
+	if data, compressed, ok := cs.readLocalCache(cacheKey); ok {
+		cs.chunkCache.Put(cacheKey, data)
 		if cs.chunkFetchHist != nil {
 			cs.chunkFetchHist.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(fcrotel.AttrSource.String("disk_cache")))
 		}
@@ -443,8 +456,8 @@ func (cs *ChunkStore) GetChunk(ctx context.Context, hash string) ([]byte, error)
 		}
 
 		// Cache locally (atomic write) and in memory
-		cs.writeLocalCache(hash, compressed)
-		cs.chunkCache.Put(hash, data)
+		cs.writeLocalCache(cacheKey, compressed)
+		cs.chunkCache.Put(cacheKey, data)
 
 		if cs.chunkFetchHist != nil {
 			cs.chunkFetchHist.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(fcrotel.AttrSource.String("gcs")))
@@ -626,20 +639,35 @@ func (cs *ChunkStore) verifyHash(expectedHash string, data []byte) error {
 
 // localChunkPath returns the sharded local cache path for a chunk hash.
 // Layout: {localCache}/{hash[:2]}/{hash} — prevents millions of files in one dir.
-func (cs *ChunkStore) localChunkPath(hash string) string {
-	return filepath.Join(cs.localCache, hash[:2], hash)
+func (cs *ChunkStore) localChunkPath(cacheKey string) string {
+	// cacheKey may be "tenantID:hash" or just "hash" (no tenant).
+	// For tenant-scoped keys, include the tenant as a subdirectory to
+	// prevent cross-tenant disk cache hits.
+	if idx := strings.IndexByte(cacheKey, ':'); idx > 0 {
+		tenantID := cacheKey[:idx]
+		hash := cacheKey[idx+1:]
+		return filepath.Join(cs.localCache, tenantID, hash[:2], hash)
+	}
+	return filepath.Join(cs.localCache, cacheKey[:2], cacheKey)
 }
 
 // readLocalCache attempts to read and decompress a chunk from the local disk
 // cache. Returns (decompressed, compressed, true) on success.
 // Returns (nil, nil, false) on miss, decompress error, or hash mismatch.
 // On corrupt/invalid entries the cache file is removed automatically.
-func (cs *ChunkStore) readLocalCache(hash string) ([]byte, []byte, bool) {
+// cacheKey may be "tenantID:hash" or just "hash".
+func (cs *ChunkStore) readLocalCache(cacheKey string) ([]byte, []byte, bool) {
 	if cs.localCache == "" {
 		return nil, nil, false
 	}
 
-	localPath := cs.localChunkPath(hash)
+	// Extract raw hash for verification (strip tenant prefix if present)
+	hash := cacheKey
+	if idx := strings.IndexByte(cacheKey, ':'); idx > 0 {
+		hash = cacheKey[idx+1:]
+	}
+
+	localPath := cs.localChunkPath(cacheKey)
 	compressed, err := os.ReadFile(localPath)
 	if err != nil {
 		return nil, nil, false
@@ -656,7 +684,7 @@ func (cs *ChunkStore) readLocalCache(hash string) ([]byte, []byte, bool) {
 		if verifyErr := cs.verifyHash(hash, data); verifyErr != nil {
 			cs.logger.WithError(verifyErr).WithField("hash", hash[:12]).Warn("Local cache chunk failed hash verification, removing")
 			os.Remove(localPath)
-			cs.chunkCache.Remove(hash)
+			cs.chunkCache.Remove(cacheKey)
 			return nil, nil, false
 		}
 	}
@@ -666,13 +694,19 @@ func (cs *ChunkStore) readLocalCache(hash string) ([]byte, []byte, bool) {
 
 // writeLocalCache atomically writes compressed chunk data to the local file
 // cache. Uses write-to-temp + fsync + rename to prevent partial/corrupt files
-// on crash.
-func (cs *ChunkStore) writeLocalCache(hash string, compressed []byte) {
+// on crash. cacheKey may be "tenantID:hash" or just "hash".
+func (cs *ChunkStore) writeLocalCache(cacheKey string, compressed []byte) {
 	if cs.localCache == "" {
 		return
 	}
 
-	destPath := cs.localChunkPath(hash)
+	// Extract raw hash for logging (strip tenant prefix if present)
+	hash := cacheKey
+	if idx := strings.IndexByte(cacheKey, ':'); idx > 0 {
+		hash = cacheKey[idx+1:]
+	}
+
+	destPath := cs.localChunkPath(cacheKey)
 	dir := filepath.Dir(destPath)
 
 	if err := os.MkdirAll(dir, 0755); err != nil {

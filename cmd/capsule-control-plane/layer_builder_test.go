@@ -261,12 +261,7 @@ func TestLayerBuilder_CleanupDrainingWorkloadKeys_SingleDrainingNoOtherConfig(t 
 		WithArgs(drainingWK).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
-	// No active config → delete version_assignments
-	mock.ExpectExec(`DELETE FROM version_assignments WHERE workload_key`).
-		WithArgs(drainingWK).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
-	// Deprecate snapshots
+	// No active config → deprecate snapshots
 	mock.ExpectExec(`UPDATE snapshots SET status='deprecated'`).
 		WithArgs(drainingWK).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -339,9 +334,6 @@ func TestLayerBuilder_CleanupDrainingWorkloadKeys_MultipleDraining(t *testing.T)
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM config_workload_keys`).
 		WithArgs("wk-1").
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
-	mock.ExpectExec(`DELETE FROM version_assignments`).
-		WithArgs("wk-1").
-		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE snapshots SET status='deprecated'`).
 		WithArgs("wk-1").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -356,9 +348,6 @@ func TestLayerBuilder_CleanupDrainingWorkloadKeys_MultipleDraining(t *testing.T)
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM config_workload_keys`).
 		WithArgs("wk-2").
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
-	mock.ExpectExec(`DELETE FROM version_assignments`).
-		WithArgs("wk-2").
-		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE snapshots SET status='deprecated'`).
 		WithArgs("wk-2").
 		WillReturnResult(sqlmock.NewResult(0, 1))

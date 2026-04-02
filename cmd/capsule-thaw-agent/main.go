@@ -120,11 +120,6 @@ var globalWarmupState = &WarmupState{
 	StartedAt: time.Now(),
 }
 
-// globalMetadataForwarderStop is set by configureAuthProxy when it starts the
-// metadata forwarder. Must be called after warmup commands complete to restore
-// MMDS access (the forwarder hijacks 169.254.169.254 from the TAP/MMDS path).
-var globalMetadataForwarderStop func()
-
 // globalProxyEnv holds proxy-related environment variables (HTTPS_PROXY, etc.)
 // set by configureAuthProxy. These are passed to child commands instead of being
 // set process-wide, so they don't persist in snapshots.
@@ -190,11 +185,11 @@ type MMDSData struct {
 			Drives   []snapshot.DriveSpec       `json:"drives,omitempty"`
 		} `json:"warmup,omitempty"`
 		Proxy struct {
-			CACertPEM    string            `json:"ca_cert_pem"`
-			Address      string            `json:"address"`
-			MetadataHost string            `json:"metadata_host"`
-			AuthHosts    []string          `json:"auth_hosts,omitempty"`
-			AuthEnv      map[string]string `json:"auth_env,omitempty"`
+			CACertPEM        string `json:"ca_cert_pem,omitempty"`
+			Address          string `json:"address,omitempty"`
+			APIEndpoint      string `json:"api_endpoint,omitempty"`
+			AttestationToken string `json:"attestation_token,omitempty"`
+			TenantID         string `json:"tenant_id,omitempty"`
 		} `json:"proxy,omitempty"`
 		// Mirrors snapshot.StartCommand -- keep in sync with pkg/snapshot/start_command.go.
 		StartCommand struct {
@@ -384,14 +379,6 @@ func main() {
 			log.Info("Warmup completed successfully")
 		}
 
-		// Stop metadata forwarder before entering MMDS poll loop.
-		// The forwarder hijacks 169.254.169.254 (binds to lo), which prevents
-		// MMDS access through the TAP. We need MMDS to detect runner_id changes.
-		if globalMetadataForwarderStop != nil {
-			globalMetadataForwarderStop()
-			globalMetadataForwarderStop = nil
-		}
-
 		// Signal ready
 		if err := signalReady(); err != nil {
 			log.WithError(err).Error("Failed to signal ready")
@@ -460,11 +447,6 @@ func main() {
 						globalWarmupState.Duration = time.Since(globalWarmupState.StartedAt).String()
 						log.Info("Re-warmup completed successfully")
 					}
-					// Stop metadata forwarder before returning to MMDS poll loop
-					if globalMetadataForwarderStop != nil {
-						globalMetadataForwarderStop()
-						globalMetadataForwarderStop = nil
-					}
 					if err := signalReady(); err != nil {
 						log.WithError(err).Error("Failed to signal ready after re-warmup")
 					}
@@ -531,18 +513,13 @@ func main() {
 					}
 				}
 
-				// Re-configure auth proxy after restore. During warmup the
-				// metadata forwarder was stopped before MMDS polling, so
-				// 169.254.169.254 is no longer on lo. Re-run the full setup
-				// (CA cert install is idempotent, forwarder will be started fresh).
+				// Re-configure auth proxy after restore. Re-run the full setup
+				// (CA cert install is idempotent, phantom env fetch is fresh).
 				if tempData.Latest.Proxy.Address != "" {
 					log.WithField("proxy_address", tempData.Latest.Proxy.Address).Info("Configuring auth proxy after restore")
-					stopFwd, proxyErr := configureAuthProxy(tempData)
+					proxyErr := configureAuthProxy(tempData)
 					if proxyErr != nil {
 						log.WithError(proxyErr).Warn("Failed to configure auth proxy after restore (non-fatal)")
-					}
-					if stopFwd != nil {
-						globalMetadataForwarderStop = stopFwd
 					}
 				}
 
@@ -586,7 +563,7 @@ func main() {
 	// Configure auth proxy if provided (needed for fresh boot and cold boot
 	// fallback — warmup mode handles this separately).
 	if mmdsData.Latest.Proxy.Address != "" {
-		if _, proxyErr := configureAuthProxy(mmdsData); proxyErr != nil {
+		if proxyErr := configureAuthProxy(mmdsData); proxyErr != nil {
 			log.WithError(proxyErr).Warn("Failed to configure auth proxy")
 		}
 	}
@@ -786,11 +763,11 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 					Drives   []snapshot.DriveSpec       `json:"drives,omitempty"`
 				} `json:"warmup,omitempty"`
 				Proxy struct {
-					CACertPEM    string            `json:"ca_cert_pem"`
-					Address      string            `json:"address"`
-					MetadataHost string            `json:"metadata_host"`
-					AuthHosts    []string          `json:"auth_hosts,omitempty"`
-					AuthEnv      map[string]string `json:"auth_env,omitempty"`
+					CACertPEM        string `json:"ca_cert_pem,omitempty"`
+					Address          string `json:"address,omitempty"`
+					APIEndpoint      string `json:"api_endpoint,omitempty"`
+					AttestationToken string `json:"attestation_token,omitempty"`
+					TenantID         string `json:"tenant_id,omitempty"`
 				} `json:"proxy,omitempty"`
 				// Mirrors snapshot.StartCommand -- keep in sync with pkg/snapshot/start_command.go.
 				StartCommand struct {
@@ -805,11 +782,11 @@ func waitForMMDS(ctx context.Context) (*MMDSData, error) {
 				return nil, fmt.Errorf("failed to parse MMDS data: %w", err)
 			}
 			log.WithFields(logrus.Fields{
-				"inner_runner_id":   inner.Meta.RunnerID,
-				"inner_mode":        inner.Meta.Mode,
-				"inner_proxy_addr":  inner.Proxy.Address,
-				"inner_proxy_meta":  inner.Proxy.MetadataHost,
-				"inner_warmup_cmds": len(inner.Warmup.Commands),
+				"inner_runner_id":    inner.Meta.RunnerID,
+				"inner_mode":         inner.Meta.Mode,
+				"inner_proxy_addr":   inner.Proxy.Address,
+				"inner_api_endpoint": inner.Proxy.APIEndpoint,
+				"inner_warmup_cmds":  len(inner.Warmup.Commands),
 			}).Info("DEBUG: Parsed MMDS inner struct")
 			data.Latest = inner
 		}
@@ -1518,19 +1495,15 @@ func runWarmupMode(data *MMDSData) error {
 	// GCP metadata emulation (for keyrings.google-artifactregistry-auth) and HTTPS
 	// credential injection transparently.
 	log.WithFields(logrus.Fields{
-		"proxy_address":       data.Latest.Proxy.Address,
-		"proxy_metadata_host": data.Latest.Proxy.MetadataHost,
-		"proxy_has_ca_cert":   data.Latest.Proxy.CACertPEM != "",
+		"proxy_address":      data.Latest.Proxy.Address,
+		"proxy_api_endpoint": data.Latest.Proxy.APIEndpoint,
+		"proxy_has_ca_cert":  data.Latest.Proxy.CACertPEM != "",
 	}).Info("DEBUG: Proxy data from parsed MMDS")
 	if data.Latest.Proxy.Address != "" {
 		log.WithField("proxy_address", data.Latest.Proxy.Address).Info("Configuring auth proxy from MMDS")
-		stopFwd, proxyErr := configureAuthProxy(data)
+		proxyErr := configureAuthProxy(data)
 		if proxyErr != nil {
 			log.WithError(proxyErr).Warn("Failed to configure auth proxy (non-fatal)")
-		}
-		if stopFwd != nil {
-			// Store stop function so it can be called after warmup to restore MMDS access
-			globalMetadataForwarderStop = stopFwd
 		}
 	}
 
@@ -1619,30 +1592,38 @@ func runShellCommand(args []string, runAsRoot bool, data *MMDSData) error {
 	return nil
 }
 
-// configureAuthProxy sets up the guest environment to use the host-side auth proxy.
+// configureAuthProxy sets up the guest environment to use the external access plane proxy.
 //
 // Sets HTTPS_PROXY process-wide so all child processes (warmup commands, /exec
-// requests, start_command workloads) route through the proxy. The proxy SSL-bumps
-// matching hosts and injects credentials (Bearer for API, Basic for git HTTP).
-//
-// Returns a stop function for the metadata forwarder (if started). The caller MUST
-// call stop() after warmup commands complete to restore MMDS access for the poll loop.
-func configureAuthProxy(data *MMDSData) (stopForwarder func(), err error) {
+// requests, start_command workloads) route through the CONNECT proxy. If an
+// APIEndpoint is configured, fetches phantom environment variables from the
+// access plane and sets them process-wide.
+func configureAuthProxy(data *MMDSData) error {
 	proxyAddr := data.Latest.Proxy.Address
 	if proxyAddr != "" && !strings.HasPrefix(proxyAddr, "http") {
 		proxyAddr = "http://" + proxyAddr
 	}
 	caCertPEM := data.Latest.Proxy.CACertPEM
 
-	// 1. Install the proxy CA certificate so TLS verification passes through the MITM proxy
+	// 1. Install the proxy CA certificate so TLS verification passes through the MITM proxy.
+	// If no CA PEM is in MMDS, fetch it from the access plane API directly.
+	if caCertPEM == "" && data.Latest.Proxy.APIEndpoint != "" {
+		fetchedPEM, err := fetchCACert(data.Latest.Proxy.APIEndpoint)
+		if err != nil {
+			log.WithError(err).Warn("Failed to fetch CA cert from access plane")
+		} else {
+			caCertPEM = fetchedPEM
+			log.Info("Fetched CA cert from access plane /v1/ca.pem")
+		}
+	}
 	if caCertPEM != "" {
 		certDir := "/usr/local/share/ca-certificates"
 		if err := os.MkdirAll(certDir, 0755); err != nil {
-			return nil, fmt.Errorf("failed to create ca-certificates dir: %w", err)
+			return fmt.Errorf("failed to create ca-certificates dir: %w", err)
 		}
 		certPath := filepath.Join(certDir, "auth-proxy.crt")
 		if err := os.WriteFile(certPath, []byte(caCertPEM), 0644); err != nil {
-			return nil, fmt.Errorf("failed to write CA cert: %w", err)
+			return fmt.Errorf("failed to write CA cert: %w", err)
 		}
 		if out, err := exec.Command("update-ca-certificates").CombinedOutput(); err != nil {
 			log.WithError(err).WithField("output", string(out)).Warn("update-ca-certificates failed (TLS through proxy may fail)")
@@ -1673,38 +1654,37 @@ func configureAuthProxy(data *MMDSData) (stopForwarder func(), err error) {
 
 	// 2. Set proxy env vars process-wide so ALL child processes (warmup
 	// commands, /exec requests, start_command workloads) route through the
-	// auth proxy. The proxy SSL-bumps CONNECT for matching hosts and injects
-	// credentials. Also stored in globalProxyEnv for warmup shell commands.
-	metadataHost := data.Latest.Proxy.MetadataHost
-	noProxy := "169.254.169.254,localhost,127.0.0.1"
-	if metadataHost != "" {
-		noProxy += "," + metadataHost
+	// access plane CONNECT proxy. Also stored in globalProxyEnv for warmup
+	// shell commands.
+	//
+	// If an attestation token is available, embed it in the proxy URL as
+	// credentials (http://bearer:TOKEN@host:port). This causes HTTP clients
+	// to send Proxy-Authorization: Basic base64(bearer:TOKEN), which the
+	// access plane extracts to identify the session.
+	proxyURL := proxyAddr
+	attestationToken := data.Latest.Proxy.AttestationToken
+	if attestationToken != "" {
+		// Use URL userinfo to pass the token as Proxy-Authorization
+		proxyURL = strings.Replace(proxyAddr, "://", "://bearer:"+attestationToken+"@", 1)
 	}
+	noProxy := "169.254.169.254,localhost,127.0.0.1"
 
-	os.Setenv("HTTPS_PROXY", proxyAddr)
-	os.Setenv("HTTP_PROXY", proxyAddr)
-	os.Setenv("https_proxy", proxyAddr)
-	os.Setenv("http_proxy", proxyAddr)
+	os.Setenv("HTTPS_PROXY", proxyURL)
+	os.Setenv("HTTP_PROXY", proxyURL)
+	os.Setenv("https_proxy", proxyURL)
+	os.Setenv("http_proxy", proxyURL)
 	os.Setenv("NO_PROXY", noProxy)
 	os.Setenv("no_proxy", noProxy)
 
 	// globalProxyEnv is still populated for warmup shell commands that
 	// build env from scratch (runShellCommand appends these).
 	globalProxyEnv = []string{
-		"HTTPS_PROXY=" + proxyAddr,
-		"HTTP_PROXY=" + proxyAddr,
-		"https_proxy=" + proxyAddr,
-		"http_proxy=" + proxyAddr,
+		"HTTPS_PROXY=" + proxyURL,
+		"HTTP_PROXY=" + proxyURL,
+		"https_proxy=" + proxyURL,
+		"http_proxy=" + proxyURL,
 		"NO_PROXY=" + noProxy,
 		"no_proxy=" + noProxy,
-	}
-
-	if metadataHost != "" {
-		os.Setenv("GCE_METADATA_HOST", metadataHost)
-		os.Setenv("METADATA_SERVER_DETECTION", "assume-present")
-		globalProxyEnv = append(globalProxyEnv, "GCE_METADATA_HOST="+metadataHost)
-		globalProxyEnv = append(globalProxyEnv, "METADATA_SERVER_DETECTION=assume-present")
-		log.WithField("metadata_host", metadataHost).Info("Set GCE_METADATA_HOST process-wide")
 	}
 
 	// Set NODE_EXTRA_CA_CERTS so Node.js apps trust the proxy CA.
@@ -1714,11 +1694,20 @@ func configureAuthProxy(data *MMDSData) (stopForwarder func(), err error) {
 		log.WithField("cert", certPath).Info("Set NODE_EXTRA_CA_CERTS for proxy CA")
 	}
 
-	// Set auth provider env vars (e.g. GH_TOKEN=proxy-injected) process-wide
-	// so tools like gh CLI attempt requests, which the proxy then intercepts.
-	for k, v := range data.Latest.Proxy.AuthEnv {
-		os.Setenv(k, v)
-		log.WithFields(logrus.Fields{"key": k}).Info("Set auth provider env var")
+	// 3. Fetch phantom env vars from the access plane and set them process-wide.
+	// These replace the old AuthEnv / metadata host approach — the access plane
+	// returns environment variables that tools (gh, gcloud, pip, etc.) need.
+	if data.Latest.Proxy.APIEndpoint != "" && data.Latest.Proxy.AttestationToken != "" {
+		phantomEnv, err := fetchPhantomEnv(data.Latest.Proxy.APIEndpoint, data.Latest.Proxy.AttestationToken, data.Latest.Meta.JobID)
+		if err != nil {
+			log.WithError(err).Warn("Failed to fetch phantom env vars from access plane (auth may not work)")
+		} else {
+			for k, v := range phantomEnv {
+				os.Setenv(k, v)
+				globalProxyEnv = append(globalProxyEnv, k+"="+v)
+				log.WithField("key", k).Info("Set phantom env var from access plane")
+			}
+		}
 	}
 
 	// Write proxy env to a file as fallback — commands that need the full
@@ -1734,141 +1723,77 @@ func configureAuthProxy(data *MMDSData) (stopForwarder func(), err error) {
 		log.Info("Wrote /etc/auth-proxy.env for opt-in proxy usage")
 	}
 
-	// 3. Intercept GCE metadata requests at the network level.
-	// Firecracker's MMDS V1 intercepts all traffic to 169.254.169.254 on the
-	// TAP device. By assigning 169.254.169.254 to the loopback interface, we
-	// keep metadata traffic local (kernel delivers to lo, never reaches TAP).
-	// An HTTP reverse proxy then forwards requests to the host-side auth proxy.
-	// This is transparent to ALL programs (bazel, pip, gcloud, etc.) -- no
-	// env vars or tool-specific config needed.
-	if metadataHost != "" {
-		stop, fwdErr := startMetadataForwarder(metadataHost)
-		if fwdErr != nil {
-			log.WithError(fwdErr).Warn("Failed to start metadata forwarder (metadata-based auth may not work)")
-		} else {
-			log.Info("Metadata forwarder active: 169.254.169.254:80 → " + metadataHost + ":80")
-			stopForwarder = stop
-		}
-	}
-
 	log.WithField("proxy", proxyAddr).Info("Auth proxy configured (CA cert + env vars)")
-	return stopForwarder, nil
+	return nil
 }
 
-// startMetadataForwarder assigns 169.254.169.254 to the loopback interface and
-// runs an HTTP reverse proxy from 169.254.169.254:80 to metadataHost:80.
-// This bypasses Firecracker's MMDS (which intercepts 169.254.169.254 on the TAP)
-// by keeping the traffic on lo, then forwarding to the host-side auth proxy.
-//
-// Returns a stop function that removes the IP from lo and closes the server.
-// The forwarder MUST be stopped before the MMDS poll loop, because 169.254.169.254
-// on lo prevents the capsule-thaw-agent from reading MMDS data (which goes through the TAP).
-func startMetadataForwarder(metadataHost string) (stop func(), err error) {
-	// Assign 169.254.169.254 to lo so the kernel delivers locally instead of
-	// routing through the TAP where MMDS would intercept.
-	if out, err := exec.Command("ip", "addr", "add", "169.254.169.254/32", "dev", "lo").CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("ip addr add 169.254.169.254/32 dev lo: %s: %w", string(out), err)
+// fetchPhantomEnv calls the access plane API to retrieve phantom environment
+// variables. These are credential-bearing env vars (e.g. GH_TOKEN, GOOGLE_APPLICATION_CREDENTIALS)
+// that the access plane manages on behalf of the tenant.
+func fetchPhantomEnv(apiEndpoint, attestationToken, sessionID string) (map[string]string, error) {
+	url := strings.TrimRight(apiEndpoint, "/") + "/v1/phantom-env"
+	if sessionID != "" {
+		url += "?session_id=" + sessionID
 	}
 
-	// Use an HTTP reverse proxy instead of raw TCP forwarding. This correctly
-	// handles HTTP connection lifecycle and provides better debugging through
-	// logging of requests and errors.
-	upstream := "http://" + metadataHost + ":80"
-	// Direct HTTP client that ignores proxy env vars — the forwarder must connect
-	// directly to the auth proxy, never routing through HTTPS_PROXY.
-	directClient := &http.Client{
+	// Use a direct HTTP client that bypasses proxy env vars — the access plane
+	// API endpoint may not be reachable through the CONNECT proxy itself.
+	client := &http.Client{
 		Timeout:   10 * time.Second,
 		Transport: &http.Transport{Proxy: nil},
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Forward the request to the host-side auth proxy metadata handler.
-		// Use RequestURI to preserve query parameters (not just Path).
-		proxyReq, _ := http.NewRequestWithContext(r.Context(), r.Method, upstream+r.URL.RequestURI(), r.Body)
-		for k, v := range r.Header {
-			proxyReq.Header[k] = v
-		}
-		proxyReq.Header.Set("Host", r.Host)
 
-		resp, err := directClient.Do(proxyReq)
-		if err != nil {
-			log.WithError(err).WithField("path", r.URL.Path).Error("Metadata forwarder: upstream request failed")
-			http.Error(w, "metadata upstream error", http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
-
-		body, _ := io.ReadAll(resp.Body)
-
-		// Copy upstream headers using canonical (Title-Case) keys only.
-		// Do NOT add lowercase duplicates — Node.js's HTTP parser rejects
-		// responses with duplicate Content-Length headers ("Parse Error:
-		// Duplicate Content-Length"). Both Python (CaseInsensitiveDict) and
-		// Node.js (lowercases automatically) handle canonical keys correctly.
-		h := w.Header()
-		for k, vals := range resp.Header {
-			h[k] = vals
-		}
-		w.WriteHeader(resp.StatusCode)
-		w.Write(body)
-	})
-
-	listener, err := gonet.Listen("tcp", "169.254.169.254:80")
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		// Remove the IP we just added since we can't listen
-		exec.Command("ip", "addr", "del", "169.254.169.254/32", "dev", "lo").Run()
-		return nil, fmt.Errorf("listen 169.254.169.254:80: %w", err)
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+attestationToken)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
 	}
 
-	srv := &http.Server{Handler: mux}
-	go srv.Serve(listener)
-
-	// Self-test 1: verify direct upstream connectivity (auth proxy on host).
-	directReq, _ := http.NewRequest("GET", upstream+"/", nil)
-	directReq.Header.Set("Metadata-Flavor", "Google")
-	directResp, directErr := directClient.Do(directReq)
-	if directErr != nil {
-		log.WithError(directErr).Warn("Metadata upstream direct test FAILED — auth proxy may not be reachable on " + metadataHost + ":80")
-	} else {
-		body, _ := io.ReadAll(directResp.Body)
-		directResp.Body.Close()
-		log.WithFields(logrus.Fields{
-			"status":          directResp.StatusCode,
-			"metadata_flavor": directResp.Header.Get("Metadata-Flavor"),
-			"body":            string(body),
-			"upstream":        upstream,
-		}).Info("Metadata upstream direct test result")
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("access plane returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Self-test 2: verify end-to-end through the forwarder (169.254.169.254 → host).
-	// Use a separate transport that ignores proxy env vars AND has the lo-bound address.
-	e2eClient := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}
-	testReq, _ := http.NewRequest("GET", "http://169.254.169.254/", nil)
-	testReq.Header.Set("Metadata-Flavor", "Google")
-	testResp, testErr := e2eClient.Do(testReq)
-	if testErr != nil {
-		log.WithError(testErr).Warn("Metadata forwarder e2e self-test FAILED (metadata-based auth may not work)")
-	} else {
-		flavor := testResp.Header.Get("Metadata-Flavor")
-		body, _ := io.ReadAll(testResp.Body)
-		testResp.Body.Close()
-		log.WithFields(logrus.Fields{
-			"status":          testResp.StatusCode,
-			"metadata_flavor": flavor,
-			"body":            string(body),
-		}).Info("Metadata forwarder e2e self-test result")
-		if testResp.StatusCode != 200 || flavor != "Google" {
-			log.Warn("Metadata forwarder e2e self-test: unexpected response (metadata-based auth may not work)")
-		}
+	var envVars map[string]string
+	if err := json.Unmarshal(body, &envVars); err != nil {
+		return nil, fmt.Errorf("parse response: %w", err)
 	}
 
-	stop = func() {
-		srv.Close()
-		exec.Command("ip", "addr", "del", "169.254.169.254/32", "dev", "lo").Run()
-		log.Info("Metadata forwarder stopped (MMDS access restored)")
-	}
+	log.WithField("count", len(envVars)).Info("Fetched phantom env vars from access plane")
+	return envVars, nil
+}
 
-	return stop, nil
+// fetchCACert fetches the CONNECT proxy's CA certificate from the access plane.
+// This is called before the proxy env vars are set, so it uses a direct HTTP client.
+func fetchCACert(apiEndpoint string) (string, error) {
+	url := strings.TrimRight(apiEndpoint, "/") + "/v1/ca.pem"
+	client := &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: &http.Transport{Proxy: nil},
+	}
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("fetch ca.pem: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read ca.pem: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ca.pem returned %d: %s", resp.StatusCode, string(body))
+	}
+	return string(body), nil
 }
 
 // runStreamedCommand runs a command, capturing stdout/stderr line by line

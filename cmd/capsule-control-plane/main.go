@@ -375,6 +375,9 @@ func main() {
 	httpMux.Handle("/api/v1/versions/fleet", instrumentAuthenticatedHandler("/api/v1/versions/fleet", "control_plane.get_fleet_convergence", http.HandlerFunc(controlPlaneServer.HandleGetFleetConvergence)))
 	// Canary report endpoint (Phase 6)
 	httpMux.Handle("/api/v1/canary/report", instrumentAuthenticatedHandler("/api/v1/canary/report", "control_plane.canary_report", http.HandlerFunc(controlPlaneServer.HandleCanaryReport)))
+	// Access plane registry endpoints
+	httpMux.Handle("/api/v1/access-planes/", instrumentAuthenticatedHandler("/api/v1/access-planes/", "control_plane.access_planes", HandleAccessPlanes(db)))
+	httpMux.Handle("/api/v1/access-planes", instrumentAuthenticatedHandler("/api/v1/access-planes", "control_plane.access_planes", HandleAccessPlanes(db)))
 	httpMux.Handle("/api/v1/", instrumentAuthenticatedHandler("/api/v1/", "control_plane.api_not_found", http.NotFoundHandler()))
 
 	httpHandler := apiLoggingMiddleware(logger, httpMux)
@@ -733,6 +736,7 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		SessionID           string            `json:"session_id"`
 		NetworkPolicyPreset string            `json:"network_policy_preset"`
 		NetworkPolicyJSON   string            `json:"network_policy_json"`
+		FamilyTokens        map[string]string `json:"family_tokens"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
@@ -763,6 +767,7 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		SessionID:           req.SessionID,
 		NetworkPolicyPreset: req.NetworkPolicyPreset,
 		NetworkPolicyJSON:   req.NetworkPolicyJSON,
+		FamilyTokens:        req.FamilyTokens,
 	})
 	if err != nil {
 		s.logger.WithError(err).Error("Manual allocation failed")
@@ -1068,7 +1073,7 @@ func (s *ControlPlaneServer) HandleGetSnapshots(w http.ResponseWriter, r *http.R
 	})
 }
 
-// HandleGetDesiredVersions returns the desired snapshot versions for a host.
+// HandleGetDesiredVersions returns the active snapshot versions for all workload keys.
 // GET /api/v1/versions/desired?instance_name={name}
 func (s *ControlPlaneServer) HandleGetDesiredVersions(w http.ResponseWriter, r *http.Request) {
 	instanceName := r.URL.Query().Get("instance_name")
@@ -1083,10 +1088,19 @@ func (s *ControlPlaneServer) HandleGetDesiredVersions(w http.ResponseWriter, r *
 		return
 	}
 
-	versions, err := s.snapshotManager.GetDesiredVersions(r.Context(), host.ID)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	// Return all active snapshot versions (no per-host overrides)
+	versions := make(map[string]string)
+	rows, err := s.snapshotManager.db.QueryContext(r.Context(), `
+		SELECT workload_key, version FROM snapshots WHERE status = 'active'
+	`)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var wk, ver string
+			if rows.Scan(&wk, &ver) == nil {
+				versions[wk] = ver
+			}
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

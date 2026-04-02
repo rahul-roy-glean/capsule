@@ -838,117 +838,10 @@ func (sm *SnapshotManager) monitorSnapshotBuildForKey(ctx context.Context, versi
 	}
 }
 
-// --- Version Assignment Methods (Phase 4.3) ---
+// --- Fleet Convergence (simplified, no version_assignments) ---
 
-// AssignVersion upserts a version assignment for a repo on a host (or fleet-wide if hostID is nil).
-func (sm *SnapshotManager) AssignVersion(ctx context.Context, workloadKey string, hostID *string, version string) error {
-	if hostID == nil {
-		// Fleet-wide assignment (host_id IS NULL)
-		_, err := sm.db.ExecContext(ctx, `
-			INSERT INTO version_assignments (workload_key, host_id, version, status)
-			VALUES ($1, NULL, $2, 'assigned')
-			ON CONFLICT (workload_key, host_id) DO UPDATE SET
-				version = EXCLUDED.version,
-				status = 'assigned',
-				assigned_at = NOW(),
-				synced_at = NULL
-		`, workloadKey, version)
-		return err
-	}
-
-	_, err := sm.db.ExecContext(ctx, `
-		INSERT INTO version_assignments (workload_key, host_id, version, status)
-		VALUES ($1, $2, $3, 'assigned')
-		ON CONFLICT (workload_key, host_id) DO UPDATE SET
-			version = EXCLUDED.version,
-			status = 'assigned',
-			assigned_at = NOW(),
-			synced_at = NULL
-	`, workloadKey, *hostID, version)
-	return err
-}
-
-// GetDesiredVersions returns the desired snapshot versions for a host,
-// combining fleet-wide defaults with per-host overrides.
-func (sm *SnapshotManager) GetDesiredVersions(ctx context.Context, hostID string) (map[string]string, error) {
-	result := make(map[string]string)
-
-	// First get fleet-wide defaults (host_id IS NULL)
-	rows, err := sm.db.QueryContext(ctx, `
-		SELECT workload_key, version FROM version_assignments
-		WHERE host_id IS NULL
-	`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var workloadKey, version string
-		if err := rows.Scan(&workloadKey, &version); err != nil {
-			return nil, err
-		}
-		result[workloadKey] = version
-	}
-
-	// Then apply per-host overrides
-	rows, err = sm.db.QueryContext(ctx, `
-		SELECT workload_key, version FROM version_assignments
-		WHERE host_id = $1
-	`, hostID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var workloadKey, version string
-		if err := rows.Scan(&workloadKey, &version); err != nil {
-			return nil, err
-		}
-		result[workloadKey] = version // Override fleet-wide default
-	}
-
-	return result, nil
-}
-
-// GetTargetVersionsByWorkloadKey returns the fleet-wide target version for a
-// workload key and any per-host overrides from version_assignments. This
-// allows batch resolution of per-host target versions for scoring without
-// N+1 queries.
-func (sm *SnapshotManager) GetTargetVersionsByWorkloadKey(ctx context.Context, workloadKey string) (fleetVersion string, hostOverrides map[string]string) {
-	hostOverrides = make(map[string]string)
-	if sm.db == nil || workloadKey == "" {
-		return "", hostOverrides
-	}
-
-	// Fleet-wide default (host_id IS NULL)
-	_ = sm.db.QueryRowContext(ctx, `
-		SELECT version FROM version_assignments
-		WHERE workload_key = $1 AND host_id IS NULL
-	`, workloadKey).Scan(&fleetVersion)
-
-	// Per-host overrides
-	rows, err := sm.db.QueryContext(ctx, `
-		SELECT host_id, version FROM version_assignments
-		WHERE workload_key = $1 AND host_id IS NOT NULL
-	`, workloadKey)
-	if err != nil {
-		return fleetVersion, hostOverrides
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var hostID, version string
-		if rows.Scan(&hostID, &version) == nil {
-			hostOverrides[hostID] = version
-		}
-	}
-
-	return fleetVersion, hostOverrides
-}
-
-// GetFleetConvergence returns the convergence status for all hosts for a given repo.
+// GetFleetConvergence returns the convergence status for all hosts for a given workload key.
+// Desired version is the active snapshot version; current is what the host last reported.
 type HostVersionStatus struct {
 	HostID         string `json:"host_id"`
 	InstanceName   string `json:"instance_name"`
@@ -958,17 +851,15 @@ type HostVersionStatus struct {
 }
 
 func (sm *SnapshotManager) GetFleetConvergence(ctx context.Context, workloadKey string) ([]HostVersionStatus, error) {
+	// Desired version is simply the active snapshot for this workload key
+	desiredVersion := sm.GetCurrentVersionForKey(workloadKey)
+
 	rows, err := sm.db.QueryContext(ctx, `
-		SELECT h.id, h.instance_name, h.snapshot_version,
-		       COALESCE(
-		           (SELECT va.version FROM version_assignments va WHERE va.workload_key = $1 AND va.host_id = h.id),
-		           (SELECT va.version FROM version_assignments va WHERE va.workload_key = $1 AND va.host_id IS NULL),
-		           ''
-		       ) as desired_version
+		SELECT h.id, h.instance_name, h.snapshot_version
 		FROM hosts h
 		WHERE h.status IN ('ready', 'draining')
 		ORDER BY h.instance_name
-	`, workloadKey)
+	`)
 	if err != nil {
 		return nil, err
 	}
@@ -978,9 +869,10 @@ func (sm *SnapshotManager) GetFleetConvergence(ctx context.Context, workloadKey 
 	for rows.Next() {
 		var s HostVersionStatus
 		var snapshotVersion sql.NullString
-		if err := rows.Scan(&s.HostID, &s.InstanceName, &snapshotVersion, &s.DesiredVersion); err != nil {
+		if err := rows.Scan(&s.HostID, &s.InstanceName, &snapshotVersion); err != nil {
 			return nil, err
 		}
+		s.DesiredVersion = desiredVersion
 		if snapshotVersion.Valid {
 			s.CurrentVersion = snapshotVersion.String
 		}
@@ -1027,16 +919,5 @@ func (sm *SnapshotManager) RollbackSnapshot(ctx context.Context, workloadKey str
 		return err
 	}
 
-	// Update fleet-wide assignment
-	if err := sm.AssignVersion(ctx, workloadKey, nil, prevVersion); err != nil {
-		return err
-	}
-
-	// Clear per-host overrides
-	_, err = sm.db.ExecContext(ctx, `
-		DELETE FROM version_assignments
-		WHERE workload_key = $1 AND host_id IS NOT NULL
-	`, workloadKey)
-
-	return err
+	return nil
 }

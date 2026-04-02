@@ -8,8 +8,16 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
+	"github.com/rahul-roy-glean/capsule/pkg/accessplane"
 )
+
+// FamilyCredential describes how a session obtains credentials for a family.
+// CredentialRef is a pointer to a secret (e.g. "sm:project/github-token")
+// resolved at allocation time and pushed to the access plane as the session's
+// per-family token.
+type FamilyCredential struct {
+	CredentialRef string `json:"credential_ref,omitempty" yaml:"credential_ref"` // e.g. "sm:project/github-token"
+}
 
 // PlatformLayerName is the reserved name for the auto-injected platform layer.
 const PlatformLayerName = "_platform"
@@ -40,20 +48,22 @@ type LayerDef struct {
 // LayeredConfig describes a multi-layer snapshot pipeline.
 type LayeredConfig struct {
 	DisplayName string     `json:"display_name" yaml:"display_name"`
+	ProjectID   string     `json:"project_id,omitempty" yaml:"project_id"` // links workload to project_access_planes
 	BaseImage   string     `json:"base_image,omitempty" yaml:"base_image"` // Docker image URI (e.g. "ubuntu:22.04", "us-docker.pkg.dev/proj/repo/img:tag")
 	Layers      []LayerDef `json:"layers" yaml:"layers"`
 	Config      struct {
-		AutoPause            bool                  `json:"auto_pause,omitempty" yaml:"auto_pause"`
-		TTL                  int                   `json:"ttl,omitempty" yaml:"ttl"`
-		Tier                 string                `json:"tier,omitempty" yaml:"tier"`
-		AutoRollout          bool                  `json:"auto_rollout,omitempty" yaml:"auto_rollout"`
-		SessionMaxAgeSeconds int                   `json:"session_max_age_seconds,omitempty" yaml:"session_max_age_seconds"`
-		RootfsSizeGB         int                   `json:"rootfs_size_gb,omitempty" yaml:"rootfs_size_gb"`       // rootfs size for layer 0 (default 8)
-		RunnerUser           string                `json:"runner_user,omitempty" yaml:"runner_user"`             // user for non-root commands (default "runner")
-		WorkspaceSizeGB      int                   `json:"workspace_size_gb,omitempty" yaml:"workspace_size_gb"` // auto-injected workspace drive size (default 50)
-		NetworkPolicyPreset  string                `json:"network_policy_preset,omitempty" yaml:"network_policy_preset"`
-		NetworkPolicy        json.RawMessage       `json:"network_policy,omitempty" yaml:"network_policy"`
-		Auth                 *authproxy.AuthConfig `json:"auth,omitempty" yaml:"auth"`
+		AutoPause            bool                        `json:"auto_pause,omitempty" yaml:"auto_pause"`
+		TTL                  int                         `json:"ttl,omitempty" yaml:"ttl"`
+		Tier                 string                      `json:"tier,omitempty" yaml:"tier"`
+		AutoRollout          bool                        `json:"auto_rollout,omitempty" yaml:"auto_rollout"`
+		SessionMaxAgeSeconds int                         `json:"session_max_age_seconds,omitempty" yaml:"session_max_age_seconds"`
+		RootfsSizeGB         int                         `json:"rootfs_size_gb,omitempty" yaml:"rootfs_size_gb"`       // rootfs size for layer 0 (default 8)
+		RunnerUser           string                      `json:"runner_user,omitempty" yaml:"runner_user"`             // user for non-root commands (default "runner")
+		WorkspaceSizeGB      int                         `json:"workspace_size_gb,omitempty" yaml:"workspace_size_gb"` // auto-injected workspace drive size (default 50)
+		NetworkPolicyPreset  string                      `json:"network_policy_preset,omitempty" yaml:"network_policy_preset"`
+		NetworkPolicy        json.RawMessage             `json:"network_policy,omitempty" yaml:"network_policy"`
+		Auth                 *accessplane.Config         `json:"auth,omitempty" yaml:"auth"`
+		Families             map[string]FamilyCredential `json:"families,omitempty" yaml:"families"`
 	} `json:"config" yaml:"config"`
 	StartCommand *StartCommand `json:"start_command,omitempty" yaml:"start_command"`
 }

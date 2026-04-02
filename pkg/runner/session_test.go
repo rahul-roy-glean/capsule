@@ -508,7 +508,7 @@ func TestResumeFromSession_NotFound(t *testing.T) {
 		m.config.SessionDir = tmpDir
 	})
 
-	_, err := m.ResumeFromSession(context.Background(), "nonexistent", "", "")
+	_, err := m.ResumeFromSession(context.Background(), "nonexistent", "", "", "")
 	if err == nil {
 		t.Error("ResumeFromSession should fail for nonexistent session")
 	}
@@ -527,7 +527,7 @@ func TestResumeFromSession_WorkloadKeyMismatch(t *testing.T) {
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
-	_, err := m.ResumeFromSession(context.Background(), "sess-1", "xyz", "")
+	_, err := m.ResumeFromSession(context.Background(), "sess-1", "xyz", "", "")
 	if err == nil {
 		t.Error("ResumeFromSession should fail on workload_key mismatch")
 	}
@@ -545,7 +545,7 @@ func TestResumeFromSession_NoLayers(t *testing.T) {
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
-	_, err := m.ResumeFromSession(context.Background(), "sess-1", "", "")
+	_, err := m.ResumeFromSession(context.Background(), "sess-1", "", "", "")
 	if err == nil {
 		t.Error("ResumeFromSession should fail with zero layers")
 	}
@@ -564,7 +564,7 @@ func TestResumeFromSession_Draining(t *testing.T) {
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
-	_, err := m.ResumeFromSession(context.Background(), "sess-1", "", "")
+	_, err := m.ResumeFromSession(context.Background(), "sess-1", "", "", "")
 	if err == nil {
 		t.Error("ResumeFromSession should fail when draining")
 	}
@@ -583,7 +583,7 @@ func TestResumeFromSession_WhenDraining(t *testing.T) {
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
-	_, err := m.ResumeFromSession(context.Background(), "sess-1", "", "")
+	_, err := m.ResumeFromSession(context.Background(), "sess-1", "", "", "")
 	if err == nil {
 		t.Error("ResumeFromSession should fail when draining")
 	}
@@ -604,7 +604,7 @@ func TestResumeFromSession_DuplicateActiveSession(t *testing.T) {
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
-	_, err := m.ResumeFromSession(context.Background(), "sess-1", "", "")
+	_, err := m.ResumeFromSession(context.Background(), "sess-1", "", "", "")
 	if err == nil {
 		t.Error("ResumeFromSession should fail when session already has an active runner")
 	}

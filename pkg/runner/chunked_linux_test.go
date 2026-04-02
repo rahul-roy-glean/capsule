@@ -16,7 +16,6 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
 	"github.com/rahul-roy-glean/capsule/pkg/firecracker"
 	"github.com/rahul-roy-glean/capsule/pkg/fuse"
 	"github.com/rahul-roy-glean/capsule/pkg/network"
@@ -166,9 +165,8 @@ func TestRegisterAllocatedRunnerPublishesResources(t *testing.T) {
 		"ext": {},
 	}
 	uffdHandler := &uffd.Handler{}
-	proxy := &authproxy.AuthProxy{}
 
-	if err := cm.registerAllocatedRunner("runner-1", runner, vm, fuseDisk, extensionDisks, uffdHandler, proxy); err != nil {
+	if err := cm.registerAllocatedRunner("runner-1", runner, vm, fuseDisk, extensionDisks, uffdHandler); err != nil {
 		t.Fatalf("registerAllocatedRunner() error = %v", err)
 	}
 
@@ -187,16 +185,13 @@ func TestRegisterAllocatedRunnerPublishesResources(t *testing.T) {
 	if got := cm.uffdHandlers["runner-1"]; got != uffdHandler {
 		t.Fatalf("uffd handler not published correctly: got %+v want %+v", got, uffdHandler)
 	}
-	if got := cm.authProxies["runner-1"]; got != proxy {
-		t.Fatalf("auth proxy not published correctly: got %+v want %+v", got, proxy)
-	}
 }
 
 func TestRegisterAllocatedRunnerRejectsDrainingHost(t *testing.T) {
 	cm := newTestChunkedManager()
 	cm.draining = true
 
-	err := cm.registerAllocatedRunner("runner-1", &Runner{ID: "runner-1"}, &firecracker.VM{}, nil, nil, nil, nil)
+	err := cm.registerAllocatedRunner("runner-1", &Runner{ID: "runner-1"}, &firecracker.VM{}, nil, nil, nil)
 	if err == nil {
 		t.Fatal("registerAllocatedRunner() should fail while draining")
 	}
@@ -222,7 +217,7 @@ func TestCleanupChunkedRunnerRemovesArtifacts(t *testing.T) {
 		}
 	}
 
-	cm.cleanupChunkedRunner("runner-1", nil, nil, nil, nil)
+	cm.cleanupChunkedRunner("runner-1", nil, nil, nil)
 
 	if _, err := os.Stat(workspaceDir); !os.IsNotExist(err) {
 		t.Fatalf("workspaceDir should be removed, stat err = %v", err)
@@ -340,7 +335,7 @@ func TestRestoreAndActivateRunnerSequencesRestoreResumeAndReady(t *testing.T) {
 	}
 
 	vmCfg := firecracker.VMConfig{VMID: "runner-1", RootfsPath: "/tmp/rootfs.img"}
-	gotVM, proxy, err := cm.restoreAndActivateRunner(
+	gotVM, err := cm.restoreAndActivateRunner(
 		context.Background(),
 		"runner-1",
 		AllocateRequest{},
@@ -360,9 +355,6 @@ func TestRestoreAndActivateRunnerSequencesRestoreResumeAndReady(t *testing.T) {
 	}
 	if gotVM != vm {
 		t.Fatalf("restoreAndActivateRunner() returned unexpected VM: %+v", gotVM)
-	}
-	if proxy != nil {
-		t.Fatalf("expected no proxy for nil AuthConfig, got %+v", proxy)
 	}
 
 	want := []string{
@@ -428,7 +420,7 @@ func TestRestoreAndActivateRunnerFallsBackToColdBoot(t *testing.T) {
 		Resources:  Resources{VCPUs: 2, MemoryMB: 2048},
 	}
 
-	_, _, err := cm.restoreAndActivateRunner(
+	_, err := cm.restoreAndActivateRunner(
 		context.Background(),
 		"runner-1",
 		AllocateRequest{},

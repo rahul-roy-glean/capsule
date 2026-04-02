@@ -15,6 +15,7 @@ import (
 // These are read on every runner allocation and rarely change.
 type WorkloadConfig struct {
 	WorkloadKey          string
+	ProjectID            string
 	Tier                 string
 	StartCommand         *snapshot.StartCommand
 	RunnerTTLSeconds     int
@@ -23,7 +24,15 @@ type WorkloadConfig struct {
 	MaxConcurrentRunners int
 	NetworkPolicyPreset  string
 	NetworkPolicyJSON    string
-	AuthConfigJSON       string // JSON-encoded authproxy.AuthConfig for injection into host agent
+
+	// Access plane fields — loaded from project_access_planes table
+	// based on the project that owns this workload.
+	AccessPlaneAddr      string                               // HTTP API address (e.g. "http://access-plane:8080")
+	AccessPlaneProxyAddr string                               // CONNECT proxy address (e.g. "access-plane:3128")
+	AttestationSecret    string                               // HMAC secret for minting runner tokens
+	CACertPEM            string                               // CA cert for SSL bump
+	TenantID             string                               // Tenant identifier for the access plane
+	Families             map[string]snapshot.FamilyCredential // family name -> credential ref
 }
 
 // ConfigCache provides in-memory lookup for workload_key→config metadata.
@@ -51,7 +60,7 @@ func (cc *ConfigCache) loadFromDB() {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
-	lcRows, err := cc.db.Query(`SELECT DISTINCT ON (leaf_workload_key) leaf_workload_key, tier, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy, config_json FROM layered_configs ORDER BY leaf_workload_key, created_at DESC`)
+	lcRows, err := cc.db.Query(`SELECT DISTINCT ON (leaf_workload_key) leaf_workload_key, tier, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy, config_json, COALESCE(project_id, '') FROM layered_configs ORDER BY leaf_workload_key, created_at DESC`)
 	if err == nil {
 		defer lcRows.Close()
 		for lcRows.Next() {
@@ -60,7 +69,7 @@ func (cc *ConfigCache) loadFromDB() {
 			var npPreset sql.NullString
 			var npJSON sql.NullString
 			var configJSON sql.NullString
-			if err := lcRows.Scan(&wc.WorkloadKey, &wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON, &configJSON); err != nil {
+			if err := lcRows.Scan(&wc.WorkloadKey, &wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON, &configJSON, &wc.ProjectID); err != nil {
 				continue
 			}
 			if startCmdJSON.Valid && startCmdJSON.String != "" {
@@ -73,8 +82,11 @@ func (cc *ConfigCache) loadFromDB() {
 			if npJSON.Valid {
 				wc.NetworkPolicyJSON = npJSON.String
 			}
-			if configJSON.Valid {
-				wc.AuthConfigJSON = extractAuthConfigJSON(configJSON.String)
+			if configJSON.Valid && configJSON.String != "" {
+				var cfg snapshot.LayeredConfig
+				if json.Unmarshal([]byte(configJSON.String), &cfg) == nil && len(cfg.Config.Families) > 0 {
+					wc.Families = cfg.Config.Families
+				}
 			}
 			cc.workloadConfig[wc.WorkloadKey] = &wc
 		}
@@ -85,7 +97,7 @@ func (cc *ConfigCache) loadFromDB() {
 	cwkRows, err := cc.db.Query(`
 		SELECT cwk.leaf_workload_key, lc.tier, lc.start_command, lc.runner_ttl_seconds,
 		       lc.session_max_age_seconds, lc.auto_pause, lc.max_concurrent_runners,
-		       lc.network_policy_preset, lc.network_policy, lc.config_json
+		       lc.network_policy_preset, lc.network_policy, lc.config_json, COALESCE(lc.project_id, '')
 		FROM config_workload_keys cwk
 		JOIN layered_configs lc ON lc.config_id = cwk.config_id
 		WHERE cwk.leaf_workload_key NOT IN (SELECT leaf_workload_key FROM layered_configs)`)
@@ -97,7 +109,7 @@ func (cc *ConfigCache) loadFromDB() {
 			var npPreset sql.NullString
 			var npJSON sql.NullString
 			var configJSON sql.NullString
-			if err := cwkRows.Scan(&wc.WorkloadKey, &wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON, &configJSON); err != nil {
+			if err := cwkRows.Scan(&wc.WorkloadKey, &wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON, &configJSON, &wc.ProjectID); err != nil {
 				continue
 			}
 			if startCmdJSON.Valid && startCmdJSON.String != "" {
@@ -110,8 +122,11 @@ func (cc *ConfigCache) loadFromDB() {
 			if npJSON.Valid {
 				wc.NetworkPolicyJSON = npJSON.String
 			}
-			if configJSON.Valid {
-				wc.AuthConfigJSON = extractAuthConfigJSON(configJSON.String)
+			if configJSON.Valid && configJSON.String != "" {
+				var cfg snapshot.LayeredConfig
+				if json.Unmarshal([]byte(configJSON.String), &cfg) == nil && len(cfg.Config.Families) > 0 {
+					wc.Families = cfg.Config.Families
+				}
 			}
 			// Only add if not already loaded from layered_configs (active takes precedence)
 			if _, exists := cc.workloadConfig[wc.WorkloadKey]; !exists {
@@ -156,19 +171,19 @@ func (cc *ConfigCache) loadWorkloadConfigFromDB(ctx context.Context, workloadKey
 	// Try layered_configs by direct leaf_workload_key match first
 	var configJSON sql.NullString
 	err := cc.db.QueryRowContext(ctx,
-		`SELECT tier, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy, config_json
+		`SELECT tier, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy, config_json, COALESCE(project_id, '')
 		 FROM layered_configs WHERE leaf_workload_key = $1 ORDER BY created_at DESC LIMIT 1`, workloadKey).Scan(
-		&wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON, &configJSON)
+		&wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON, &configJSON, &wc.ProjectID)
 	if err != nil {
 		// Fallback: the workload_key may be from a previous config version (draining).
 		// Look up the config_id via config_workload_keys, then load the current config.
 		err = cc.db.QueryRowContext(ctx,
-			`SELECT lc.tier, lc.start_command, lc.runner_ttl_seconds, lc.session_max_age_seconds, lc.auto_pause, lc.max_concurrent_runners, lc.network_policy_preset, lc.network_policy, lc.config_json
+			`SELECT lc.tier, lc.start_command, lc.runner_ttl_seconds, lc.session_max_age_seconds, lc.auto_pause, lc.max_concurrent_runners, lc.network_policy_preset, lc.network_policy, lc.config_json, COALESCE(lc.project_id, '')
 			 FROM config_workload_keys cwk
 			 JOIN layered_configs lc ON lc.config_id = cwk.config_id
 			 WHERE cwk.leaf_workload_key = $1
 			 ORDER BY lc.created_at DESC LIMIT 1`, workloadKey).Scan(
-			&wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON, &configJSON)
+			&wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON, &configJSON, &wc.ProjectID)
 		if err != nil {
 			return nil
 		}
@@ -183,8 +198,11 @@ func (cc *ConfigCache) loadWorkloadConfigFromDB(ctx context.Context, workloadKey
 	if npJSON.Valid {
 		wc.NetworkPolicyJSON = npJSON.String
 	}
-	if configJSON.Valid {
-		wc.AuthConfigJSON = extractAuthConfigJSON(configJSON.String)
+	if configJSON.Valid && configJSON.String != "" {
+		var cfg snapshot.LayeredConfig
+		if json.Unmarshal([]byte(configJSON.String), &cfg) == nil && len(cfg.Config.Families) > 0 {
+			wc.Families = cfg.Config.Families
+		}
 	}
 	return &wc
 }
@@ -196,17 +214,33 @@ func (cc *ConfigCache) PutWorkloadConfig(wc *WorkloadConfig) {
 	cc.mu.Unlock()
 }
 
-// extractAuthConfigJSON extracts the "config.auth" field from a LayeredConfig JSON blob.
-func extractAuthConfigJSON(configJSON string) string {
-	var raw struct {
-		Config struct {
-			Auth json.RawMessage `json:"auth"`
-		} `json:"config"`
+// LoadAccessPlaneForProject looks up the access plane configuration for a
+// project from the project_access_planes table. Returns nil if no access plane
+// is configured for the project.
+func (cc *ConfigCache) LoadAccessPlaneForProject(ctx context.Context, projectID string) *AccessPlaneInfo {
+	if projectID == "" {
+		return nil
 	}
-	if err := json.Unmarshal([]byte(configJSON), &raw); err != nil || len(raw.Config.Auth) == 0 || string(raw.Config.Auth) == "null" {
-		return ""
+	var info AccessPlaneInfo
+	err := cc.db.QueryRowContext(ctx,
+		`SELECT access_plane_addr, proxy_addr, attestation_secret_ref, COALESCE(ca_cert_pem, ''), tenant_id
+		 FROM project_access_planes WHERE project_id = $1`, projectID).Scan(
+		&info.Addr, &info.ProxyAddr, &info.AttestationSecretRef, &info.CACertPEM, &info.TenantID)
+	if err != nil {
+		return nil
 	}
-	return string(raw.Config.Auth)
+	info.ProjectID = projectID
+	return &info
+}
+
+// AccessPlaneInfo holds the access plane deployment details for a project.
+type AccessPlaneInfo struct {
+	ProjectID            string
+	Addr                 string // HTTP API address
+	ProxyAddr            string // CONNECT proxy address
+	AttestationSecretRef string // sm:project/secret reference
+	CACertPEM            string
+	TenantID             string
 }
 
 // InvalidateWorkloadConfig removes a workload config from the cache.

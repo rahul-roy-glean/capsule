@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
 	"github.com/rahul-roy-glean/capsule/pkg/firecracker"
 	"github.com/sirupsen/logrus"
 )
@@ -23,7 +22,6 @@ func newTestManager(opts ...func(*Manager)) *Manager {
 		runnerToSlot:    make(map[string]int),
 		pendingSessions: make(map[string]string),
 		uffdHandlers:    make(map[string]uffdStopper),
-		authProxies:     make(map[string]*authproxy.AuthProxy),
 		pauseSem:        make(chan struct{}, maxConcurrentSnapshots),
 		uploadSem:       make(chan struct{}, maxConcurrentUploads),
 		stopCh:          make(chan struct{}),

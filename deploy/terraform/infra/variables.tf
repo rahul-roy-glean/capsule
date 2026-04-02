@@ -194,3 +194,17 @@ variable "enable_monitoring" {
   type        = bool
   default     = true
 }
+
+# --- Access Plane VPC Peering ---
+
+variable "access_plane_vpc_peering_enabled" {
+  description = "Enable VPC peering to the access plane's VPC so microVMs can reach tenant access planes"
+  type        = bool
+  default     = false
+}
+
+variable "access_plane_vpc_network" {
+  description = "Full self-link of the access plane VPC to peer with. Must include project for cross-project peering: projects/{PROJECT}/global/networks/{NAME}"
+  type        = string
+  default     = ""
+}

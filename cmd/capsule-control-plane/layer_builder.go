@@ -585,13 +585,13 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 		baseImage := b.buildBaseImage
 		runnerUser := b.buildRunnerUser
 
-		// Extract auth config from the layered config JSON (if present)
-		authConfigJSON := ""
+		// Extract access plane config from the layered config JSON (if present)
+		accessPlaneConfigJSON := ""
 		if b.configJSON.Valid && b.configJSON.String != "" {
 			var lcfg snapshot.LayeredConfig
 			if err := json.Unmarshal([]byte(b.configJSON.String), &lcfg); err == nil && lcfg.Config.Auth != nil {
 				if authBytes, err := json.Marshal(lcfg.Config.Auth); err == nil {
-					authConfigJSON = string(authBytes)
+					accessPlaneConfigJSON = string(authBytes)
 				}
 			}
 		}
@@ -599,7 +599,7 @@ func (s *LayerBuildScheduler) processQueuedBuilds(ctx context.Context) {
 		err := s.launchLayerBuildVM(ctx, instanceName, b.layerHash, commandsJSON, b.version,
 			parentWorkloadKey, parentVersion, b.allChainDrivesJSON, b.buildType,
 			snapshotVCPUs, snapshotMemoryMB,
-			baseImage, runnerUser, b.oldLayerHash, b.oldLayerVersion, authConfigJSON)
+			baseImage, runnerUser, b.oldLayerHash, b.oldLayerVersion, accessPlaneConfigJSON)
 		if err != nil {
 			s.logger.WithError(err).WithField("build_id", b.buildID).Error("Failed to launch layer build VM")
 			// Clean up VM if it was partially created before the error
@@ -848,9 +848,6 @@ func (s *LayerBuildScheduler) onLeafLayerComplete(ctx context.Context, layerHash
 	if autoRollout {
 		s.logger.WithField("version", version).Info("Auto-rollout: setting active snapshot")
 		s.snapshotManager.SetActiveSnapshotForKey(ctx, workloadKey, version)
-		if err := s.snapshotManager.AssignVersion(ctx, workloadKey, nil, version); err != nil {
-			return fmt.Errorf("failed to assign fleet-wide desired version: %w", err)
-		}
 	}
 
 	// Clean up draining workload_keys for configs that use this leaf
@@ -898,8 +895,6 @@ func (s *LayerBuildScheduler) cleanupDrainingWorkloadKeys(ctx context.Context, c
 
 		if otherCount == 0 {
 			// No active config uses this workload_key — safe to clean up
-			s.db.ExecContext(ctx,
-				`DELETE FROM version_assignments WHERE workload_key = $1`, drainingWK)
 			s.db.ExecContext(ctx,
 				`UPDATE snapshots SET status='deprecated'
 				 WHERE workload_key = $1 AND status = 'active'`, drainingWK)
@@ -1399,7 +1394,7 @@ func (s *LayerBuildScheduler) GCOrphanedLayers(ctx context.Context) {
 // launchLayerBuildVM creates a GCE instance to build a layer snapshot.
 // It builds its own startup script with all layer-specific flags instead of
 // delegating to launchSnapshotBuilderVMForKey.
-func (s *LayerBuildScheduler) launchLayerBuildVM(ctx context.Context, instanceName, layerHash, commandsJSON, version, parentWorkloadKey, parentVersion, drivesJSON, buildType string, snapshotVCPUs, snapshotMemoryMB int, baseImage, runnerUser, oldLayerHash, oldLayerVersion, authConfigJSON string) error {
+func (s *LayerBuildScheduler) launchLayerBuildVM(ctx context.Context, instanceName, layerHash, commandsJSON, version, parentWorkloadKey, parentVersion, drivesJSON, buildType string, snapshotVCPUs, snapshotMemoryMB int, baseImage, runnerUser, oldLayerHash, oldLayerVersion, accessPlaneConfigJSON string) error {
 	if s.snapshotManager.gcpProject == "" {
 		s.logger.Warn("GCP project not configured, skipping VM launch")
 		return nil
@@ -1451,10 +1446,10 @@ func (s *LayerBuildScheduler) launchLayerBuildVM(ctx context.Context, instanceNa
 		"runner_user": runnerUser,
 	}).Info("Layer build flags")
 
-	// Auth config flag: pass via base64-encoded env var to avoid shell quoting issues
+	// Access plane config flag: pass via base64-encoded env var to avoid shell quoting issues
 	authConfigSetup := ""
-	if authConfigJSON != "" {
-		authConfigB64 := base64.StdEncoding.EncodeToString([]byte(authConfigJSON))
+	if accessPlaneConfigJSON != "" {
+		authConfigB64 := base64.StdEncoding.EncodeToString([]byte(accessPlaneConfigJSON))
 		authConfigSetup = fmt.Sprintf(`
 # Decode auth config from base64
 AUTH_CONFIG=$(echo '%s' | base64 -d)

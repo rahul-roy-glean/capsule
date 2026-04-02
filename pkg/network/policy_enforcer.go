@@ -286,12 +286,26 @@ func (e *PolicyEnforcer) populateEgressChain() error {
 			"-d", vethSupernet, "-j", "ACCEPT")
 	}
 
-	// 5-7. RFC1918 DROP
+	// 5. Allow explicitly-listed RFC1918 destinations before the blanket
+	// RFC1918 DROP. This lets policies whitelist internal services like the
+	// access plane (e.g. 10.0.16.7) without opening all of 10.0.0.0/8.
+	if p.DefaultEgressAction == PolicyActionDeny {
+		for _, rule := range p.AllowedEgress {
+			for _, cidr := range rule.CIDRs {
+				if isRFC1918(cidr) {
+					e.nsExecErr("iptables", "-A", policyEgressChain,
+						"-d", cidr, "-j", "ACCEPT")
+				}
+			}
+		}
+	}
+
+	// 6-8. RFC1918 DROP
 	e.nsExecErr("iptables", "-A", policyEgressChain, "-d", "10.0.0.0/8", "-j", "DROP")
 	e.nsExecErr("iptables", "-A", policyEgressChain, "-d", "172.16.0.0/12", "-j", "DROP")
 	e.nsExecErr("iptables", "-A", policyEgressChain, "-d", "192.168.0.0/16", "-j", "DROP")
 
-	// 8. CIDR ipset rules
+	// 9. CIDR ipset rules (non-RFC1918 destinations)
 	if p.DefaultEgressAction == PolicyActionDeny {
 		// deny-default: match CIDR allow set → ACCEPT
 		e.nsExecErr("iptables", "-A", policyEgressChain,
@@ -302,13 +316,13 @@ func (e *PolicyEnforcer) populateEgressChain() error {
 			"-m", "set", "--match-set", e.cidrDenySet(), "dst", "-j", "DROP")
 	}
 
-	// 9. Domain IP allow set (deny-default only)
+	// 10. Domain IP allow set (deny-default only)
 	if p.DefaultEgressAction == PolicyActionDeny {
 		e.nsExecErr("iptables", "-A", policyEgressChain,
 			"-m", "set", "--match-set", e.domAllowSet(), "dst", "-j", "ACCEPT")
 	}
 
-	// 10. Default action
+	// 11. Default action
 	defaultTarget := "ACCEPT"
 	if p.DefaultEgressAction == PolicyActionDeny {
 		defaultTarget = "DROP"
@@ -514,4 +528,49 @@ func (e *PolicyEnforcer) nsExecErr(name string, args ...string) error {
 		return fmt.Errorf("%s %s: %w (output: %s)", name, strings.Join(args, " "), err, string(out))
 	}
 	return nil
+}
+
+// rfc1918Nets are the private IPv4 address ranges (RFC 1918).
+var rfc1918Nets = []*net.IPNet{
+	parseCIDR("10.0.0.0/8"),
+	parseCIDR("172.16.0.0/12"),
+	parseCIDR("192.168.0.0/16"),
+}
+
+func parseCIDR(s string) *net.IPNet {
+	_, n, _ := net.ParseCIDR(s)
+	return n
+}
+
+// isRFC1918 returns true if the given CIDR string overlaps with any RFC1918 range.
+func isRFC1918(cidr string) bool {
+	ip, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		// Might be a bare IP
+		ip = net.ParseIP(cidr)
+		if ip == nil {
+			return false
+		}
+		for _, rfc := range rfc1918Nets {
+			if rfc.Contains(ip) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, rfc := range rfc1918Nets {
+		if rfc.Contains(ip) || rfc.Contains(lastIP(ipNet)) {
+			return true
+		}
+	}
+	return false
+}
+
+// lastIP returns the last IP in a subnet.
+func lastIP(n *net.IPNet) net.IP {
+	ip := make(net.IP, len(n.IP))
+	for i := range ip {
+		ip[i] = n.IP[i] | ^n.Mask[i]
+	}
+	return ip
 }

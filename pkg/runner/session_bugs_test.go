@@ -53,7 +53,7 @@ func TestWorkloadKeyEmptyBreaksResume(t *testing.T) {
 	data, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
-	_, err := m.ResumeFromSession(context.TODO(), "sess-empty-wk", "real-key-123", "")
+	_, err := m.ResumeFromSession(context.TODO(), "sess-empty-wk", "real-key-123", "", "")
 	if err == nil {
 		t.Fatal("ResumeFromSession should fail when session has empty workload_key but request has a key")
 	}
@@ -217,7 +217,7 @@ func TestResumeFromSession_CrossHostWithRunnerID(t *testing.T) {
 	os.WriteFile(filepath.Join(sessDir, "metadata.json"), data, 0644)
 
 	// Call with the cross-host runner ID (same as metadata's).
-	_, err := m.ResumeFromSession(context.Background(), "sess-cross-host", "wk-abc", "runner-original")
+	_, err := m.ResumeFromSession(context.Background(), "sess-cross-host", "wk-abc", "runner-original", "")
 	if err == nil {
 		t.Fatal("expected error from duplicate session check")
 	}
@@ -261,7 +261,7 @@ func TestResumeFromSession_OverridesRunnerIDFromMetadata(t *testing.T) {
 
 	// Pass a DIFFERENT runnerID — the function should use metadata's "runner-metadata"
 	// for the bringup lease, hitting the duplicate check for that ID.
-	_, err := m.ResumeFromSession(context.Background(), "sess-override-id", "wk-abc", "runner-different")
+	_, err := m.ResumeFromSession(context.Background(), "sess-override-id", "wk-abc", "runner-different", "")
 	if err == nil {
 		t.Fatal("expected error from duplicate session check")
 	}

@@ -235,3 +235,51 @@ resource "google_service_networking_connection" "private_vpc_connection" {
 
   depends_on = [google_project_service.apis]
 }
+
+# --- Access Plane VPC Peering (Cross-Project) ---
+# Enables microVMs on host VMs to reach tenant access planes deployed in a
+# separate GCP project/VPC (e.g. a dedicated access-plane GKE cluster).
+#
+# Cross-project peering requirements:
+#   1. This side: creates peering from capsule VPC → access-plane VPC (below)
+#   2. Remote side: must create matching peering from access-plane VPC → capsule VPC
+#      using vpc_network_self_link output from this module
+#   3. IAM: the access-plane project must grant compute.networkPeering.create
+#      or roles/compute.networkAdmin to the identity running this Terraform
+#      (typically handled by the remote project's Terraform)
+#
+# Set access_plane_vpc_network to the full self-link:
+#   projects/{ACCESS_PLANE_PROJECT}/global/networks/{NETWORK_NAME}
+
+resource "google_compute_network_peering" "capsule_to_access_plane" {
+  count        = var.access_plane_vpc_peering_enabled ? 1 : 0
+  name         = "${local.name_prefix}-to-access-plane"
+  network      = local.network_self_link
+  peer_network = var.access_plane_vpc_network
+
+  export_custom_routes = true
+  import_custom_routes = true
+
+  lifecycle {
+    precondition {
+      condition     = trimspace(var.access_plane_vpc_network) != ""
+      error_message = "access_plane_vpc_network must be set when access_plane_vpc_peering_enabled is true."
+    }
+  }
+}
+
+# Allow microVM traffic (NAT'd through hosts) to reach access plane ports
+resource "google_compute_firewall" "access_plane_egress" {
+  count   = var.access_plane_vpc_peering_enabled ? 1 : 0
+  name    = "${local.name_prefix}-allow-access-plane"
+  network = local.network_name
+
+  allow {
+    protocol = "tcp"
+    ports    = ["8080", "3128"] # HTTP API + CONNECT proxy
+  }
+
+  # Host subnet is the source (microVM traffic is NAT'd through the host)
+  source_ranges = [local.host_subnet_cidr]
+  direction     = "EGRESS"
+}

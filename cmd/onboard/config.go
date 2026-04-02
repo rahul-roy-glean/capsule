@@ -6,7 +6,7 @@ import (
 	"os"
 	"os/exec"
 
-	"github.com/rahul-roy-glean/capsule/pkg/authproxy"
+	"github.com/rahul-roy-glean/capsule/pkg/accessplane"
 	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
 	"gopkg.in/yaml.v3"
 )
@@ -89,17 +89,17 @@ type WorkloadConfig struct {
 }
 
 type WorkloadRuntimeConfig struct {
-	AutoPause            *bool                 `yaml:"auto_pause"`
-	TTL                  int                   `yaml:"ttl"`
-	Tier                 string                `yaml:"tier"`
-	AutoRollout          *bool                 `yaml:"auto_rollout"`
-	SessionMaxAgeSeconds int                   `yaml:"session_max_age_seconds"`
-	RootfsSizeGB         int                   `yaml:"rootfs_size_gb"`
-	RunnerUser           string                `yaml:"runner_user"`
-	WorkspaceSizeGB      int                   `yaml:"workspace_size_gb"`
-	NetworkPolicyPreset  string                `yaml:"network_policy_preset"`
-	NetworkPolicy        json.RawMessage       `yaml:"network_policy"`
-	Auth                 *authproxy.AuthConfig `yaml:"auth"`
+	AutoPause            *bool               `yaml:"auto_pause"`
+	TTL                  int                 `yaml:"ttl"`
+	Tier                 string              `yaml:"tier"`
+	AutoRollout          *bool               `yaml:"auto_rollout"`
+	SessionMaxAgeSeconds int                 `yaml:"session_max_age_seconds"`
+	RootfsSizeGB         int                 `yaml:"rootfs_size_gb"`
+	RunnerUser           string              `yaml:"runner_user"`
+	WorkspaceSizeGB      int                 `yaml:"workspace_size_gb"`
+	NetworkPolicyPreset  string              `yaml:"network_policy_preset"`
+	NetworkPolicy        json.RawMessage     `yaml:"network_policy"`
+	Auth                 *accessplane.Config `yaml:"auth"`
 }
 
 // SnapshotCommandConfig is one warmup step baked into the golden snapshot.

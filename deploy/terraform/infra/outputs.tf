@@ -109,3 +109,16 @@ output "host_instance_group_manager_name" {
   value       = "${local.name_prefix}-hosts"
   description = "Pre-computed MIG manager name for the host fleet"
 }
+
+# --- Access Plane Peering Outputs ---
+# These are consumed by the access plane's Terraform to set up the reverse VPC peering.
+
+output "vpc_network_self_link" {
+  value       = local.network_self_link
+  description = "VPC network self-link for access plane VPC peering"
+}
+
+output "host_subnet_cidr" {
+  value       = local.host_subnet_cidr
+  description = "Host subnet CIDR — access plane firewall rules should allow ingress from this range"
+}
