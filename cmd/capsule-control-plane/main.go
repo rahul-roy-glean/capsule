@@ -688,11 +688,149 @@ func (s *ControlPlaneServer) GetSnapshot(ctx context.Context, req *pb.GetSnapsho
 
 // HTTP Handlers
 
+// EnrichedRunner represents a runner with full details from DB, heartbeat, and computed fields
+type EnrichedRunner struct {
+	// Original 5 fields (backward compatibility)
+	RunnerID    string `json:"runner_id"`
+	HostID      string `json:"host_id"`
+	HostName    string `json:"host_name"`
+	WorkloadKey string `json:"workload_key"`
+	Status      string `json:"status"`
+
+	// Lifecycle timestamps
+	CreatedAt   *time.Time `json:"created_at,omitempty"`
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+
+	// Computed lifecycle fields
+	AgeSeconds            *int `json:"age_seconds,omitempty"`
+	IdleSince             *time.Time `json:"idle_since,omitempty"`
+	IdleDurationSeconds   *int `json:"idle_duration_seconds,omitempty"`
+
+	// Network and configuration
+	InternalIP          *string `json:"internal_ip,omitempty"`
+	RunnerTTLSeconds    *int    `json:"runner_ttl_seconds,omitempty"`
+	TimeUntilTTLSeconds *int    `json:"time_until_ttl_seconds,omitempty"`
+	AutoPause           *bool   `json:"auto_pause,omitempty"`
+	NetworkPolicyPreset *string `json:"network_policy_preset,omitempty"`
+	JobID               *string `json:"job_id,omitempty"`
+
+	// Host metrics (from heartbeat)
+	HostCPUUtilizationPercent    *float64   `json:"host_cpu_utilization_percent,omitempty"`
+	HostMemoryUtilizationPercent *float64   `json:"host_memory_utilization_percent,omitempty"`
+	HostLastHeartbeat            *time.Time `json:"host_last_heartbeat,omitempty"`
+	HostDiskUsagePercent         *float64   `json:"host_disk_usage_percent,omitempty"`
+
+	// Attached session info (from session_snapshots)
+	AttachedSessionID     *string    `json:"attached_session_id,omitempty"`
+	SessionStatus         *string    `json:"session_status,omitempty"`
+	SessionLayerCount     *int       `json:"session_layer_count,omitempty"`
+	SessionPausedAt       *time.Time `json:"session_paused_at,omitempty"`
+}
+
+// DBRunner represents a runner record from the database
+type DBRunner struct {
+	ID                  string
+	HostID              string
+	Status              string
+	InternalIP          sql.NullString
+	JobID               sql.NullString
+	WorkloadKey         sql.NullString
+	RunnerTTLSeconds    sql.NullInt32
+	AutoPause           sql.NullBool
+	NetworkPolicyPreset sql.NullString
+	CreatedAt           sql.NullTime
+	StartedAt           sql.NullTime
+	CompletedAt         sql.NullTime
+}
+
+// DBSessionSnapshot represents a session snapshot record from the database
+type DBSessionSnapshot struct {
+	SessionID   string
+	Status      string
+	LayerCount  int
+	PausedAt    sql.NullTime
+}
+
+// getRunnersFromDB fetches runner data from the database with optional session info
+func (s *ControlPlaneServer) getRunnersFromDB(ctx context.Context) (map[string]*DBRunner, map[string]*DBSessionSnapshot, error) {
+	// Query runners
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT
+			id, host_id, status, internal_ip, job_id, workload_key,
+			runner_ttl_seconds, auto_pause, network_policy_preset,
+			created_at, started_at, completed_at
+		FROM runners
+		WHERE status NOT IN ('terminated', 'completed')
+	`)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to query runners: %w", err)
+	}
+	defer rows.Close()
+
+	runners := make(map[string]*DBRunner)
+	for rows.Next() {
+		r := &DBRunner{}
+		err := rows.Scan(
+			&r.ID, &r.HostID, &r.Status, &r.InternalIP, &r.JobID, &r.WorkloadKey,
+			&r.RunnerTTLSeconds, &r.AutoPause, &r.NetworkPolicyPreset,
+			&r.CreatedAt, &r.StartedAt, &r.CompletedAt,
+		)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to scan runner: %w", err)
+		}
+		runners[r.ID] = r
+	}
+
+	// Query session snapshots
+	sessionRows, err := s.db.QueryContext(ctx, `
+		SELECT runner_id, session_id, status, layer_count, paused_at
+		FROM session_snapshots
+		WHERE status = 'active'
+	`)
+	if err != nil {
+		return runners, nil, fmt.Errorf("failed to query session snapshots: %w", err)
+	}
+	defer sessionRows.Close()
+
+	sessions := make(map[string]*DBSessionSnapshot)
+	for sessionRows.Next() {
+		var runnerID string
+		s := &DBSessionSnapshot{}
+		err := sessionRows.Scan(&runnerID, &s.SessionID, &s.Status, &s.LayerCount, &s.PausedAt)
+		if err != nil {
+			return runners, nil, fmt.Errorf("failed to scan session snapshot: %w", err)
+		}
+		sessions[runnerID] = s
+	}
+
+	return runners, sessions, nil
+}
+
 func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
+	// Fetch DB data (runners + sessions)
+	dbRunners, sessions, err := s.getRunnersFromDB(r.Context())
+	if err != nil {
+		s.logger.WithError(err).Error("Failed to fetch runners from database")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Get in-memory host data
 	hosts := s.hostRegistry.GetAllHosts()
-	allRunners := make([]map[string]interface{}, 0)
+	hostMap := make(map[string]*Host)
+	for _, h := range hosts {
+		hostMap[h.ID] = h
+	}
+
+	// Build enriched runner list
+	allRunners := make([]*EnrichedRunner, 0)
+	now := time.Now()
+
+	// Track status breakdown for summary
+	statusCounts := make(map[string]int)
 
 	for _, h := range hosts {
 		s.hostRegistry.mu.RLock()
@@ -700,21 +838,103 @@ func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Req
 		s.hostRegistry.mu.RUnlock()
 
 		for _, ri := range runnerInfos {
-			allRunners = append(allRunners, map[string]interface{}{
-				"runner_id":    ri.RunnerID,
-				"host_id":      h.ID,
-				"host_name":    h.InstanceName,
-				"workload_key": ri.WorkloadKey,
-				"status":       ri.State,
-			})
+			enriched := &EnrichedRunner{
+				RunnerID:    ri.RunnerID,
+				HostID:      h.ID,
+				HostName:    h.InstanceName,
+				WorkloadKey: ri.WorkloadKey,
+				Status:      ri.State,
+			}
+
+			// Count status
+			statusCounts[ri.State]++
+
+			// Merge DB data if available
+			if dbRunner, ok := dbRunners[ri.RunnerID]; ok {
+				if dbRunner.CreatedAt.Valid {
+					enriched.CreatedAt = &dbRunner.CreatedAt.Time
+					ageSeconds := int(now.Sub(dbRunner.CreatedAt.Time).Seconds())
+					enriched.AgeSeconds = &ageSeconds
+
+					// Calculate time until TTL if TTL is set
+					if dbRunner.RunnerTTLSeconds.Valid && dbRunner.RunnerTTLSeconds.Int32 > 0 {
+						ttl := int(dbRunner.RunnerTTLSeconds.Int32)
+						enriched.RunnerTTLSeconds = &ttl
+						timeUntilTTL := ttl - ageSeconds
+						if timeUntilTTL < 0 {
+							timeUntilTTL = 0
+						}
+						enriched.TimeUntilTTLSeconds = &timeUntilTTL
+					}
+				}
+				if dbRunner.StartedAt.Valid {
+					enriched.StartedAt = &dbRunner.StartedAt.Time
+				}
+				if dbRunner.CompletedAt.Valid {
+					enriched.CompletedAt = &dbRunner.CompletedAt.Time
+				}
+				if dbRunner.InternalIP.Valid {
+					enriched.InternalIP = &dbRunner.InternalIP.String
+				}
+				if dbRunner.JobID.Valid {
+					enriched.JobID = &dbRunner.JobID.String
+				}
+				if dbRunner.AutoPause.Valid {
+					enriched.AutoPause = &dbRunner.AutoPause.Bool
+				}
+				if dbRunner.NetworkPolicyPreset.Valid {
+					enriched.NetworkPolicyPreset = &dbRunner.NetworkPolicyPreset.String
+				}
+			}
+
+			// Add idle tracking from heartbeat
+			if !ri.IdleSince.IsZero() {
+				enriched.IdleSince = &ri.IdleSince
+				idleDuration := int(now.Sub(ri.IdleSince).Seconds())
+				enriched.IdleDurationSeconds = &idleDuration
+			}
+
+			// Add host metrics
+			if h.TotalCPUMillicores > 0 {
+				cpuPercent := float64(h.UsedCPUMillicores) / float64(h.TotalCPUMillicores) * 100.0
+				enriched.HostCPUUtilizationPercent = &cpuPercent
+			}
+			if h.TotalMemoryMB > 0 {
+				memPercent := float64(h.UsedMemoryMB) / float64(h.TotalMemoryMB) * 100.0
+				enriched.HostMemoryUtilizationPercent = &memPercent
+			}
+			if !h.LastHeartbeat.IsZero() {
+				enriched.HostLastHeartbeat = &h.LastHeartbeat
+			}
+			if h.DiskUsage > 0 {
+				diskPercent := h.DiskUsage * 100.0
+				enriched.HostDiskUsagePercent = &diskPercent
+			}
+
+			// Add session info if available
+			if session, ok := sessions[ri.RunnerID]; ok {
+				enriched.AttachedSessionID = &session.SessionID
+				enriched.SessionStatus = &session.Status
+				enriched.SessionLayerCount = &session.LayerCount
+				if session.PausedAt.Valid {
+					enriched.SessionPausedAt = &session.PausedAt.Time
+				}
+			}
+
+			allRunners = append(allRunners, enriched)
 		}
 	}
 
-	allRunners = nonNilSlice(allRunners)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"runners": allRunners,
-		"count":   len(allRunners),
-	})
+	// Build response with summary stats
+	response := map[string]interface{}{
+		"runners":       allRunners,
+		"total_count":   len(allRunners),
+		"status_counts": statusCounts,
+	}
+
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		s.logger.WithError(err).Error("Failed to encode response")
+	}
 }
 
 // HandleAllocateRunner handles manual runner allocation requests.
