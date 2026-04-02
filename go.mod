@@ -20,7 +20,7 @@ require (
 	github.com/miekg/dns v1.1.72
 	github.com/modelcontextprotocol/go-sdk v1.4.0
 	github.com/sirupsen/logrus v1.9.3
-	github.com/vishvananda/netlink v1.3.0
+	github.com/vishvananda/netlink v1.3.1
 	github.com/vishvananda/netns v0.0.5
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.61.0
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.61.0
