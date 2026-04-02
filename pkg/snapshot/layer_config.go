@@ -40,6 +40,7 @@ type LayerDef struct {
 // LayeredConfig describes a multi-layer snapshot pipeline.
 type LayeredConfig struct {
 	DisplayName string     `json:"display_name" yaml:"display_name"`
+	ProjectID   string     `json:"project_id,omitempty" yaml:"project_id"` // links workload to project_access_planes
 	BaseImage   string     `json:"base_image,omitempty" yaml:"base_image"` // Docker image URI (e.g. "ubuntu:22.04", "us-docker.pkg.dev/proj/repo/img:tag")
 	Layers      []LayerDef `json:"layers" yaml:"layers"`
 	Config      struct {

@@ -446,6 +446,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	var configNetworkPolicyPreset string
 	var configNetworkPolicyJSON string
 	var accessPlaneInfo *AccessPlaneInfo
+	var resolvedProjectID string
 	if workloadKey != "" {
 		var wc *WorkloadConfig
 		if s.configCache != nil {
@@ -458,6 +459,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			autoPause = wc.AutoPause
 			configNetworkPolicyPreset = wc.NetworkPolicyPreset
 			configNetworkPolicyJSON = wc.NetworkPolicyJSON
+			resolvedProjectID = wc.ProjectID
 			if wc.MaxConcurrentRunners > 0 && s.db != nil {
 				var currentCount int
 				_ = s.db.QueryRowContext(ctx, `
@@ -478,16 +480,17 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			var npPreset sql.NullString
 			var npJSON sql.NullString
 			var configJSON sql.NullString
+			var projectID sql.NullString
 
-			err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, start_command, tier, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, config_json FROM layered_configs WHERE leaf_workload_key = $1 ORDER BY created_at DESC LIMIT 1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON, &configJSON)
+			err := s.db.QueryRowContext(ctx, `SELECT max_concurrent_runners, start_command, tier, runner_ttl_seconds, auto_pause, network_policy_preset, network_policy, config_json, project_id FROM layered_configs WHERE leaf_workload_key = $1 ORDER BY created_at DESC LIMIT 1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON, &configJSON, &projectID)
 			if err != nil {
 				// Fallback: workload_key may be from a previous config version (draining).
 				err = s.db.QueryRowContext(ctx, `
-					SELECT lc.max_concurrent_runners, lc.start_command, lc.tier, lc.runner_ttl_seconds, lc.auto_pause, lc.network_policy_preset, lc.network_policy, lc.config_json
+					SELECT lc.max_concurrent_runners, lc.start_command, lc.tier, lc.runner_ttl_seconds, lc.auto_pause, lc.network_policy_preset, lc.network_policy, lc.config_json, lc.project_id
 					FROM config_workload_keys cwk
 					JOIN layered_configs lc ON lc.config_id = cwk.config_id
 					WHERE cwk.leaf_workload_key = $1
-					ORDER BY lc.created_at DESC LIMIT 1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON, &configJSON)
+					ORDER BY lc.created_at DESC LIMIT 1`, workloadKey).Scan(&maxConcurrent, &startCommandJSON, &tierCol, &ttlCol, &autoPauseCol, &npPreset, &npJSON, &configJSON, &projectID)
 			}
 			if err != nil {
 				failureReason = "workload_key_not_found"
@@ -524,6 +527,9 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			}
 			if npJSON.Valid {
 				configNetworkPolicyJSON = npJSON.String
+			}
+			if projectID.Valid {
+				resolvedProjectID = projectID.String
 			}
 		}
 	}
@@ -564,17 +570,9 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// the fleet-wide latest. This matters during canary or per-host override
 	// rollouts where different hosts have different desired versions.
 	var scoringVersion string
-	var hostVersionOverrides map[string]string
 	if taggedSnapshotVersion != "" {
 		scoringVersion = taggedSnapshotVersion
-	} else if workloadKey != "" && s.snapshotManager != nil && s.snapshotManager.db != nil {
-		var fleetAssigned string
-		fleetAssigned, hostVersionOverrides = s.snapshotManager.GetTargetVersionsByWorkloadKey(ctx, workloadKey)
-		if fleetAssigned != "" {
-			scoringVersion = fleetAssigned
-		}
-	}
-	if scoringVersion == "" && workloadKey != "" && s.snapshotManager != nil {
+	} else if workloadKey != "" && s.snapshotManager != nil {
 		scoringVersion = s.snapshotManager.GetCurrentVersionForKey(workloadKey)
 	}
 
@@ -633,17 +631,9 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	// --- Step B: Score off-lock ---
 	// Scoring touches no shared mutable state; the captured usage values and
 	// host pointers give a consistent-enough view for ranking.
-	// Per-host version overrides ensure scoring matches the version each host
-	// will actually boot (important during canary rollouts).
 	for i := range candidates {
-		targetVersion := scoringVersion
-		if hostVersionOverrides != nil {
-			if override, ok := hostVersionOverrides[candidates[i].host.ID]; ok {
-				targetVersion = override
-			}
-		}
 		candidates[i].score = s.scoreHostForWorkloadKeyWithUsage(
-			candidates[i].host, workloadKey, targetVersion,
+			candidates[i].host, workloadKey, scoringVersion,
 			candidates[i].usedCPU, candidates[i].usedMem,
 		)
 	}
@@ -715,9 +705,8 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		}
 	}
 	// Load access plane config for this project and pack into labels.
-	if s.configCache != nil {
-		// TODO: resolve project_id from workload config or request
-		accessPlaneInfo = s.configCache.LoadAccessPlaneForProject(ctx, "")
+	if s.configCache != nil && resolvedProjectID != "" {
+		accessPlaneInfo = s.configCache.LoadAccessPlaneForProject(ctx, resolvedProjectID)
 	}
 	if accessPlaneInfo != nil {
 		if protoReq.Labels == nil {
@@ -827,12 +816,6 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		var snapshotVersion string
 		if taggedSnapshotVersion != "" {
 			snapshotVersion = taggedSnapshotVersion
-		}
-		if snapshotVersion == "" && workloadKey != "" && s.snapshotManager != nil && s.snapshotManager.db != nil {
-			desired, _ := s.snapshotManager.GetDesiredVersions(ctx, h.ID)
-			if v, ok := desired[workloadKey]; ok {
-				snapshotVersion = v
-			}
 		}
 		if snapshotVersion == "" && workloadKey != "" && s.snapshotManager != nil {
 			snapshotVersion = s.snapshotManager.GetCurrentVersionForKey(workloadKey)

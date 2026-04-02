@@ -141,21 +141,29 @@ func (s *ControlPlaneServer) HandleHostHeartbeat(w http.ResponseWriter, r *http.
 	}
 
 	// Compute per-workload-key sync directives: only send workload keys whose
-	// desired version the host doesn't already have loaded. This avoids
+	// active version the host doesn't already have loaded. This avoids
 	// re-downloading snapshot.mem on every heartbeat.
 	var syncVersions map[string]string
 	if s.snapshotManager.db != nil {
-		desired, err := s.snapshotManager.GetDesiredVersions(r.Context(), host.ID)
+		// Get all active snapshot versions across all workload keys
+		rows, err := s.snapshotManager.db.QueryContext(r.Context(), `
+			SELECT workload_key, version FROM snapshots
+			WHERE status = 'active'
+		`)
 		if err != nil {
-			s.logger.WithError(err).Warn("Failed to get desired versions for heartbeat")
+			s.logger.WithError(err).Warn("Failed to get active versions for heartbeat")
 		} else {
-			for workloadKey, ver := range desired {
-				loaded, hasLoaded := req.LoadedManifests[workloadKey]
-				if !hasLoaded || loaded != ver {
-					if syncVersions == nil {
-						syncVersions = make(map[string]string)
+			defer rows.Close()
+			for rows.Next() {
+				var wk, ver string
+				if rows.Scan(&wk, &ver) == nil {
+					loaded, hasLoaded := req.LoadedManifests[wk]
+					if !hasLoaded || loaded != ver {
+						if syncVersions == nil {
+							syncVersions = make(map[string]string)
+						}
+						syncVersions[wk] = ver
 					}
-					syncVersions[workloadKey] = ver
 				}
 			}
 		}

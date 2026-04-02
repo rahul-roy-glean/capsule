@@ -112,6 +112,7 @@ resource "google_service_account" "control_plane" {
 }
 
 # IAM bindings for GCS
+# Host agent needs read/write: reads base snapshots, writes session chunks during pause.
 resource "google_storage_bucket_iam_member" "host_read" {
   bucket = google_storage_bucket.snapshots.name
   role   = "roles/storage.objectAdmin"
@@ -215,16 +216,17 @@ resource "google_project_iam_member" "builder_logs" {
   member  = "serviceAccount:${google_service_account.snapshot_builder.email}"
 }
 
-# Allow snapshot builder to impersonate host agent SA (for gcp-metadata auth provider)
+# Allow snapshot builder to impersonate host agent SA (for GCS access during builds)
 resource "google_service_account_iam_member" "builder_impersonate_host" {
   service_account_id = google_service_account.host_agent.name
   role               = "roles/iam.serviceAccountTokenCreator"
   member             = "serviceAccount:${google_service_account.snapshot_builder.email}"
 }
 
-# IAM for host agent to read secrets (GitHub App key)
-resource "google_project_iam_member" "host_secrets" {
+# IAM for control plane to read attestation secrets from Secret Manager
+# (used for minting HMAC tokens for access plane authentication)
+resource "google_project_iam_member" "control_plane_secrets" {
   project = var.project_id
   role    = "roles/secretmanager.secretAccessor"
-  member  = "serviceAccount:${google_service_account.host_agent.email}"
+  member  = "serviceAccount:${google_service_account.control_plane.email}"
 }

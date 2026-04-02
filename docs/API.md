@@ -143,13 +143,15 @@ Revoke grant and stop its proxy.
 #### `POST /v1/providers/update-token`
 Push a delegated credential token. No auth required (host-local communication).
 
+Tokens can be scoped per-session using `session_id` (preferred), per-source using `source_ip`, or global (no scope key). The proxy resolves tokens in order: session_id > source_ip > global.
+
 **Request:**
 ```json
 {
-  "provider": "github-delegated",
+  "provider": "github",
+  "session_id": "sess-123",
   "token": "ghs_installation_token_...",
   "expires_at": "2026-04-02T10:00:00Z",
-  "source_ip": "172.16.1.5",
   "identity": {
     "user_email": "alice@company.com",
     "headers": {"X-Request-ID": "req-123"}
@@ -157,7 +159,16 @@ Push a delegated credential token. No auth required (host-local communication).
 }
 ```
 
-**Response:** `{"status": "updated", "provider": "github-delegated"}`
+| Field | Required | Description |
+|---|---|---|
+| `provider` | Yes | Provider name (must be a `delegated` type) |
+| `token` | Yes | Credential token to inject |
+| `session_id` | No | Scope token to a specific session (from attestation token claims) |
+| `source_ip` | No | Deprecated: scope by source IP. Prefer `session_id` |
+| `expires_at` | No | Token expiry (tokens rejected after this time) |
+| `identity` | No | User identity to inject as headers |
+
+**Response:** `{"status": "updated", "provider": "github"}`
 
 ---
 
@@ -190,15 +201,27 @@ Get a short-lived GCS access token scoped to the tenant's project.
 
 ---
 
+#### `GET /v1/ca.pem`
+Get the CONNECT proxy's CA certificate in PEM format. VMs fetch this at boot to install in their trust store for SSL bump.
+
+No auth required. Returns `503` if the CONNECT proxy is not enabled.
+
+**Response (200):** PEM-encoded certificate (`Content-Type: application/x-pem-file`)
+
+---
+
 #### CONNECT Proxy (`:3128`)
 Transparent HTTPS proxy with selective SSL bump for credential injection.
 
-- Set `HTTPS_PROXY=http://<access-plane>:3128` in the VM
+- Set `HTTPS_PROXY=http://bearer:ATTESTATION_TOKEN@<access-plane>:3128` in the VM
+- The thaw agent embeds the attestation token in the proxy URL for session identification
+- Proxy extracts `session_id` from the `Proxy-Authorization` header (Basic auth decoded from URL credentials)
 - Validates target host against manifest destinations
 - SSRF protection (blocks private/loopback IPs)
 - SSL bump (MITM) for hosts with credential providers — injects Authorization header
 - Raw tunnel for allowed hosts without providers
 - Rejects unknown hosts with 403
+- Method/path validation against manifest constraints (e.g. `GET /repos/**` allowed, `DELETE /**` denied)
 
 ---
 
@@ -302,11 +325,82 @@ Query layered configuration registry.
 #### `POST /api/v1/layered-configs`
 Register or update a layered snapshot configuration.
 
+**Request includes `project_id`** to link the workload to a project's access plane:
+```json
+{
+  "display_name": "my-sandbox",
+  "project_id": "my-project",
+  "base_image": "ubuntu:22.04",
+  "layers": [],
+  "config": {
+    "tier": "xs",
+    "auto_rollout": true,
+    "rootfs_size_gb": 2
+  }
+}
+```
+
+**Response (201):**
+```json
+{
+  "config_id": "my-sandbox",
+  "leaf_workload_key": "bf583f0c952897a5",
+  "layers": [{"name": "_platform", "hash": "...", "status": "active", "depth": 0}]
+}
+```
+
 #### `GET /api/v1/versions/desired`
 Get desired snapshot versions for fleet rollout.
 
 #### `GET /api/v1/versions/fleet`
 Get fleet version convergence status.
+
+---
+
+#### `GET /api/v1/access-planes`
+List all registered project access planes.
+
+**Response:**
+```json
+{
+  "access_planes": [
+    {
+      "project_id": "my-project",
+      "access_plane_addr": "http://10.0.16.7:8080",
+      "proxy_addr": "10.0.16.7:3128",
+      "attestation_secret_ref": "secret-uuid-...",
+      "ca_cert_pem": "",
+      "tenant_id": "my-tenant",
+      "created_at": "2026-04-02T06:14:06Z",
+      "updated_at": "2026-04-02T06:14:06Z"
+    }
+  ],
+  "count": 1
+}
+```
+
+#### `POST /api/v1/access-planes`
+Register or update a project's access plane configuration. Used by the scheduler to resolve access plane info when allocating runners.
+
+**Request:**
+```json
+{
+  "project_id": "my-project",
+  "access_plane_addr": "http://10.0.16.7:8080",
+  "proxy_addr": "10.0.16.7:3128",
+  "attestation_secret_ref": "secret-uuid-here",
+  "ca_cert_pem": "",
+  "tenant_id": "my-tenant"
+}
+```
+
+**Response (201):** `{"project_id": "my-project", "status": "ok"}`
+
+#### `GET /api/v1/access-planes/{project_id}`
+Get a specific project's access plane configuration.
+
+#### `DELETE /api/v1/access-planes/{project_id}`
+Remove a project's access plane configuration.
 
 ---
 
@@ -404,7 +498,7 @@ The control plane passes configuration to the host agent via gRPC request labels
 
 | Service | Protocol | Default Port | Endpoints | Auth |
 |---|---|---|---|---|
-| Access Plane | HTTP + CONNECT | 8080, 3128 | 11 + proxy | HMAC bearer token |
-| Control Plane | HTTP | 8080 | ~14 | API bearer token |
+| Access Plane | HTTP + CONNECT | 8080, 3128 | 12 + proxy | HMAC bearer token (session-scoped) |
+| Control Plane | HTTP | 8080 | ~18 | API bearer token |
 | Host Agent | gRPC + HTTP | 50051, 8080 | 12 gRPC + 8 HTTP | Network-scoped |
 | Thaw Agent | HTTP | 10500, 10501 | ~13 | None (VM-internal) |

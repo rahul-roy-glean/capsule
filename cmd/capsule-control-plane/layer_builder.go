@@ -848,9 +848,6 @@ func (s *LayerBuildScheduler) onLeafLayerComplete(ctx context.Context, layerHash
 	if autoRollout {
 		s.logger.WithField("version", version).Info("Auto-rollout: setting active snapshot")
 		s.snapshotManager.SetActiveSnapshotForKey(ctx, workloadKey, version)
-		if err := s.snapshotManager.AssignVersion(ctx, workloadKey, nil, version); err != nil {
-			return fmt.Errorf("failed to assign fleet-wide desired version: %w", err)
-		}
 	}
 
 	// Clean up draining workload_keys for configs that use this leaf
@@ -898,8 +895,6 @@ func (s *LayerBuildScheduler) cleanupDrainingWorkloadKeys(ctx context.Context, c
 
 		if otherCount == 0 {
 			// No active config uses this workload_key — safe to clean up
-			s.db.ExecContext(ctx,
-				`DELETE FROM version_assignments WHERE workload_key = $1`, drainingWK)
 			s.db.ExecContext(ctx,
 				`UPDATE snapshots SET status='deprecated'
 				 WHERE workload_key = $1 AND status = 'active'`, drainingWK)

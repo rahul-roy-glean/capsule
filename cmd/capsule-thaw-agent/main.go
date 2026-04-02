@@ -1605,7 +1605,17 @@ func configureAuthProxy(data *MMDSData) error {
 	}
 	caCertPEM := data.Latest.Proxy.CACertPEM
 
-	// 1. Install the proxy CA certificate so TLS verification passes through the MITM proxy
+	// 1. Install the proxy CA certificate so TLS verification passes through the MITM proxy.
+	// If no CA PEM is in MMDS, fetch it from the access plane API directly.
+	if caCertPEM == "" && data.Latest.Proxy.APIEndpoint != "" {
+		fetchedPEM, err := fetchCACert(data.Latest.Proxy.APIEndpoint)
+		if err != nil {
+			log.WithError(err).Warn("Failed to fetch CA cert from access plane")
+		} else {
+			caCertPEM = fetchedPEM
+			log.Info("Fetched CA cert from access plane /v1/ca.pem")
+		}
+	}
 	if caCertPEM != "" {
 		certDir := "/usr/local/share/ca-certificates"
 		if err := os.MkdirAll(certDir, 0755); err != nil {
@@ -1646,22 +1656,33 @@ func configureAuthProxy(data *MMDSData) error {
 	// commands, /exec requests, start_command workloads) route through the
 	// access plane CONNECT proxy. Also stored in globalProxyEnv for warmup
 	// shell commands.
+	//
+	// If an attestation token is available, embed it in the proxy URL as
+	// credentials (http://bearer:TOKEN@host:port). This causes HTTP clients
+	// to send Proxy-Authorization: Basic base64(bearer:TOKEN), which the
+	// access plane extracts to identify the session.
+	proxyURL := proxyAddr
+	attestationToken := data.Latest.Proxy.AttestationToken
+	if attestationToken != "" {
+		// Use URL userinfo to pass the token as Proxy-Authorization
+		proxyURL = strings.Replace(proxyAddr, "://", "://bearer:"+attestationToken+"@", 1)
+	}
 	noProxy := "169.254.169.254,localhost,127.0.0.1"
 
-	os.Setenv("HTTPS_PROXY", proxyAddr)
-	os.Setenv("HTTP_PROXY", proxyAddr)
-	os.Setenv("https_proxy", proxyAddr)
-	os.Setenv("http_proxy", proxyAddr)
+	os.Setenv("HTTPS_PROXY", proxyURL)
+	os.Setenv("HTTP_PROXY", proxyURL)
+	os.Setenv("https_proxy", proxyURL)
+	os.Setenv("http_proxy", proxyURL)
 	os.Setenv("NO_PROXY", noProxy)
 	os.Setenv("no_proxy", noProxy)
 
 	// globalProxyEnv is still populated for warmup shell commands that
 	// build env from scratch (runShellCommand appends these).
 	globalProxyEnv = []string{
-		"HTTPS_PROXY=" + proxyAddr,
-		"HTTP_PROXY=" + proxyAddr,
-		"https_proxy=" + proxyAddr,
-		"http_proxy=" + proxyAddr,
+		"HTTPS_PROXY=" + proxyURL,
+		"HTTP_PROXY=" + proxyURL,
+		"https_proxy=" + proxyURL,
+		"http_proxy=" + proxyURL,
 		"NO_PROXY=" + noProxy,
 		"no_proxy=" + noProxy,
 	}
@@ -1747,6 +1768,29 @@ func fetchPhantomEnv(apiEndpoint, attestationToken string) (map[string]string, e
 
 	log.WithField("count", len(envVars)).Info("Fetched phantom env vars from access plane")
 	return envVars, nil
+}
+
+// fetchCACert fetches the CONNECT proxy's CA certificate from the access plane.
+// This is called before the proxy env vars are set, so it uses a direct HTTP client.
+func fetchCACert(apiEndpoint string) (string, error) {
+	url := strings.TrimRight(apiEndpoint, "/") + "/v1/ca.pem"
+	client := &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: &http.Transport{Proxy: nil},
+	}
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("fetch ca.pem: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read ca.pem: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ca.pem returned %d: %s", resp.StatusCode, string(body))
+	}
+	return string(body), nil
 }
 
 // runStreamedCommand runs a command, capturing stdout/stderr line by line

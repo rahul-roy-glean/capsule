@@ -15,6 +15,7 @@ import (
 // These are read on every runner allocation and rarely change.
 type WorkloadConfig struct {
 	WorkloadKey          string
+	ProjectID            string
 	Tier                 string
 	StartCommand         *snapshot.StartCommand
 	RunnerTTLSeconds     int
@@ -58,7 +59,7 @@ func (cc *ConfigCache) loadFromDB() {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
-	lcRows, err := cc.db.Query(`SELECT DISTINCT ON (leaf_workload_key) leaf_workload_key, tier, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy, config_json FROM layered_configs ORDER BY leaf_workload_key, created_at DESC`)
+	lcRows, err := cc.db.Query(`SELECT DISTINCT ON (leaf_workload_key) leaf_workload_key, tier, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy, config_json, COALESCE(project_id, '') FROM layered_configs ORDER BY leaf_workload_key, created_at DESC`)
 	if err == nil {
 		defer lcRows.Close()
 		for lcRows.Next() {
@@ -67,7 +68,7 @@ func (cc *ConfigCache) loadFromDB() {
 			var npPreset sql.NullString
 			var npJSON sql.NullString
 			var configJSON sql.NullString
-			if err := lcRows.Scan(&wc.WorkloadKey, &wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON, &configJSON); err != nil {
+			if err := lcRows.Scan(&wc.WorkloadKey, &wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON, &configJSON, &wc.ProjectID); err != nil {
 				continue
 			}
 			if startCmdJSON.Valid && startCmdJSON.String != "" {
@@ -89,7 +90,7 @@ func (cc *ConfigCache) loadFromDB() {
 	cwkRows, err := cc.db.Query(`
 		SELECT cwk.leaf_workload_key, lc.tier, lc.start_command, lc.runner_ttl_seconds,
 		       lc.session_max_age_seconds, lc.auto_pause, lc.max_concurrent_runners,
-		       lc.network_policy_preset, lc.network_policy, lc.config_json
+		       lc.network_policy_preset, lc.network_policy, lc.config_json, COALESCE(lc.project_id, '')
 		FROM config_workload_keys cwk
 		JOIN layered_configs lc ON lc.config_id = cwk.config_id
 		WHERE cwk.leaf_workload_key NOT IN (SELECT leaf_workload_key FROM layered_configs)`)
@@ -101,7 +102,7 @@ func (cc *ConfigCache) loadFromDB() {
 			var npPreset sql.NullString
 			var npJSON sql.NullString
 			var configJSON sql.NullString
-			if err := cwkRows.Scan(&wc.WorkloadKey, &wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON, &configJSON); err != nil {
+			if err := cwkRows.Scan(&wc.WorkloadKey, &wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON, &configJSON, &wc.ProjectID); err != nil {
 				continue
 			}
 			if startCmdJSON.Valid && startCmdJSON.String != "" {
@@ -157,19 +158,19 @@ func (cc *ConfigCache) loadWorkloadConfigFromDB(ctx context.Context, workloadKey
 	// Try layered_configs by direct leaf_workload_key match first
 	var configJSON sql.NullString
 	err := cc.db.QueryRowContext(ctx,
-		`SELECT tier, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy, config_json
+		`SELECT tier, start_command, runner_ttl_seconds, session_max_age_seconds, auto_pause, max_concurrent_runners, network_policy_preset, network_policy, config_json, COALESCE(project_id, '')
 		 FROM layered_configs WHERE leaf_workload_key = $1 ORDER BY created_at DESC LIMIT 1`, workloadKey).Scan(
-		&wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON, &configJSON)
+		&wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON, &configJSON, &wc.ProjectID)
 	if err != nil {
 		// Fallback: the workload_key may be from a previous config version (draining).
 		// Look up the config_id via config_workload_keys, then load the current config.
 		err = cc.db.QueryRowContext(ctx,
-			`SELECT lc.tier, lc.start_command, lc.runner_ttl_seconds, lc.session_max_age_seconds, lc.auto_pause, lc.max_concurrent_runners, lc.network_policy_preset, lc.network_policy, lc.config_json
+			`SELECT lc.tier, lc.start_command, lc.runner_ttl_seconds, lc.session_max_age_seconds, lc.auto_pause, lc.max_concurrent_runners, lc.network_policy_preset, lc.network_policy, lc.config_json, COALESCE(lc.project_id, '')
 			 FROM config_workload_keys cwk
 			 JOIN layered_configs lc ON lc.config_id = cwk.config_id
 			 WHERE cwk.leaf_workload_key = $1
 			 ORDER BY lc.created_at DESC LIMIT 1`, workloadKey).Scan(
-			&wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON, &configJSON)
+			&wc.Tier, &startCmdJSON, &wc.RunnerTTLSeconds, &wc.SessionMaxAgeSeconds, &wc.AutoPause, &wc.MaxConcurrentRunners, &npPreset, &npJSON, &configJSON, &wc.ProjectID)
 		if err != nil {
 			return nil
 		}
