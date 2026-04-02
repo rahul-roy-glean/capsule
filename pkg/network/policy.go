@@ -219,6 +219,7 @@ const (
 	PresetQuarantine       = "quarantine"
 	PresetRestrictedEgress = "restricted-egress"
 	PresetAgentSandbox     = "agent-sandbox"
+	PresetAccessPlaneOnly  = "access-plane-only"
 )
 
 // GetPreset returns a named preset policy. Returns nil for unknown names.
@@ -234,6 +235,31 @@ func GetPreset(name string) *NetworkPolicy {
 		return presetAgentSandbox()
 	default:
 		return nil
+	}
+}
+
+// AccessPlaneOnlyPolicy creates a deny-all policy that only allows egress to
+// the given access plane IP on ports 8080 (HTTP API) and 3128 (CONNECT proxy).
+// DNS is allowed so the VM can resolve hostnames (the proxy handles the actual
+// outbound connections).
+func AccessPlaneOnlyPolicy(accessPlaneIP string) *NetworkPolicy {
+	return &NetworkPolicy{
+		Name:                "access-plane-only",
+		DefaultEgressAction: PolicyActionDeny,
+		AllowedEgress: []EgressRule{
+			{
+				Description: "Access plane HTTP API + CONNECT proxy",
+				CIDRs:       []string{accessPlaneIP + "/32"},
+				Ports:       []PortRange{{Start: 8080}, {Start: 3128}},
+				Protocols:   []string{"tcp"},
+			},
+			{
+				Description: "DNS",
+				CIDRs:       []string{"0.0.0.0/0"},
+				Ports:       []PortRange{{Start: 53}},
+				Protocols:   []string{"udp", "tcp"},
+			},
+		},
 	}
 }
 

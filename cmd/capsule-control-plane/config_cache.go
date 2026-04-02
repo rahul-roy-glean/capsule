@@ -27,11 +27,12 @@ type WorkloadConfig struct {
 
 	// Access plane fields — loaded from project_access_planes table
 	// based on the project that owns this workload.
-	AccessPlaneAddr      string // HTTP API address (e.g. "http://access-plane:8080")
-	AccessPlaneProxyAddr string // CONNECT proxy address (e.g. "access-plane:3128")
-	AttestationSecret    string // HMAC secret for minting runner tokens
-	CACertPEM            string // CA cert for SSL bump
-	TenantID             string // Tenant identifier for the access plane
+	AccessPlaneAddr      string                               // HTTP API address (e.g. "http://access-plane:8080")
+	AccessPlaneProxyAddr string                               // CONNECT proxy address (e.g. "access-plane:3128")
+	AttestationSecret    string                               // HMAC secret for minting runner tokens
+	CACertPEM            string                               // CA cert for SSL bump
+	TenantID             string                               // Tenant identifier for the access plane
+	Families             map[string]snapshot.FamilyCredential // family name -> credential ref
 }
 
 // ConfigCache provides in-memory lookup for workload_key→config metadata.
@@ -81,6 +82,12 @@ func (cc *ConfigCache) loadFromDB() {
 			if npJSON.Valid {
 				wc.NetworkPolicyJSON = npJSON.String
 			}
+			if configJSON.Valid && configJSON.String != "" {
+				var cfg snapshot.LayeredConfig
+				if json.Unmarshal([]byte(configJSON.String), &cfg) == nil && len(cfg.Config.Families) > 0 {
+					wc.Families = cfg.Config.Families
+				}
+			}
 			cc.workloadConfig[wc.WorkloadKey] = &wc
 		}
 	}
@@ -114,6 +121,12 @@ func (cc *ConfigCache) loadFromDB() {
 			}
 			if npJSON.Valid {
 				wc.NetworkPolicyJSON = npJSON.String
+			}
+			if configJSON.Valid && configJSON.String != "" {
+				var cfg snapshot.LayeredConfig
+				if json.Unmarshal([]byte(configJSON.String), &cfg) == nil && len(cfg.Config.Families) > 0 {
+					wc.Families = cfg.Config.Families
+				}
 			}
 			// Only add if not already loaded from layered_configs (active takes precedence)
 			if _, exists := cc.workloadConfig[wc.WorkloadKey]; !exists {
@@ -184,6 +197,12 @@ func (cc *ConfigCache) loadWorkloadConfigFromDB(ctx context.Context, workloadKey
 	}
 	if npJSON.Valid {
 		wc.NetworkPolicyJSON = npJSON.String
+	}
+	if configJSON.Valid && configJSON.String != "" {
+		var cfg snapshot.LayeredConfig
+		if json.Unmarshal([]byte(configJSON.String), &cfg) == nil && len(cfg.Config.Families) > 0 {
+			wc.Families = cfg.Config.Families
+		}
 	}
 	return &wc
 }

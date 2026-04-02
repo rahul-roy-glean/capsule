@@ -736,6 +736,7 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		SessionID           string            `json:"session_id"`
 		NetworkPolicyPreset string            `json:"network_policy_preset"`
 		NetworkPolicyJSON   string            `json:"network_policy_json"`
+		FamilyTokens        map[string]string `json:"family_tokens"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
@@ -766,6 +767,7 @@ func (s *ControlPlaneServer) HandleAllocateRunner(w http.ResponseWriter, r *http
 		SessionID:           req.SessionID,
 		NetworkPolicyPreset: req.NetworkPolicyPreset,
 		NetworkPolicyJSON:   req.NetworkPolicyJSON,
+		FamilyTokens:        req.FamilyTokens,
 	})
 	if err != nil {
 		s.logger.WithError(err).Error("Manual allocation failed")

@@ -175,7 +175,9 @@ Tokens can be scoped per-session using `session_id` (preferred), per-source usin
 #### `GET /v1/phantom-env`
 Get phantom environment variables for CLI tools. No auth required.
 
-**Query params:** `families` (optional, comma-separated: `gcp_cli_read,github_rest`)
+**Query params:**
+- `families` (optional, comma-separated: `gcp_cli_read,github_rest`)
+- `session_id` (optional) — scope to the session's allowed families. If provided, only families in the session's policy are included.
 
 **Response (200):**
 ```json
@@ -184,6 +186,101 @@ Get phantom environment variables for CLI tools. No auth required.
   "CLOUDSDK_CORE_PROJECT": "phantom"
 }
 ```
+
+---
+
+#### `POST /v1/sessions/{id}/policy`
+Set a session's allowed families and credentials. Called by the control plane after runner allocation.
+
+**Request:**
+```json
+{
+  "families": {
+    "github_rest": {"token": "ghs_xxxxxxxxxxxx"},
+    "gcp_cli_read": {"credential_ref": "sm:my-project/gcp-sa-key"},
+    "slack_api": {}
+  }
+}
+```
+
+Per-family value shapes:
+
+| Shape | Meaning |
+|---|---|
+| `{"token": "..."}` | Delegated — use this token for credential injection |
+| `{"credential_ref": "sm:..."}` | Managed — access plane resolves the secret ref |
+| `{}` | Auto-minting — access plane provider handles token generation |
+
+**Response (200):** `{"status": "ok", "session_id": "sess-1"}`
+
+**Error codes:** 400 (unknown family name), 404 (session not found)
+
+---
+
+#### `GET /v1/sessions/{id}/policy`
+Get a session's current policy.
+
+**Response (200):**
+```json
+{
+  "session_id": "sess-1",
+  "families": ["github_rest", "gcp_cli_read", "slack_api"]
+}
+```
+
+**Error codes:** 404 (no policy set)
+
+---
+
+#### `DELETE /v1/sessions/{id}/policy`
+Revoke a session's policy. The session loses access to all families.
+
+**Response (200):** `{"status": "revoked", "session_id": "sess-1"}`
+
+---
+
+#### `GET /v1/families`
+List all available families (YAML base + API-created dynamic).
+
+**Response (200):**
+```json
+{
+  "families": [
+    {"name": "github_rest", "source": "yaml"},
+    {"name": "custom_api", "source": "api"}
+  ]
+}
+```
+
+---
+
+#### `GET /v1/families/{name}`
+Get a single family definition (full manifest JSON).
+
+---
+
+#### `POST /v1/families`
+Create or update a dynamic family. Cannot override YAML-defined families.
+
+**Request:**
+```json
+{
+  "family": "custom_api",
+  "destinations": [{"host": "api.custom.com", "port": 443}],
+  "provider": {"type": "delegated", "name": "custom"}
+}
+```
+
+**Response (201):** `{"family": "custom_api", "status": "created"}`
+
+**Error codes:** 400 (validation error), 409 (conflicts with YAML base family)
+
+---
+
+#### `DELETE /v1/families/{name}`
+Remove an API-created family. Returns 409 if the family is YAML-defined.
+
+**Response (204):** No content
 
 ---
 
@@ -258,9 +355,23 @@ Allocate a runner. Handles scheduling, session resume, and host selection.
   "labels": {"env": "prod"},
   "session_id": "sess-1",
   "network_policy_preset": "agent-sandbox",
-  "network_policy_json": ""
+  "network_policy_json": "",
+  "family_tokens": {
+    "github_rest": "ghs_xxxxxxxxxxxx"
+  }
 }
 ```
+
+| Field | Required | Description |
+|---|---|---|
+| `request_id` | Yes | Idempotency key (deduplicates within 5 min) |
+| `workload_key` | Yes | Workload to allocate |
+| `session_id` | No | Existing session ID for resume |
+| `network_policy_preset` | No | Named network policy preset |
+| `network_policy_json` | No | Full network policy JSON override |
+| `family_tokens` | No | Per-family delegated tokens (e.g. `{"github_rest": "ghs_..."}`) |
+
+When `family_tokens` is provided, the control plane merges them with the workload's configured families and pushes the session policy to the access plane (`POST /v1/sessions/{session_id}/policy`). Families with `credential_ref` in the config are forwarded as-is for the access plane to resolve.
 
 **Response (200):**
 ```json
@@ -335,10 +446,22 @@ Register or update a layered snapshot configuration.
   "config": {
     "tier": "xs",
     "auto_rollout": true,
-    "rootfs_size_gb": 2
+    "rootfs_size_gb": 2,
+    "families": {
+      "github_rest": {},
+      "gcp_cli_read": {"credential_ref": "sm:my-project/gcp-sa-key"},
+      "slack_api": {"credential_ref": "sm:my-project/slack-token"}
+    }
   }
 }
 ```
+
+`config.families` declares which API families the workload uses:
+
+| Family value | Meaning |
+|---|---|
+| `{}` | Delegated (token from caller at allocation) or auto-minting (access plane provider handles it) |
+| `{"credential_ref": "sm:..."}` | Managed — access plane resolves the secret ref at runtime |
 
 **Response (201):**
 ```json
@@ -498,7 +621,7 @@ The control plane passes configuration to the host agent via gRPC request labels
 
 | Service | Protocol | Default Port | Endpoints | Auth |
 |---|---|---|---|---|
-| Access Plane | HTTP + CONNECT | 8080, 3128 | 12 + proxy | HMAC bearer token (session-scoped) |
+| Access Plane | HTTP + CONNECT | 8080, 3128 | ~20 + proxy | HMAC bearer token (session-scoped) |
 | Control Plane | HTTP | 8080 | ~18 | API bearer token |
 | Host Agent | gRPC + HTTP | 50051, 8080 | 12 gRPC + 8 HTTP | Network-scoped |
 | Thaw Agent | HTTP | 10500, 10501 | ~13 | None (VM-internal) |

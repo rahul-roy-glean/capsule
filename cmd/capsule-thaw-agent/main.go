@@ -1698,7 +1698,7 @@ func configureAuthProxy(data *MMDSData) error {
 	// These replace the old AuthEnv / metadata host approach — the access plane
 	// returns environment variables that tools (gh, gcloud, pip, etc.) need.
 	if data.Latest.Proxy.APIEndpoint != "" && data.Latest.Proxy.AttestationToken != "" {
-		phantomEnv, err := fetchPhantomEnv(data.Latest.Proxy.APIEndpoint, data.Latest.Proxy.AttestationToken)
+		phantomEnv, err := fetchPhantomEnv(data.Latest.Proxy.APIEndpoint, data.Latest.Proxy.AttestationToken, data.Latest.Meta.JobID)
 		if err != nil {
 			log.WithError(err).Warn("Failed to fetch phantom env vars from access plane (auth may not work)")
 		} else {
@@ -1730,8 +1730,11 @@ func configureAuthProxy(data *MMDSData) error {
 // fetchPhantomEnv calls the access plane API to retrieve phantom environment
 // variables. These are credential-bearing env vars (e.g. GH_TOKEN, GOOGLE_APPLICATION_CREDENTIALS)
 // that the access plane manages on behalf of the tenant.
-func fetchPhantomEnv(apiEndpoint, attestationToken string) (map[string]string, error) {
+func fetchPhantomEnv(apiEndpoint, attestationToken, sessionID string) (map[string]string, error) {
 	url := strings.TrimRight(apiEndpoint, "/") + "/v1/phantom-env"
+	if sessionID != "" {
+		url += "?session_id=" + sessionID
+	}
 
 	// Use a direct HTTP client that bypasses proxy env vars — the access plane
 	// API endpoint may not be reachable through the CONNECT proxy itself.

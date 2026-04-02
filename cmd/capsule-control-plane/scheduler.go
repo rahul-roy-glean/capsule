@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -8,6 +9,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -24,6 +28,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/rahul-roy-glean/capsule/api/proto/runner"
+	"github.com/rahul-roy-glean/capsule/pkg/network"
 	fcrotel "github.com/rahul-roy-glean/capsule/pkg/otel"
 	"github.com/rahul-roy-glean/capsule/pkg/snapshot"
 	"github.com/rahul-roy-glean/capsule/pkg/tiers"
@@ -223,6 +228,7 @@ type AllocateRunnerRequest struct {
 	MemoryMB            int
 	NetworkPolicyPreset string
 	NetworkPolicyJSON   string
+	FamilyTokens        map[string]string // per-family delegated tokens from caller
 }
 
 // AllocateRunnerResponse represents the response from runner allocation
@@ -447,6 +453,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 	var configNetworkPolicyJSON string
 	var accessPlaneInfo *AccessPlaneInfo
 	var resolvedProjectID string
+	var configFamilies map[string]snapshot.FamilyCredential
 	if workloadKey != "" {
 		var wc *WorkloadConfig
 		if s.configCache != nil {
@@ -460,6 +467,7 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			configNetworkPolicyPreset = wc.NetworkPolicyPreset
 			configNetworkPolicyJSON = wc.NetworkPolicyJSON
 			resolvedProjectID = wc.ProjectID
+			configFamilies = wc.Families
 			if wc.MaxConcurrentRunners > 0 && s.db != nil {
 				var currentCount int
 				_ = s.db.QueryRowContext(ctx, `
@@ -729,6 +737,20 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 		if err == nil {
 			protoReq.Labels["_attestation_token"] = token
 		}
+
+		// Auto-apply access-plane-only network policy: deny all egress except
+		// the access plane IP. Only set if no explicit policy was configured.
+		if effectiveNPPreset == "" && effectiveNPJSON == "" {
+			apIP := accessPlaneInfo.Addr
+			// Extract IP from addr (may be "http://10.0.16.7:8080")
+			apIP = strings.TrimPrefix(apIP, "http://")
+			apIP = strings.TrimPrefix(apIP, "https://")
+			if host, _, err := net.SplitHostPort(apIP); err == nil {
+				apIP = host
+			}
+			npBytes, _ := json.Marshal(network.AccessPlaneOnlyPolicy(apIP))
+			protoReq.Labels["_network_policy_json"] = string(npBytes)
+		}
 	}
 	// Pass base image migration info via labels so the host agent can do a
 	// migrated fresh boot (new golden snapshot + old session extension drives).
@@ -935,6 +957,13 @@ func (s *Scheduler) AllocateRunner(ctx context.Context, req AllocateRunnerReques
 			_, _ = s.db.ExecContext(ctx,
 				`UPDATE session_snapshots SET workload_key = $1, status = 'active', host_id = $2 WHERE session_id = $3`,
 				workloadKey, h.ID, req.SessionID)
+		}
+
+		// Push session policy to access plane (async, best-effort).
+		// This tells the access plane which families/credentials the
+		// session is allowed to use.
+		if accessPlaneInfo != nil && (len(configFamilies) > 0 || len(req.FamilyTokens) > 0) && req.SessionID != "" {
+			go s.pushSessionPolicy(accessPlaneInfo, req.SessionID, configFamilies, req.FamilyTokens)
 		}
 
 		return allocatedResp, nil
@@ -1259,4 +1288,63 @@ func mintAttestationToken(runnerID, sessionID, tenantID string, secret []byte) (
 	mac.Write(payload)
 	sig := mac.Sum(nil)
 	return base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(sig), nil
+}
+
+// pushSessionPolicy calls POST /v1/sessions/{id}/policy on the access plane to
+// set the session's allowed families and credentials. Best-effort: failures are
+// logged but don't block the allocation response.
+//
+// configFamilies come from the workload's layered config (credential_refs).
+// familyTokens come from the caller's allocation request (delegated tokens).
+// Delegated tokens override credential_refs for the same family.
+func (s *Scheduler) pushSessionPolicy(apInfo *AccessPlaneInfo, sessionID string, configFamilies map[string]snapshot.FamilyCredential, familyTokens map[string]string) {
+	policyFamilies := make(map[string]map[string]string, len(configFamilies)+len(familyTokens))
+
+	// Start with config-declared families (credential_refs).
+	for name, fc := range configFamilies {
+		entry := map[string]string{}
+		if fc.CredentialRef != "" {
+			entry["credential_ref"] = fc.CredentialRef
+		}
+		policyFamilies[name] = entry
+	}
+
+	// Merge caller-provided delegated tokens (override credential_ref if both set).
+	for name, token := range familyTokens {
+		policyFamilies[name] = map[string]string{"token": token}
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"families": policyFamilies,
+	})
+	if err != nil {
+		s.logger.WithError(err).Warn("Failed to marshal session policy")
+		return
+	}
+
+	url := strings.TrimRight(apInfo.Addr, "/") + "/v1/sessions/" + sessionID + "/policy"
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		s.logger.WithError(err).Warn("Failed to create session policy request")
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		s.logger.WithError(err).WithField("session_id", sessionID).Warn("Failed to push session policy to access plane")
+		return
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode >= 300 {
+		s.logger.WithFields(logrus.Fields{
+			"session_id":  sessionID,
+			"status_code": resp.StatusCode,
+		}).Warn("Access plane rejected session policy")
+	}
 }

@@ -332,6 +332,7 @@ func (r *LayeredConfigRegistry) RegisterLayeredConfig(ctx context.Context, cfg *
 			MaxConcurrentRunners: 0,
 			NetworkPolicyPreset:  cfg.Config.NetworkPolicyPreset,
 			NetworkPolicyJSON:    npJSON,
+			Families:             cfg.Config.Families,
 		})
 	}
 	return configID, leafWorkloadKey, nil
