@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
       - run: helm lint deploy/helm/capsule
 
   build-candidates:
@@ -73,7 +73,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
 
       - uses: docker/setup-buildx-action@v3
 
