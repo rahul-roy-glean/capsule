@@ -172,9 +172,87 @@ class Runners:
             self._host_cache[result.runner_id] = result.host_address
         return result
 
-    def list(self) -> list[Runner]:
-        data = self._http.get("/api/v1/runners")
+    def list(
+        self,
+        *,
+        detail: bool = False,
+        limit: int | None = None,
+        cursor: str | None = None,
+        status: str | None = None,
+        host_id: str | None = None,
+        workload_key: str | None = None,
+    ) -> list[Runner]:
+        """List runners with optional filtering and pagination.
+
+        Args:
+            detail: If True, fetch enriched runner details (sessions, resources, etc.)
+            limit: Maximum number of runners to return (default: 50, max: 200)
+            cursor: Pagination cursor from previous response
+            status: Filter by runner status
+            host_id: Filter by host ID
+            workload_key: Filter by workload key
+
+        Returns:
+            List of Runner objects. Use the returned pagination info for subsequent pages.
+        """
+        params: dict[str, str] = {}
+        if detail:
+            params["detail"] = "full"
+        if limit is not None:
+            params["limit"] = str(limit)
+        if cursor:
+            params["cursor"] = cursor
+        if status:
+            params["status"] = status
+        if host_id:
+            params["host_id"] = host_id
+        if workload_key:
+            params["workload_key"] = workload_key
+
+        data = self._http.get("/api/v1/runners", params=params)
         return RunnerListResponse.model_validate(data).runners
+
+    def list_paginated(
+        self,
+        *,
+        detail: bool = False,
+        limit: int | None = None,
+        cursor: str | None = None,
+        status: str | None = None,
+        host_id: str | None = None,
+        workload_key: str | None = None,
+    ) -> RunnerListResponse:
+        """List runners with pagination metadata.
+
+        Same as list() but returns the full response including pagination info.
+
+        Args:
+            detail: If True, fetch enriched runner details (sessions, resources, etc.)
+            limit: Maximum number of runners to return (default: 50, max: 200)
+            cursor: Pagination cursor from previous response
+            status: Filter by runner status
+            host_id: Filter by host ID
+            workload_key: Filter by workload key
+
+        Returns:
+            RunnerListResponse with runners and pagination metadata.
+        """
+        params: dict[str, str] = {}
+        if detail:
+            params["detail"] = "full"
+        if limit is not None:
+            params["limit"] = str(limit)
+        if cursor:
+            params["cursor"] = cursor
+        if status:
+            params["status"] = status
+        if host_id:
+            params["host_id"] = host_id
+        if workload_key:
+            params["workload_key"] = workload_key
+
+        data = self._http.get("/api/v1/runners", params=params)
+        return RunnerListResponse.model_validate(data)
 
     def release(self, runner_id: str) -> bool:
         data = self._http.post("/api/v1/runners/release", json_body={"runner_id": runner_id})

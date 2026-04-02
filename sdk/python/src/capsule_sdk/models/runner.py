@@ -30,16 +30,65 @@ class RunnerState(str, Enum):
     unavailable = "unavailable"
 
 
+class SessionDetail(CapsuleModel):
+    """Session information for a runner."""
+
+    session_id: str
+    status: str = "active"
+    paused_at: str | None = None
+    layer_count: int = 0
+
+
+class HostDetail(CapsuleModel):
+    """Detailed host information."""
+
+    zone: str
+    snapshot_version: str | None = None
+    last_heartbeat: str | None = None
+    last_heartbeat_age_seconds: int | None = None
+    is_healthy: bool = False
+
+
+class ResourceInfo(CapsuleModel):
+    """Resource utilization details."""
+
+    cpu_reserved: int = 0
+    cpu_used: int | None = None
+    memory_reserved_mb: int = 0
+    memory_used_mb: int | None = None
+    tier: str | None = None
+
+
+class ConfigInfo(CapsuleModel):
+    """Runner configuration details."""
+
+    runner_ttl_seconds: int = 0
+    auto_pause: bool = False
+    network_policy_preset: str | None = None
+
+
 class Runner(CapsuleModel):
     """A runner instance."""
 
     runner_id: str | None = None
     host_id: str | None = None
     host_address: str | None = None
+    host_name: str | None = None
     status: str | None = None
+    workload_key: str | None = None
     internal_ip: str | None = None
     session_id: str | None = None
     resumed: bool | None = None
+    # Enriched fields (available when detail=full)
+    created_at: str | None = None
+    age_seconds: int | None = None
+    uptime_seconds: int | None = None
+    idle_for_seconds: int | None = None
+    sessions: list[SessionDetail] | None = None
+    resources: ResourceInfo | None = None
+    host: HostDetail | None = None
+    config: ConfigInfo | None = None
+    job_id: str | None = None
 
 
 class AllocateRunnerRequest(CapsuleModel):
@@ -83,11 +132,20 @@ class PauseResult(CapsuleModel):
     layer: int | None = None
 
 
+class PaginationInfo(CapsuleModel):
+    """Pagination metadata."""
+
+    next_cursor: str | None = None
+    has_more: bool = False
+    total_count: int | None = None
+
+
 class RunnerListResponse(CapsuleModel):
     """Response from listing runners."""
 
     runners: list[Runner] = Field(default_factory=_empty_runners)
     count: int | None = None
+    pagination: PaginationInfo | None = None
 
 
 class ExecRequest(CapsuleModel):

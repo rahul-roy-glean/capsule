@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -688,33 +689,424 @@ func (s *ControlPlaneServer) GetSnapshot(ctx context.Context, req *pb.GetSnapsho
 
 // HTTP Handlers
 
+// SessionDetail contains session information for a runner
+type SessionDetail struct {
+	SessionID string     `json:"session_id"`
+	Status    string     `json:"status"`
+	PausedAt  *time.Time `json:"paused_at,omitempty"`
+	LayerCount int       `json:"layer_count"`
+}
+
+// HostDetail contains detailed host information
+type HostDetail struct {
+	Zone                  string     `json:"zone"`
+	SnapshotVersion       string     `json:"snapshot_version,omitempty"`
+	LastHeartbeat         *time.Time `json:"last_heartbeat,omitempty"`
+	LastHeartbeatAgeSeconds *int     `json:"last_heartbeat_age_seconds,omitempty"`
+	IsHealthy             bool       `json:"is_healthy"`
+}
+
+// ResourceInfo contains resource utilization details
+type ResourceInfo struct {
+	CPUReserved       int     `json:"cpu_reserved"`
+	CPUUsed           *int    `json:"cpu_used,omitempty"`
+	MemoryReservedMB  int     `json:"memory_reserved_mb"`
+	MemoryUsedMB      *int    `json:"memory_used_mb,omitempty"`
+	Tier              string  `json:"tier,omitempty"`
+}
+
+// ConfigInfo contains runner configuration details
+type ConfigInfo struct {
+	RunnerTTLSeconds    int    `json:"runner_ttl_seconds"`
+	AutoPause           bool   `json:"auto_pause"`
+	NetworkPolicyPreset string `json:"network_policy_preset,omitempty"`
+}
+
+// RunnerDetail contains enriched runner information
+type RunnerDetail struct {
+	RunnerID       string          `json:"runner_id"`
+	HostID         string          `json:"host_id"`
+	HostName       string          `json:"host_name,omitempty"`
+	WorkloadKey    string          `json:"workload_key"`
+	Status         string          `json:"status"`
+	CreatedAt      *time.Time      `json:"created_at,omitempty"`
+	AgeSeconds     *int            `json:"age_seconds,omitempty"`
+	UptimeSeconds  *int            `json:"uptime_seconds,omitempty"`
+	IdleForSeconds *int            `json:"idle_for_seconds,omitempty"`
+	Sessions       []SessionDetail `json:"sessions,omitempty"`
+	Resources      *ResourceInfo   `json:"resources,omitempty"`
+	Host           *HostDetail     `json:"host,omitempty"`
+	Config         *ConfigInfo     `json:"config,omitempty"`
+	JobID          string          `json:"job_id,omitempty"`
+	InternalIP     string          `json:"internal_ip,omitempty"`
+}
+
+// PaginationInfo contains pagination metadata
+type PaginationInfo struct {
+	NextCursor string `json:"next_cursor,omitempty"`
+	HasMore    bool   `json:"has_more"`
+	TotalCount *int   `json:"total_count,omitempty"`
+}
+
+// RunnersListResponse wraps the runners list with pagination
+type RunnersListResponse struct {
+	Runners    interface{}     `json:"runners"`
+	Count      int             `json:"count"`
+	Pagination *PaginationInfo `json:"pagination,omitempty"`
+}
+
+// RunnerFilters contains filtering parameters
+type RunnerFilters struct {
+	Status      string
+	HostID      string
+	WorkloadKey string
+}
+
+// buildRunnersCursor creates an opaque pagination cursor from runner_id and created_at
+func buildRunnersCursor(runnerID string, createdAt time.Time) string {
+	// Format: timestamp_runnerID
+	cursorData := fmt.Sprintf("%d_%s", createdAt.Unix(), runnerID)
+	return base64.URLEncoding.EncodeToString([]byte(cursorData))
+}
+
+// parseRunnersCursor decodes pagination cursor
+func parseRunnersCursor(cursor string) (createdAtUnix int64, runnerID string, err error) {
+	decoded, err := base64.URLEncoding.DecodeString(cursor)
+	if err != nil {
+		return 0, "", fmt.Errorf("invalid cursor encoding: %w", err)
+	}
+	parts := strings.SplitN(string(decoded), "_", 2)
+	if len(parts) != 2 {
+		return 0, "", fmt.Errorf("invalid cursor format")
+	}
+	timestamp, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, "", fmt.Errorf("invalid cursor timestamp: %w", err)
+	}
+	return timestamp, parts[1], nil
+}
+
 func (s *ControlPlaneServer) HandleGetRunners(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	hosts := s.hostRegistry.GetAllHosts()
-	allRunners := make([]map[string]interface{}, 0)
+	// Parse query parameters
+	queryParams := r.URL.Query()
+	detail := queryParams.Get("detail") == "full"
+	limitStr := queryParams.Get("limit")
+	cursor := queryParams.Get("cursor")
 
-	for _, h := range hosts {
-		s.hostRegistry.mu.RLock()
-		runnerInfos := h.RunnerInfos
-		s.hostRegistry.mu.RUnlock()
+	// Filtering params
+	filters := RunnerFilters{
+		Status:      queryParams.Get("status"),
+		HostID:      queryParams.Get("host_id"),
+		WorkloadKey: queryParams.Get("workload_key"),
+	}
 
-		for _, ri := range runnerInfos {
-			allRunners = append(allRunners, map[string]interface{}{
-				"runner_id":    ri.RunnerID,
-				"host_id":      h.ID,
-				"host_name":    h.InstanceName,
-				"workload_key": ri.WorkloadKey,
-				"status":       ri.State,
-			})
+	// Parse limit with defaults
+	limit := 50
+	if limitStr != "" {
+		if parsed, err := strconv.Atoi(limitStr); err == nil {
+			if parsed > 0 && parsed <= 200 {
+				limit = parsed
+			} else if parsed > 200 {
+				limit = 200
+			}
 		}
 	}
 
-	allRunners = nonNilSlice(allRunners)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"runners": allRunners,
-		"count":   len(allRunners),
-	})
+	if detail {
+		// Enriched path with database query
+		runners, pagination, err := s.getRunnersDetailed(r.Context(), limit, cursor, filters)
+		if err != nil {
+			s.logger.WithError(err).Error("Failed to fetch detailed runners")
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		response := RunnersListResponse{
+			Runners:    runners,
+			Count:      len(runners),
+			Pagination: pagination,
+		}
+		json.NewEncoder(w).Encode(response)
+	} else {
+		// Lightweight in-memory path (backward compatible)
+		hosts := s.hostRegistry.GetAllHosts()
+		allRunners := make([]map[string]interface{}, 0)
+
+		for _, h := range hosts {
+			s.hostRegistry.mu.RLock()
+			runnerInfos := h.RunnerInfos
+			s.hostRegistry.mu.RUnlock()
+
+			for _, ri := range runnerInfos {
+				// Apply filters
+				if filters.Status != "" && ri.State != filters.Status {
+					continue
+				}
+				if filters.HostID != "" && h.ID != filters.HostID {
+					continue
+				}
+				if filters.WorkloadKey != "" && ri.WorkloadKey != filters.WorkloadKey {
+					continue
+				}
+
+				allRunners = append(allRunners, map[string]interface{}{
+					"runner_id":    ri.RunnerID,
+					"host_id":      h.ID,
+					"host_name":    h.InstanceName,
+					"workload_key": ri.WorkloadKey,
+					"status":       ri.State,
+				})
+			}
+		}
+
+		// Apply pagination to in-memory results
+		total := len(allRunners)
+		var paginationInfo *PaginationInfo
+
+		// For simplicity, in-memory pagination uses offset-based approach
+		// We could enhance this to be cursor-based too
+		if limit < total {
+			allRunners = allRunners[:limit]
+			paginationInfo = &PaginationInfo{
+				HasMore: true,
+			}
+		} else {
+			paginationInfo = &PaginationInfo{
+				HasMore: false,
+			}
+		}
+
+		allRunners = nonNilSlice(allRunners)
+		response := RunnersListResponse{
+			Runners:    allRunners,
+			Count:      len(allRunners),
+			Pagination: paginationInfo,
+		}
+		json.NewEncoder(w).Encode(response)
+	}
+}
+
+// getRunnersDetailed fetches enriched runner data from the database with JOINs
+func (s *ControlPlaneServer) getRunnersDetailed(ctx context.Context, limit int, cursor string, filters RunnerFilters) ([]RunnerDetail, *PaginationInfo, error) {
+	query := `
+		SELECT
+			r.id, r.host_id, r.status, r.workload_key, r.created_at, r.started_at,
+			r.runner_ttl_seconds, r.auto_pause, r.network_policy_preset, r.job_id, r.internal_ip,
+			h.instance_name, h.zone, h.snapshot_version, h.last_heartbeat,
+			h.total_cpu_millicores, h.used_cpu_millicores,
+			h.total_memory_mb, h.used_memory_mb,
+			ss.session_id, ss.status AS session_status, ss.paused_at, ss.layer_count
+		FROM runners r
+		JOIN hosts h ON r.host_id = h.id
+		LEFT JOIN session_snapshots ss ON r.id = ss.runner_id
+		WHERE 1=1
+	`
+
+	args := []interface{}{}
+	argNum := 1
+
+	// Apply filters
+	if filters.Status != "" {
+		query += fmt.Sprintf(" AND r.status = $%d", argNum)
+		args = append(args, filters.Status)
+		argNum++
+	}
+	if filters.HostID != "" {
+		query += fmt.Sprintf(" AND r.host_id = $%d", argNum)
+		args = append(args, filters.HostID)
+		argNum++
+	}
+	if filters.WorkloadKey != "" {
+		query += fmt.Sprintf(" AND r.workload_key = $%d", argNum)
+		args = append(args, filters.WorkloadKey)
+		argNum++
+	}
+
+	// Apply cursor-based pagination
+	if cursor != "" {
+		createdAtUnix, runnerID, err := parseRunnersCursor(cursor)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid cursor: %w", err)
+		}
+		cursorTime := time.Unix(createdAtUnix, 0)
+		query += fmt.Sprintf(" AND (r.created_at, r.id) < ($%d, $%d)", argNum, argNum+1)
+		args = append(args, cursorTime, runnerID)
+		argNum += 2
+	}
+
+	// Order by created_at DESC, id DESC for stable pagination
+	query += " ORDER BY r.created_at DESC, r.id DESC"
+
+	// Fetch limit + 1 to determine if there are more results
+	query += fmt.Sprintf(" LIMIT $%d", argNum)
+	args = append(args, limit+1)
+
+	rows, err := s.scheduler.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("query failed: %w", err)
+	}
+	defer rows.Close()
+
+	runnerMap := make(map[string]*RunnerDetail)
+	var orderedIDs []string
+
+	for rows.Next() {
+		var (
+			runnerID, hostID, status, workloadKey, hostName, zone                    string
+			snapshotVersion, jobID, internalIP                                       sql.NullString
+			createdAt, startedAt, lastHeartbeat                                      sql.NullTime
+			runnerTTL, totalCPU, usedCPU, totalMem, usedMem, layerCount             sql.NullInt32
+			autoPause                                                                sql.NullBool
+			networkPolicyPreset                                                      sql.NullString
+			sessionID, sessionStatus                                                 sql.NullString
+			pausedAt                                                                 sql.NullTime
+		)
+
+		err := rows.Scan(
+			&runnerID, &hostID, &status, &workloadKey, &createdAt, &startedAt,
+			&runnerTTL, &autoPause, &networkPolicyPreset, &jobID, &internalIP,
+			&hostName, &zone, &snapshotVersion, &lastHeartbeat,
+			&totalCPU, &usedCPU, &totalMem, &usedMem,
+			&sessionID, &sessionStatus, &pausedAt, &layerCount,
+		)
+		if err != nil {
+			return nil, nil, fmt.Errorf("scan failed: %w", err)
+		}
+
+		// Get or create runner detail
+		rd, exists := runnerMap[runnerID]
+		if !exists {
+			rd = &RunnerDetail{
+				RunnerID:    runnerID,
+				HostID:      hostID,
+				HostName:    hostName,
+				WorkloadKey: workloadKey,
+				Status:      status,
+			}
+
+			// Set timestamps and computed fields
+			if createdAt.Valid {
+				rd.CreatedAt = &createdAt.Time
+				ageSeconds := int(time.Since(createdAt.Time).Seconds())
+				rd.AgeSeconds = &ageSeconds
+			}
+
+			if startedAt.Valid && createdAt.Valid {
+				uptimeSeconds := int(time.Since(startedAt.Time).Seconds())
+				rd.UptimeSeconds = &uptimeSeconds
+			}
+
+			// Job and IP
+			if jobID.Valid {
+				rd.JobID = jobID.String
+			}
+			if internalIP.Valid {
+				rd.InternalIP = internalIP.String
+			}
+
+			// Host details
+			rd.Host = &HostDetail{
+				Zone:            zone,
+				IsHealthy:       lastHeartbeat.Valid && time.Since(lastHeartbeat.Time) < 2*time.Minute,
+			}
+			if snapshotVersion.Valid {
+				rd.Host.SnapshotVersion = snapshotVersion.String
+			}
+			if lastHeartbeat.Valid {
+				rd.Host.LastHeartbeat = &lastHeartbeat.Time
+				heartbeatAge := int(time.Since(lastHeartbeat.Time).Seconds())
+				rd.Host.LastHeartbeatAgeSeconds = &heartbeatAge
+			}
+
+			// Resources
+			rd.Resources = &ResourceInfo{
+				CPUReserved:      0,
+				MemoryReservedMB: 0,
+			}
+			if usedCPU.Valid {
+				usedCPUInt := int(usedCPU.Int32)
+				rd.Resources.CPUUsed = &usedCPUInt
+			}
+			if usedMem.Valid {
+				usedMemInt := int(usedMem.Int32)
+				rd.Resources.MemoryUsedMB = &usedMemInt
+			}
+
+			// Config
+			rd.Config = &ConfigInfo{
+				RunnerTTLSeconds: 0,
+				AutoPause:        false,
+			}
+			if runnerTTL.Valid {
+				rd.Config.RunnerTTLSeconds = int(runnerTTL.Int32)
+			}
+			if autoPause.Valid {
+				rd.Config.AutoPause = autoPause.Bool
+			}
+			if networkPolicyPreset.Valid {
+				rd.Config.NetworkPolicyPreset = networkPolicyPreset.String
+			}
+
+			runnerMap[runnerID] = rd
+			orderedIDs = append(orderedIDs, runnerID)
+		}
+
+		// Add session if present
+		if sessionID.Valid {
+			session := SessionDetail{
+				SessionID:  sessionID.String,
+				Status:     "active",
+				LayerCount: 0,
+			}
+			if sessionStatus.Valid {
+				session.Status = sessionStatus.String
+			}
+			if pausedAt.Valid {
+				session.PausedAt = &pausedAt.Time
+			}
+			if layerCount.Valid {
+				session.LayerCount = int(layerCount.Int32)
+			}
+			rd.Sessions = append(rd.Sessions, session)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("rows iteration failed: %w", err)
+	}
+
+	// Build ordered result list
+	results := make([]RunnerDetail, 0, len(orderedIDs))
+	for _, id := range orderedIDs {
+		results = append(results, *runnerMap[id])
+	}
+
+	// Determine pagination
+	hasMore := len(results) > limit
+	if hasMore {
+		results = results[:limit]
+	}
+
+	var paginationInfo *PaginationInfo
+	if len(results) > 0 {
+		lastRunner := results[len(results)-1]
+		var nextCursor string
+		if hasMore && lastRunner.CreatedAt != nil {
+			nextCursor = buildRunnersCursor(lastRunner.RunnerID, *lastRunner.CreatedAt)
+		}
+		paginationInfo = &PaginationInfo{
+			NextCursor: nextCursor,
+			HasMore:    hasMore,
+		}
+	} else {
+		paginationInfo = &PaginationInfo{
+			HasMore: false,
+		}
+	}
+
+	return results, paginationInfo, nil
 }
 
 // HandleAllocateRunner handles manual runner allocation requests.

@@ -214,3 +214,80 @@ class TestAsyncRunners:
             assert result.runner_id == "r-123"
 
         asyncio.run(run())
+
+    def test_list_with_detail(self, runners: AsyncRunners, http_client: AsyncHttpClient) -> None:
+        resp_data = {
+            "runners": [{
+                "runner_id": "r-1",
+                "host_id": "h1",
+                "status": "running",
+                "age_seconds": 120,
+                "sessions": [{"session_id": "s-1", "status": "active", "layer_count": 3}],
+            }],
+            "count": 1,
+            "pagination": {"has_more": False}
+        }
+        mock_resp = httpx.Response(200, json=resp_data)
+
+        async def run() -> None:
+            with patch.object(http_client._client, "request", AsyncMock(return_value=mock_resp)) as request:
+                result = await runners.list(detail=True)
+            assert len(result) == 1
+            assert result[0].runner_id == "r-1"
+            assert result[0].age_seconds == 120
+            assert request.await_args.kwargs["params"]["detail"] == "full"
+
+        asyncio.run(run())
+
+    def test_list_with_pagination(self, runners: AsyncRunners, http_client: AsyncHttpClient) -> None:
+        resp_data = {
+            "runners": [{"runner_id": f"r-{i}", "host_id": "h1", "status": "running"} for i in range(10)],
+            "count": 10,
+            "pagination": {"has_more": True, "next_cursor": "cursor-abc"}
+        }
+        mock_resp = httpx.Response(200, json=resp_data)
+
+        async def run() -> None:
+            with patch.object(http_client._client, "request", AsyncMock(return_value=mock_resp)) as request:
+                result = await runners.list(limit=10)
+            assert len(result) == 10
+            assert request.await_args.kwargs["params"]["limit"] == "10"
+
+        asyncio.run(run())
+
+    def test_list_paginated(self, runners: AsyncRunners, http_client: AsyncHttpClient) -> None:
+        resp_data = {
+            "runners": [{"runner_id": "r-1", "host_id": "h1", "status": "running"}],
+            "count": 1,
+            "pagination": {"has_more": True, "next_cursor": "cursor-xyz"}
+        }
+        mock_resp = httpx.Response(200, json=resp_data)
+
+        async def run() -> None:
+            with patch.object(http_client._client, "request", AsyncMock(return_value=mock_resp)):
+                result = await runners.list_paginated(limit=1)
+            assert len(result.runners) == 1
+            assert result.pagination is not None
+            assert result.pagination.has_more is True
+            assert result.pagination.next_cursor == "cursor-xyz"
+
+        asyncio.run(run())
+
+    def test_list_with_filters(self, runners: AsyncRunners, http_client: AsyncHttpClient) -> None:
+        resp_data = {
+            "runners": [{"runner_id": "r-1", "host_id": "h1", "status": "busy", "workload_key": "wk-1"}],
+            "count": 1,
+            "pagination": {"has_more": False}
+        }
+        mock_resp = httpx.Response(200, json=resp_data)
+
+        async def run() -> None:
+            with patch.object(http_client._client, "request", AsyncMock(return_value=mock_resp)) as request:
+                result = await runners.list(status="busy", host_id="h1", workload_key="wk-1")
+            assert len(result) == 1
+            params = request.await_args.kwargs["params"]
+            assert params["status"] == "busy"
+            assert params["host_id"] == "h1"
+            assert params["workload_key"] == "wk-1"
+
+        asyncio.run(run())
