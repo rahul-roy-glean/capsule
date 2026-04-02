@@ -323,6 +323,7 @@ func (p *AuthProxy) handleConnect(clientConn net.Conn, connectReq *http.Request)
 	hostname := hostOnly(targetHost)
 
 	if !p.isAllowedHost(hostname) {
+		p.logger.WithField("blocked_host", hostname).Warn("CONNECT blocked: host not in allowed list")
 		resp := &http.Response{
 			StatusCode: http.StatusForbidden,
 			ProtoMajor: 1, ProtoMinor: 1,
@@ -419,6 +420,7 @@ func (p *AuthProxy) handleHTTP(clientConn net.Conn, req *http.Request) {
 	hostname := hostOnly(req.Host)
 
 	if !p.isAllowedHost(hostname) {
+		p.logger.WithField("blocked_host", hostname).Warn("HTTP blocked: host not in allowed list")
 		resp := &http.Response{
 			StatusCode: http.StatusForbidden,
 			ProtoMajor: 1, ProtoMinor: 1,
